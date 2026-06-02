@@ -1,4 +1,7 @@
 # Project exclude paths
+/references
+/.idea
+/main.js
 /node_modules/
 /node_modules/@codemirror/state/
 /node_modules/@codemirror/state/dist/index.cjs
