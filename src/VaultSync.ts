@@ -1,0 +1,250 @@
+import * as Y from "yjs";
+import {
+	YSweetProvider,
+	STATUS_CONNECTED,
+	EVENT_CONNECTION_STATUS,
+	type YSweetStatus,
+} from "@y-sweet/client";
+import { TFile, TAbstractFile, Notice } from "obsidian";
+import type InstaSyncPlugin from "./main";
+import { getClientToken } from "./ysweet";
+import { Document } from "./Document";
+
+function newGuid(): string {
+	if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+		return crypto.randomUUID();
+	}
+	return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+		const r = (Math.random() * 16) | 0;
+		const v = c === "x" ? r : (r & 0x3) | 0x8;
+		return v.toString(16);
+	});
+}
+
+/**
+ * Coordinates collaborative sync for the whole vault:
+ *  - maintains a shared "file index" (path -> doc guid) in its own Y.Doc, so
+ *    file creations/deletions propagate between clients;
+ *  - owns a {@link Document} per Markdown file.
+ *
+ * One vault maps to one y-sweet server (configured by URL + vault id).
+ */
+export class VaultSync {
+	private plugin: InstaSyncPlugin;
+	private indexDoc: Y.Doc;
+	private indexProvider: YSweetProvider;
+	/** Shared map of vault-relative path -> document guid. */
+	private files: Y.Map<string>;
+
+	private documents = new Map<string, Document>();
+	private destroyed = false;
+	private initialSynced = false;
+
+	private filesObserver: (event: Y.YMapEvent<string>) => void;
+	private statusListener: (status: YSweetStatus) => void;
+
+	constructor(plugin: InstaSyncPlugin) {
+		this.plugin = plugin;
+
+		this.indexDoc = new Y.Doc();
+		this.files = this.indexDoc.getMap("files");
+
+		this.indexProvider = new YSweetProvider(
+			() => getClientToken(plugin.settings.serverUrl, plugin.settings.vaultId),
+			plugin.settings.vaultId,
+			this.indexDoc,
+			{ connect: true, showDebuggerLink: false },
+		);
+
+		this.filesObserver = this.onFilesChanged.bind(this);
+		this.files.observe(this.filesObserver);
+
+		this.statusListener = (status) => {
+			if (status === STATUS_CONNECTED) {
+				this.plugin.setStatus("connected");
+				void this.runInitialSync();
+			} else if (status === "connecting" || status === "handshaking") {
+				this.plugin.setStatus("connecting");
+			} else if (status === "error") {
+				this.plugin.setStatus("error");
+			}
+		};
+		this.indexProvider.on(EVENT_CONNECTION_STATUS, this.statusListener);
+
+		this.registerVaultEvents();
+	}
+
+	// --- Index synchronisation -------------------------------------------------
+
+	private async runInitialSync(): Promise<void> {
+		if (this.initialSynced || this.destroyed) return;
+		this.initialSynced = true;
+
+		// Connect documents for entries that already exist in the shared index.
+		for (const [path, guid] of this.files.entries()) {
+			this.ensureDocument(path, guid, false);
+		}
+
+		// Add any local Markdown files that aren't tracked yet.
+		const mdFiles = this.plugin.app.vault.getMarkdownFiles();
+		for (const file of mdFiles) {
+			if (!this.files.has(file.path)) {
+				const guid = newGuid();
+				this.indexDoc.transact(() => {
+					this.files.set(file.path, guid);
+				});
+				this.ensureDocument(file.path, guid, true);
+			} else {
+				this.ensureDocument(file.path, this.files.get(file.path)!, false);
+			}
+		}
+
+		new Notice(`InstaSync: connected, syncing ${this.documents.size} files.`);
+	}
+
+	private onFilesChanged(event: Y.YMapEvent<string>): void {
+		if (this.destroyed) return;
+		event.changes.keys.forEach((change, path) => {
+			if (change.action === "add" || change.action === "update") {
+				const guid = this.files.get(path);
+				if (guid) this.ensureDocument(path, guid, false);
+			} else if (change.action === "delete") {
+				this.handleRemoteDelete(path);
+			}
+		});
+	}
+
+	private async handleRemoteDelete(path: string): Promise<void> {
+		this.removeDocument(path);
+		const file = this.plugin.app.vault.getAbstractFileByPath(path);
+		if (file instanceof TFile) {
+			try {
+				await this.plugin.app.vault.delete(file);
+			} catch (e) {
+				console.error(`[InstaSync] failed to delete ${path}`, e);
+			}
+		}
+	}
+
+	// --- Document registry -----------------------------------------------------
+
+	private ensureDocument(path: string, guid: string, isCreator: boolean): Document {
+		const existing = this.documents.get(path);
+		if (existing && existing.guid === guid) return existing;
+		if (existing) this.removeDocument(path);
+
+		const doc = new Document(this.plugin, path, guid, isCreator);
+		this.documents.set(path, doc);
+		this.plugin.applyAwarenessTo(doc);
+		return doc;
+	}
+
+	private removeDocument(path: string): void {
+		const doc = this.documents.get(path);
+		if (doc) {
+			doc.destroy();
+			this.documents.delete(path);
+		}
+	}
+
+	getDocumentForPath(path: string): Document | undefined {
+		return this.documents.get(path);
+	}
+
+	allDocuments(): Document[] {
+		return Array.from(this.documents.values());
+	}
+
+	// --- Local vault events ----------------------------------------------------
+
+	private registerVaultEvents(): void {
+		const vault = this.plugin.app.vault;
+
+		this.plugin.registerEvent(
+			vault.on("create", (file) => this.onLocalCreate(file)),
+		);
+		this.plugin.registerEvent(
+			vault.on("delete", (file) => this.onLocalDelete(file)),
+		);
+		this.plugin.registerEvent(
+			vault.on("rename", (file, oldPath) => this.onLocalRename(file, oldPath)),
+		);
+		this.plugin.registerEvent(
+			vault.on("modify", (file) => this.onLocalModify(file)),
+		);
+	}
+
+	private isSyncable(file: TAbstractFile): file is TFile {
+		return file instanceof TFile && file.extension === "md";
+	}
+
+	private onLocalCreate(file: TAbstractFile): void {
+		if (!this.initialSynced || !this.isSyncable(file)) return;
+		if (this.files.has(file.path)) {
+			// Created locally because a remote entry arrived; Document handles it.
+			this.ensureDocument(file.path, this.files.get(file.path)!, false);
+			return;
+		}
+		const guid = newGuid();
+		this.indexDoc.transact(() => {
+			this.files.set(file.path, guid);
+		});
+		this.ensureDocument(file.path, guid, true);
+	}
+
+	private onLocalDelete(file: TAbstractFile): void {
+		if (!this.initialSynced) return;
+		const path = file.path;
+		if (!this.documents.has(path) && !this.files.has(path)) return;
+		this.removeDocument(path);
+		if (this.files.has(path)) {
+			this.indexDoc.transact(() => {
+				this.files.delete(path);
+			});
+		}
+	}
+
+	private onLocalRename(file: TAbstractFile, oldPath: string): void {
+		if (!this.initialSynced || !(file instanceof TFile)) return;
+		const newPath = file.path;
+
+		// Drop tracking of the old path.
+		const wasTracked = this.files.has(oldPath);
+		const guid = this.files.get(oldPath) ?? this.documents.get(oldPath)?.guid;
+		this.removeDocument(oldPath);
+
+		if (file.extension !== "md") {
+			// Renamed out of Markdown; stop syncing it.
+			if (wasTracked) {
+				this.indexDoc.transact(() => this.files.delete(oldPath));
+			}
+			return;
+		}
+
+		const finalGuid = guid ?? newGuid();
+		this.indexDoc.transact(() => {
+			if (wasTracked) this.files.delete(oldPath);
+			this.files.set(newPath, finalGuid);
+		});
+		this.ensureDocument(newPath, finalGuid, !wasTracked);
+	}
+
+	private onLocalModify(file: TAbstractFile): void {
+		if (!this.initialSynced || !this.isSyncable(file)) return;
+		const doc = this.documents.get(file.path);
+		if (doc) void doc.onDiskChanged();
+	}
+
+	// --- Lifecycle -------------------------------------------------------------
+
+	destroy(): void {
+		if (this.destroyed) return;
+		this.destroyed = true;
+		this.files.unobserve(this.filesObserver);
+		this.indexProvider.off(EVENT_CONNECTION_STATUS, this.statusListener);
+		for (const doc of this.documents.values()) doc.destroy();
+		this.documents.clear();
+		this.indexProvider.destroy();
+		this.indexDoc.destroy();
+	}
+}
