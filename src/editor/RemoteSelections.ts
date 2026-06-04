@@ -44,6 +44,9 @@ export const yRemoteSelectionsTheme = EditorView.baseTheme({
 		transformOrigin: "bottom center",
 		transform: "scale(0)",
 	},
+	".cm-ySelectionInfo::after": {
+		content: "attr(data-name)",
+	},
 	".cm-ySelectionInfo": {
 		position: "absolute",
 		top: "-1.05em",
@@ -91,7 +94,12 @@ class YRemoteCaretWidget extends WidgetType {
 		span.appendChild(document.createTextNode("⁠"));
 		const info = document.createElement("div");
 		info.className = "cm-ySelectionInfo";
-		info.textContent = this.name;
+		// Render the name via a CSS pseudo-element (content: attr(data-name))
+		// rather than a real text node. A text node here lives inside CodeMirror's
+		// contenteditable and can be absorbed into the document by the browser's
+		// DOM observer (e.g. when typing/IME at a remote cursor), which then gets
+		// forwarded into the shared Y.Text. An attribute is invisible to that path.
+		info.setAttribute("data-name", this.name);
 		span.appendChild(info);
 		span.appendChild(document.createTextNode("⁠"));
 		return span;

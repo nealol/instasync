@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//u/u/instasync/references/Relay/src/**)",
+      "Read(//u/u/instasync/references/Relay/**)"
+    ]
+  }
+}

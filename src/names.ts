@@ -10,10 +10,7 @@ const ADJECTIVES = [
 ];
 
 const ANIMALS = [
-	"Otter", "Falcon", "Badger", "Lynx", "Heron", "Marmot", "Panda", "Raven",
-	"Wombat", "Ferret", "Gecko", "Ibex", "Jackal", "Koala", "Lemur", "Manta",
-	"Newt", "Ocelot", "Puffin", "Quokka", "Robin", "Stoat", "Tapir", "Urchin",
-	"Viper", "Walrus", "Yak", "Zebra", "Mole", "Finch", "Hare", "Crane",
+	"Puppy", "Puppygirl", "Computer", "Computer Puppy"
 ];
 
 // A pleasant, high-contrast palette for cursor colors.

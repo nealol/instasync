@@ -37,6 +37,20 @@ export default class InstaSyncPlugin extends Plugin {
 			callback: () => this.reloadSync(),
 		});
 
+		// Aggressively recover connectivity after transient drops. The provider's
+		// own backoff caps at ~5s, so these nudges (and OS-level signals) shorten
+		// real-world downtime and revive sockets left dead by sleep/network changes.
+		this.registerInterval(
+			window.setInterval(() => this.vaultSync?.reconnectAll(), 10_000),
+		);
+		this.registerDomEvent(window, "online", () => this.vaultSync?.reconnectAll());
+		this.registerDomEvent(document, "visibilitychange", () => {
+			if (document.visibilityState === "visible") this.vaultSync?.reconnectAll();
+		});
+		this.registerEvent(
+			this.app.workspace.on("active-leaf-change", () => this.vaultSync?.reconnectAll()),
+		);
+
 		// Wait for the vault to finish loading before scanning files.
 		this.app.workspace.onLayoutReady(() => {
 			if (this.settings.enabled) this.startSync();

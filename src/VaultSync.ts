@@ -2,13 +2,26 @@ import * as Y from "yjs";
 import {
 	YSweetProvider,
 	STATUS_CONNECTED,
+	STATUS_OFFLINE,
+	STATUS_ERROR,
 	EVENT_CONNECTION_STATUS,
 	type YSweetStatus,
 } from "@y-sweet/client";
+import { IndexeddbPersistence } from "y-indexeddb";
 import { TFile, TAbstractFile, Notice } from "obsidian";
 import type InstaSyncPlugin from "./main";
 import { getClientToken } from "./ysweet";
 import { Document } from "./Document";
+
+/** Matches the sibling backups written on conflict; these must never sync. */
+const CONFLICT_COPY_RE = / \(conflicted copy .+\)$/;
+
+/** True for files like "Note (conflicted copy Brave Otter 2026-06-02 154233).md". */
+function isConflictCopy(path: string): boolean {
+	const dot = path.lastIndexOf(".");
+	const base = dot > path.lastIndexOf("/") ? path.slice(0, dot) : path;
+	return CONFLICT_COPY_RE.test(base);
+}
 
 function newGuid(): string {
 	if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -33,6 +46,7 @@ export class VaultSync {
 	private plugin: InstaSyncPlugin;
 	private indexDoc: Y.Doc;
 	private indexProvider: YSweetProvider;
+	private indexPersistence: IndexeddbPersistence;
 	/** Shared map of vault-relative path -> document guid. */
 	private files: Y.Map<string>;
 
@@ -49,12 +63,15 @@ export class VaultSync {
 		this.indexDoc = new Y.Doc();
 		this.files = this.indexDoc.getMap("files");
 
+		// Connect only after the persisted index has loaded (see init()), so local
+		// offline map changes merge with the server instead of racing it.
 		this.indexProvider = new YSweetProvider(
 			() => getClientToken(plugin.settings.serverUrl, plugin.settings.vaultId),
 			plugin.settings.vaultId,
 			this.indexDoc,
-			{ connect: true, showDebuggerLink: false },
+			{ connect: false, showDebuggerLink: false },
 		);
+		this.indexPersistence = new IndexeddbPersistence(plugin.settings.vaultId, this.indexDoc);
 
 		this.filesObserver = this.onFilesChanged.bind(this);
 		this.files.observe(this.filesObserver);
@@ -72,6 +89,28 @@ export class VaultSync {
 		this.indexProvider.on(EVENT_CONNECTION_STATUS, this.statusListener);
 
 		this.registerVaultEvents();
+		void this.init();
+	}
+
+	/** Load the persisted index, then connect so local offline changes sync. */
+	private async init(): Promise<void> {
+		try {
+			await this.indexPersistence.whenSynced;
+		} catch (e) {
+			console.error("[InstaSync] index persistence failed to load", e);
+		}
+		if (this.destroyed) return;
+		void this.indexProvider.connect();
+	}
+
+	/** Nudge the index provider and every document to reconnect if stalled. */
+	reconnectAll(): void {
+		if (this.destroyed) return;
+		const status = this.indexProvider.status;
+		if (status === STATUS_OFFLINE || status === STATUS_ERROR) {
+			void this.indexProvider.connect();
+		}
+		for (const doc of this.documents.values()) doc.ensureConnected();
 	}
 
 	// --- Index synchronisation -------------------------------------------------
@@ -88,6 +127,7 @@ export class VaultSync {
 		// Add any local Markdown files that aren't tracked yet.
 		const mdFiles = this.plugin.app.vault.getMarkdownFiles();
 		for (const file of mdFiles) {
+			if (isConflictCopy(file.path)) continue;
 			if (!this.files.has(file.path)) {
 				const guid = newGuid();
 				this.indexDoc.transact(() => {
@@ -180,6 +220,7 @@ export class VaultSync {
 
 	private onLocalCreate(file: TAbstractFile): void {
 		if (!this.initialSynced || !this.isSyncable(file)) return;
+		if (isConflictCopy(file.path)) return;
 		if (this.files.has(file.path)) {
 			// Created locally because a remote entry arrived; Document handles it.
 			this.ensureDocument(file.path, this.files.get(file.path)!, false);
@@ -245,6 +286,7 @@ export class VaultSync {
 		for (const doc of this.documents.values()) doc.destroy();
 		this.documents.clear();
 		this.indexProvider.destroy();
+		void this.indexPersistence.destroy();
 		this.indexDoc.destroy();
 	}
 }
