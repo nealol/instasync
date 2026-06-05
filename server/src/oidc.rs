@@ -120,7 +120,18 @@ pub async fn callback(
     } else {
         let sep = if flow.redirect.contains('?') { '&' } else { '?' };
         let dest = format!("{}{}token={}", flow.redirect, sep, token);
-        Ok(Redirect::to(&dest).into_response())
+        let is_web = dest.starts_with("http://") || dest.starts_with("https://");
+        if is_web {
+            Ok(Redirect::to(&dest).into_response())
+        } else {
+            // We can't 303 straight to a custom scheme like `obsidian://…`:
+            // browsers refuse to launch the protocol handler from a server
+            // redirect without a user gesture, so the deep link would silently
+            // never fire. Serve an interstitial that tries the link via JS,
+            // offers a manual button (a real user gesture), and always keeps the
+            // paste-code fallback visible.
+            Ok(Html(redirect_page(&dest, &token)).into_response())
+        }
     }
 }
 
@@ -200,6 +211,36 @@ async fn discover(
         cfg.oidc_client_secret.clone().map(ClientSecret::new),
         redirect,
     ))
+}
+
+/// Interstitial shown after a successful login when a deep-link redirect target
+/// was supplied. Fires the `obsidian://…` link from JS, exposes a manual button
+/// (so the user gesture lets the browser launch the external handler), and keeps
+/// the paste-code fallback visible in case the protocol handler isn't registered.
+fn redirect_page(dest: &str, token: &str) -> String {
+    let href = html_escape(dest);
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>InstaSync</title></head>\
+<body style=\"font-family:system-ui;max-width:40rem;margin:3rem auto\">\
+<h2>InstaSync sign-in complete</h2>\
+<p><a id=\"open\" href=\"{href}\" \
+style=\"display:inline-block;padding:.6rem 1rem;background:#7c3aed;color:#fff;\
+border-radius:6px;text-decoration:none\">Open Obsidian</a> to finish signing in.</p>\
+<p>If Obsidian did not open automatically, click the button above, or copy this \
+code into the plugin's <em>paste code</em> field:</p>\
+<pre style=\"padding:1rem;background:#f4f4f4;border-radius:6px;user-select:all\">{token}</pre>\
+<script>setTimeout(function(){{window.location.href=document.getElementById('open').href;}},250);</script>\
+</body></html>"
+    )
+}
+
+/// Minimal HTML-attribute escaping for values we interpolate into markup.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn token_page(token: &str) -> String {
