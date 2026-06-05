@@ -17,7 +17,7 @@ import { Document } from "./Document";
 const CONFLICT_COPY_RE = / \(conflicted copy .+\)$/;
 
 /** True for files like "Note (conflicted copy Brave Otter 2026-06-02 154233).md". */
-function isConflictCopy(path: string): boolean {
+export function isConflictCopy(path: string): boolean {
 	const dot = path.lastIndexOf(".");
 	const base = dot > path.lastIndexOf("/") ? path.slice(0, dot) : path;
 	return CONFLICT_COPY_RE.test(base);
@@ -63,15 +63,18 @@ export class VaultSync {
 		this.indexDoc = new Y.Doc();
 		this.files = this.indexDoc.getMap("files");
 
+		const vaultId = plugin.settings.activeVaultId;
+
 		// Connect only after the persisted index has loaded (see init()), so local
-		// offline map changes merge with the server instead of racing it.
+		// offline map changes merge with the server instead of racing it. The index
+		// doc keeps the bare vault id; file docs are namespaced as `${vaultId}__${guid}`.
 		this.indexProvider = new YSweetProvider(
-			() => getClientToken(plugin.settings.serverUrl, plugin.settings.vaultId),
-			plugin.settings.vaultId,
+			() => getClientToken(plugin, vaultId),
+			vaultId,
 			this.indexDoc,
 			{ connect: false, showDebuggerLink: false },
 		);
-		this.indexPersistence = new IndexeddbPersistence(plugin.settings.vaultId, this.indexDoc);
+		this.indexPersistence = new IndexeddbPersistence(vaultId, this.indexDoc);
 
 		this.filesObserver = this.onFilesChanged.bind(this);
 		this.files.observe(this.filesObserver);
@@ -133,6 +136,7 @@ export class VaultSync {
 				this.indexDoc.transact(() => {
 					this.files.set(file.path, guid);
 				});
+				this.registerFile(file.path, guid);
 				this.ensureDocument(file.path, guid, true);
 			} else {
 				this.ensureDocument(file.path, this.files.get(file.path)!, false);
@@ -173,10 +177,16 @@ export class VaultSync {
 		if (existing && existing.guid === guid) return existing;
 		if (existing) this.removeDocument(path);
 
-		const doc = new Document(this.plugin, path, guid, isCreator);
+		const serverDocId = `${this.plugin.settings.activeVaultId}__${guid}`;
+		const doc = new Document(this.plugin, path, guid, serverDocId, isCreator);
 		this.documents.set(path, doc);
 		this.plugin.applyAwarenessTo(doc);
 		return doc;
+	}
+
+	/** Best-effort: keep the server's guid → path registry current (for ACLs). */
+	private registerFile(path: string, guid: string): void {
+		void this.plugin.auth.registerFile(this.plugin.settings.activeVaultId, guid, path);
 	}
 
 	private removeDocument(path: string): void {
@@ -230,6 +240,7 @@ export class VaultSync {
 		this.indexDoc.transact(() => {
 			this.files.set(file.path, guid);
 		});
+		this.registerFile(file.path, guid);
 		this.ensureDocument(file.path, guid, true);
 	}
 
@@ -267,6 +278,7 @@ export class VaultSync {
 			if (wasTracked) this.files.delete(oldPath);
 			this.files.set(newPath, finalGuid);
 		});
+		this.registerFile(newPath, finalGuid);
 		this.ensureDocument(newPath, finalGuid, !wasTracked);
 	}
 

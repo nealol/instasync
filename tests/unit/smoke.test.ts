@@ -1,23 +1,33 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { startYSweetServer, type YSweetServer } from "../support/ysweetServer";
+import { startAuthHarness, type AuthHarness } from "../support/authServer";
+import { makeFakePlugin, type FakePlugin } from "../support/fakePlugin";
 import { Peer } from "../support/peer";
 import { waitFor, freshGuid } from "../support/util";
 
 describe("harness smoke", () => {
-	let server: YSweetServer;
+	let harness: AuthHarness;
+	let plugin: FakePlugin;
+	let vaultId: string;
 
 	beforeAll(async () => {
-		server = await startYSweetServer();
-	}, 120_000);
+		harness = await startAuthHarness();
+		const token = await harness.loginUser("smoke");
+		const vault = await harness.createVault(token, "smoke");
+		vaultId = vault.id;
+		plugin = makeFakePlugin(harness.authUrl, {
+			sessionToken: token,
+			activeVaultId: vaultId,
+		}).plugin;
+	}, 180_000);
 
 	afterAll(async () => {
-		await server?.stop();
+		await harness?.stop();
 	});
 
-	it("two peers sync text through the spawned y-sweet server", async () => {
-		const guid = freshGuid();
-		const a = new Peer(server.url, guid);
-		const b = new Peer(server.url, guid);
+	it("two peers sync text through the auth server + y-sweet", async () => {
+		const docId = `${vaultId}__${freshGuid()}`;
+		const a = new Peer(plugin, docId);
+		const b = new Peer(plugin, docId);
 		try {
 			await a.whenSynced();
 			await b.whenSynced();

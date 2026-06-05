@@ -149,3 +149,14 @@
 /node_modules/yjs/dist/src/utils/YEvent.d.ts.map
 # wdio e2e
 .obsidian-cache/
+
+# Rust auth server build output
+/server/target/
+/server/.check.log
+/server/.test.log
+
+# test logs / local data
+/.test-unit.log
+/.test-e2e.log
+/.ysweet-data/
+/instasync.zip

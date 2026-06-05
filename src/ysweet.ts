@@ -1,4 +1,4 @@
-import { requestUrl } from "obsidian";
+import type InstaSyncPlugin from "./main";
 
 /** Subset of the y-sweet client token needed to connect (see y-sweet SDK). */
 export type ClientToken = {
@@ -10,44 +10,21 @@ export type ClientToken = {
 };
 
 /**
- * Obtains a y-sweet {@link ClientToken} for a document by talking directly to a
- * y-sweet server. This mirrors `getOrCreateDocAndToken` from the y-sweet SDK,
- * but uses Obsidian's `requestUrl` so it works around CORS in the desktop app.
+ * Obtains a y-sweet {@link ClientToken} for a document by asking the InstaSync
+ * auth server to mint one. The server performs the access checks and relays to
+ * y-sweet, so the plugin never talks to y-sweet's HTTP API directly.
  *
- * The development server (`y-sweet serve`) requires no server token, which is
- * the intended target for this prototype.
+ * `docId` is the *namespaced* id (`{vaultId}` for the index, `{vaultId}__{guid}`
+ * for a file); the vault is always the active vault.
  */
-export async function getClientToken(serverUrl: string, docId: string): Promise<ClientToken> {
-	const base = serverUrl.replace(/\/$/, "");
-
-	// Ensure the document exists. This is idempotent server-side.
-	try {
-		await requestUrl({
-			url: `${base}/doc/new`,
-			method: "POST",
-			contentType: "application/json",
-			body: JSON.stringify({ docId }),
-			throw: false,
-		});
-	} catch (e) {
-		// Non-fatal: the doc may already exist, or the server may auto-create on auth.
+export async function getClientToken(plugin: InstaSyncPlugin, docId: string): Promise<ClientToken> {
+	const vaultId = plugin.settings.activeVaultId;
+	if (!vaultId) {
+		throw new Error("InstaSync: no active vault selected.");
 	}
-
-	const res = await requestUrl({
-		url: `${base}/doc/${encodeURIComponent(docId)}/auth`,
-		method: "POST",
-		contentType: "application/json",
-		body: JSON.stringify({}),
-		throw: false,
-	});
-
-	if (res.status < 200 || res.status >= 300) {
-		throw new Error(`y-sweet auth failed for "${docId}": HTTP ${res.status}`);
-	}
-
-	const token = res.json as ClientToken;
+	const token = await plugin.auth.docToken(vaultId, docId);
 	if (!token || !token.url) {
-		throw new Error(`y-sweet returned an invalid client token for "${docId}"`);
+		throw new Error(`InstaSync: auth server returned an invalid token for "${docId}".`);
 	}
 	return token;
 }
