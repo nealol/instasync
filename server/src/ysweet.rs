@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use url::Url;
 
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
@@ -20,9 +21,14 @@ impl Level {
 }
 
 /// Strip the scheme from a base URL, returning the `host[:port]` authority.
-fn authority(url: &str) -> &str {
-    let without_scheme = url.split("://").nth(1).unwrap_or(url);
-    without_scheme.trim_end_matches('/')
+fn authority(url: &str) -> Option<String> {
+    Url::parse(url).ok().and_then(|u| u.host_str().map(|host| {
+        if let Some(port) = u.port() {
+            format!("{host}:{port}")
+        } else {
+            host.to_string()
+        }
+    }))
 }
 
 /// Rewrite the internal y-sweet authority in a minted token URL to the public one.
@@ -86,8 +92,10 @@ pub async fn mint_client_token(state: &AppState, doc_id: &str, level: Level) -> 
         .await
         .map_err(|e| AppError::Internal(format!("y-sweet auth body: {e}")))?;
 
-    let internal = authority(&state.config.ysweet_url).to_string();
-    let public = authority(&state.config.ysweet_public_url).to_string();
+    let internal = authority(&state.config.ysweet_url)
+        .ok_or_else(|| AppError::Internal("invalid YSWEET_URL".into()))?;
+    let public = authority(&state.config.ysweet_public_url)
+        .ok_or_else(|| AppError::Internal("invalid YSWEET_PUBLIC_URL".into()))?;
     rewrite_host(&mut token, "url", &internal, &public);
     rewrite_host(&mut token, "baseUrl", &internal, &public);
     Ok(token)
@@ -99,8 +107,8 @@ mod tests {
 
     #[test]
     fn authority_strips_scheme_and_trailing_slash() {
-        assert_eq!(authority("http://127.0.0.1:8080/"), "127.0.0.1:8080");
-        assert_eq!(authority("ws://example.com"), "example.com");
+        assert_eq!(authority("http://127.0.0.1:8080/").unwrap(), "127.0.0.1:8080");
+        assert_eq!(authority("ws://example.com").unwrap(), "example.com");
     }
 
     #[test]

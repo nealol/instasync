@@ -1,18 +1,20 @@
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use axum::Json;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::entities::{invites, memberships, permissions, users, vault_files, vaults};
 use crate::error::{AppError, AppResult};
-use crate::session::{now_millis, AuthUser};
+use crate::session::{bearer_token, now_millis, revoke_session, AuthUser};
 use crate::state::AppState;
 use crate::words::generate_invite_code;
 use crate::ysweet::{ensure_doc, mint_client_token, Level};
 
 const ROLE_ADMIN: &str = "admin";
 const ROLE_MEMBER: &str = "member";
+const INVITE_TTL_MS: i64 = 1000 * 60 * 60 * 24 * 7;
 
 // ---------- shared response shapes ----------
 
@@ -95,13 +97,15 @@ pub async fn create_vault(
     let now = now_millis();
     let vault_id = uuid::Uuid::new_v4().to_string();
 
+    let txn = state.db.begin().await?;
+
     vaults::ActiveModel {
         id: Set(vault_id.clone()),
         name: Set(body.name.clone()),
         created_by: Set(user.id.clone()),
         created_at: Set(now),
     }
-    .insert(&state.db)
+    .insert(&txn)
     .await?;
 
     memberships::ActiveModel {
@@ -111,8 +115,10 @@ pub async fn create_vault(
         role: Set(ROLE_ADMIN.to_string()),
         created_at: Set(now),
     }
-    .insert(&state.db)
+    .insert(&txn)
     .await?;
+
+    txn.commit().await?;
 
     Ok(Json(VaultResponse {
         id: vault_id,
@@ -187,7 +193,7 @@ pub async fn create_invite(
             used_by: Set(None),
             used_at: Set(None),
             created_at: Set(now_millis()),
-            expires_at: Set(None),
+            expires_at: Set(Some(now_millis() + INVITE_TTL_MS)),
         }
         .insert(&state.db)
         .await;
@@ -223,6 +229,10 @@ pub async fn redeem_invite(
         .await?
         .ok_or(AppError::NotFound)?;
 
+    if invite.expires_at.is_some_and(|expires| expires < now_millis()) {
+        return Err(AppError::NotFound);
+    }
+
     let vault = vaults::Entity::find_by_id(invite.vault_id.clone())
         .one(&state.db)
         .await?
@@ -236,17 +246,20 @@ pub async fn redeem_invite(
         }));
     }
 
-    // Atomic single-use claim: only succeeds while used_by IS NULL.
+    let txn = state.db.begin().await?;
+
+    // Atomic single-use claim: only succeeds while used_by IS NULL and unexpired.
     let claimed = invites::Entity::update_many()
         .col_expr(invites::Column::UsedBy, sea_orm::sea_query::Expr::value(user.id.clone()))
         .col_expr(invites::Column::UsedAt, sea_orm::sea_query::Expr::value(now_millis()))
         .filter(invites::Column::Code.eq(&body.code))
         .filter(invites::Column::UsedBy.is_null())
-        .exec(&state.db)
+        .filter(invites::Column::ExpiresAt.is_null().or(invites::Column::ExpiresAt.gt(now_millis())))
+        .exec(&txn)
         .await?;
 
     if claimed.rows_affected == 0 {
-        return Err(AppError::Conflict("invite already used".into()));
+        return Err(AppError::Conflict("invite already used or expired".into()));
     }
 
     memberships::ActiveModel {
@@ -256,8 +269,10 @@ pub async fn redeem_invite(
         role: Set(invite.role_granted.clone()),
         created_at: Set(now_millis()),
     }
-    .insert(&state.db)
+    .insert(&txn)
     .await?;
+
+    txn.commit().await?;
 
     Ok(Json(RedeemResponse {
         vault_id: vault.id,
@@ -429,6 +444,10 @@ pub async fn doc_token(
 ) -> AppResult<Json<Value>> {
     require_member(&state, &user.id, &body.vault_id).await?;
 
+    if !safe_doc_id(&body.doc_id) {
+        return Err(AppError::BadRequest("invalid doc id".into()));
+    }
+
     // Cheap scope gate: the doc must belong to this vault's namespace.
     let prefix = format!("{}__", body.vault_id);
     if body.doc_id != body.vault_id && !body.doc_id.starts_with(&prefix) {
@@ -440,6 +459,23 @@ pub async fn doc_token(
     ensure_doc(&state, &body.doc_id).await?;
     let token = mint_client_token(&state, &body.doc_id, level).await?;
     Ok(Json(token))
+}
+
+pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> AppResult<Json<Value>> {
+    let header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(AppError::Unauthorized)?;
+    let token = bearer_token(header).ok_or(AppError::Unauthorized)?;
+    revoke_session(&state.db, token).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+fn safe_doc_id(doc_id: &str) -> bool {
+    !doc_id.is_empty()
+        && doc_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
 /// Resolve the docId to a path and evaluate the (currently allow-all) ACL.

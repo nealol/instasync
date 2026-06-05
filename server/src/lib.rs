@@ -15,10 +15,12 @@ use std::sync::Arc;
 
 use axum::{
     extract::DefaultBodyLimit,
+    http::HeaderValue,
     routing::{any, delete, get, post},
     Router,
 };
 use sea_orm::Database;
+use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
 use y_sweet_core::auth::Authenticator;
 
@@ -44,6 +46,8 @@ pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
     let http = reqwest::Client::builder()
         // Following redirects on the token endpoint opens us to SSRF.
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
         .build()?;
 
     Ok(AppState {
@@ -57,15 +61,26 @@ pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
 
 /// Assemble the axum router for the given state.
 pub fn app(state: AppState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = if state.config.cors_allowed_origins.is_empty() {
+        CorsLayer::new()
+            .allow_origin(HeaderValue::from_static("obsidian://app"))
+            .allow_methods(Any)
+            .allow_headers(Any)
+    } else {
+        let origins: Vec<HeaderValue> = state
+            .config
+            .cors_allowed_origins
+            .iter()
+            .filter_map(|origin| origin.parse().ok())
+            .collect();
+        CorsLayer::new().allow_origin(origins).allow_methods(Any).allow_headers(Any)
+    };
 
     Router::new()
         .route("/auth/login", get(oidc::login))
         .route("/auth/callback", get(oidc::callback))
         .route("/api/me", get(routes::me))
+        .route("/api/logout", post(routes::logout))
         .route("/api/vaults", get(routes::list_vaults).post(routes::create_vault))
         .route("/api/vaults/{id}/invites", post(routes::create_invite))
         .route("/api/vaults/{id}/members", get(routes::list_members))
@@ -85,7 +100,7 @@ pub fn app(state: AppState) -> Router {
             get(blobs::get_blob)
                 .head(blobs::head_blob)
                 .put(blobs::put_blob)
-                .layer(DefaultBodyLimit::disable()),
+                .layer(DefaultBodyLimit::max(blobs::MAX_BLOB_BYTES as usize)),
         )
         .route("/api/invites/redeem", post(routes::redeem_invite))
         .route("/api/doc-token", post(routes::doc_token))

@@ -20,7 +20,9 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
+use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as WsMsg};
+use url::Url;
 
 use crate::state::AppState;
 
@@ -38,10 +40,14 @@ const HOP_BY_HOP: &[&str] = &[
 ];
 
 /// `host[:port]` of the internal y-sweet, derived from the configured URL.
-fn upstream_authority(state: &AppState) -> &str {
-    let url = &state.config.ysweet_url;
-    let without_scheme = url.split("://").nth(1).unwrap_or(url);
-    without_scheme.trim_end_matches('/')
+fn upstream_authority(state: &AppState) -> anyhow::Result<String> {
+    let url = Url::parse(&state.config.ysweet_url)?;
+    let host = url.host_str().ok_or_else(|| anyhow::anyhow!("missing y-sweet host"))?;
+    Ok(if let Some(port) = url.port() {
+        format!("{host}:{port}")
+    } else {
+        host.to_string()
+    })
 }
 
 /// Largest document HTTP body we relay (y-sweet `update` payloads).
@@ -59,7 +65,13 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 /// Forward a request under `/d/*` to the internal y-sweet. WebSocket upgrades are
 /// relayed bidirectionally; everything else is proxied as a plain HTTP request.
 pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
-    let authority = upstream_authority(&state).to_string();
+    let authority = match upstream_authority(&state) {
+        Ok(authority) => authority,
+        Err(e) => {
+            tracing::warn!("invalid y-sweet upstream: {e}");
+            return (StatusCode::BAD_GATEWAY, "invalid y-sweet upstream").into_response();
+        }
+    };
     let (mut parts, body) = req.into_parts();
     let path_and_query = parts
         .uri
@@ -116,7 +128,10 @@ async fn proxy_http(
     }
     req = req.body(body);
 
-    let upstream = req.send().await?;
+    let upstream = timeout(Duration::from_secs(30), req.send()).await??;
+    if upstream.content_length().is_some_and(|len| len > MAX_BODY_BYTES as u64) {
+        return Ok((StatusCode::BAD_GATEWAY, "y-sweet response too large").into_response());
+    }
 
     let mut builder = Response::builder().status(upstream.status());
     for (name, value) in upstream.headers() {
@@ -124,7 +139,7 @@ async fn proxy_http(
             builder = builder.header(name, value);
         }
     }
-    let bytes = upstream.bytes().await?;
+    let bytes = timeout(Duration::from_secs(30), upstream.bytes()).await??;
     Ok(builder
         .body(axum::body::Body::from(bytes))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response()))
@@ -139,8 +154,8 @@ async fn relay_ws(client: WebSocket, target: &str) -> anyhow::Result<()> {
         .authority()
         .map(|a| a.as_str().to_string())
         .ok_or_else(|| anyhow::anyhow!("missing authority in {target}"))?;
-    let tcp = TcpStream::connect(&host).await?;
-    let (upstream, _resp) = tokio_tungstenite::client_async(request, tcp).await?;
+    let tcp = timeout(Duration::from_secs(10), TcpStream::connect(&host)).await??;
+    let (upstream, _resp) = timeout(Duration::from_secs(10), tokio_tungstenite::client_async(request, tcp)).await??;
 
     let (mut up_tx, mut up_rx) = upstream.split();
     let (mut cl_tx, mut cl_rx) = client.split();

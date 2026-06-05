@@ -2,6 +2,8 @@
 /references
 /.idea
 /main.js
+/data.json
+/.ysweet-server.log
 /node_modules/
 /node_modules/@codemirror/state/
 /node_modules/@codemirror/state/dist/index.cjs

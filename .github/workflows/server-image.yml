@@ -3,7 +3,7 @@ name: Server image
 on:
   push:
     branches: [master]
-    tags: ["v*"]
+    tags: ["*.*.*"]
     paths:
       - "server/**"
       - ".github/workflows/server-image.yml"

@@ -22,6 +22,12 @@ export class FakeVault {
 	off(name: string, cb: Handler): void {
 		this.handlers[name] = (this.handlers[name] ?? []).filter((h) => h !== cb);
 	}
+	offref(ref: { name: string; cb: Handler }): void {
+		this.off(ref.name, ref.cb);
+	}
+	handlerCount(name: string): number {
+		return (this.handlers[name] ?? []).length;
+	}
 	private emit(name: string, ...args: any[]): void {
 		for (const h of this.handlers[name] ?? []) h(...args);
 	}

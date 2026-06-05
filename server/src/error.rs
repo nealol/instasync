@@ -12,6 +12,8 @@ pub enum AppError {
     Forbidden,
     #[error("not found")]
     NotFound,
+    #[error("payload too large")]
+    PayloadTooLarge,
     #[error("{0}")]
     BadRequest(String),
     #[error("{0}")]
@@ -26,6 +28,7 @@ impl AppError {
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
             AppError::Forbidden => StatusCode::FORBIDDEN,
             AppError::NotFound => StatusCode::NOT_FOUND,
+            AppError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -38,6 +41,7 @@ impl IntoResponse for AppError {
         let status = self.status();
         if status == StatusCode::INTERNAL_SERVER_ERROR {
             tracing::error!("{self}");
+            return (status, Json(json!({ "error": "internal server error" }))).into_response();
         }
         (status, Json(json!({ "error": self.to_string() }))).into_response()
     }

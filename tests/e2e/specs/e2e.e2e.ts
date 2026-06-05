@@ -270,7 +270,7 @@ describe("InstaSync — two isolated Obsidian devices", function () {
 					},
 					{
 						timeout: 60 * SECONDS,
-						timeoutMsg: () => `editors never converged: A="${last.a}" B="${last.b}"`,
+						timeoutMsg: "editors never converged",
 					},
 				);
 				// ...and that text must contain exactly the characters typed — no

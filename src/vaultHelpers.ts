@@ -14,9 +14,13 @@ export async function ensureParentFolder(app: App, path: string): Promise<void> 
 	const slash = path.lastIndexOf("/");
 	if (slash <= 0) return;
 	const folder = path.slice(0, slash);
-	if (!app.vault.getAbstractFileByPath(folder)) {
+	let current = "";
+	for (const part of folder.split("/")) {
+		if (!part) continue;
+		current = current ? `${current}/${part}` : part;
+		if (app.vault.getAbstractFileByPath(current)) continue;
 		try {
-			await app.vault.createFolder(folder);
+			await app.vault.createFolder(current);
 		} catch (e) {
 			// Folder may have been created concurrently; ignore.
 		}

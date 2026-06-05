@@ -36,9 +36,10 @@ export class AuthError extends Error {}
 export class AuthClient {
 	private plugin: InstaSyncPlugin;
 	/** Resolver for an in-flight login call awaiting the deep link / paste code. */
-	private pendingLogin: ((token: string) => void) | null = null;
+	private pendingLogin: ((token: string) => Promise<MeResponse>) | null = null;
 	/** Rejecter paired with {@link pendingLogin}, so the wait can be cancelled. */
 	private pendingReject: ((err: Error) => void) | null = null;
+	private pendingTimer: number | null = null;
 
 	constructor(plugin: InstaSyncPlugin) {
 		this.plugin = plugin;
@@ -115,8 +116,23 @@ export class AuthClient {
 		await this.plugin.saveSettings();
 	}
 
+	destroy(): void {
+		if (this.pendingTimer !== null) {
+			window.clearTimeout(this.pendingTimer);
+			this.pendingTimer = null;
+		}
+		this.cancelPendingLogin("Sign-in cancelled: plugin unloaded.");
+	}
+
 	/** Log out: drop the session and the active vault binding. */
 	async logout(): Promise<void> {
+		try {
+			if (this.plugin.settings.sessionToken) {
+				await this.api("/api/logout", { method: "POST", body: {} });
+			}
+		} catch (e) {
+			console.warn("[InstaSync] server logout failed", e);
+		}
 		this.plugin.settings.activeVaultId = "";
 		await this.clearSession();
 	}
@@ -158,16 +174,26 @@ export class AuthClient {
 			this.pendingLogin = (token: string) => {
 				this.pendingLogin = null;
 				this.pendingReject = null;
-				this.apiAt<MeResponse>(normalized, "/api/me", token)
-					.then((me) => resolve({ token, me }))
-					.catch(reject);
+				if (this.pendingTimer !== null) {
+					window.clearTimeout(this.pendingTimer);
+					this.pendingTimer = null;
+				}
+				const validation = this.apiAt<MeResponse>(normalized, "/api/me", token)
+					.then(async (me) => {
+						await this.setSessionForServer(normalized, token, me);
+						resolve({ token, me });
+						return me;
+					});
+				validation.catch(reject);
+				return validation;
 			};
 			// Abandon the wait after 5 minutes so the promise can't leak forever.
 			// Guard on identity so a stale timer can't reject a newer attempt.
-			window.setTimeout(() => {
+			this.pendingTimer = window.setTimeout(() => {
 				if (this.pendingReject === reject) {
 					this.pendingLogin = null;
 					this.pendingReject = null;
+					this.pendingTimer = null;
 					reject(new Error("Login timed out."));
 				}
 			}, 5 * 60 * 1000);
@@ -193,14 +219,18 @@ export class AuthClient {
 		const reject = this.pendingReject;
 		this.pendingLogin = null;
 		this.pendingReject = null;
+		if (this.pendingTimer !== null) {
+			window.clearTimeout(this.pendingTimer);
+			this.pendingTimer = null;
+		}
 		reject?.(new Error(reason));
 	}
 
 	/** Called by the registered protocol handler in main.ts. */
-	handleProtocol(params: Record<string, string>): void {
+	handleProtocol(params: Record<string, string>): Promise<MeResponse | void> {
 		const token = params.token;
-		if (!token) return;
-		this.completeWithToken(token);
+		if (!token) return Promise.resolve();
+		return this.completeWithToken(token);
 	}
 
 	/**
@@ -210,15 +240,15 @@ export class AuthClient {
 	submitPastedCode(token: string): void {
 		const trimmed = token.trim();
 		if (!trimmed) return;
-		this.completeWithToken(trimmed);
+		void this.completeWithToken(trimmed);
 	}
 
-	private completeWithToken(token: string): void {
+	private completeWithToken(token: string): Promise<MeResponse | void> {
 		if (this.pendingLogin) {
-			this.pendingLogin(token);
+			return this.pendingLogin(token);
 		} else {
 			// No awaiting promise (e.g. app restarted between open and callback).
-			void this.setSession(token);
+			return this.setSession(token);
 		}
 	}
 
@@ -308,7 +338,10 @@ export class AuthClient {
 			headers: this.authHeaders,
 			throw: false,
 		});
-		if (res.status === 401) throw new AuthError("Session expired. Please sign in again.");
+		if (res.status === 401) {
+			await this.clearSession();
+			throw new AuthError("Session expired. Please sign in again.");
+		}
 		return res.status >= 200 && res.status < 300;
 	}
 
@@ -320,7 +353,10 @@ export class AuthClient {
 			headers: this.authHeaders,
 			throw: false,
 		});
-		if (res.status === 401) throw new AuthError("Session expired. Please sign in again.");
+		if (res.status === 401) {
+			await this.clearSession();
+			throw new AuthError("Session expired. Please sign in again.");
+		}
 		if (res.status < 200 || res.status >= 300) {
 			throw new Error(`blob download failed: ${blobErrorMessage(res)}`);
 		}
@@ -337,7 +373,10 @@ export class AuthClient {
 			body: data,
 			throw: false,
 		});
-		if (res.status === 401) throw new AuthError("Session expired. Please sign in again.");
+		if (res.status === 401) {
+			await this.clearSession();
+			throw new AuthError("Session expired. Please sign in again.");
+		}
 		if (res.status < 200 || res.status >= 300) {
 			throw new Error(`blob upload failed: ${blobErrorMessage(res)}`);
 		}

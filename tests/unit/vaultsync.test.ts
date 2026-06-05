@@ -104,4 +104,24 @@ describe("VaultSync index", () => {
 
 		await expect(getClientToken(plugin as any, vault.id)).rejects.toThrow();
 	});
+
+	it("unregisters vault event handlers when destroyed", async () => {
+		const vault = await harness.createVault(aliceToken, "cleanup");
+		const { plugin, vault: localVault } = makeFakePlugin(harness.authUrl, {
+			sessionToken: aliceToken,
+			activeVaultId: vault.id,
+		});
+
+		const sync = new VaultSync(plugin as any);
+		expect(localVault.handlerCount("create")).toBe(1);
+		expect(localVault.handlerCount("delete")).toBe(1);
+		expect(localVault.handlerCount("rename")).toBe(1);
+		expect(localVault.handlerCount("modify")).toBe(1);
+
+		sync.destroy();
+		expect(localVault.handlerCount("create")).toBe(0);
+		expect(localVault.handlerCount("delete")).toBe(0);
+		expect(localVault.handlerCount("rename")).toBe(0);
+		expect(localVault.handlerCount("modify")).toBe(0);
+	});
 });

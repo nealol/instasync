@@ -225,7 +225,7 @@ export class Document {
 	 * that {@link VaultSync} recognises and skips it (it must not sync itself).
 	 */
 	private async writeConflictCopy(localContent: string): Promise<void> {
-		const conflictPath = this.conflictCopyPath();
+		const conflictPath = this.uniqueConflictCopyPath();
 		try {
 			await ensureParentFolder(this.plugin.app, conflictPath);
 			await this.plugin.app.vault.create(conflictPath, localContent);
@@ -239,8 +239,22 @@ export class Document {
 		}
 	}
 
+	private uniqueConflictCopyPath(): string {
+		const first = this.conflictCopyPath();
+		if (!this.plugin.app.vault.getAbstractFileByPath(first)) return first;
+		const dot = first.lastIndexOf(".");
+		const hasExt = dot > first.lastIndexOf("/");
+		const base = hasExt ? first.slice(0, dot) : first;
+		const ext = hasExt ? first.slice(dot) : "";
+		for (let i = 2; i < 1000; i++) {
+			const candidate = `${base} ${i}${ext}`;
+			if (!this.plugin.app.vault.getAbstractFileByPath(candidate)) return candidate;
+		}
+		return `${base} ${Date.now()}${ext}`;
+	}
+
 	private conflictCopyPath(): string {
-		const name = this.plugin.settings.clientName || "local";
+		const name = safeFilenamePart(this.plugin.settings.clientName || "local");
 		const stamp = formatTimestamp(new Date());
 		const dot = this.path.lastIndexOf(".");
 		const hasExt = dot > this.path.lastIndexOf("/");
@@ -350,6 +364,11 @@ export class Document {
 		void this.persistence.destroy();
 		this.ydoc.destroy();
 	}
+}
+
+function safeFilenamePart(value: string): string {
+	const cleaned = value.replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim();
+	return cleaned || "local";
 }
 
 /** Formats a date as `YYYY-MM-DD HHmmss` (no colons — safe in filenames). */

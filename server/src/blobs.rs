@@ -26,6 +26,8 @@ use crate::routes::require_member;
 use crate::session::AuthUser;
 use crate::state::AppState;
 
+pub const MAX_BLOB_BYTES: u64 = 100 * 1024 * 1024;
+
 /// A sha256 hex digest is exactly 64 lowercase hex characters. Validating this
 /// before building any path is what keeps `hash` from escaping the blob dir.
 fn valid_hash(hash: &str) -> bool {
@@ -144,6 +146,9 @@ async fn stream_to_file(body: Body, tmp: &FsPath) -> AppResult<String> {
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| AppError::BadRequest(format!("upload stream: {e}")))?;
+        if file.metadata().await.map(|m| m.len()).unwrap_or(0) + chunk.len() as u64 > MAX_BLOB_BYTES {
+            return Err(AppError::PayloadTooLarge);
+        }
         hasher.update(&chunk);
         file.write_all(&chunk)
             .await

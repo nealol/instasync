@@ -124,6 +124,7 @@ export class BinarySync {
 
 		for (const path of paths) {
 			await this.reconcile(path);
+			if (this.destroyed) return;
 		}
 	}
 
@@ -173,6 +174,7 @@ export class BinarySync {
 		if (this.destroyed) return;
 
 		const localHash = await this.hashDisk(path);
+		if (this.destroyed) return;
 		const remote = this.binaries.get(path);
 		const remoteHash = remote?.hash ?? null;
 		const base = this.lastSyncedHash.get(path) ?? null;
@@ -257,16 +259,20 @@ export class BinarySync {
 		try {
 			bytes = await this.plugin.auth.getBlob(this.vaultId, hash);
 		} catch (e) {
+			if (this.destroyed) return;
 			console.error(`[InstaSync] blob download failed for ${path}`, e);
 			window.setTimeout(() => void this.reconcile(path), DRAIN_RETRY_MS);
 			return;
 		}
+		if (this.destroyed) return;
 		await this.writeDisk(path, bytes);
+		if (this.destroyed) return;
 		this.lastSyncedHash.set(path, hash);
 		dbg("binary downloaded", path, hash, bytes.byteLength);
 	}
 
 	private async writeDisk(path: string, bytes: ArrayBuffer): Promise<void> {
+		if (this.destroyed) return;
 		this.writing.add(path);
 		try {
 			const file = getFileByPath(this.plugin.app, path);
@@ -286,6 +292,7 @@ export class BinarySync {
 	}
 
 	private async deleteLocal(path: string): Promise<void> {
+		if (this.destroyed) return;
 		const file = getFileByPath(this.plugin.app, path);
 		if (!file) {
 			this.lastSyncedHash.delete(path);
@@ -323,8 +330,10 @@ export class BinarySync {
 	/** Read the current local bytes for `path` and enqueue them for upload. */
 	private async queueLocalUpload(path: string): Promise<void> {
 		const bytes = await this.readDisk(path);
+		if (this.destroyed) return;
 		if (!bytes) return;
 		const hash = await sha256Hex(bytes);
+		if (this.destroyed) return;
 		this.enqueueUpload({ path, hash, bytes, size: bytes.byteLength, attempts: 0 });
 	}
 
@@ -396,10 +405,12 @@ export class BinarySync {
 	}
 
 	private async doUpload(job: UploadJob): Promise<void> {
-		const exists = await this.plugin.auth.blobExists(this.vaultId, job.hash).catch(() => false);
+		const exists = await this.plugin.auth.blobExists(this.vaultId, job.hash);
+		if (this.destroyed) return;
 		if (!exists) {
 			await this.plugin.auth.putBlob(this.vaultId, job.hash, job.bytes);
 		}
+		if (this.destroyed) return;
 		// Publish only now that the bytes are on the server.
 		this.publishMeta(job.path, { hash: job.hash, size: job.size });
 		dbg("binary uploaded+published", job.path, job.hash, job.size);

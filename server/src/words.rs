@@ -1,7 +1,7 @@
 use rand::seq::SliceRandom;
 
 /// Short wordlist for human-friendly single-use invite codes. Lowercase, no
-/// ambiguous spellings; four picks give ~1e15 combinations.
+/// ambiguous spellings; four picks from this 100-word list give about 94M combinations.
 const WORDS: &[&str] = &[
     "amber", "anchor", "apple", "aqua", "arrow", "aspen", "basil", "beacon", "berry", "birch",
     "bloom", "branch", "breeze", "brook", "cabin", "cedar", "cherry", "cloud", "clover", "coral",

@@ -1,8 +1,7 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set,
-};
+use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
+use sha2::{Digest, Sha256};
 
 use crate::entities::{sessions, users};
 use crate::error::AppError;
@@ -28,7 +27,7 @@ fn random_token() -> String {
 
 /// Upsert a user by (issuer, subject); refreshes email / display name on login.
 pub async fn upsert_user(
-    db: &DatabaseConnection,
+	db: &impl ConnectionTrait,
     issuer: &str,
     subject: &str,
     email: &str,
@@ -59,17 +58,32 @@ pub async fn upsert_user(
 }
 
 /// Create a session row for the user and return its opaque bearer token.
-pub async fn create_session(db: &DatabaseConnection, user_id: &str) -> Result<String, AppError> {
+pub async fn create_session(db: &impl ConnectionTrait, user_id: &str) -> Result<String, AppError> {
     let token = random_token();
+    let token_hash = hash_token(&token);
     let now = now_millis();
     let model = sessions::ActiveModel {
-        token: Set(token.clone()),
+        token: Set(token_hash),
         user_id: Set(user_id.to_string()),
         created_at: Set(now),
         expires_at: Set(now + SESSION_TTL_MS),
     };
     model.insert(db).await?;
     Ok(token)
+}
+
+fn hash_token(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub async fn revoke_session(db: &impl ConnectionTrait, token: &str) -> Result<(), AppError> {
+    sessions::Entity::delete_by_id(hash_token(token)).exec(db).await?;
+    Ok(())
+}
+
+pub fn bearer_token(header: &str) -> Option<&str> {
+    header.strip_prefix("Bearer ").or_else(|| header.strip_prefix("bearer "))
 }
 
 /// Authenticated user, extracted from the `Authorization: Bearer <token>` header.
@@ -87,12 +101,9 @@ impl FromRequestParts<AppState> for AuthUser {
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .ok_or(AppError::Unauthorized)?;
-        let token = header
-            .strip_prefix("Bearer ")
-            .or_else(|| header.strip_prefix("bearer "))
-            .ok_or(AppError::Unauthorized)?;
+        let token = bearer_token(header).ok_or(AppError::Unauthorized)?;
 
-        let session = sessions::Entity::find_by_id(token.to_string())
+        let session = sessions::Entity::find_by_id(hash_token(token))
             .one(&state.db)
             .await?
             .ok_or(AppError::Unauthorized)?;

@@ -34,7 +34,7 @@ export async function mockLogin(authUrl: string, sub: string): Promise<string> {
 	);
 	const state = new URL(`http://x${start.location}`).searchParams.get("state");
 	const done = await rawGet(`${authUrl}/auth/callback?state=${state}`);
-	const token = new URL(done.location!).searchParams.get("token");
+	const token = new URL(done.location!, authUrl).searchParams.get("token");
 	if (!token) throw new Error("mock login did not return a token");
 	return token;
 }
@@ -137,6 +137,8 @@ export async function startAuthServer(opts: {
 			YSWEET_PUBLIC_URL: opts.ysweetUrl,
 			YSWEET_AUTH_KEY: opts.authKey,
 			OIDC_MODE: "mock",
+			ALLOW_MOCK_OIDC: "1",
+			ALLOWED_LOGIN_REDIRECTS: "http://app",
 			// The readiness probe waits for the "listening on" info log.
 			RUST_LOG: "instasync_server=info,warn",
 		},

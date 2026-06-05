@@ -10,6 +10,7 @@ use serde::Deserialize;
 use crate::config::OidcMode;
 use crate::error::{AppError, AppResult};
 use crate::session::{create_session, upsert_user};
+use crate::session::now_millis;
 use crate::state::{AppState, MockIdentity, OidcFlow};
 
 #[derive(Debug, Deserialize)]
@@ -34,7 +35,8 @@ pub async fn login(
     State(state): State<AppState>,
     Query(params): Query<LoginParams>,
 ) -> AppResult<Response> {
-    let redirect = params.redirect.clone().unwrap_or_default();
+    let redirect = validate_login_redirect(&state, params.redirect.as_deref())?;
+    prune_oidc_flows(&state).await;
 
     match state.config.oidc_mode {
         OidcMode::Mock => {
@@ -53,6 +55,7 @@ pub async fn login(
                     pkce_verifier: String::new(),
                     nonce: String::new(),
                     redirect,
+                    created_at: now_millis(),
                     mock: Some(identity),
                 },
             );
@@ -81,6 +84,7 @@ pub async fn login(
                     pkce_verifier: pkce_verifier.secret().clone(),
                     nonce: nonce.secret().clone(),
                     redirect,
+                    created_at: now_millis(),
                     mock: None,
                 },
             );
@@ -105,6 +109,10 @@ pub async fn callback(
         .await
         .remove(&csrf_state)
         .ok_or_else(|| AppError::BadRequest("unknown or expired state".into()))?;
+
+    if flow.is_expired() {
+        return Err(AppError::BadRequest("unknown or expired state".into()));
+    }
 
     let (issuer, subject, email, name) = if let Some(mock) = flow.mock {
         (mock.issuer, mock.subject, mock.email, mock.name)
@@ -133,6 +141,35 @@ pub async fn callback(
             Ok(Html(redirect_page(&dest, &token)).into_response())
         }
     }
+}
+
+fn validate_login_redirect(state: &AppState, redirect: Option<&str>) -> AppResult<String> {
+    let Some(redirect) = redirect else { return Ok(String::new()); };
+    if redirect.is_empty() || redirect == "obsidian://instasync-auth" {
+        return Ok(redirect.to_string());
+    }
+
+    let url = url::Url::parse(redirect)
+        .map_err(|_| AppError::BadRequest("invalid login redirect".into()))?;
+    let origin = url.origin().ascii_serialization();
+    let public_origin = url::Url::parse(&state.config.public_base_url)
+        .ok()
+        .map(|u| u.origin().ascii_serialization());
+    let allowed = state.config.allowed_login_redirects.iter().any(|allowed| {
+        url::Url::parse(allowed)
+            .map(|u| u.origin().ascii_serialization() == origin)
+            .unwrap_or(false)
+    });
+    if allowed || public_origin.as_deref() == Some(origin.as_str()) {
+        Ok(redirect.to_string())
+    } else {
+        Err(AppError::BadRequest("login redirect is not allowed".into()))
+    }
+}
+
+async fn prune_oidc_flows(state: &AppState) {
+    let mut flows = state.oidc.lock().await;
+    flows.retain(|_, flow| !flow.is_expired());
 }
 
 /// Exchange the authorization code and verify the id_token (real IdP path).

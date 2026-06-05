@@ -72,6 +72,8 @@ async fn test_app(ysweet_url: &str, ysweet_public_url: &str) -> Router {
         oidc_client_id: None,
         oidc_client_secret: None,
         oidc_redirect_url: None,
+        allowed_login_redirects: vec!["http://app".into()],
+        cors_allowed_origins: vec!["http://app".into()],
     };
     let state = build_state(config).await.unwrap();
     app(state)
@@ -169,6 +171,38 @@ async fn login_creates_session_and_me_works() {
     // No bearer -> 401.
     let (status, _) = send(&app, "GET", "/api/me", None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn logout_revokes_session() {
+    let ys = fake_ysweet().await;
+    let app = test_app(&ys, &ys).await;
+
+    let token = login(&app, "alice").await;
+    let (status, _) = send(&app, "POST", "/api/logout", Some(&token), Some(json!({}))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = send(&app, "GET", "/api/me", Some(&token), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn login_rejects_unallowed_redirect() {
+    let ys = fake_ysweet().await;
+    let app = test_app(&ys, &ys).await;
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/auth/login?redirect=https://evil.example/cb")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

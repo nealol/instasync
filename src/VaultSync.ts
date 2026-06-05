@@ -8,12 +8,13 @@ import {
 	type YSweetStatus,
 } from "@y-sweet/client";
 import { IndexeddbPersistence } from "y-indexeddb";
-import { TFile, TAbstractFile, Notice } from "obsidian";
+import { TFile, TAbstractFile, Notice, type EventRef } from "obsidian";
 import type InstaSyncPlugin from "./main";
 import { getClientToken } from "./ysweet";
 import { Document } from "./Document";
 import { BinarySync } from "./BinarySync";
 import { matchesAnyGlob, parseGlobs } from "./glob";
+import { isOpenInWorkspace } from "./vaultHelpers";
 
 /** Matches the sibling backups written on conflict; these must never sync. */
 const CONFLICT_COPY_RE = / \(conflicted copy .+\)$/;
@@ -64,6 +65,7 @@ export class VaultSync {
 
 	private filesObserver: (event: Y.YMapEvent<string>) => void;
 	private statusListener: (status: YSweetStatus) => void;
+	private vaultEvents: EventRef[] = [];
 
 	constructor(plugin: InstaSyncPlugin) {
 		this.plugin = plugin;
@@ -194,15 +196,30 @@ export class VaultSync {
 	}
 
 	private async handleRemoteDelete(path: string): Promise<void> {
-		this.removeDocument(path);
+		if (this.destroyed) return;
+		const doc = this.documents.get(path);
 		const file = this.plugin.app.vault.getAbstractFileByPath(path);
-		if (file instanceof TFile) {
+		if (file instanceof TFile && doc) {
 			try {
-				await this.plugin.app.vault.delete(file);
+				const local = await this.plugin.app.vault.read(file);
+				if (this.destroyed) return;
+				if (local === doc.content && !isOpenInWorkspace(this.plugin.app, path)) {
+					this.removeDocument(path);
+					await this.plugin.app.vault.delete(file);
+					return;
+				}
 			} catch (e) {
-				console.error(`[InstaSync] failed to delete ${path}`, e);
+				console.error(`[InstaSync] failed to inspect remote delete for ${path}`, e);
 			}
 		}
+		if (doc || file instanceof TFile) {
+			new Notice(
+				`InstaSync: "${path}" was deleted remotely. Keeping your local copy; delete it locally to accept the remote delete.`,
+				10000,
+			);
+			return;
+		}
+		this.removeDocument(path);
 	}
 
 	// --- Document registry -----------------------------------------------------
@@ -260,18 +277,12 @@ export class VaultSync {
 	private registerVaultEvents(): void {
 		const vault = this.plugin.app.vault;
 
-		this.plugin.registerEvent(
+		this.vaultEvents = [
 			vault.on("create", (file) => this.onLocalCreate(file)),
-		);
-		this.plugin.registerEvent(
 			vault.on("delete", (file) => this.onLocalDelete(file)),
-		);
-		this.plugin.registerEvent(
 			vault.on("rename", (file, oldPath) => this.onLocalRename(file, oldPath)),
-		);
-		this.plugin.registerEvent(
 			vault.on("modify", (file) => this.onLocalModify(file)),
-		);
+		];
 	}
 
 	/**
@@ -292,7 +303,7 @@ export class VaultSync {
 	}
 
 	private onLocalCreate(file: TAbstractFile): void {
-		if (!this.initialSynced) return;
+		if (this.destroyed || !this.initialSynced) return;
 		const kind = this.classify(file);
 		if (kind === "binary") {
 			this.binarySync.onLocalChanged(file.path);
@@ -313,7 +324,7 @@ export class VaultSync {
 	}
 
 	private onLocalDelete(file: TAbstractFile): void {
-		if (!this.initialSynced) return;
+		if (this.destroyed || !this.initialSynced) return;
 		const path = file.path;
 		if (this.documents.has(path) || this.files.has(path)) {
 			this.removeDocument(path);
@@ -329,7 +340,7 @@ export class VaultSync {
 	}
 
 	private onLocalRename(file: TAbstractFile, oldPath: string): void {
-		if (!this.initialSynced || !(file instanceof TFile)) return;
+		if (this.destroyed || !this.initialSynced || !(file instanceof TFile)) return;
 		const newPath = file.path;
 
 		// Drop tracking of the old path on the text side.
@@ -358,7 +369,7 @@ export class VaultSync {
 	}
 
 	private onLocalModify(file: TAbstractFile): void {
-		if (!this.initialSynced) return;
+		if (this.destroyed || !this.initialSynced) return;
 		const kind = this.classify(file);
 		if (kind === "binary") {
 			this.binarySync.onLocalChanged(file.path);
@@ -371,9 +382,12 @@ export class VaultSync {
 
 	// --- Lifecycle -------------------------------------------------------------
 
-	destroy(): void {
+		destroy(): void {
 		if (this.destroyed) return;
 		this.destroyed = true;
+		const vault = this.plugin.app.vault;
+		for (const ref of this.vaultEvents) vault.offref(ref);
+		this.vaultEvents = [];
 		this.binarySync.destroy();
 		this.files.unobserve(this.filesObserver);
 		this.indexProvider.off(EVENT_CONNECTION_STATUS, this.statusListener);

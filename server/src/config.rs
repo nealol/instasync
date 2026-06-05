@@ -21,6 +21,8 @@ pub struct Config {
     pub oidc_client_id: Option<String>,
     pub oidc_client_secret: Option<String>,
     pub oidc_redirect_url: Option<String>,
+    pub allowed_login_redirects: Vec<String>,
+    pub cors_allowed_origins: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +41,9 @@ impl Config {
             Some("mock") => OidcMode::Mock,
             _ => OidcMode::Oidc,
         };
+        if oidc_mode == OidcMode::Mock && opt("ALLOW_MOCK_OIDC").as_deref() != Some("1") {
+            panic!("OIDC_MODE=mock requires ALLOW_MOCK_OIDC=1 and must not be used in production");
+        }
         Config {
             database_url: opt("DATABASE_URL")
                 .unwrap_or_else(|| "sqlite://instasync.db?mode=rwc".to_string()),
@@ -56,6 +61,8 @@ impl Config {
             oidc_client_id: opt("OIDC_CLIENT_ID"),
             oidc_client_secret: opt("OIDC_CLIENT_SECRET"),
             oidc_redirect_url: opt("OIDC_REDIRECT_URL"),
+            allowed_login_redirects: list("ALLOWED_LOGIN_REDIRECTS"),
+            cors_allowed_origins: list("CORS_ALLOWED_ORIGINS"),
         }
     }
 
@@ -65,4 +72,10 @@ impl Config {
             .clone()
             .unwrap_or_else(|| format!("{}/auth/callback", self.public_base_url.trim_end_matches('/')))
     }
+}
+
+fn list(name: &str) -> Vec<String> {
+    opt(name)
+        .map(|s| s.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default()
 }

@@ -6,7 +6,7 @@ import { VaultSync, isConflictCopy } from "./VaultSync";
 import type { UploadStatus } from "./BinarySync";
 import { matchesAnyGlob, parseGlobs } from "./glob";
 import type { Document } from "./Document";
-import { AuthClient, AuthError } from "./auth";
+import { AuthClient, AuthError, normalizeServerUrl } from "./auth";
 import { liveEdit } from "./editor/LiveEdit";
 import { yRemoteSelections, yRemoteSelectionsTheme } from "./editor/RemoteSelections";
 
@@ -44,9 +44,16 @@ export default class InstaSyncPlugin extends Plugin {
 
 		// Deep link back from the SSO login page: obsidian://instasync-auth?token=…
 		this.registerObsidianProtocolHandler("instasync-auth", (params) => {
-			this.auth.handleProtocol(params as Record<string, string>);
-			new Notice("InstaSync: signed in.");
-			void this.onLoggedIn();
+			void (async () => {
+				try {
+					await this.auth.handleProtocol(params as Record<string, string>);
+					new Notice("InstaSync: signed in.");
+					await this.onLoggedIn();
+				} catch (e) {
+					console.error("[InstaSync] sign-in callback failed", e);
+					new Notice(`InstaSync: sign-in failed: ${e instanceof Error ? e.message : String(e)}`);
+				}
+			})();
 		});
 
 		this.addCommand({
@@ -82,6 +89,7 @@ export default class InstaSyncPlugin extends Plugin {
 
 	onunload(): void {
 		this.stopSync();
+		this.auth?.destroy();
 		this.statusRoot?.unmount();
 		this.statusRoot = null;
 	}
@@ -259,10 +267,49 @@ export default class InstaSyncPlugin extends Plugin {
 	// --- Settings persistence --------------------------------------------------
 
 	async loadSettings(): Promise<void> {
-		this.settings = Object.assign({}, defaultSettings(), await this.loadData());
+		this.settings = sanitizeSettings(await this.loadData());
 	}
 
 	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
 	}
+}
+
+function sanitizeSettings(raw: unknown): InstaSyncSettings {
+	const defaults = defaultSettings();
+	const data = raw && typeof raw === "object" ? raw as Partial<InstaSyncSettings> : {};
+	const settings: InstaSyncSettings = { ...defaults };
+
+	settings.authServerUrl = sanitizeUrl(data.authServerUrl, defaults.authServerUrl);
+	settings.pendingSetupServerUrl = data.pendingSetupServerUrl
+		? sanitizeUrl(data.pendingSetupServerUrl, "")
+		: "";
+	settings.sessionToken = typeof data.sessionToken === "string" ? data.sessionToken.trim() : "";
+	settings.userDisplayName = typeof data.userDisplayName === "string" ? data.userDisplayName : "";
+	settings.userEmail = typeof data.userEmail === "string" ? data.userEmail : "";
+	settings.activeVaultId = typeof data.activeVaultId === "string" ? data.activeVaultId.trim() : "";
+	settings.clientName = typeof data.clientName === "string" && data.clientName.trim()
+		? data.clientName.trim()
+		: defaults.clientName;
+	settings.clientColor = sanitizeColor(data.clientColor, defaults.clientColor);
+	settings.clientColorLight = sanitizeColor(data.clientColorLight, defaults.clientColorLight);
+	settings.enabled = typeof data.enabled === "boolean" ? data.enabled : defaults.enabled;
+	settings.syncBinaries = typeof data.syncBinaries === "boolean" ? data.syncBinaries : defaults.syncBinaries;
+	settings.binaryExcludeGlobs = typeof data.binaryExcludeGlobs === "string" ? data.binaryExcludeGlobs : "";
+
+	return settings;
+}
+
+function sanitizeUrl(value: unknown, fallback: string): string {
+	if (typeof value !== "string" || !value.trim()) return fallback;
+	try {
+		return normalizeServerUrl(value);
+	} catch {
+		return fallback;
+	}
+}
+
+function sanitizeColor(value: unknown, fallback: string): string {
+	if (typeof value !== "string") return fallback;
+	return /^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/.test(value) ? value : fallback;
 }
