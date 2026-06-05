@@ -8,6 +8,7 @@ import { getClientToken } from "./ysweet";
 import { applyTextToYText } from "./diff";
 import { dbg, snip } from "./debug";
 import { ensureParentFolder, getFileByPath, isOpenInWorkspace } from "./vaultHelpers";
+import { openTextConflictModal } from "./TextConflictModal";
 
 /**
  * Origin tag used on Yjs transactions that originate from this Document writing
@@ -51,6 +52,8 @@ export class Document {
 	private persistence: IndexeddbPersistence;
 	/** Disk content captured at startup, before remote sync (for conflict checks). */
 	private diskAtStartup: string | null = null;
+	/** Locally persisted Y.Text content before the first remote sync. */
+	private baselineAtStartup = "";
 	/** Whether the local disk diverged from the baseline at startup. */
 	private localChangedAtStartup = false;
 	/** Guards the one-time startup merge so reconnects don't re-run it. */
@@ -155,9 +158,9 @@ export class Document {
 	}
 
 	/**
-	 * Startup sequence: load the persisted baseline, fold local offline disk edits
-	 * into the CRDT, then connect. Resolves {@link readyPromise} once the local
-	 * state is ready so editors can bind even while offline.
+	 * Startup sequence: load the persisted baseline, read local disk, then connect.
+	 * Local disk edits are deliberately not folded into Y.Text until the first
+	 * remote sync tells us whether the remote also changed from the baseline.
 	 */
 	private async init(): Promise<void> {
 		try {
@@ -165,21 +168,13 @@ export class Document {
 			if (this.destroyed) return;
 
 			const baseline = this.content;
+			this.baselineAtStartup = baseline;
 			const disk = await this.readFromDisk();
 			this.diskAtStartup = disk;
 			this.localChangedAtStartup = disk !== null && disk !== baseline;
-
-			if (this.localChangedAtStartup && disk !== null) {
-				// Fold the local on-disk version into the CRDT as local operations,
-				// so it merges with whatever the server has rather than overwriting it.
-				this.ydoc.transact(() => {
-					applyTextToYText(this.ytext, disk, DISK_ORIGIN);
-				}, DISK_ORIGIN);
-			}
 		} catch (e) {
 			console.error(`[InstaSync] init failed for ${this.path}`, e);
-		} finally {
-			// Editors may bind now: ytext holds (baseline + local offline edits).
+			// If local persistence failed, do not leave editors waiting forever.
 			this.resolveReady();
 		}
 
@@ -187,80 +182,61 @@ export class Document {
 	}
 
 	/**
-	 * Runs once, after the first successful server sync. The CRDT now holds the
-	 * merge of our local offline edits and any concurrent remote edits.
+	 * Runs once, after the first successful server sync. Since local startup disk
+	 * edits have not yet been applied, the current Y.Text is the pre-merge remote
+	 * version. We compare baseline/local/remote and publish exactly one canonical
+	 * version.
 	 *  - pure remote update            -> write the merged text to disk;
-	 *  - local-only fast-forward       -> write (a no-op in practice);
-	 *  - both sides changed (conflict) -> save the local pre-merge copy aside,
-	 *                                     write the merged text, and notify.
+	 *  - local-only fast-forward       -> apply local disk to Y.Text;
+	 *  - both sides changed (conflict) -> prompt for local vs remote, then apply
+	 *                                     the chosen text as canonical.
 	 */
 	private async finishStartupReconcile(): Promise<void> {
 		if (this.startupReconciled || this.destroyed) return;
 		this.startupReconciled = true;
 
 		try {
-			const merged = this.content;
+			const remote = this.content;
+			const baseline = this.baselineAtStartup;
 			const localDisk = this.diskAtStartup;
+			const remoteChanged = remote !== baseline;
 
 			const isConflict =
-				this.localChangedAtStartup && localDisk !== null && merged !== localDisk;
+				this.localChangedAtStartup && localDisk !== null && remoteChanged && remote !== localDisk;
 
 			if (isConflict) {
-				await this.writeConflictCopy(localDisk);
+				const choice = await openTextConflictModal(this.plugin, {
+					path: this.path,
+					localContent: localDisk,
+					remoteContent: remote,
+				});
+				if (this.destroyed) return;
+				if (choice === "local") {
+					this.applyText(localDisk);
+					new Notice(`InstaSync: kept your local version of "${this.path}".`);
+				} else {
+					new Notice(`InstaSync: kept the remote version of "${this.path}".`);
+				}
+			} else if (this.localChangedAtStartup && localDisk !== null && !remoteChanged) {
+				this.applyText(localDisk);
 			}
 
 			// The editor (if open) receives the merged text via the ytext observer;
 			// writing through vault.modify would make Obsidian merge an external change.
 			if (!this.hasBoundEditor && !this.isOpenInWorkspace()) {
-				await this.writeToDisk(merged);
+				await this.writeToDisk(this.content);
 			}
 		} catch (e) {
 			console.error(`[InstaSync] startup reconcile failed for ${this.path}`, e);
+		} finally {
+			this.resolveReady();
 		}
 	}
 
-	/**
-	 * Saves the user's pre-merge local version next to the file so nothing is lost
-	 * when a CRDT auto-merge interleaves concurrent edits. The copy is named so
-	 * that {@link VaultSync} recognises and skips it (it must not sync itself).
-	 */
-	private async writeConflictCopy(localContent: string): Promise<void> {
-		const conflictPath = this.uniqueConflictCopyPath();
-		try {
-			await ensureParentFolder(this.plugin.app, conflictPath);
-			await this.plugin.app.vault.create(conflictPath, localContent);
-			new Notice(
-				`InstaSync: "${this.path}" was edited in two places. ` +
-					`Merged remote changes in; your local copy was saved as "${conflictPath}".`,
-				10000,
-			);
-		} catch (e) {
-			console.error(`[InstaSync] failed to write conflict copy for ${this.path}`, e);
-		}
-	}
-
-	private uniqueConflictCopyPath(): string {
-		const first = this.conflictCopyPath();
-		if (!this.plugin.app.vault.getAbstractFileByPath(first)) return first;
-		const dot = first.lastIndexOf(".");
-		const hasExt = dot > first.lastIndexOf("/");
-		const base = hasExt ? first.slice(0, dot) : first;
-		const ext = hasExt ? first.slice(dot) : "";
-		for (let i = 2; i < 1000; i++) {
-			const candidate = `${base} ${i}${ext}`;
-			if (!this.plugin.app.vault.getAbstractFileByPath(candidate)) return candidate;
-		}
-		return `${base} ${Date.now()}${ext}`;
-	}
-
-	private conflictCopyPath(): string {
-		const name = safeFilenamePart(this.plugin.settings.clientName || "local");
-		const stamp = formatTimestamp(new Date());
-		const dot = this.path.lastIndexOf(".");
-		const hasExt = dot > this.path.lastIndexOf("/");
-		const base = hasExt ? this.path.slice(0, dot) : this.path;
-		const ext = hasExt ? this.path.slice(dot) : ".md";
-		return normalizePath(`${base} (conflicted copy ${name} ${stamp})${ext}`);
+	private applyText(text: string): void {
+		this.ydoc.transact(() => {
+			applyTextToYText(this.ytext, text, DISK_ORIGIN);
+		}, DISK_ORIGIN);
 	}
 
 	private onYTextChanged(): void {
@@ -364,18 +340,4 @@ export class Document {
 		void this.persistence.destroy();
 		this.ydoc.destroy();
 	}
-}
-
-function safeFilenamePart(value: string): string {
-	const cleaned = value.replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim();
-	return cleaned || "local";
-}
-
-/** Formats a date as `YYYY-MM-DD HHmmss` (no colons — safe in filenames). */
-function formatTimestamp(d: Date): string {
-	const p = (n: number, w = 2) => String(n).padStart(w, "0");
-	return (
-		`${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
-		`${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
-	);
 }

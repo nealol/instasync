@@ -141,7 +141,7 @@ describe("BinarySync", () => {
 		}
 	});
 
-	it("propagates a local delete to a peer", async () => {
+	it("applies a clean remote delete to a peer's local attachment", async () => {
 		const A = makeDevice("A");
 		const B = makeDevice("B");
 		try {
@@ -155,14 +155,49 @@ describe("BinarySync", () => {
 			await A.bs.reconcileAll(["doc.pdf"]);
 			await waitFor(() => B.vault.binaries.has("doc.pdf"), { label: "B has the file" });
 
-			// A deletes the file locally → the index entry is removed → B deletes too.
+			// A deletes the file locally → the index entry is removed. B has no
+			// unsynced local changes, so the remote delete is authoritative and B
+			// removes its local copy too.
 			A.vault.binaries.delete("doc.pdf");
 			A.bs.onLocalDeleted("doc.pdf");
 
-			await waitFor(() => !B.vault.binaries.has("doc.pdf"), {
-				label: "B removed the file",
-			});
 			await waitFor(() => !B.binaries.has("doc.pdf"), { label: "index entry gone" });
+			await waitFor(() => !B.vault.binaries.has("doc.pdf"), { label: "B applied the delete" });
+		} finally {
+			A.bs.destroy();
+			A.provider.destroy();
+			A.indexDoc.destroy();
+			B.bs.destroy();
+			B.provider.destroy();
+			B.indexDoc.destroy();
+		}
+	});
+
+	it("keeps a peer attachment when remote delete races local edits (conflict)", async () => {
+		const A = makeDevice("A");
+		const B = makeDevice("B");
+		try {
+			await synced(A.provider);
+			await synced(B.provider);
+			B.bs.seedBaseline();
+			await B.bs.reconcileAll([]);
+
+			A.vault.binaries.set("doc.pdf", bytes([9, 8, 7]));
+			A.bs.seedBaseline();
+			await A.bs.reconcileAll(["doc.pdf"]);
+			await waitFor(() => B.vault.binaries.has("doc.pdf"), { label: "B has the file" });
+
+			// B edits the file locally (now diverged from the synced baseline)...
+			B.vault.binaries.set("doc.pdf", bytes([1, 2, 3, 4]));
+
+			// ...while A deletes it remotely. The delete is no longer clean, so B
+			// keeps its local copy and surfaces a conflict for the user to resolve.
+			A.vault.binaries.delete("doc.pdf");
+			A.bs.onLocalDeleted("doc.pdf");
+
+			await waitFor(() => !B.binaries.has("doc.pdf"), { label: "index entry gone" });
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			expect(B.vault.binaries.has("doc.pdf")).toBe(true);
 		} finally {
 			A.bs.destroy();
 			A.provider.destroy();

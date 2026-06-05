@@ -1,19 +1,15 @@
 /**
- * Lightweight, opt-in debug logging for diagnosing sync issues.
- *
- * Enable from the Obsidian devtools console with:
- *   window.INSTASYNC_DEBUG = true
- * (or `localStorage.INSTASYNC_DEBUG = "1"` to persist across reloads), then
- * reproduce the problem. Disable with `window.INSTASYNC_DEBUG = false`.
+ * Lightweight, opt-in debug logging for diagnosing sync issues. Hidden and off
+ * by default; the advanced settings toggle updates this module-level flag.
  */
+let enabled = false;
+
+export function setDiagnosticLoggingEnabled(value: boolean): void {
+	enabled = value;
+}
+
 export function dbgEnabled(): boolean {
-	const w = window as any;
-	if (w.INSTASYNC_DEBUG !== undefined) return !!w.INSTASYNC_DEBUG;
-	try {
-		return localStorage.getItem("INSTASYNC_DEBUG") === "1";
-	} catch {
-		return false;
-	}
+	return enabled;
 }
 
 export function dbg(...args: unknown[]): void {

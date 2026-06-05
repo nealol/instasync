@@ -1,10 +1,22 @@
-import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
 import { Document } from "../../src/Document";
 import { makeFakePlugin, type FakePlugin, type FakeVault } from "../support/fakePlugin";
 import { notices } from "../support/obsidian-mock";
 import { Peer } from "../support/peer";
 import { startAuthHarness, type AuthHarness } from "../support/authServer";
 import { waitFor, freshGuid } from "../support/util";
+
+const modalMock = vi.hoisted(() => ({
+	choice: "local" as "local" | "remote",
+	calls: [] as Array<{ path: string; localContent: string; remoteContent: string }>,
+}));
+
+vi.mock("../../src/TextConflictModal", () => ({
+	openTextConflictModal: async (_plugin: unknown, info: { path: string; localContent: string; remoteContent: string }) => {
+		modalMock.calls.push(info);
+		return modalMock.choice;
+	},
+}));
 
 let harness: AuthHarness;
 let token: string;
@@ -28,6 +40,8 @@ afterAll(async () => {
 
 afterEach(() => {
 	notices.length = 0;
+	modalMock.choice = "local";
+	modalMock.calls.length = 0;
 });
 
 /** The vault-namespaced doc id for a bare guid. */
@@ -241,7 +255,7 @@ describe("Document sync", () => {
 		}
 	});
 
-	it("startup conflict: merges divergent offline writes and saves a conflict copy", async () => {
+	it("startup conflict: prompts and accepts local as the canonical version", async () => {
 		const guid = freshGuid();
 		const peer = new Peer(memberPlugin, docId(guid));
 
@@ -275,19 +289,62 @@ describe("Document sync", () => {
 				label: "A2 and B converge",
 			});
 
-			// Both sides agree (CRDT merge) and nothing was clobbered.
+			// Both sides agree on the explicitly selected local version.
 			expect(a2.content).toBe(peer.getText());
-			expect(a2.content).not.toBe("base LOCAL side"); // remote edits were merged in
+			expect(a2.content).toBe("base LOCAL side");
 
-			// The user's pre-merge local version was preserved and surfaced.
-			const copies = conflictFiles(plugin.app.vault as FakeVault);
-			expect(copies).toHaveLength(1);
-			expect((plugin.app.vault as FakeVault).files.get(copies[0])).toBe("base LOCAL side");
-			expect(copies[0]).toMatch(/Brave Otter/);
-			expect(notices.some((n) => /conflicted copy/i.test(n))).toBe(true);
+			expect(modalMock.calls).toEqual([
+				{
+					path: "note.md",
+					localContent: "base LOCAL side",
+					remoteContent: "base REMOTE side",
+				},
+			]);
+			expect(conflictFiles(plugin.app.vault as FakeVault)).toHaveLength(0);
+			expect(notices.some((n) => /kept your local version/i.test(n))).toBe(true);
 
-			// The merged text was written back to the live file.
+			// The canonical text was written back to the live file.
 			expect((plugin.app.vault as FakeVault).files.get("note.md")).toBe(a2.content);
+		} finally {
+			a2.destroy();
+			peer.destroy();
+		}
+	});
+
+	it("startup conflict: accepts remote as the canonical version without a conflict copy", async () => {
+		modalMock.choice = "remote";
+		const guid = freshGuid();
+		const peer = new Peer(memberPlugin, docId(guid));
+
+		const a1 = makeDoc(guid, { file: { path: "note.md", content: "base" } });
+		await a1.doc.whenReady();
+		await peer.whenSynced();
+		await waitFor(() => peer.getText() === "base", { label: "baseline synced" });
+		await new Promise((r) => setTimeout(r, 250));
+		a1.doc.destroy();
+
+		peer.setText("base REMOTE side");
+		a1.vault.files.set("note.md", "base LOCAL side");
+
+		const { plugin } = makeFakePlugin(harness.authUrl, {
+			sessionToken: token,
+			activeVaultId: vaultId,
+			clientName: "Brave Otter",
+		});
+		(plugin.app.vault as FakeVault).files = a1.vault.files;
+		const a2 = new Document(plugin as any, "note.md", guid, docId(guid), false);
+		try {
+			await a2.whenReady();
+			await waitFor(() => peer.getText() === "base REMOTE side", {
+				timeout: 15_000,
+				label: "remote remains canonical",
+			});
+
+			expect(a2.content).toBe("base REMOTE side");
+			expect(modalMock.calls).toHaveLength(1);
+			expect(conflictFiles(plugin.app.vault as FakeVault)).toHaveLength(0);
+			expect((plugin.app.vault as FakeVault).files.get("note.md")).toBe("base REMOTE side");
+			expect(notices.some((n) => /kept the remote version/i.test(n))).toBe(true);
 		} finally {
 			a2.destroy();
 			peer.destroy();

@@ -35,6 +35,8 @@ export interface InstaSyncSettings {
      * files to exclude from sync, e.g. `*.tmp, .obsidian/**`. Empty syncs all.
      */
     binaryExcludeGlobs: string;
+    /** Hidden advanced setting for verbose diagnostic logging. */
+    diagnosticLogging: boolean;
 }
 
 export function defaultSettings(): InstaSyncSettings {
@@ -52,6 +54,7 @@ export function defaultSettings(): InstaSyncSettings {
         enabled: true,
         syncBinaries: true,
         binaryExcludeGlobs: '',
+        diagnosticLogging: false,
     }
 }
 
@@ -481,6 +484,15 @@ function InviteGenerator({ plugin, vault }: { plugin: InstaSyncPlugin; vault: Va
 function AdvancedSettings({ app, plugin, refresh }: { app: App; plugin: InstaSyncPlugin; refresh: () => void }) {
     return <details className="instasync-advanced">
         <summary>Advanced settings</summary>
+        <SettingRow name="Diagnostic logging"
+                    desc="Write verbose InstaSync diagnostics to the developer console. Keep this off unless troubleshooting."
+                    control={<Toggle value={plugin.settings.diagnosticLogging}
+                                     onChange={(value) => void runNotice(undefined, async () => {
+                                         plugin.settings.diagnosticLogging = value
+                                         await plugin.saveSettings()
+                                         plugin.applyDiagnosticLoggingSetting()
+                                         refresh()
+                                     })}/>}/>
         <p className="setting-item-description">Changing the InstaSync server URL should usually only be done when
             resetting or migrating the entire vault.</p><SettingRow name="Instasync server URL"
                                                                     desc={plugin.settings.authServerUrl}

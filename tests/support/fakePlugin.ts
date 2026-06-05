@@ -107,6 +107,7 @@ export interface FakePlugin {
 		enabled: boolean;
 		syncBinaries: boolean;
 		binaryExcludeGlobs: string;
+		diagnosticLogging: boolean;
 	};
 	auth: AuthClient;
 	app: { vault: FakeVault; workspace: { on: () => unknown } };
@@ -115,6 +116,7 @@ export interface FakePlugin {
 	setStatus: (status: string) => void;
 	setUploadStatus: (status: "idle" | "uploading" | "pending") => void;
 	saveSettings: () => Promise<void>;
+	applyDiagnosticLoggingSetting: () => void;
 }
 
 export function makeFakePlugin(
@@ -135,6 +137,7 @@ export function makeFakePlugin(
 			enabled: true,
 			syncBinaries: true,
 			binaryExcludeGlobs: "",
+			diagnosticLogging: false,
 		},
 		// Set just below, once the object exists (AuthClient needs the plugin).
 		auth: undefined as unknown as AuthClient,
@@ -144,6 +147,7 @@ export function makeFakePlugin(
 		setStatus: () => {},
 		setUploadStatus: () => {},
 		saveSettings: async () => {},
+		applyDiagnosticLoggingSetting: () => {},
 	};
 	plugin.auth = new AuthClient(plugin as any);
 	return { plugin, vault };

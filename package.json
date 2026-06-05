@@ -1,6 +1,6 @@
 {
   "name": "instasync",
-  "version": "0.1.1-beta.10",
+  "version": "0.1.1-beta.13",
   "description": "Google-docs-like collaborative editing for Obsidian, powered by Yjs and y-sweet.",
   "main": "main.js",
   "scripts": {
@@ -53,6 +53,7 @@
     "y-sweet": "^0.9.1"
   },
   "dependencies": {
+    "@pierre/diffs": "^1.2.7",
     "@y-sweet/client": "^0.9.1",
     "lib0": "^0.2.93",
     "react": "^19.2.7",

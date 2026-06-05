@@ -9,6 +9,7 @@ import type { Document } from "./Document";
 import { AuthClient, AuthError, normalizeServerUrl } from "./auth";
 import { liveEdit } from "./editor/LiveEdit";
 import { yRemoteSelections, yRemoteSelectionsTheme } from "./editor/RemoteSelections";
+import { setDiagnosticLoggingEnabled } from "./debug";
 
 type ConnectionStatus = "offline" | "connecting" | "connected" | "error" | "signin";
 
@@ -268,10 +269,15 @@ export default class InstaSyncPlugin extends Plugin {
 
 	async loadSettings(): Promise<void> {
 		this.settings = sanitizeSettings(await this.loadData());
+		this.applyDiagnosticLoggingSetting();
 	}
 
 	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
+	}
+
+	applyDiagnosticLoggingSetting(): void {
+		setDiagnosticLoggingEnabled(!!this.settings.diagnosticLogging);
 	}
 }
 
@@ -296,6 +302,7 @@ function sanitizeSettings(raw: unknown): InstaSyncSettings {
 	settings.enabled = typeof data.enabled === "boolean" ? data.enabled : defaults.enabled;
 	settings.syncBinaries = typeof data.syncBinaries === "boolean" ? data.syncBinaries : defaults.syncBinaries;
 	settings.binaryExcludeGlobs = typeof data.binaryExcludeGlobs === "string" ? data.binaryExcludeGlobs : "";
+	settings.diagnosticLogging = typeof data.diagnosticLogging === "boolean" ? data.diagnosticLogging : false;
 
 	return settings;
 }

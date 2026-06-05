@@ -186,16 +186,22 @@ export class BinarySync {
 			return;
 		}
 
+		if (localHash === undefined) {
+			// Could not read the local file. Do not treat that as a delete.
+			return;
+		}
+
 		// Local present, remote absent.
 		if (localHash && !remoteHash) {
 			if (base === null) {
 				// Brand-new local file → publish it.
 				await this.queueLocalUpload(path);
-			} else if (localHash === base) {
-				// Was synced, now removed remotely → honor the remote delete.
+			} else if (base === localHash) {
+				// Cleanly deleted remotely and we have no unsynced local changes →
+				// the remote delete is authoritative, so remove the local copy.
 				await this.deleteLocal(path);
 			} else {
-				// Removed remotely but also changed locally → conflict.
+				// Deleted remotely but we also have unsynced local edits → conflict.
 				await this.resolveConflict(path, localHash, null);
 			}
 			return;
@@ -230,7 +236,7 @@ export class BinarySync {
 
 	// --- disk I/O --------------------------------------------------------------
 
-	private async hashDisk(path: string): Promise<string | null> {
+	private async hashDisk(path: string): Promise<string | null | undefined> {
 		const file = getFileByPath(this.plugin.app, path);
 		if (!file) return null;
 		try {
@@ -238,7 +244,7 @@ export class BinarySync {
 			return await sha256Hex(buf);
 		} catch (e) {
 			console.error(`[InstaSync] failed to read binary ${path}`, e);
-			return null;
+			return undefined;
 		}
 	}
 
@@ -431,6 +437,7 @@ export class BinarySync {
 			if (this.destroyed) return;
 			// Re-check state at prompt time — it may have converged while queued.
 			const nowLocal = await this.hashDisk(path);
+			if (nowLocal === undefined) return;
 			const nowRemote = this.binaries.get(path)?.hash ?? null;
 			if (nowLocal === nowRemote) {
 				if (nowRemote) this.lastSyncedHash.set(path, nowRemote);

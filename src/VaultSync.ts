@@ -14,7 +14,6 @@ import { getClientToken } from "./ysweet";
 import { Document } from "./Document";
 import { BinarySync } from "./BinarySync";
 import { matchesAnyGlob, parseGlobs } from "./glob";
-import { isOpenInWorkspace } from "./vaultHelpers";
 
 /** Matches the sibling backups written on conflict; these must never sync. */
 const CONFLICT_COPY_RE = / \(conflicted copy .+\)$/;
@@ -197,29 +196,18 @@ export class VaultSync {
 
 	private async handleRemoteDelete(path: string): Promise<void> {
 		if (this.destroyed) return;
-		const doc = this.documents.get(path);
+		// A remote delete is authoritative: drop our Document and remove the local
+		// file. We deliberately do not gate on local edits or whether the file is
+		// open — the index is the source of truth, so the delete propagates.
+		this.removeDocument(path);
 		const file = this.plugin.app.vault.getAbstractFileByPath(path);
-		if (file instanceof TFile && doc) {
+		if (file instanceof TFile) {
 			try {
-				const local = await this.plugin.app.vault.read(file);
-				if (this.destroyed) return;
-				if (local === doc.content && !isOpenInWorkspace(this.plugin.app, path)) {
-					this.removeDocument(path);
-					await this.plugin.app.vault.delete(file);
-					return;
-				}
+				await this.plugin.app.vault.delete(file);
 			} catch (e) {
-				console.error(`[InstaSync] failed to inspect remote delete for ${path}`, e);
+				console.error(`[InstaSync] failed to apply remote delete for ${path}`, e);
 			}
 		}
-		if (doc || file instanceof TFile) {
-			new Notice(
-				`InstaSync: "${path}" was deleted remotely. Keeping your local copy; delete it locally to accept the remote delete.`,
-				10000,
-			);
-			return;
-		}
-		this.removeDocument(path);
 	}
 
 	// --- Document registry -----------------------------------------------------
