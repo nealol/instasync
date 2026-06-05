@@ -66,3 +66,8 @@
 	border-top: 1px solid var(--background-modifier-border);
 	padding-top: 16px;
 }
+
+
+.instasync-w-full {
+	width: 100%;
+}

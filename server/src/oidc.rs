@@ -70,6 +70,7 @@ pub async fn login(
                     CsrfToken::new_random,
                     Nonce::new_random,
                 )
+                .add_scope(Scope::new("openid".to_string()))
                 .add_scope(Scope::new("email".to_string()))
                 .add_scope(Scope::new("profile".to_string()))
                 .set_pkce_challenge(pkce_challenge)

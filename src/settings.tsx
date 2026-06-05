@@ -100,7 +100,7 @@ function SetupView({ app, plugin, refresh }: { app: App; plugin: InstaSyncPlugin
 						}}
 					>
 						<p className="setting-item-description">Enter your InstaSync server URL to start syncing this vault.</p>
-						<input className="instasync-wide-input" type="url" placeholder="https://instasync.example.com" value={serverUrl} onChange={(event) => setServerUrl(event.currentTarget.value)} />
+						<input className="instasync-w-full" type="text" placeholder="https://instasync.example.com" value={serverUrl} onChange={(event) => setServerUrl(event.currentTarget.value)} />
 						{error ? <p className="instasync-error">{error}</p> : null}
 						<button className="mod-cta instasync-wide-button" type="submit" disabled={busy}>{busy ? "Waiting for SSO..." : "Get Started"}</button>
 					</form>
