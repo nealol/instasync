@@ -13,27 +13,73 @@ For this prototype, **every Markdown file in the vault is synced** (rather than 
 
 ## Running a server
 
-Use the y-sweet development server (no auth token required):
+InstaSync requires two servers running side-by-side:
+
+| Server | Role |
+| --- | --- |
+| **y-sweet** | CRDT sync (WebSocket) |
+| **InstaSync auth server** | SSO login, vault management, mints y-sweet tokens |
+
+### 1. Generate a shared auth key
 
 ```bash
-npx y-sweet@latest serve
-# serves on http://127.0.0.1:8080 by default
+npx y-sweet@latest gen-auth --json
+# prints { "private_key": "...", ... } — copy the private_key value
 ```
 
-Or run the included reference server in `references/y-sweet`.
+### 2. Start y-sweet
+
+```bash
+npx y-sweet@latest serve --auth <private_key> --port 8080
+```
+
+### 3. Start the InstaSync auth server (Docker — recommended)
+
+```bash
+docker run -d \
+  --name instasync-server \
+  -p 8081:8081 \
+  -v instasync-data:/data \
+  -e OIDC_MODE=oidc \
+  -e OIDC_ISSUER=https://id.example.com \       # your PocketID base URL (no trailing slash)
+  -e OIDC_CLIENT_ID=<uuid from PocketID> \
+  -e OIDC_CLIENT_SECRET=<secret shown once> \
+  -e PUBLIC_BASE_URL=https://auth.example.com \ # how browsers reach this server
+  -e YSWEET_AUTH_KEY=<same private_key> \
+  -e YSWEET_URL=http://127.0.0.1:8080 \
+  ghcr.io/nealol/instasync-server:latest
+```
+
+The SQLite database is stored in the `/data` volume and persists across restarts.
+
+#### Environment variables
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `OIDC_MODE` | `oidc` | `oidc` for a real IdP; `mock` for local dev/testing |
+| `OIDC_ISSUER` | — | Your PocketID base URL (no trailing slash) |
+| `OIDC_CLIENT_ID` | — | UUID from PocketID |
+| `OIDC_CLIENT_SECRET` | — | Secret shown once in PocketID |
+| `OIDC_REDIRECT_URL` | `${PUBLIC_BASE_URL}/auth/callback` | Override only if you need a custom callback URL — must match the PocketID callback URL exactly |
+| `PUBLIC_BASE_URL` | `http://127.0.0.1:8081` | How browsers reach the auth server |
+| `YSWEET_AUTH_KEY` | — | Shared private key (same value as `y-sweet serve --auth`) |
+| `YSWEET_URL` | `http://127.0.0.1:8080` | Internal URL used to reach y-sweet |
+| `YSWEET_PUBLIC_URL` | = `YSWEET_URL` | URL clients connect to (set this if y-sweet is on a different host) |
+| `BIND_ADDR` | `0.0.0.0:8081` | Listen address inside the container |
+| `DATABASE_URL` | `sqlite:///data/instasync.db?mode=rwc` | SeaORM SQLite URL |
 
 ## Plugin setup
 
-1. Build the plugin:
+1. Install via [BRAT](https://github.com/TfTHacker/obsidian42-brat): add `nealol/instasync` as a beta plugin, or build manually:
    ```bash
    npm install
    npm run build
    ```
-2. Copy `main.js`, `manifest.json`, and `styles.css` into
-   `<your-vault>/.obsidian/plugins/instasync/` (or symlink this folder there).
-3. Enable **InstaSync** in Obsidian's *Community plugins* settings.
-4. Open **Settings → InstaSync** and set the **Server URL** (default
-   `http://127.0.0.1:8080`). All collaborators must use the same URL and **Vault id**.
+   Then copy `main.js`, `manifest.json`, and `styles.css` into
+   `<your-vault>/.obsidian/plugins/instasync/`.
+2. Enable **InstaSync** in Obsidian's *Community plugins* settings.
+3. Open **Settings → InstaSync**, set the **Auth server URL** (e.g. `https://auth.example.com`), and sign in.
+4. Create or join a vault from the InstaSync settings. All collaborators must join the same vault.
 5. Each client gets a random two-word cursor name; reroll it with the dice button.
 
 The status bar shows `InstaSync: connecting… / live / error`.
@@ -52,4 +98,3 @@ npm run typecheck  # tsc -noEmit
   authoritative and overwrite their local copy. There is no three-way merge.
 - Conflict handling beyond CRDT text merging (e.g. simultaneous first-time
   sharing of differing files) is intentionally minimal.
-- No access control / encryption; intended for trusted, local prototyping.

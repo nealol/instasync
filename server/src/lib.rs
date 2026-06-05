@@ -3,6 +3,7 @@ pub mod db;
 pub mod entities;
 pub mod error;
 pub mod oidc;
+pub mod proxy;
 pub mod routes;
 pub mod session;
 pub mod state;
@@ -12,7 +13,7 @@ pub mod ysweet;
 use std::sync::Arc;
 
 use axum::{
-    routing::{get, post},
+    routing::{any, get, post},
     Router,
 };
 use sea_orm::Database;
@@ -73,6 +74,8 @@ pub fn app(state: AppState) -> Router {
         .route("/api/vaults/{id}/files", post(routes::upsert_file))
         .route("/api/invites/redeem", post(routes::redeem_invite))
         .route("/api/doc-token", post(routes::doc_token))
+        // Reverse-proxy the bundled y-sweet so clients need only this server's URL.
+        .route("/d/{*rest}", any(proxy::proxy))
         .layer(cors)
         .with_state(state)
 }
