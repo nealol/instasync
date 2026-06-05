@@ -45,12 +45,15 @@ export async function requestUrl(opts: {
 	url: string;
 	method?: string;
 	contentType?: string;
+	headers?: Record<string, string>;
 	body?: string;
 	throw?: boolean;
 }): Promise<{ status: number; text: string; json: unknown }> {
+	const headers: Record<string, string> = { ...(opts.headers ?? {}) };
+	if (opts.contentType) headers["Content-Type"] = opts.contentType;
 	const res = await fetch(opts.url, {
 		method: opts.method ?? "GET",
-		headers: opts.contentType ? { "Content-Type": opts.contentType } : undefined,
+		headers,
 		body: opts.body,
 	});
 	const text = await res.text();

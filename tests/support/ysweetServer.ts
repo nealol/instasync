@@ -30,7 +30,7 @@ function freePort(): Promise<number> {
 }
 
 /** Resolve a directly-spawnable y-sweet binary path (download + .exe fixup). */
-async function resolveBinary(): Promise<string> {
+export async function resolveBinary(): Promise<string> {
 	if (process.env.YSWEET_BIN) return process.env.YSWEET_BIN;
 
 	const { getBinary } = require("y-sweet/src/get-binary");
@@ -44,13 +44,26 @@ async function resolveBinary(): Promise<string> {
 	return binpath;
 }
 
-export async function startYSweetServer(fixedPort?: number): Promise<YSweetServer> {
+/** Generate a y-sweet private key via `y-sweet gen-auth --json`. */
+export async function genAuthKey(): Promise<string> {
+	const bin = await resolveBinary();
+	const { execFileSync } = require("child_process");
+	const out = execFileSync(bin, ["gen-auth", "--json"], { encoding: "utf8" });
+	return JSON.parse(out).private_key as string;
+}
+
+export async function startYSweetServer(
+	fixedPort?: number,
+	authKey?: string,
+): Promise<YSweetServer> {
 	const [port, bin] = await Promise.all([
 		fixedPort ? Promise.resolve(fixedPort) : freePort(),
 		resolveBinary(),
 	]);
 
-	const child: ChildProcess = spawn(bin, ["serve", "--port", String(port)], {
+	const args = ["serve", "--port", String(port)];
+	if (authKey) args.push("--auth", authKey);
+	const child: ChildProcess = spawn(bin, args, {
 		stdio: ["ignore", "pipe", "pipe"],
 	});
 

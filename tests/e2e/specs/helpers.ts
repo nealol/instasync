@@ -3,6 +3,78 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+import { mockLogin, apiCreateInvite } from "../../support/authServer.js";
+
+// --- InstaSync auth / vault onboarding (Tier-3) ----------------------------
+
+/**
+ * Sign a device in: mint a mock-OIDC session (Node side) for a distinct user,
+ * then inject the auth URL + session into that device's plugin. Returns the
+ * session token so the caller can drive admin API calls (e.g. invites).
+ */
+export async function signInDevice(b: any, authUrl: string, sub: string): Promise<string> {
+	const token = await mockLogin(authUrl, sub);
+	await b.executeObsidian(
+		async ({ app }: any, url: string, tok: string) => {
+			const p = (app as any).plugins.plugins.instasync;
+			p.settings.authServerUrl = url;
+			await p.auth.setSession(tok);
+		},
+		authUrl,
+		token,
+	);
+	return token;
+}
+
+/** Create a vault from the device's local files and start syncing it. */
+export async function createVaultFromLocal(b: any, name: string): Promise<string> {
+	return b.executeObsidian(async ({ app }: any, n: string) => {
+		const p = (app as any).plugins.plugins.instasync;
+		await p.createAndActivateVault(n);
+		return p.settings.activeVaultId as string;
+	}, name);
+}
+
+/** Generate a single-use invite for a vault (admin, Node side). */
+export function generateInvite(authUrl: string, adminToken: string, vaultId: string): Promise<string> {
+	return apiCreateInvite(authUrl, adminToken, vaultId);
+}
+
+/**
+ * Redeem an invite on a device and adopt that vault locally: erases local
+ * Markdown, binds the vault, and reloads sync (mirrors plugin.adoptVault without
+ * the confirm modal, which is impractical to drive headless).
+ */
+export async function redeemAndAdopt(b: any, code: string): Promise<string> {
+	return b.executeObsidian(async ({ app }: any, c: string) => {
+		const p = (app as any).plugins.plugins.instasync;
+		const { vaultId } = await p.auth.redeemInvite(c);
+		for (const f of app.vault.getMarkdownFiles()) {
+			try {
+				await app.vault.delete(f);
+			} catch {
+				/* ignore */
+			}
+		}
+		p.settings.activeVaultId = vaultId;
+		await p.saveSettings();
+		await p.reloadSync();
+		return vaultId as string;
+	}, code);
+}
+
+/** Returns "ok" if the device can mint a token for the vault, else "refused". */
+export async function docTokenStatus(b: any, vaultId: string): Promise<string> {
+	return b.executeObsidian(async ({ app }: any, vid: string) => {
+		try {
+			await (app as any).plugins.plugins.instasync.auth.docToken(vid, vid);
+			return "ok";
+		} catch {
+			return "refused";
+		}
+	}, vaultId);
+}
+
 export async function readNote(b: any, path: string): Promise<string | null> {
 	return b.executeObsidian(
 		async ({ app }: any, p: string) => {

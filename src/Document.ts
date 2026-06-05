@@ -28,6 +28,8 @@ const DISK_ORIGIN = Symbol("instasync-disk");
 export class Document {
 	readonly path: string;
 	readonly guid: string;
+	/** Vault-namespaced id used for the y-sweet provider and local persistence. */
+	readonly serverDocId: string;
 	readonly ydoc: Y.Doc;
 	readonly ytext: Y.Text;
 	readonly provider: YSweetProvider;
@@ -60,10 +62,17 @@ export class Document {
 	private syncedListener: (synced: boolean) => void;
 	private writeTimer: number | null = null;
 
-	constructor(plugin: InstaSyncPlugin, path: string, guid: string, isCreator: boolean) {
+	constructor(
+		plugin: InstaSyncPlugin,
+		path: string,
+		guid: string,
+		serverDocId: string,
+		isCreator: boolean,
+	) {
 		this.plugin = plugin;
 		this.path = path;
 		this.guid = guid;
+		this.serverDocId = serverDocId;
 		this.isCreator = isCreator;
 
 		this.ydoc = new Y.Doc();
@@ -74,15 +83,16 @@ export class Document {
 		});
 
 		// Connect only after we have loaded the local baseline and folded in any
-		// offline disk edits (see init()).
+		// offline disk edits (see init()). The provider/persistence are keyed by the
+		// vault-namespaced doc id; the CRDT format (the bare guid) is unchanged.
 		this.provider = new YSweetProvider(
-			() => getClientToken(plugin.settings.serverUrl, guid),
-			guid,
+			() => getClientToken(plugin, serverDocId),
+			serverDocId,
 			this.ydoc,
 			{ connect: false, showDebuggerLink: false },
 		);
 		this.awareness = this.provider.awareness;
-		this.persistence = new IndexeddbPersistence(guid, this.ydoc);
+		this.persistence = new IndexeddbPersistence(serverDocId, this.ydoc);
 
 		// ytext changes (local edits from other peers, or our own editor) flow to
 		// disk only while no editor is bound — otherwise Obsidian persists the file.

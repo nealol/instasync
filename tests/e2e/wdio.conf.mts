@@ -6,18 +6,23 @@
 // fully isolated headless Obsidian instances (separate sandboxed vault copies +
 // user-data dirs => isolated IndexedDB), coordinated in one test.
 //
-// The server is pinned to the plugin's DEFAULT URL (127.0.0.1:8080) so freshly
-// installed plugins connect with no settings injection. Override via YSWEET_PORT.
+// We boot a y-sweet server (started with --auth) AND the InstaSync auth server
+// (mock OIDC), sharing one key. They are pinned to the plugin's default ports
+// (y-sweet 8080, auth 8081) so a freshly installed plugin reaches them with no
+// URL injection; the spec signs each device in and binds it to a vault.
 
 import * as path from "path";
 import { fileURLToPath } from "url";
-import { startYSweetServer, type YSweetServer } from "../support/ysweetServer.js";
+import { startYSweetServer, genAuthKey, type YSweetServer } from "../support/ysweetServer.js";
+import { startAuthServer, type AuthServer } from "../support/authServer.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "../..");
-const PORT = Number(process.env.YSWEET_PORT ?? 8080);
+const YSWEET_PORT = Number(process.env.YSWEET_PORT ?? 8080);
+const AUTH_PORT = Number(process.env.AUTH_PORT ?? 8081);
 
-let server: YSweetServer | undefined;
+let ysweet: YSweetServer | undefined;
+let authServer: AuthServer | undefined;
 
 export const config: WebdriverIO.Config = {
 	runner: "local",
@@ -45,9 +50,16 @@ export const config: WebdriverIO.Config = {
 	logLevel: "warn",
 
 	async onPrepare() {
-		server = await startYSweetServer(PORT);
+		const authKey = await genAuthKey();
+		ysweet = await startYSweetServer(YSWEET_PORT, authKey);
+		authServer = await startAuthServer({
+			port: AUTH_PORT,
+			ysweetUrl: ysweet.url,
+			authKey,
+		});
 	},
 	async onComplete() {
-		await server?.stop();
+		await authServer?.stop();
+		await ysweet?.stop();
 	},
 };

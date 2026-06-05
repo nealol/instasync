@@ -12,7 +12,12 @@ import {
 	installNetworkShim,
 	setNetworkOffline,
 	statusText,
+	signInDevice,
+	createVaultFromLocal,
+	generateInvite,
+	redeemAndAdopt,
 } from "./helpers.js";
+import { mockLogin } from "../../support/authServer.js";
 
 /** Reserve then release a port so nothing listens on it — a dead endpoint. */
 function reserveDeadPort(): Promise<number> {
@@ -32,13 +37,18 @@ const vaultB = path.resolve(here, "../vaults/vaultB");
 const cacheDir = path.resolve(repoRoot, ".obsidian-cache");
 
 const SECONDS = 1000;
+const AUTH_PORT = Number(process.env.AUTH_PORT ?? 8081);
+const authUrl = `http://127.0.0.1:${AUTH_PORT}`;
 
 // Device A is the wdio session (vault A). Device B is a second, fully isolated
-// Obsidian instance started programmatically (vault B). Both install this plugin
-// and use its default settings (127.0.0.1:8080, vaultId "instasync-vault"), so
-// they sync through the server the conf spawned.
+// Obsidian instance started programmatically (vault B). Both install this plugin;
+// the conf boots y-sweet (--auth) + the auth server (mock OIDC) on the plugin's
+// default ports. Device A signs in and creates a vault from its local files;
+// device B signs in as a different user, redeems an invite, and adopts it.
 let A: WebdriverIO.Browser;
 let B: WebdriverIO.Browser;
+let vaultId: string;
+let adminToken: string;
 
 describe("InstaSync — two isolated Obsidian devices", function () {
 	before(async function () {
@@ -56,6 +66,18 @@ describe("InstaSync — two isolated Obsidian devices", function () {
 			},
 			cacheDir,
 		} as any);
+
+		// Device A: sign in, seed a file, create a vault from the local files.
+		adminToken = await signInDevice(A, authUrl, "alice");
+		await writeNote(A, "Seed.md", "seeded on A");
+		vaultId = await createVaultFromLocal(A, "shared");
+
+		// Device B: sign in as a different user, then redeem an invite and adopt.
+		// LocalOnlyB.md must be erased by the adopt; Seed.md must be pulled in.
+		await signInDevice(B, authUrl, "bob");
+		await writeNote(B, "LocalOnlyB.md", "should be erased by adopt");
+		const code = await generateInvite(authUrl, adminToken, vaultId);
+		await redeemAndAdopt(B, code);
 
 		// Wait until both devices are connected ("live") before exercising sync.
 		for (const dev of [A, B]) {
@@ -79,6 +101,26 @@ describe("InstaSync — two isolated Obsidian devices", function () {
 
 	after(async function () {
 		await B?.deleteSession();
+	});
+
+	describe("onboarding & access control", function () {
+		it("adopt pulled the remote vault and erased local-only files on B", async function () {
+			await B.waitUntil(async () => (await readNote(B, "Seed.md")) === "seeded on A", {
+				timeout: 60 * SECONDS,
+				timeoutMsg: "B never pulled the adopted vault's Seed.md",
+			});
+			expect(await readNote(B, "LocalOnlyB.md")).toBe(null);
+		});
+
+		it("refuses a doc token to a non-member of the vault", async function () {
+			const carol = await mockLogin(authUrl, "carol");
+			const res = await fetch(`${authUrl}/api/doc-token`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json", Authorization: `Bearer ${carol}` },
+				body: JSON.stringify({ vaultId, docId: vaultId }),
+			});
+			expect(res.status).toBe(403);
+		});
 	});
 
 	describe("live sync", function () {

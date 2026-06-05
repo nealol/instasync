@@ -4,6 +4,7 @@
 // (it is set true around the mutation that triggers the event).
 
 import { TFile, TAbstractFile } from "./obsidian-mock";
+import { AuthClient } from "../../src/auth";
 
 type Handler = (...args: any[]) => void;
 
@@ -53,6 +54,9 @@ export class FakeVault {
 			.filter((p) => p.endsWith(".md"))
 			.map((p) => new TFile(p));
 	}
+	getName(): string {
+		return "fake-vault";
+	}
 
 	/** Test helper: simulate an external/offline edit + the resulting event. */
 	rename(oldPath: string, newPath: string): void {
@@ -65,37 +69,49 @@ export class FakeVault {
 
 export interface FakePlugin {
 	settings: {
-		serverUrl: string;
-		vaultId: string;
+		authServerUrl: string;
+		sessionToken: string;
+		userDisplayName: string;
+		userEmail: string;
+		activeVaultId: string;
 		clientName: string;
 		clientColor: string;
 		clientColorLight: string;
 		enabled: boolean;
 	};
+	auth: AuthClient;
 	app: { vault: FakeVault; workspace: { on: () => unknown } };
 	registerEvent: (ref: unknown) => void;
 	applyAwarenessTo: (doc: unknown) => void;
 	setStatus: (status: string) => void;
+	saveSettings: () => Promise<void>;
 }
 
 export function makeFakePlugin(
-	serverUrl: string,
-	opts: { clientName?: string; vaultId?: string } = {},
+	authServerUrl: string,
+	opts: { sessionToken: string; activeVaultId: string; clientName?: string },
 ): { plugin: FakePlugin; vault: FakeVault } {
 	const vault = new FakeVault();
 	const plugin: FakePlugin = {
 		settings: {
-			serverUrl,
-			vaultId: opts.vaultId ?? "test-vault",
+			authServerUrl,
+			sessionToken: opts.sessionToken,
+			userDisplayName: "",
+			userEmail: "",
+			activeVaultId: opts.activeVaultId,
 			clientName: opts.clientName ?? "Test Client",
 			clientColor: "#ffffff",
 			clientColorLight: "#ffffff33",
 			enabled: true,
 		},
+		// Set just below, once the object exists (AuthClient needs the plugin).
+		auth: undefined as unknown as AuthClient,
 		app: { vault, workspace: { on: () => ({}) } },
 		registerEvent: () => {},
 		applyAwarenessTo: () => {},
 		setStatus: () => {},
+		saveSettings: async () => {},
 	};
+	plugin.auth = new AuthClient(plugin as any);
 	return { plugin, vault };
 }

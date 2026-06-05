@@ -1,33 +1,50 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
 import { Document } from "../../src/Document";
-import { makeFakePlugin, type FakeVault } from "../support/fakePlugin";
+import { makeFakePlugin, type FakePlugin, type FakeVault } from "../support/fakePlugin";
 import { notices } from "../support/obsidian-mock";
 import { Peer } from "../support/peer";
-import { startYSweetServer, type YSweetServer } from "../support/ysweetServer";
+import { startAuthHarness, type AuthHarness } from "../support/authServer";
 import { waitFor, freshGuid } from "../support/util";
 
-let server: YSweetServer;
+let harness: AuthHarness;
+let token: string;
+let vaultId: string;
+let memberPlugin: FakePlugin;
 
 beforeAll(async () => {
-	server = await startYSweetServer();
-}, 120_000);
+	harness = await startAuthHarness();
+	token = await harness.loginUser("alice");
+	const vault = await harness.createVault(token, "docs");
+	vaultId = vault.id;
+	memberPlugin = makeFakePlugin(harness.authUrl, {
+		sessionToken: token,
+		activeVaultId: vaultId,
+	}).plugin;
+}, 180_000);
 
 afterAll(async () => {
-	await server?.stop();
+	await harness?.stop();
 });
 
 afterEach(() => {
 	notices.length = 0;
 });
 
+/** The vault-namespaced doc id for a bare guid. */
+const docId = (guid: string) => `${vaultId}__${guid}`;
+
 /** Build a Document (client "A") over a fresh fake vault, optionally preloaded. */
 function makeDoc(
 	guid: string,
 	opts: { file?: { path: string; content: string }; clientName?: string } = {},
 ) {
-	const { plugin, vault } = makeFakePlugin(server.url, { clientName: opts.clientName });
+	const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+		sessionToken: token,
+		activeVaultId: vaultId,
+		clientName: opts.clientName,
+	});
 	if (opts.file) vault.files.set(opts.file.path, opts.file.content);
-	const doc = new Document(plugin as any, opts.file?.path ?? "note.md", guid, true);
+	const doc = new Document(plugin as any, opts.file?.path ?? "note.md", guid, docId(guid), true);
 	return { doc, vault, plugin };
 }
 
@@ -38,7 +55,7 @@ describe("Document sync", () => {
 	it("propagates local and remote edits (clean, no conflict)", async () => {
 		const guid = freshGuid();
 		const { doc, vault } = makeDoc(guid, { file: { path: "note.md", content: "seed" } });
-		const peer = new Peer(server.url, guid);
+		const peer = new Peer(memberPlugin, docId(guid));
 		try {
 			await doc.whenReady();
 			await peer.whenSynced();
@@ -68,13 +85,16 @@ describe("Document sync", () => {
 	it("pure remote update writes to disk without a conflict copy", async () => {
 		const guid = freshGuid();
 		// Seed the server from B first.
-		const peer = new Peer(server.url, guid);
+		const peer = new Peer(memberPlugin, docId(guid));
 		await peer.whenSynced();
 		peer.setText("authored elsewhere");
 
 		// A starts with no local file at all.
-		const { plugin, vault } = makeFakePlugin(server.url);
-		const doc = new Document(plugin as any, "note.md", guid, false);
+		const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+			sessionToken: token,
+			activeVaultId: vaultId,
+		});
+		const doc = new Document(plugin as any, "note.md", guid, docId(guid), false);
 		try {
 			await doc.whenReady();
 			await waitFor(() => vault.files.get("note.md") === "authored elsewhere", {
@@ -90,7 +110,7 @@ describe("Document sync", () => {
 
 	it("startup conflict: merges divergent offline writes and saves a conflict copy", async () => {
 		const guid = freshGuid();
-		const peer = new Peer(server.url, guid);
+		const peer = new Peer(memberPlugin, docId(guid));
 
 		// Phase 1 — establish a shared baseline "base" and persist it to A's IndexedDB.
 		const a1 = makeDoc(guid, {
@@ -108,9 +128,13 @@ describe("Document sync", () => {
 		a1.vault.files.set("note.md", "base LOCAL side"); // external offline edit on A's disk
 
 		// Phase 3 — A restarts on the same guid + vault (baseline reloads from IndexedDB).
-		const { plugin } = makeFakePlugin(server.url, { clientName: "Brave Otter" });
+		const { plugin } = makeFakePlugin(harness.authUrl, {
+			sessionToken: token,
+			activeVaultId: vaultId,
+			clientName: "Brave Otter",
+		});
 		(plugin.app.vault as FakeVault).files = a1.vault.files; // same on-disk state
-		const a2 = new Document(plugin as any, "note.md", guid, false);
+		const a2 = new Document(plugin as any, "note.md", guid, docId(guid), false);
 		try {
 			await a2.whenReady();
 			await waitFor(() => peer.getText() === a2.content && a2.content.length > 0, {
@@ -151,9 +175,12 @@ describe("Document sync", () => {
 		a1.doc.destroy();
 
 		// Restart on the same guid; the offline edit must survive (no server needed).
-		const { plugin } = makeFakePlugin(server.url);
+		const { plugin } = makeFakePlugin(harness.authUrl, {
+			sessionToken: token,
+			activeVaultId: vaultId,
+		});
 		(plugin.app.vault as FakeVault).files = a1.vault.files;
-		const a2 = new Document(plugin as any, "note.md", guid, false);
+		const a2 = new Document(plugin as any, "note.md", guid, docId(guid), false);
 		try {
 			await a2.whenReady();
 			expect(a2.content).toBe("written while offline");
@@ -165,7 +192,7 @@ describe("Document sync", () => {
 	it("reconnect: ensureConnected revives a disconnected provider", async () => {
 		const guid = freshGuid();
 		const { doc, vault } = makeDoc(guid, { file: { path: "note.md", content: "hi" } });
-		const peer = new Peer(server.url, guid);
+		const peer = new Peer(memberPlugin, docId(guid));
 		try {
 			await doc.whenReady();
 			await waitFor(() => doc.provider.status === "connected");

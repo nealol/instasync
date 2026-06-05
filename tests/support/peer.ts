@@ -12,12 +12,18 @@ export class Peer {
 	readonly text: Y.Text;
 	readonly provider: YSweetProvider;
 
-	constructor(serverUrl: string, guid: string) {
+	/**
+	 * A second device, minting tokens through the auth server like the real
+	 * plugin. `plugin` is a fakePlugin (carries authServerUrl/session/vault);
+	 * `serverDocId` is the namespaced doc id (`${vaultId}__${guid}` or the index
+	 * `${vaultId}`).
+	 */
+	constructor(plugin: unknown, serverDocId: string) {
 		this.doc = new Y.Doc();
 		this.text = this.doc.getText("contents");
 		this.provider = new YSweetProvider(
-			() => getClientToken(serverUrl, guid) as any,
-			guid,
+			() => getClientToken(plugin as any, serverDocId) as any,
+			serverDocId,
 			this.doc,
 			{ connect: true, showDebuggerLink: false },
 		);
