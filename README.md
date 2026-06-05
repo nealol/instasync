@@ -13,27 +13,29 @@ For this prototype, **every Markdown file in the vault is synced** (rather than 
 
 ## Running a server
 
-InstaSync requires two servers running side-by-side:
+The Docker image is **self-contained**: it runs y-sweet internally and
+reverse-proxies its sync traffic under `/d/*`, so you expose **one port** and the
+plugin only ever needs **one URL** (`PUBLIC_BASE_URL`). No separate y-sweet
+process or second URL to manage.
 
-| Server | Role |
-| --- | --- |
-| **y-sweet** | CRDT sync (WebSocket) |
-| **InstaSync auth server** | SSO login, vault management, mints y-sweet tokens |
+```
+                          ┌──────── instasync-server container ────────┐
+Obsidian ──HTTPS/WSS──▶   │ auth + /d/* proxy ──▶ y-sweet (127.0.0.1)   │
+                          │ SQLite + y-sweet store on the /data volume  │
+                          └─────────────────────────────────────────────┘
+```
 
 ### 1. Generate a shared auth key
 
+The image bundles a correctly-built y-sweet binary, so generate the key straight
+from it (this avoids the broken Windows `npx y-sweet` launcher):
+
 ```bash
-npx y-sweet@latest gen-auth --json
+docker run --rm --entrypoint y-sweet ghcr.io/nealol/instasync-server:latest gen-auth --json
 # prints { "private_key": "...", ... } — copy the private_key value
 ```
 
-### 2. Start y-sweet
-
-```bash
-npx y-sweet@latest serve --auth <private_key> --port 8080
-```
-
-### 3. Start the InstaSync auth server (Docker — recommended)
+### 2. Start the server
 
 ```bash
 docker run -d \
@@ -44,13 +46,19 @@ docker run -d \
   -e OIDC_ISSUER=https://id.example.com \       # your PocketID base URL (no trailing slash)
   -e OIDC_CLIENT_ID=<uuid from PocketID> \
   -e OIDC_CLIENT_SECRET=<secret shown once> \
-  -e PUBLIC_BASE_URL=https://auth.example.com \ # how browsers reach this server
-  -e YSWEET_AUTH_KEY=<same private_key> \
-  -e YSWEET_URL=http://127.0.0.1:8080 \
+  -e PUBLIC_BASE_URL=https://sync.example.com \ # how clients reach this server (baked into tokens)
+  -e YSWEET_AUTH_KEY=<private_key from step 1> \
   ghcr.io/nealol/instasync-server:latest
 ```
 
-The SQLite database is stored in the `/data` volume and persists across restarts.
+Put a TLS-terminating reverse proxy (Caddy, nginx, Traefik, …) in front and point
+it at port `8081`; it must forward **WebSocket upgrades** on `/d/*`. Set
+`PUBLIC_BASE_URL` to that public HTTPS URL — it is baked into the client tokens
+y-sweet mints (`wss://sync.example.com/d/{doc}/ws`), and it is the only URL you
+enter in the plugin.
+
+The SQLite database **and** the y-sweet document store both live under the
+`/data` volume and persist across restarts.
 
 #### Environment variables
 
@@ -61,12 +69,15 @@ The SQLite database is stored in the `/data` volume and persists across restarts
 | `OIDC_CLIENT_ID` | — | UUID from PocketID |
 | `OIDC_CLIENT_SECRET` | — | Secret shown once in PocketID |
 | `OIDC_REDIRECT_URL` | `${PUBLIC_BASE_URL}/auth/callback` | Override only if you need a custom callback URL — must match the PocketID callback URL exactly |
-| `PUBLIC_BASE_URL` | `http://127.0.0.1:8081` | How browsers reach the auth server |
-| `YSWEET_AUTH_KEY` | — | Shared private key (same value as `y-sweet serve --auth`) |
-| `YSWEET_URL` | `http://127.0.0.1:8080` | Internal URL used to reach y-sweet |
-| `YSWEET_PUBLIC_URL` | = `YSWEET_URL` | URL clients connect to (set this if y-sweet is on a different host) |
+| `PUBLIC_BASE_URL` | `http://127.0.0.1:8081` | How clients reach this server; baked into minted sync tokens |
+| `YSWEET_AUTH_KEY` | — | Shared private key from step 1 (used by both the internal y-sweet and the auth server) |
 | `BIND_ADDR` | `0.0.0.0:8081` | Listen address inside the container |
 | `DATABASE_URL` | `sqlite:///data/instasync.db?mode=rwc` | SeaORM SQLite URL |
+
+The internal y-sweet is wired up automatically (`YSWEET_INTERNAL_PORT`, default
+`8080`; `YSWEET_STORE`, default `/data/ysweet`) — override these only for advanced
+setups. To run y-sweet as a separate external process instead, see
+[`server/README.md`](server/README.md).
 
 ## Plugin setup
 

@@ -1,4 +1,6 @@
 import { Notice, Plugin } from "obsidian";
+import { flushSync } from "react-dom";
+import { createRoot, type Root } from "react-dom/client";
 import { InstaSyncSettings, InstaSyncSettingTab, defaultSettings } from "./settings";
 import { VaultSync, isConflictCopy } from "./VaultSync";
 import type { Document } from "./Document";
@@ -22,6 +24,7 @@ export default class InstaSyncPlugin extends Plugin {
 	auth!: AuthClient;
 	vaultSync: VaultSync | null = null;
 	private statusBarEl!: HTMLElement;
+	private statusRoot: Root | null = null;
 	private status: ConnectionStatus = "offline";
 
 	async onload(): Promise<void> {
@@ -80,6 +83,8 @@ export default class InstaSyncPlugin extends Plugin {
 
 	onunload(): void {
 		this.stopSync();
+		this.statusRoot?.unmount();
+		this.statusRoot = null;
 	}
 
 	// --- Sync lifecycle --------------------------------------------------------
@@ -225,7 +230,10 @@ export default class InstaSyncPlugin extends Plugin {
 
 	private renderStatus(): void {
 		if (!this.statusBarEl) return;
-		this.statusBarEl.setText(STATUS_TEXT[this.status]);
+		this.statusRoot ??= createRoot(this.statusBarEl);
+		flushSync(() => {
+			this.statusRoot?.render(STATUS_TEXT[this.status]);
+		});
 	}
 
 	// --- Settings persistence --------------------------------------------------

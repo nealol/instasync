@@ -11,6 +11,9 @@ import {
 	type ViewUpdate,
 	type DecorationSet,
 } from "@codemirror/view";
+import { Fragment, createElement } from "react";
+import { flushSync } from "react-dom";
+import { createRoot, type Root } from "react-dom/client";
 import * as Y from "yjs";
 import type { Awareness } from "y-protocols/awareness";
 import type * as YType from "yjs";
@@ -74,6 +77,7 @@ export const yRemoteSelectionsTheme = EditorView.baseTheme({
 });
 
 const yRemoteSelectionsAnnotation = Annotation.define<Array<number>>();
+const caretRoots = new WeakMap<HTMLElement, Root>();
 
 class YRemoteCaretWidget extends WidgetType {
 	constructor(
@@ -87,21 +91,11 @@ class YRemoteCaretWidget extends WidgetType {
 		const span = document.createElement("span");
 		span.className = "cm-ySelectionCaret";
 		span.setAttribute("style", `background-color: ${this.color}; border-color: ${this.color}`);
-		span.appendChild(document.createTextNode("⁠"));
-		const dot = document.createElement("div");
-		dot.className = "cm-ySelectionCaretDot";
-		span.appendChild(dot);
-		span.appendChild(document.createTextNode("⁠"));
-		const info = document.createElement("div");
-		info.className = "cm-ySelectionInfo";
-		// Render the name via a CSS pseudo-element (content: attr(data-name))
-		// rather than a real text node. A text node here lives inside CodeMirror's
-		// contenteditable and can be absorbed into the document by the browser's
-		// DOM observer (e.g. when typing/IME at a remote cursor), which then gets
-		// forwarded into the shared Y.Text. An attribute is invisible to that path.
-		info.setAttribute("data-name", this.name);
-		span.appendChild(info);
-		span.appendChild(document.createTextNode("⁠"));
+		const root = createRoot(span);
+		caretRoots.set(span, root);
+		flushSync(() => {
+			root.render(createElement(RemoteCaret, { name: this.name }));
+		});
 		return span;
 	}
 
@@ -117,6 +111,11 @@ class YRemoteCaretWidget extends WidgetType {
 		return false;
 	}
 
+	destroy(dom: HTMLElement): void {
+		caretRoots.get(dom)?.unmount();
+		caretRoots.delete(dom);
+	}
+
 	get estimatedHeight(): number {
 		return -1;
 	}
@@ -124,6 +123,23 @@ class YRemoteCaretWidget extends WidgetType {
 	ignoreEvent(): boolean {
 		return true;
 	}
+}
+
+function RemoteCaret({ name }: { name: string }) {
+	return createElement(
+		Fragment,
+		null,
+		"⁠",
+		createElement("div", { className: "cm-ySelectionCaretDot" }),
+		"⁠",
+		// Render the name via a CSS pseudo-element (content: attr(data-name))
+		// rather than a real text node. A text node here lives inside CodeMirror's
+		// contenteditable and can be absorbed into the document by the browser's
+		// DOM observer (e.g. when typing/IME at a remote cursor), which then gets
+		// forwarded into the shared Y.Text. An attribute is invisible to that path.
+		createElement("div", { className: "cm-ySelectionInfo", "data-name": name }),
+		"⁠",
+	);
 }
 
 type AwarenessChange = { added: number[]; updated: number[]; removed: number[] };
