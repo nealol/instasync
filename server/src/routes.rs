@@ -1,8 +1,6 @@
 use axum::extract::{Path, State};
 use axum::Json;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set,
-};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -32,6 +30,8 @@ pub struct VaultResponse {
     pub id: String,
     pub name: String,
     pub role: String,
+    pub created_by: String,
+    pub owner: bool,
 }
 
 // ---------- membership guards ----------
@@ -118,6 +118,8 @@ pub async fn create_vault(
         id: vault_id,
         name: body.name,
         role: ROLE_ADMIN.to_string(),
+        created_by: user.id,
+        owner: true,
     }))
 }
 
@@ -140,6 +142,8 @@ pub async fn list_vaults(
                 id: v.id,
                 name: v.name,
                 role: m.role,
+                owner: v.created_by == user.id,
+                created_by: v.created_by,
             });
         }
     }
@@ -270,6 +274,7 @@ pub struct MemberResponse {
     pub email: String,
     pub display_name: String,
     pub role: String,
+    pub owner: bool,
 }
 
 pub async fn list_members(
@@ -277,7 +282,12 @@ pub async fn list_members(
     AuthUser(user): AuthUser,
     Path(vault_id): Path<String>,
 ) -> AppResult<Json<Vec<MemberResponse>>> {
-    require_admin(&state, &user.id, &vault_id).await?;
+    require_member(&state, &user.id, &vault_id).await?;
+
+    let vault = vaults::Entity::find_by_id(vault_id.clone())
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
 
     let mems = memberships::Entity::find()
         .filter(memberships::Column::VaultId.eq(&vault_id))
@@ -290,11 +300,13 @@ pub async fn list_members(
             .one(&state.db)
             .await?
         {
+            let owner = u.id == vault.created_by;
             out.push(MemberResponse {
                 user_id: u.id,
                 email: u.email,
                 display_name: u.display_name,
                 role: m.role,
+                owner,
             });
         }
     }
@@ -323,7 +335,40 @@ pub async fn promote_member(
         email: u.email,
         display_name: u.display_name,
         role: updated.role,
+        owner: false,
     }))
+}
+
+pub async fn remove_member(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((vault_id, target_user_id)): Path<(String, String)>,
+) -> AppResult<Json<Value>> {
+    let actor = require_admin(&state, &user.id, &vault_id).await?;
+    let target = require_member(&state, &target_user_id, &vault_id).await?;
+    let vault = vaults::Entity::find_by_id(vault_id.clone())
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    if target_user_id == vault.created_by {
+        return Err(AppError::Forbidden);
+    }
+
+    let actor_is_owner = user.id == vault.created_by;
+    if target.role == ROLE_ADMIN && !actor_is_owner {
+        return Err(AppError::Forbidden);
+    }
+
+    if target.role == ROLE_MEMBER && actor.role != ROLE_ADMIN {
+        return Err(AppError::Forbidden);
+    }
+
+    memberships::Entity::delete_by_id(target.id)
+        .exec(&state.db)
+        .await?;
+
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 // ---------- file registry ----------

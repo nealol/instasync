@@ -13,7 +13,7 @@ pub mod ysweet;
 use std::sync::Arc;
 
 use axum::{
-    routing::{any, get, post},
+    routing::{any, delete, get, post},
     Router,
 };
 use sea_orm::Database;
@@ -70,6 +70,10 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/api/vaults/{id}/members/{user_id}/promote",
             post(routes::promote_member),
+        )
+        .route(
+            "/api/vaults/{id}/members/{user_id}",
+            delete(routes::remove_member),
         )
         .route("/api/vaults/{id}/files", post(routes::upsert_file))
         .route("/api/invites/redeem", post(routes::redeem_invite))

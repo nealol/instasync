@@ -1,2 +1,68 @@
 /* InstaSync — remote cursor styles are defined as a CodeMirror baseTheme in
-   src/editor/RemoteSelections.ts. This file is intentionally minimal. */
+   src/editor/RemoteSelections.ts. */
+
+.instasync-setup-wrap {
+	display: flex;
+	justify-content: center;
+	padding: 48px 12px;
+}
+
+.instasync-setup-card {
+	width: min(100%, 420px);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 12px;
+	padding: 24px;
+	background: var(--background-primary);
+	box-shadow: 0 12px 32px rgba(0, 0, 0, 0.12);
+}
+
+.instasync-wide-input,
+.instasync-wide-button {
+	width: 100%;
+}
+
+.instasync-choice-list {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+
+.instasync-choice {
+	display: flex;
+	width: 100%;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 4px;
+	height: auto;
+	padding: 12px;
+	text-align: left;
+}
+
+.instasync-choice span {
+	color: var(--text-muted);
+	font-size: var(--font-ui-small);
+}
+
+.instasync-actions {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+	margin-top: 16px;
+}
+
+.instasync-warning-box {
+	border: 1px solid var(--background-modifier-error);
+	border-radius: 8px;
+	padding: 12px;
+	background: var(--background-secondary);
+}
+
+.instasync-error {
+	color: var(--text-error);
+}
+
+.instasync-advanced {
+	margin-top: 24px;
+	border-top: 1px solid var(--background-modifier-border);
+	padding-top: 16px;
+}

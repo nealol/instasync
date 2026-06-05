@@ -18,6 +18,7 @@ export async function signInDevice(b: any, authUrl: string, sub: string): Promis
 		async ({ app }: any, url: string, tok: string) => {
 			const p = (app as any).plugins.plugins.instasync;
 			p.settings.authServerUrl = url;
+			p.settings.enabled = true;
 			await p.auth.setSession(tok);
 		},
 		authUrl,
@@ -61,6 +62,36 @@ export async function redeemAndAdopt(b: any, code: string): Promise<string> {
 		await p.reloadSync();
 		return vaultId as string;
 	}, code);
+}
+
+/** Redeem an invite but leave the local vault bound to its current remote. */
+export async function redeemInviteOnly(b: any, code: string): Promise<{ vaultId: string; activeVaultId: string }> {
+	return b.executeObsidian(async ({ app }: any, c: string) => {
+		const p = (app as any).plugins.plugins.instasync;
+		const { vaultId } = await p.auth.redeemInvite(c);
+		return { vaultId, activeVaultId: p.settings.activeVaultId as string };
+	}, code);
+}
+
+export async function activeVaultId(b: any): Promise<string> {
+	return b.executeObsidian(async ({ app }: any) => {
+		return (app as any).plugins.plugins.instasync.settings.activeVaultId as string;
+	});
+}
+
+export async function listedVaultIds(b: any): Promise<string[]> {
+	return b.executeObsidian(async ({ app }: any) => {
+		return ((await (app as any).plugins.plugins.instasync.auth.listVaults()) as { id: string }[]).map((v) => v.id);
+	});
+}
+
+export async function setSyncPaused(b: any, paused: boolean): Promise<void> {
+	await b.executeObsidian(async ({ app }: any, p: boolean) => {
+		const plugin = (app as any).plugins.plugins.instasync;
+		plugin.settings.enabled = !p;
+		await plugin.saveSettings();
+		await plugin.reloadSync();
+	}, paused);
 }
 
 /** Returns "ok" if the device can mint a token for the vault, else "refused". */

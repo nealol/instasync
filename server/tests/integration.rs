@@ -177,6 +177,8 @@ async fn create_list_vault() {
         send(&app, "POST", "/api/vaults", Some(&token), Some(json!({"name": "Notes"}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(vault["role"], "admin");
+    assert_eq!(vault["owner"], true);
+    assert_eq!(vault["createdBy"].as_str().is_some(), true);
 
     let (status, list) = send(&app, "GET", "/api/vaults", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
@@ -255,10 +257,10 @@ async fn promote_member_to_admin() {
     let code = invite["code"].as_str().unwrap().to_string();
     send(&app, "POST", "/api/invites/redeem", Some(&bob), Some(json!({"code": code}))).await;
 
-    // Bob (member) cannot list members; after promotion he can.
+    // Bob (member) can list members; promotion still succeeds.
     let (status, _) =
         send(&app, "GET", &format!("/api/vaults/{vault_id}/members"), Some(&bob), None).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::OK);
 
     let (status, _) = send(
         &app,
@@ -273,6 +275,107 @@ async fn promote_member_to_admin() {
     let (status, _) =
         send(&app, "GET", &format!("/api/vaults/{vault_id}/members"), Some(&bob), None).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn remove_member_permissions() {
+    let ys = fake_ysweet().await;
+    let app = test_app(&ys, &ys).await;
+    let owner = login(&app, "owner").await;
+    let admin = login(&app, "admin").await;
+    let member = login(&app, "member").await;
+    let outsider = login(&app, "outsider").await;
+
+    let admin_id = send(&app, "GET", "/api/me", Some(&admin), None).await.1["userId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let member_id = send(&app, "GET", "/api/me", Some(&member), None).await.1["userId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let owner_id = send(&app, "GET", "/api/me", Some(&owner), None).await.1["userId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (_, vault) =
+        send(&app, "POST", "/api/vaults", Some(&owner), Some(json!({"name": "V"}))).await;
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+
+    for token in [&admin, &member] {
+        let (_, invite) = send(
+            &app,
+            "POST",
+            &format!("/api/vaults/{vault_id}/invites"),
+            Some(&owner),
+            Some(json!({})),
+        )
+        .await;
+        let code = invite["code"].as_str().unwrap().to_string();
+        send(&app, "POST", "/api/invites/redeem", Some(token), Some(json!({"code": code})))
+            .await;
+    }
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/members/{admin_id}/promote"),
+        Some(&owner),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = send(
+        &app,
+        "DELETE",
+        &format!("/api/vaults/{vault_id}/members/{admin_id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "admin cannot remove another admin");
+
+    let (status, _) = send(
+        &app,
+        "DELETE",
+        &format!("/api/vaults/{vault_id}/members/{member_id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "admin can remove a member");
+
+    let (status, _) = send(
+        &app,
+        "DELETE",
+        &format!("/api/vaults/{vault_id}/members/{admin_id}"),
+        Some(&owner),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "owner can remove an admin");
+
+    let (status, _) = send(
+        &app,
+        "DELETE",
+        &format!("/api/vaults/{vault_id}/members/{owner_id}"),
+        Some(&owner),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "owner cannot remove themselves");
+
+    let (status, _) = send(
+        &app,
+        "DELETE",
+        &format!("/api/vaults/{vault_id}/members/{owner_id}"),
+        Some(&outsider),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "outsider cannot remove anyone");
 }
 
 #[tokio::test]

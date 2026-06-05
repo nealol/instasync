@@ -58,6 +58,28 @@ export const apiCreateInvite = async (authUrl: string, token: string, vaultId: s
 export const apiRedeemInvite = (authUrl: string, token: string, code: string) =>
 	apiPost<{ vaultId: string; name: string }>(authUrl, token, "/api/invites/redeem", { code });
 
+export async function apiGet<T>(authUrl: string, token: string, pathName: string): Promise<T> {
+	const res = await fetch(`${authUrl}${pathName}`, {
+		headers: { Authorization: `Bearer ${token}` },
+	});
+	if (!res.ok) throw new Error(`${pathName} -> HTTP ${res.status}`);
+	return (await res.json()) as T;
+}
+
+export async function apiDelete(authUrl: string, token: string, pathName: string): Promise<number> {
+	const res = await fetch(`${authUrl}${pathName}`, {
+		method: "DELETE",
+		headers: { Authorization: `Bearer ${token}` },
+	});
+	return res.status;
+}
+
+export const apiPromoteMember = (authUrl: string, token: string, vaultId: string, userId: string) =>
+	apiPost(authUrl, token, `/api/vaults/${vaultId}/members/${userId}/promote`, {});
+
+export const apiRemoveMember = (authUrl: string, token: string, vaultId: string, userId: string) =>
+	apiDelete(authUrl, token, `/api/vaults/${vaultId}/members/${userId}`);
+
 // ---------- server process ----------
 
 function freePort(): Promise<number> {

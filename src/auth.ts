@@ -13,6 +13,8 @@ export interface VaultInfo {
 	id: string;
 	name: string;
 	role: "admin" | "member";
+	createdBy?: string;
+	owner?: boolean;
 }
 
 export interface MemberInfo {
@@ -20,6 +22,7 @@ export interface MemberInfo {
 	email: string;
 	displayName: string;
 	role: "admin" | "member";
+	owner?: boolean;
 }
 
 /** Thrown when the server rejects the session; callers should prompt re-login. */
@@ -32,7 +35,7 @@ export class AuthError extends Error {}
  */
 export class AuthClient {
 	private plugin: InstaSyncPlugin;
-	/** Resolver for an in-flight {@link login} call awaiting the deep link. */
+	/** Resolver for an in-flight login call awaiting the deep link. */
 	private pendingLogin: ((token: string) => void) | null = null;
 
 	constructor(plugin: InstaSyncPlugin) {
@@ -40,7 +43,7 @@ export class AuthClient {
 	}
 
 	private get baseUrl(): string {
-		return this.plugin.settings.authServerUrl.replace(/\/$/, "");
+		return normalizeServerUrl(this.plugin.settings.authServerUrl);
 	}
 
 	get isLoggedIn(): boolean {
@@ -51,8 +54,12 @@ export class AuthClient {
 
 	private async api<T>(path: string, init?: { method?: string; body?: unknown }): Promise<T> {
 		const token = this.plugin.settings.sessionToken;
+		return this.apiAt<T>(this.baseUrl, path, token, init);
+	}
+
+	async apiAt<T>(baseUrl: string, path: string, token?: string, init?: { method?: string; body?: unknown }): Promise<T> {
 		const res = await requestUrl({
-			url: `${this.baseUrl}${path}`,
+			url: `${normalizeServerUrl(baseUrl)}${path}`,
 			method: init?.method ?? "GET",
 			contentType: init?.body !== undefined ? "application/json" : undefined,
 			headers: token ? { Authorization: `Bearer ${token}` } : undefined,
@@ -61,7 +68,7 @@ export class AuthClient {
 		});
 
 		if (res.status === 401) {
-			await this.clearSession();
+			if (normalizeServerUrl(baseUrl) === this.baseUrl) await this.clearSession();
 			throw new AuthError("Session expired. Please sign in again.");
 		}
 		if (res.status < 200 || res.status >= 300) {
@@ -79,6 +86,17 @@ export class AuthClient {
 		await this.plugin.saveSettings();
 
 		const me = await this.me();
+		await this.applySession(token, me);
+		return me;
+	}
+
+	async setSessionForServer(baseUrl: string, token: string, me: MeResponse): Promise<void> {
+		this.plugin.settings.authServerUrl = normalizeServerUrl(baseUrl);
+		await this.applySession(token, me);
+	}
+
+	private async applySession(token: string, me: MeResponse): Promise<void> {
+		this.plugin.settings.sessionToken = token;
 		this.plugin.settings.userDisplayName = me.displayName;
 		this.plugin.settings.userEmail = me.email;
 		// Default the cursor name to the SSO display name on first login.
@@ -86,7 +104,6 @@ export class AuthClient {
 			this.plugin.settings.clientName = me.displayName;
 		}
 		await this.plugin.saveSettings();
-		return me;
 	}
 
 	private async clearSession(): Promise<void> {
@@ -113,13 +130,29 @@ export class AuthClient {
 	 * redirects back to `obsidian://instasync-auth?token=…`. The settings tab also
 	 * offers a paste-code fallback that calls {@link setSession} directly.
 	 */
-	login(): Promise<MeResponse> {
+	async login(): Promise<MeResponse> {
+		const { token, me } = await this.authenticateAt(this.baseUrl);
+		await this.applySession(token, me);
+		return me;
+	}
+
+	async loginToServer(baseUrl: string): Promise<MeResponse> {
+		const normalized = normalizeServerUrl(baseUrl);
+		const { token, me } = await this.authenticateAt(normalized);
+		await this.setSessionForServer(normalized, token, me);
+		return me;
+	}
+
+	authenticateAt(baseUrl: string): Promise<{ token: string; me: MeResponse }> {
+		const normalized = normalizeServerUrl(baseUrl);
 		const redirect = encodeURIComponent("obsidian://instasync-auth");
-		window.open(`${this.baseUrl}/auth/login?redirect=${redirect}`);
-		return new Promise<MeResponse>((resolve, reject) => {
+		window.open(`${normalized}/auth/login?redirect=${redirect}`);
+		return new Promise<{ token: string; me: MeResponse }>((resolve, reject) => {
 			this.pendingLogin = (token: string) => {
 				this.pendingLogin = null;
-				this.setSession(token).then(resolve, reject);
+				this.apiAt<MeResponse>(normalized, "/api/me", token)
+					.then((me) => resolve({ token, me }))
+					.catch(reject);
 			};
 			// Abandon the wait after 5 minutes so the promise can't leak forever.
 			window.setTimeout(() => {
@@ -147,6 +180,10 @@ export class AuthClient {
 
 	listVaults(): Promise<VaultInfo[]> {
 		return this.api<VaultInfo[]>("/api/vaults");
+	}
+
+	listVaultsAt(baseUrl: string, token: string): Promise<VaultInfo[]> {
+		return this.apiAt<VaultInfo[]>(baseUrl, "/api/vaults", token);
 	}
 
 	createVault(name: string): Promise<VaultInfo> {
@@ -178,6 +215,10 @@ export class AuthClient {
 		});
 	}
 
+	async removeMember(vaultId: string, userId: string): Promise<void> {
+		await this.api(`/api/vaults/${vaultId}/members/${userId}`, { method: "DELETE" });
+	}
+
 	/** Best-effort registry update so the server can resolve doc → path for ACLs. */
 	async registerFile(vaultId: string, guid: string, path: string): Promise<void> {
 		try {
@@ -197,4 +238,14 @@ export class AuthClient {
 			body: { vaultId, docId },
 		});
 	}
+}
+
+export function normalizeServerUrl(url: string): string {
+	const trimmed = url.trim().replace(/\/+$/, "");
+	if (!trimmed) throw new Error("Enter a server URL.");
+	const parsed = new URL(trimmed);
+	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+		throw new Error("Server URL must start with http:// or https://.");
+	}
+	return parsed.toString().replace(/\/$/, "");
 }

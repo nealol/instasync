@@ -5,7 +5,6 @@ import { InstaSyncSettings, InstaSyncSettingTab, defaultSettings } from "./setti
 import { VaultSync, isConflictCopy } from "./VaultSync";
 import type { Document } from "./Document";
 import { AuthClient, AuthError } from "./auth";
-import { ConfirmModal, OnboardingModal } from "./ui/modals";
 import { liveEdit } from "./editor/LiveEdit";
 import { yRemoteSelections, yRemoteSelectionsTheme } from "./editor/RemoteSelections";
 
@@ -55,11 +54,7 @@ export default class InstaSyncPlugin extends Plugin {
 			id: "instasync-setup-vault",
 			name: "Set up vault",
 			callback: () => {
-				if (!this.auth.isLoggedIn) {
-					new Notice("InstaSync: sign in first (Settings → InstaSync).");
-					return;
-				}
-				new OnboardingModal(this.app, this).open();
+				new Notice("InstaSync: open Settings → InstaSync to set up this vault.");
 			},
 		});
 
@@ -144,7 +139,7 @@ export default class InstaSyncPlugin extends Plugin {
 	/** Called after a successful login; prompts onboarding when no vault is set. */
 	async onLoggedIn(): Promise<void> {
 		if (!this.settings.activeVaultId) {
-			new OnboardingModal(this.app, this).open();
+			this.setStatus("signin");
 		} else {
 			await this.reloadSync();
 		}
@@ -174,14 +169,6 @@ export default class InstaSyncPlugin extends Plugin {
 	 */
 	async adoptVault(vaultId: string, name: string): Promise<void> {
 		if (vaultId === this.settings.activeVaultId && this.vaultSync) return;
-
-		const ok = await new ConfirmModal(
-			this.app,
-			"Adopt remote vault?",
-			`This erases all Markdown in this local Obsidian vault and replaces it with "${name}". This cannot be undone.`,
-			"Erase & adopt",
-		).ask();
-		if (!ok) return;
 
 		this.stopSync();
 		await this.wipeLocalMarkdown();

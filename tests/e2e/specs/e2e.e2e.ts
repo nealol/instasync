@@ -16,8 +16,13 @@ import {
 	createVaultFromLocal,
 	generateInvite,
 	redeemAndAdopt,
+	redeemInviteOnly,
+	activeVaultId,
+	listedVaultIds,
+	setSyncPaused,
+	docTokenStatus,
 } from "./helpers.js";
-import { mockLogin } from "../../support/authServer.js";
+import { apiCreateVault, apiPromoteMember, apiRedeemInvite, apiRemoveMember, mockLogin } from "../../support/authServer.js";
 
 /** Reserve then release a port so nothing listens on it — a dead endpoint. */
 function reserveDeadPort(): Promise<number> {
@@ -49,6 +54,7 @@ let A: WebdriverIO.Browser;
 let B: WebdriverIO.Browser;
 let vaultId: string;
 let adminToken: string;
+let bobToken: string;
 
 describe("InstaSync — two isolated Obsidian devices", function () {
 	before(async function () {
@@ -74,7 +80,7 @@ describe("InstaSync — two isolated Obsidian devices", function () {
 
 		// Device B: sign in as a different user, then redeem an invite and adopt.
 		// LocalOnlyB.md must be erased by the adopt; Seed.md must be pulled in.
-		await signInDevice(B, authUrl, "bob");
+		bobToken = await signInDevice(B, authUrl, "bob");
 		await writeNote(B, "LocalOnlyB.md", "should be erased by adopt");
 		const code = await generateInvite(authUrl, adminToken, vaultId);
 		await redeemAndAdopt(B, code);
@@ -121,6 +127,16 @@ describe("InstaSync — two isolated Obsidian devices", function () {
 			});
 			expect(res.status).toBe(403);
 		});
+
+		it("redeems an invite without adopting and keeps the current active vault", async function () {
+			const other = await apiCreateVault(authUrl, adminToken, "not-active");
+			const code = await generateInvite(authUrl, adminToken, other.id);
+			const redeemed = await redeemInviteOnly(B, code);
+			expect(redeemed.vaultId).toBe(other.id);
+			expect(redeemed.activeVaultId).toBe(vaultId);
+			expect(await activeVaultId(B)).toBe(vaultId);
+			expect(await listedVaultIds(B)).toContain(other.id);
+		});
 	});
 
 	describe("live sync", function () {
@@ -147,6 +163,19 @@ describe("InstaSync — two isolated Obsidian devices", function () {
 				timeoutMsg: "B still has the deleted note",
 			});
 		});
+
+		it("pause syncing stops propagation until syncing resumes", async function () {
+			await setSyncPaused(A, true);
+			await writeNote(B, "Paused.md", "written while A is paused");
+			await A.pause(2 * SECONDS);
+			expect(await readNote(A, "Paused.md")).toBe(null);
+
+			await setSyncPaused(A, false);
+			await A.waitUntil(
+				async () => (await readNote(A, "Paused.md")) === "written while A is paused",
+				{ timeout: 60 * SECONDS, timeoutMsg: "A did not catch up after unpausing" },
+			);
+		});
 	});
 
 	describe("offline divergence -> conflict copy", function () {
@@ -160,7 +189,7 @@ describe("InstaSync — two isolated Obsidian devices", function () {
 				timeout: 60 * SECONDS,
 				timeoutMsg: "baseline never reached B",
 			});
-			await A.pause(1 * SECONDS); // persist baseline to A's IndexedDB
+			await A.pause(SECONDS); // persist baseline to A's IndexedDB
 
 			await setPluginEnabled(A, false); // A goes offline & stops tracking
 
@@ -211,6 +240,30 @@ describe("InstaSync — two isolated Obsidian devices", function () {
 				async () => (await readNote(A, "Reconnect.md")) === "after reconnect",
 				{ timeout: 60 * SECONDS, timeoutMsg: "sync did not resume after reconnect" },
 			);
+		});
+	});
+
+	describe("vault administration", function () {
+		it("allows admins to remove members but not admins", async function () {
+			const bobMe = await fetch(`${authUrl}/api/me`, { headers: { Authorization: `Bearer ${bobToken}` } }).then((res) => res.json() as Promise<{ userId: string }>);
+			await apiPromoteMember(authUrl, adminToken, vaultId, bobMe.userId);
+
+			const charlie = await mockLogin(authUrl, "charlie");
+			const charlieMe = await fetch(`${authUrl}/api/me`, { headers: { Authorization: `Bearer ${charlie}` } }).then((res) => res.json() as Promise<{ userId: string }>);
+			await apiRedeemInvite(authUrl, charlie, await generateInvite(authUrl, adminToken, vaultId));
+			expect(await apiRemoveMember(authUrl, bobToken, vaultId, charlieMe.userId)).toBe(200);
+
+			const dave = await mockLogin(authUrl, "dave");
+			const daveMe = await fetch(`${authUrl}/api/me`, { headers: { Authorization: `Bearer ${dave}` } }).then((res) => res.json() as Promise<{ userId: string }>);
+			await apiRedeemInvite(authUrl, dave, await generateInvite(authUrl, adminToken, vaultId));
+			await apiPromoteMember(authUrl, adminToken, vaultId, daveMe.userId);
+			expect(await apiRemoveMember(authUrl, bobToken, vaultId, daveMe.userId)).toBe(403);
+		});
+
+		it("allows the owner to remove an admin and revokes that device's access", async function () {
+			const bobMe = await fetch(`${authUrl}/api/me`, { headers: { Authorization: `Bearer ${bobToken}` } }).then((res) => res.json() as Promise<{ userId: string }>);
+			expect(await apiRemoveMember(authUrl, adminToken, vaultId, bobMe.userId)).toBe(200);
+			expect(await docTokenStatus(B, vaultId)).toBe("refused");
 		});
 	});
 });
