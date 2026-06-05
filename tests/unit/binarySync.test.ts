@@ -1,0 +1,157 @@
+import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
+import * as Y from "yjs";
+import { YSweetProvider } from "@y-sweet/client";
+import { BinarySync, type BinaryMeta } from "../../src/BinarySync";
+import { getClientToken } from "../../src/ysweet";
+import { makeFakePlugin, type FakePlugin, type FakeVault } from "../support/fakePlugin";
+import { notices } from "../support/obsidian-mock";
+import { startAuthHarness, type AuthHarness } from "../support/authServer";
+import { waitFor } from "../support/util";
+
+let harness: AuthHarness;
+let token: string;
+let vaultId: string;
+
+beforeAll(async () => {
+	harness = await startAuthHarness();
+	token = await harness.loginUser("alice");
+	const vault = await harness.createVault(token, "attachments");
+	vaultId = vault.id;
+}, 180_000);
+
+afterAll(async () => {
+	await harness?.stop();
+});
+
+afterEach(() => {
+	notices.length = 0;
+});
+
+const bytes = (arr: number[]) => new Uint8Array(arr).buffer;
+const asArray = (buf: ArrayBuffer | undefined) => (buf ? [...new Uint8Array(buf)] : null);
+
+/** A "device": fake vault + an index doc/provider + a BinarySync over it. */
+function makeDevice(name: string) {
+	const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+		sessionToken: token,
+		activeVaultId: vaultId,
+		clientName: name,
+	});
+	const indexDoc = new Y.Doc();
+	const provider = new YSweetProvider(
+		() => getClientToken(plugin as any, vaultId) as any,
+		vaultId,
+		indexDoc,
+		{ connect: true, showDebuggerLink: false },
+	);
+	// BinarySync only needs isTextSyncBusy() from its VaultSync.
+	const vaultSyncStub = { isTextSyncBusy: () => false };
+	const bs = new BinarySync(plugin as any, vaultSyncStub as any, indexDoc);
+	const binaries = indexDoc.getMap<BinaryMeta>("binaries");
+	return { plugin, vault, indexDoc, provider, bs, binaries };
+}
+
+const synced = (p: YSweetProvider) =>
+	waitFor(() => p.status === "connected", { label: "provider connected" });
+
+describe("BinarySync", () => {
+	it("uploads a local binary and a peer downloads identical bytes", async () => {
+		const A = makeDevice("A");
+		const B = makeDevice("B");
+		try {
+			await synced(A.provider);
+			await synced(B.provider);
+
+			// B is online with its observer armed but has no local files.
+			B.bs.seedBaseline();
+			await B.bs.reconcileAll([]);
+
+			// A creates a binary file and reconciles it (uploads + publishes hash).
+			A.vault.binaries.set("img.png", bytes([1, 2, 3, 4, 5]));
+			A.bs.seedBaseline();
+			await A.bs.reconcileAll(["img.png"]);
+
+			// The hash mapping propagates and B pulls the bytes from the blob store.
+			await waitFor(() => B.vault.binaries.has("img.png"), {
+				label: "B downloaded the blob",
+			});
+			expect(asArray(B.vault.binaries.get("img.png"))).toEqual([1, 2, 3, 4, 5]);
+
+			// The published map entry carries the size.
+			await waitFor(() => B.binaries.get("img.png")?.size === 5, { label: "size published" });
+		} finally {
+			A.bs.destroy();
+			A.provider.destroy();
+			A.indexDoc.destroy();
+			B.bs.destroy();
+			B.provider.destroy();
+			B.indexDoc.destroy();
+		}
+	});
+
+	it("propagates a local delete to a peer", async () => {
+		const A = makeDevice("A");
+		const B = makeDevice("B");
+		try {
+			await synced(A.provider);
+			await synced(B.provider);
+			B.bs.seedBaseline();
+			await B.bs.reconcileAll([]);
+
+			A.vault.binaries.set("doc.pdf", bytes([9, 8, 7]));
+			A.bs.seedBaseline();
+			await A.bs.reconcileAll(["doc.pdf"]);
+			await waitFor(() => B.vault.binaries.has("doc.pdf"), { label: "B has the file" });
+
+			// A deletes the file locally → the index entry is removed → B deletes too.
+			A.vault.binaries.delete("doc.pdf");
+			A.bs.onLocalDeleted("doc.pdf");
+
+			await waitFor(() => !B.vault.binaries.has("doc.pdf"), {
+				label: "B removed the file",
+			});
+			await waitFor(() => !B.binaries.has("doc.pdf"), { label: "index entry gone" });
+		} finally {
+			A.bs.destroy();
+			A.provider.destroy();
+			A.indexDoc.destroy();
+			B.bs.destroy();
+			B.provider.destroy();
+			B.indexDoc.destroy();
+		}
+	});
+
+	it("re-downloads when a peer replaces the file (clean remote update)", async () => {
+		const A = makeDevice("A");
+		const B = makeDevice("B");
+		try {
+			await synced(A.provider);
+			await synced(B.provider);
+			B.bs.seedBaseline();
+			await B.bs.reconcileAll([]);
+
+			A.vault.binaries.set("photo.jpg", bytes([1, 1, 1]));
+			A.bs.seedBaseline();
+			await A.bs.reconcileAll(["photo.jpg"]);
+			await waitFor(() => asArray(B.vault.binaries.get("photo.jpg"))?.[0] === 1, {
+				label: "B has v1",
+			});
+
+			// A replaces the content; B (unchanged locally) should pull the new bytes.
+			A.vault.binaries.set("photo.jpg", bytes([2, 2, 2, 2]));
+			A.bs.onLocalChanged("photo.jpg");
+
+			await waitFor(() => asArray(B.vault.binaries.get("photo.jpg"))?.length === 4, {
+				label: "B has v2",
+			});
+			expect(asArray(B.vault.binaries.get("photo.jpg"))).toEqual([2, 2, 2, 2]);
+		} finally {
+			A.bs.destroy();
+			A.provider.destroy();
+			A.indexDoc.destroy();
+			B.bs.destroy();
+			B.provider.destroy();
+			B.indexDoc.destroy();
+		}
+	});
+});

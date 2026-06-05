@@ -7,6 +7,7 @@ import type InstaSyncPlugin from "./main";
 import { getClientToken } from "./ysweet";
 import { applyTextToYText } from "./diff";
 import { dbg, snip } from "./debug";
+import { ensureParentFolder, getFileByPath, isOpenInWorkspace } from "./vaultHelpers";
 
 /**
  * Origin tag used on Yjs transactions that originate from this Document writing
@@ -226,7 +227,7 @@ export class Document {
 	private async writeConflictCopy(localContent: string): Promise<void> {
 		const conflictPath = this.conflictCopyPath();
 		try {
-			await this.ensureParentFolder(conflictPath);
+			await ensureParentFolder(this.plugin.app, conflictPath);
 			await this.plugin.app.vault.create(conflictPath, localContent);
 			new Notice(
 				`InstaSync: "${this.path}" was edited in two places. ` +
@@ -250,6 +251,9 @@ export class Document {
 
 	private onYTextChanged(): void {
 		if (this.destroyed) return;
+		// Note text-sync activity so the binary upload queue can defer large
+		// transfers while notes are actively syncing.
+		this.plugin.vaultSync?.noteTextActivity();
 		// While a note is open, Obsidian owns its editor buffer and persistence;
 		// writing through vault.modify would appear as an external file change.
 		if (this.hasBoundEditor || this.isOpenInWorkspace()) return;
@@ -277,6 +281,7 @@ export class Document {
 		const disk = await this.readFromDisk();
 		if (disk === null) return;
 		if (disk === this.content) return;
+		this.plugin.vaultSync?.noteTextActivity();
 		dbg("onDiskChanged FOLD disk->ytext", this.path, "disk", snip(disk), "ytext", snip(this.content));
 		this.ydoc.transact(() => {
 			applyTextToYText(this.ytext, disk, DISK_ORIGIN);
@@ -284,22 +289,11 @@ export class Document {
 	}
 
 	private getFile(): TFile | null {
-		const af = this.plugin.app.vault.getAbstractFileByPath(this.path);
-		return af instanceof TFile ? af : null;
+		return getFileByPath(this.plugin.app, this.path);
 	}
 
 	private isOpenInWorkspace(): boolean {
-		const workspace = (this.plugin.app as any).workspace;
-		if (workspace?.getActiveFile?.()?.path === this.path) return true;
-
-		let found = false;
-		workspace?.iterateAllLeaves?.((leaf: any) => {
-			if (leaf?.view?.file?.path === this.path) found = true;
-		});
-		if (found) return true;
-
-		const leaves = workspace?.getLeavesOfType?.("markdown") ?? [];
-		return leaves.some((leaf: any) => leaf?.view?.file?.path === this.path);
+		return isOpenInWorkspace(this.plugin.app, this.path);
 	}
 
 	private async readFromDisk(): Promise<string | null> {
@@ -329,7 +323,7 @@ export class Document {
 			} else {
 				// Remote-created file that does not exist locally yet.
 				const path = normalizePath(this.path);
-				await this.ensureParentFolder(path);
+				await ensureParentFolder(this.plugin.app, path);
 				await this.plugin.app.vault.create(path, text);
 			}
 		} catch (e) {
@@ -340,19 +334,6 @@ export class Document {
 			window.setTimeout(() => {
 				this.writingToDisk = false;
 			}, 0);
-		}
-	}
-
-	private async ensureParentFolder(path: string): Promise<void> {
-		const slash = path.lastIndexOf("/");
-		if (slash <= 0) return;
-		const folder = path.slice(0, slash);
-		if (!this.plugin.app.vault.getAbstractFileByPath(folder)) {
-			try {
-				await this.plugin.app.vault.createFolder(folder);
-			} catch (e) {
-				// Folder may have been created concurrently; ignore.
-			}
 		}
 	}
 

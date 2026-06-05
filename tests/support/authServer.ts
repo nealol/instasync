@@ -123,12 +123,14 @@ export async function startAuthServer(opts: {
 	const port = opts.port ?? (await freePort());
 	const url = `http://127.0.0.1:${port}`;
 	const dbPath = path.join(os.tmpdir(), `instasync-test-${Date.now()}-${port}.db`);
+	const blobDir = path.join(os.tmpdir(), `instasync-blobs-${Date.now()}-${port}`);
 
 	const child: ChildProcess = spawn(serverBinary(), [], {
 		stdio: ["ignore", "pipe", "pipe"],
 		env: {
 			...process.env,
 			DATABASE_URL: `sqlite://${dbPath.replace(/\\/g, "/")}?mode=rwc`,
+			BLOB_DIR: blobDir,
 			BIND_ADDR: `127.0.0.1:${port}`,
 			PUBLIC_BASE_URL: url,
 			YSWEET_URL: opts.ysweetUrl,

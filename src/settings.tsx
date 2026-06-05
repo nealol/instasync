@@ -28,6 +28,13 @@ export interface InstaSyncSettings {
     clientColorLight: string;
     /** Whether syncing is enabled. */
     enabled: boolean;
+    /** Whether to sync binary (non-Markdown) files via the content-addressed blob store. */
+    syncBinaries: boolean;
+    /**
+     * Comma-separated globs (matched against the vault-relative path) of binary
+     * files to exclude from sync, e.g. `*.tmp, .obsidian/**`. Empty syncs all.
+     */
+    binaryExcludeGlobs: string;
 }
 
 export function defaultSettings(): InstaSyncSettings {
@@ -43,6 +50,8 @@ export function defaultSettings(): InstaSyncSettings {
         clientColor: identity.color,
         clientColorLight: identity.colorLight,
         enabled: true,
+        syncBinaries: true,
+        binaryExcludeGlobs: '',
     }
 }
 
@@ -270,6 +279,7 @@ function FullSettings({ app, plugin, refresh }: { app: App; plugin: InstaSyncPlu
             {/*<h2>InstaSync</h2>*/}
             <AccountSection plugin={plugin} refresh={refresh}/>
             <EnableSyncSection plugin={plugin} refresh={refresh}/>
+            <BinarySyncSection plugin={plugin} refresh={refresh}/>
             <DeviceSection plugin={plugin}/>
             <VaultDetails app={app} plugin={plugin}/>
             <AdvancedSettings app={app} plugin={plugin} refresh={refresh}/>
@@ -297,6 +307,32 @@ function EnableSyncSection({ plugin, refresh }: { plugin: InstaSyncPlugin; refre
                                             if (!value) new Notice('InstaSync: syncing disabled for this vault.')
                                             refresh()
                                         })}/>}/>
+}
+
+function BinarySyncSection({ plugin, refresh }: { plugin: InstaSyncPlugin; refresh: () => void }) {
+    const [globs, setGlobs] = useState(plugin.settings.binaryExcludeGlobs)
+    return <>
+        <SettingRow name="Sync attachments"
+                    desc="Sync binary files (images, PDFs, and other non-Markdown files) via the content-addressed blob store."
+                    control={<Toggle value={plugin.settings.syncBinaries}
+                                     onChange={(value) => void runNotice(undefined, async () => {
+                                         plugin.settings.syncBinaries = value
+                                         await plugin.saveSettings()
+                                         await plugin.reloadSync()
+                                         refresh()
+                                     })}/>}/>
+        {plugin.settings.syncBinaries ? <SettingRow name="Attachment exclusions"
+                    desc="Comma-separated globs (matched on the file path) to skip, e.g. *.tmp, private/**."
+                    control={<input className="instasync-modal-input" type="text" value={globs}
+                                    placeholder="*.tmp, private/**"
+                                    onChange={(e) => setGlobs(e.currentTarget.value)}
+                                    onBlur={() => void (async () => {
+                                        if (globs === plugin.settings.binaryExcludeGlobs) return
+                                        plugin.settings.binaryExcludeGlobs = globs
+                                        await plugin.saveSettings()
+                                        await plugin.reloadSync()
+                                    })()}/>}/> : null}
+    </>
 }
 
 /**

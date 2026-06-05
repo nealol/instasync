@@ -22,6 +22,22 @@ export class TFile extends TAbstractFile {
 	}
 }
 
+/** Placeholder for Obsidian's App; tests pass a fake plugin's `app` in practice. */
+export class App {}
+
+/** Minimal Modal stand-in so modules that subclass it can be imported under Node. */
+export class Modal {
+	app: unknown;
+	contentEl: { empty: () => void } = { empty: () => {} };
+	constructor(app: unknown) {
+		this.app = app;
+	}
+	open(): void {}
+	close(): void {}
+	onOpen(): void {}
+	onClose(): void {}
+}
+
 /** Captures every Notice message so tests can assert on user-facing surfacing. */
 export const notices: string[] = [];
 
@@ -46,22 +62,25 @@ export async function requestUrl(opts: {
 	method?: string;
 	contentType?: string;
 	headers?: Record<string, string>;
-	body?: string;
+	body?: string | ArrayBuffer;
 	throw?: boolean;
-}): Promise<{ status: number; text: string; json: unknown }> {
+}): Promise<{ status: number; text: string; json: unknown; arrayBuffer: ArrayBuffer }> {
 	const headers: Record<string, string> = { ...(opts.headers ?? {}) };
 	if (opts.contentType) headers["Content-Type"] = opts.contentType;
 	const res = await fetch(opts.url, {
 		method: opts.method ?? "GET",
 		headers,
-		body: opts.body,
+		body: opts.body as BodyInit | undefined,
 	});
-	const text = await res.text();
+	// Read the body once as bytes, then derive text/json from it (Obsidian's
+	// requestUrl exposes all three on the response).
+	const arrayBuffer = await res.arrayBuffer();
+	const text = new TextDecoder().decode(arrayBuffer);
 	let json: unknown = undefined;
 	try {
 		json = text ? JSON.parse(text) : undefined;
 	} catch {
 		/* not json */
 	}
-	return { status: res.status, text, json };
+	return { status: res.status, text, json, arrayBuffer };
 }

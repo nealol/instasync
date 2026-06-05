@@ -9,6 +9,8 @@ pub struct Config {
     pub public_base_url: String,
     /// Internal URL the auth server uses to reach y-sweet.
     pub ysweet_url: String,
+    /// Filesystem directory for the content-addressed binary blob store.
+    pub blob_dir: String,
     /// URL clients should connect to (host rewritten into minted tokens).
     pub ysweet_public_url: String,
     /// Shared private key, identical to what `y-sweet serve --auth` is given.
@@ -44,6 +46,7 @@ impl Config {
             public_base_url: opt("PUBLIC_BASE_URL")
                 .unwrap_or_else(|| "http://127.0.0.1:8081".to_string()),
             ysweet_url: opt("YSWEET_URL").unwrap_or_else(|| "http://127.0.0.1:8080".to_string()),
+            blob_dir: opt("BLOB_DIR").unwrap_or_else(|| "./blobs".to_string()),
             ysweet_public_url: opt("YSWEET_PUBLIC_URL")
                 .or_else(|| opt("YSWEET_URL"))
                 .unwrap_or_else(|| "http://127.0.0.1:8080".to_string()),

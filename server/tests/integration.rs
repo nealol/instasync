@@ -56,10 +56,14 @@ async fn test_app(ysweet_url: &str, ysweet_public_url: &str) -> Router {
     path.push(format!("instasync-test-{}.db", uuid::Uuid::new_v4()));
     let database_url = format!("sqlite://{}?mode=rwc", path.display());
 
+    let mut blob_dir = std::env::temp_dir();
+    blob_dir.push(format!("instasync-blobs-{}", uuid::Uuid::new_v4()));
+
     let config = Config {
         database_url,
         bind_addr: "127.0.0.1:0".into(),
         public_base_url: "http://auth.test".into(),
+        blob_dir: blob_dir.display().to_string(),
         ysweet_url: ysweet_url.to_string(),
         ysweet_public_url: ysweet_public_url.to_string(),
         ysweet_auth_key: gen_auth_key(),
@@ -376,6 +380,109 @@ async fn remove_member_permissions() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "outsider cannot remove anyone");
+}
+
+// ---------- blob store ----------
+
+/// Send a request with a raw (non-JSON) body and return status + collected bytes.
+async fn send_raw(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    bearer: Option<&str>,
+    body: Vec<u8>,
+) -> (StatusCode, Vec<u8>) {
+    let mut req = Request::builder().method(method).uri(uri);
+    if let Some(b) = bearer {
+        req = req.header(header::AUTHORIZATION, format!("Bearer {b}"));
+    }
+    let req = req.body(Body::from(body)).unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes().to_vec();
+    (status, bytes)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[tokio::test]
+async fn blob_put_head_get_roundtrip() {
+    let ys = fake_ysweet().await;
+    let app = test_app(&ys, &ys).await;
+    let alice = login(&app, "alice").await;
+    let bob = login(&app, "bob").await;
+
+    let (_, vault) =
+        send(&app, "POST", "/api/vaults", Some(&alice), Some(json!({"name": "V"}))).await;
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+
+    let content = b"\x00\x01\x02 binary payload \xff\xfe".to_vec();
+    let hash = sha256_hex(&content);
+    let uri = format!("/api/vaults/{vault_id}/blobs/{hash}");
+
+    // Missing before upload.
+    let (status, _) = send_raw(&app, "HEAD", &uri, Some(&alice), vec![]).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Upload.
+    let (status, _) = send_raw(&app, "PUT", &uri, Some(&alice), content.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Present after upload.
+    let (status, _) = send_raw(&app, "HEAD", &uri, Some(&alice), vec![]).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Download returns identical bytes.
+    let (status, got) = send_raw(&app, "GET", &uri, Some(&alice), vec![]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(got, content);
+
+    // Idempotent re-upload.
+    let (status, _) = send_raw(&app, "PUT", &uri, Some(&alice), content.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A non-member of the vault is refused.
+    let (status, _) = send_raw(&app, "GET", &uri, Some(&bob), vec![]).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn blob_rejects_bad_hash_and_mismatch() {
+    let ys = fake_ysweet().await;
+    let app = test_app(&ys, &ys).await;
+    let alice = login(&app, "alice").await;
+    let (_, vault) =
+        send(&app, "POST", "/api/vaults", Some(&alice), Some(json!({"name": "V"}))).await;
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+
+    // Non-hex / wrong-length hash is rejected before touching the filesystem.
+    let bad = format!("/api/vaults/{vault_id}/blobs/not-a-valid-hash");
+    let (status, _) = send_raw(&app, "PUT", &bad, Some(&alice), b"x".to_vec()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Well-formed hash that doesn't match the body is rejected.
+    let wrong = format!("/api/vaults/{vault_id}/blobs/{}", "a".repeat(64));
+    let (status, _) = send_raw(&app, "PUT", &wrong, Some(&alice), b"payload".to_vec()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn blob_requires_auth() {
+    let ys = fake_ysweet().await;
+    let app = test_app(&ys, &ys).await;
+    let alice = login(&app, "alice").await;
+    let (_, vault) =
+        send(&app, "POST", "/api/vaults", Some(&alice), Some(json!({"name": "V"}))).await;
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+    let uri = format!("/api/vaults/{vault_id}/blobs/{}", "b".repeat(64));
+
+    let (status, _) = send_raw(&app, "HEAD", &uri, None, vec![]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

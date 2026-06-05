@@ -12,6 +12,8 @@ import { TFile, TAbstractFile, Notice } from "obsidian";
 import type InstaSyncPlugin from "./main";
 import { getClientToken } from "./ysweet";
 import { Document } from "./Document";
+import { BinarySync } from "./BinarySync";
+import { matchesAnyGlob, parseGlobs } from "./glob";
 
 /** Matches the sibling backups written on conflict; these must never sync. */
 const CONFLICT_COPY_RE = / \(conflicted copy .+\)$/;
@@ -49,10 +51,14 @@ export class VaultSync {
 	private indexPersistence: IndexeddbPersistence;
 	/** Shared map of vault-relative path -> document guid. */
 	private files: Y.Map<string>;
+	/** Sibling sync path for binary (non-Markdown) files; shares the index doc. */
+	private binarySync: BinarySync;
 
 	private documents = new Map<string, Document>();
 	private destroyed = false;
 	private initialSynced = false;
+	/** Last time a text document synced (ms epoch); gates background blob uploads. */
+	private lastTextActivityAt = 0;
 	/** Tracks the live connection so we only notify on a connected→dropped edge. */
 	private wasConnected = false;
 
@@ -64,6 +70,7 @@ export class VaultSync {
 
 		this.indexDoc = new Y.Doc();
 		this.files = this.indexDoc.getMap("files");
+		this.binarySync = new BinarySync(plugin, this, this.indexDoc);
 
 		const vaultId = plugin.settings.activeVaultId;
 
@@ -110,6 +117,8 @@ export class VaultSync {
 			console.error("[InstaSync] index persistence failed to load", e);
 		}
 		if (this.destroyed) return;
+		// Capture the persisted (pre-merge) binary baseline before connecting.
+		this.binarySync.seedBaseline();
 		void this.indexProvider.connect();
 	}
 
@@ -158,6 +167,18 @@ export class VaultSync {
 		}
 
 		new Notice(`InstaSync: connected, syncing ${this.documents.size} files.`);
+
+		// Reconcile binary files against the blob store (after the text pass so
+		// note sync wins the bandwidth while binaries settle in the background).
+		void this.binarySync.reconcileAll(this.localBinaryPaths());
+	}
+
+	/** Vault-relative paths of all local files classified as binary. */
+	private localBinaryPaths(): string[] {
+		return this.plugin.app.vault
+			.getFiles()
+			.filter((f) => this.classify(f) === "binary")
+			.map((f) => f.path);
 	}
 
 	private onFilesChanged(event: Y.YMapEvent<string>): void {
@@ -211,6 +232,21 @@ export class VaultSync {
 		}
 	}
 
+	/** Record that a text document just synced (called by {@link Document}). */
+	noteTextActivity(): void {
+		this.lastTextActivityAt = Date.now();
+	}
+
+	/**
+	 * True while notes are actively syncing — the index isn't connected/synced yet,
+	 * or a text document synced within the last {@link quietMs}. The binary upload
+	 * queue uses this to hold large transfers back until things are quiet.
+	 */
+	isTextSyncBusy(quietMs = 2000): boolean {
+		if (!this.initialSynced) return true;
+		return Date.now() - this.lastTextActivityAt < quietMs;
+	}
+
 	getDocumentForPath(path: string): Document | undefined {
 		return this.documents.get(path);
 	}
@@ -238,13 +274,31 @@ export class VaultSync {
 		);
 	}
 
-	private isSyncable(file: TAbstractFile): file is TFile {
-		return file instanceof TFile && file.extension === "md";
+	/**
+	 * Decide how a file syncs: `text` (Markdown, via a {@link Document} CRDT),
+	 * `binary` (everything else, via {@link BinarySync}'s blob store), or `ignore`
+	 * (folders, conflict copies, and — when binary sync is off or excluded — the
+	 * non-Markdown files).
+	 */
+	private classify(file: TAbstractFile): "text" | "binary" | "ignore" {
+		if (!(file instanceof TFile)) return "ignore";
+		if (isConflictCopy(file.path)) return "ignore";
+		if (file.extension === "md") return "text";
+		if (!this.plugin.settings.syncBinaries) return "ignore";
+		if (matchesAnyGlob(file.path, parseGlobs(this.plugin.settings.binaryExcludeGlobs))) {
+			return "ignore";
+		}
+		return "binary";
 	}
 
 	private onLocalCreate(file: TAbstractFile): void {
-		if (!this.initialSynced || !this.isSyncable(file)) return;
-		if (isConflictCopy(file.path)) return;
+		if (!this.initialSynced) return;
+		const kind = this.classify(file);
+		if (kind === "binary") {
+			this.binarySync.onLocalChanged(file.path);
+			return;
+		}
+		if (kind !== "text") return;
 		if (this.files.has(file.path)) {
 			// Created locally because a remote entry arrived; Document handles it.
 			this.ensureDocument(file.path, this.files.get(file.path)!, false);
@@ -261,43 +315,56 @@ export class VaultSync {
 	private onLocalDelete(file: TAbstractFile): void {
 		if (!this.initialSynced) return;
 		const path = file.path;
-		if (!this.documents.has(path) && !this.files.has(path)) return;
-		this.removeDocument(path);
-		if (this.files.has(path)) {
-			this.indexDoc.transact(() => {
-				this.files.delete(path);
-			});
+		if (this.documents.has(path) || this.files.has(path)) {
+			this.removeDocument(path);
+			if (this.files.has(path)) {
+				this.indexDoc.transact(() => {
+					this.files.delete(path);
+				});
+			}
+			return;
 		}
+		// Binary (or formerly-binary) file: let BinarySync propagate the delete.
+		this.binarySync.onLocalDeleted(path);
 	}
 
 	private onLocalRename(file: TAbstractFile, oldPath: string): void {
 		if (!this.initialSynced || !(file instanceof TFile)) return;
 		const newPath = file.path;
 
-		// Drop tracking of the old path.
+		// Drop tracking of the old path on the text side.
 		const wasTracked = this.files.has(oldPath);
 		const guid = this.files.get(oldPath) ?? this.documents.get(oldPath)?.guid;
 		this.removeDocument(oldPath);
-
-		if (file.extension !== "md") {
-			// Renamed out of Markdown; stop syncing it.
-			if (wasTracked) {
-				this.indexDoc.transact(() => this.files.delete(oldPath));
-			}
-			return;
+		if (wasTracked) {
+			this.indexDoc.transact(() => this.files.delete(oldPath));
 		}
 
-		const finalGuid = guid ?? newGuid();
-		this.indexDoc.transact(() => {
-			if (wasTracked) this.files.delete(oldPath);
-			this.files.set(newPath, finalGuid);
-		});
-		this.registerFile(newPath, finalGuid);
-		this.ensureDocument(newPath, finalGuid, !wasTracked);
+		const kind = this.classify(file);
+		if (kind === "text") {
+			const finalGuid = guid ?? newGuid();
+			this.indexDoc.transact(() => {
+				this.files.set(newPath, finalGuid);
+			});
+			this.registerFile(newPath, finalGuid);
+			this.ensureDocument(newPath, finalGuid, !wasTracked);
+		} else if (kind === "binary") {
+			// Reconcile both old (now gone) and new paths on the binary side.
+			this.binarySync.onLocalRenamed(file, oldPath);
+		} else {
+			// Renamed to an ignored path: ensure any old binary entry is dropped.
+			this.binarySync.onLocalDeleted(oldPath);
+		}
 	}
 
 	private onLocalModify(file: TAbstractFile): void {
-		if (!this.initialSynced || !this.isSyncable(file)) return;
+		if (!this.initialSynced) return;
+		const kind = this.classify(file);
+		if (kind === "binary") {
+			this.binarySync.onLocalChanged(file.path);
+			return;
+		}
+		if (kind !== "text") return;
 		const doc = this.documents.get(file.path);
 		if (doc) void doc.onDiskChanged();
 	}
@@ -307,6 +374,7 @@ export class VaultSync {
 	destroy(): void {
 		if (this.destroyed) return;
 		this.destroyed = true;
+		this.binarySync.destroy();
 		this.files.unobserve(this.filesObserver);
 		this.indexProvider.off(EVENT_CONNECTION_STATUS, this.statusListener);
 		for (const doc of this.documents.values()) doc.destroy();

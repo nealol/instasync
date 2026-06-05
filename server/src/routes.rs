@@ -48,7 +48,7 @@ async fn membership(
         .await?)
 }
 
-async fn require_member(
+pub(crate) async fn require_member(
     state: &AppState,
     user_id: &str,
     vault_id: &str,

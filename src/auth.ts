@@ -284,6 +284,83 @@ export class AuthClient {
 			body: { vaultId, docId },
 		});
 	}
+
+	// --- binary blob store -----------------------------------------------------
+	//
+	// Binary file contents are stored content-addressed by sha256 hash, separate
+	// from the JSON API (these carry raw bytes, not JSON). All three are vault
+	// scoped: the server requires membership of `vaultId`.
+
+	private blobUrl(vaultId: string, hash: string): string {
+		return `${this.baseUrl}/api/vaults/${vaultId}/blobs/${hash}`;
+	}
+
+	private get authHeaders(): Record<string, string> {
+		const token = this.plugin.settings.sessionToken;
+		return token ? { Authorization: `Bearer ${token}` } : {};
+	}
+
+	/** True if the server already holds the blob (lets callers skip re-upload). */
+	async blobExists(vaultId: string, hash: string): Promise<boolean> {
+		const res = await requestUrl({
+			url: this.blobUrl(vaultId, hash),
+			method: "HEAD",
+			headers: this.authHeaders,
+			throw: false,
+		});
+		if (res.status === 401) throw new AuthError("Session expired. Please sign in again.");
+		return res.status >= 200 && res.status < 300;
+	}
+
+	/** Download blob bytes by hash. */
+	async getBlob(vaultId: string, hash: string): Promise<ArrayBuffer> {
+		const res = await requestUrl({
+			url: this.blobUrl(vaultId, hash),
+			method: "GET",
+			headers: this.authHeaders,
+			throw: false,
+		});
+		if (res.status === 401) throw new AuthError("Session expired. Please sign in again.");
+		if (res.status < 200 || res.status >= 300) {
+			throw new Error(`blob download failed: ${blobErrorMessage(res)}`);
+		}
+		return res.arrayBuffer;
+	}
+
+	/** Upload blob bytes; idempotent and content-verified server-side. */
+	async putBlob(vaultId: string, hash: string, data: ArrayBuffer): Promise<void> {
+		const res = await requestUrl({
+			url: this.blobUrl(vaultId, hash),
+			method: "PUT",
+			headers: this.authHeaders,
+			contentType: "application/octet-stream",
+			body: data,
+			throw: false,
+		});
+		if (res.status === 401) throw new AuthError("Session expired. Please sign in again.");
+		if (res.status < 200 || res.status >= 300) {
+			throw new Error(`blob upload failed: ${blobErrorMessage(res)}`);
+		}
+	}
+}
+
+/**
+ * Build an error message from a failed blob response without touching the
+ * response's lazy `.json` getter, which throws on an empty body (e.g. axum's
+ * default 404, which has no body — the symptom when the server lacks the blob
+ * routes). Falls back to the bare status code.
+ */
+function blobErrorMessage(res: { status: number; text?: string }): string {
+	const text = (res.text ?? "").trim();
+	if (text) {
+		try {
+			const parsed = JSON.parse(text) as { error?: string };
+			if (parsed?.error) return parsed.error;
+		} catch {
+			return `HTTP ${res.status}: ${text.slice(0, 200)}`;
+		}
+	}
+	return `HTTP ${res.status}`;
 }
 
 export function normalizeServerUrl(url: string): string {

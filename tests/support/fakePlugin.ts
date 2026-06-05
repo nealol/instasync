@@ -10,6 +10,8 @@ type Handler = (...args: any[]) => void;
 
 export class FakeVault {
 	files = new Map<string, string>();
+	/** Binary file contents, keyed by path (parallel to `files`). */
+	binaries = new Map<string, ArrayBuffer>();
 	folders = new Set<string>();
 	private handlers: Record<string, Handler[]> = {};
 
@@ -25,12 +27,27 @@ export class FakeVault {
 	}
 
 	getAbstractFileByPath(path: string): TAbstractFile | null {
-		if (this.files.has(path)) return new TFile(path);
+		if (this.files.has(path) || this.binaries.has(path)) return new TFile(path);
 		if (this.folders.has(path)) return new TAbstractFile(path);
 		return null;
 	}
 	async read(file: TFile): Promise<string> {
 		return this.files.get(file.path) ?? "";
+	}
+	async readBinary(file: TFile): Promise<ArrayBuffer> {
+		const buf = this.binaries.get(file.path);
+		if (!buf) throw new Error(`no binary at ${file.path}`);
+		return buf;
+	}
+	async modifyBinary(file: TFile, data: ArrayBuffer): Promise<void> {
+		this.binaries.set(file.path, data);
+		this.emit("modify", new TFile(file.path));
+	}
+	async createBinary(path: string, data: ArrayBuffer): Promise<TFile> {
+		this.binaries.set(path, data);
+		const f = new TFile(path);
+		this.emit("create", f);
+		return f;
 	}
 	async modify(file: TFile, text: string): Promise<void> {
 		this.files.set(file.path, text);
@@ -44,6 +61,7 @@ export class FakeVault {
 	}
 	async delete(file: TAbstractFile): Promise<void> {
 		this.files.delete(file.path);
+		this.binaries.delete(file.path);
 		this.emit("delete", new TFile(file.path));
 	}
 	async createFolder(path: string): Promise<void> {
@@ -53,6 +71,9 @@ export class FakeVault {
 		return [...this.files.keys()]
 			.filter((p) => p.endsWith(".md"))
 			.map((p) => new TFile(p));
+	}
+	getFiles(): TFile[] {
+		return [...this.files.keys(), ...this.binaries.keys()].map((p) => new TFile(p));
 	}
 	getName(): string {
 		return "fake-vault";
@@ -78,6 +99,8 @@ export interface FakePlugin {
 		clientColor: string;
 		clientColorLight: string;
 		enabled: boolean;
+		syncBinaries: boolean;
+		binaryExcludeGlobs: string;
 	};
 	auth: AuthClient;
 	app: { vault: FakeVault; workspace: { on: () => unknown } };
@@ -103,6 +126,8 @@ export function makeFakePlugin(
 			clientColor: "#ffffff",
 			clientColorLight: "#ffffff33",
 			enabled: true,
+			syncBinaries: true,
+			binaryExcludeGlobs: "",
 		},
 		// Set just below, once the object exists (AuthClient needs the plugin).
 		auth: undefined as unknown as AuthClient,

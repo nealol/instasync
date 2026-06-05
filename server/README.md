@@ -19,6 +19,15 @@ Obsidian plugin ─WSS───▶│ /d/* proxy ──▶ y-sweet (127.0.0.1)  
 The auth server holds the **same private key** as y-sweet (via `y-sweet-core`'s
 `Authenticator`), so the client tokens it relays are accepted by y-sweet.
 
+**Binary files** (images, PDFs, and other non-Markdown attachments) do not go
+through y-sweet — that's a text CRDT and would bloat. Instead the plugin syncs only
+a `path → sha256` mapping through the CRDT index and stores the bytes in a
+**content-addressed blob store** served by this server under
+`/api/vaults/{id}/blobs/{hash}` (HEAD to check, GET to download, PUT to upload).
+Blobs live on disk at `BLOB_DIR/{vaultId}/{hash}`, alongside the y-sweet data;
+uploads are content-verified (the streamed bytes must hash to the claimed `hash`)
+and access is vault-scoped.
+
 ## Running with Docker (recommended)
 
 The image bundles y-sweet and runs it internally, so you only expose **one port**
@@ -79,6 +88,7 @@ in the Obsidian plugin's **Auth server URL** and you're done.
 | `BIND_ADDR` | `127.0.0.1:8081` | listen address |
 | `PUBLIC_BASE_URL` | `http://127.0.0.1:8081` | this server's public URL; OIDC redirect default **and** the URL baked into minted client tokens (clients connect to `/d/*` here) |
 | `YSWEET_URL` | `http://127.0.0.1:8080` | internal URL used to reach (and proxy to) y-sweet |
+| `BLOB_DIR` | `./blobs` | filesystem directory for the content-addressed binary blob store (use a path on the persistent volume, e.g. `/data/blobs`) |
 | `YSWEET_PUBLIC_URL` | = `YSWEET_URL` | legacy host-rewrite target; leave unset when y-sweet runs with `--url-prefix` (the Docker default) |
 | `YSWEET_AUTH_KEY` | — | shared private key (same as `y-sweet serve --auth`) |
 | `OIDC_MODE` | `oidc` | `oidc` for a real IdP, `mock` for the in-process test issuer |
@@ -104,6 +114,8 @@ cargo test
 ```
 
 Covers (mock OIDC + temp sqlite + a hermetic fake y-sweet): login → session,
-vault create/list, single-use invites (second redeem 409), promote, and
-`/api/doc-token` scope + default-allow ACL + host rewrite, plus unit tests for the
-invite word generator and token host-rewrite.
+vault create/list, single-use invites (second redeem 409), promote,
+`/api/doc-token` scope + default-allow ACL + host rewrite, and the binary blob
+store (PUT/HEAD/GET round-trip, bad-hash and content-mismatch rejection, auth +
+membership scoping), plus unit tests for the invite word generator, token
+host-rewrite, and blob hash validation.

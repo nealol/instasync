@@ -3,6 +3,7 @@ import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { InstaSyncSettings, InstaSyncSettingTab, defaultSettings } from "./settings";
 import { VaultSync, isConflictCopy } from "./VaultSync";
+import { matchesAnyGlob, parseGlobs } from "./glob";
 import type { Document } from "./Document";
 import { AuthClient, AuthError } from "./auth";
 import { liveEdit } from "./editor/LiveEdit";
@@ -171,16 +172,31 @@ export default class InstaSyncPlugin extends Plugin {
 		if (vaultId === this.settings.activeVaultId && this.vaultSync) return;
 
 		this.stopSync();
-		await this.wipeLocalMarkdown();
+		await this.wipeLocalSyncedFiles();
 		this.settings.activeVaultId = vaultId;
 		await this.saveSettings();
 		await this.reloadSync();
 		new Notice(`InstaSync: adopting "${name}"…`);
 	}
 
-	private async wipeLocalMarkdown(): Promise<void> {
-		for (const file of this.app.vault.getMarkdownFiles()) {
+	/**
+	 * Erase local files that InstaSync would sync (Markdown, plus binaries when
+	 * enabled) so the adopted vault's contents replace them cleanly — otherwise
+	 * local-only files would be pushed up as new additions.
+	 */
+	private async wipeLocalSyncedFiles(): Promise<void> {
+		const excludes = parseGlobs(this.settings.binaryExcludeGlobs);
+		const targets = this.settings.syncBinaries
+			? this.app.vault.getFiles()
+			: this.app.vault.getMarkdownFiles();
+		for (const file of targets) {
 			if (isConflictCopy(file.path)) continue;
+			if (
+				file.extension !== "md" &&
+				(!this.settings.syncBinaries || matchesAnyGlob(file.path, excludes))
+			) {
+				continue;
+			}
 			try {
 				await this.app.vault.delete(file);
 			} catch (e) {

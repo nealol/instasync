@@ -2,12 +2,13 @@
 
 Google-Docs-style collaborative editing for Obsidian, powered by [Yjs](https://github.com/yjs/yjs) and a [y-sweet](https://github.com/drifting-in-space/y-sweet) server.
 
-For this prototype, **every Markdown file in the vault is synced** (rather than specific shared folders). You point the plugin at one server URL, and that server hosts one vault.
+For this prototype, **the whole vault is synced** — every Markdown file, plus binary attachments (images, PDFs, …) by default — rather than specific shared folders. You point the plugin at one server URL, and that server hosts one vault. (Binary sync is toggleable in settings, with an exclude-glob list.)
 
 ## How it works
 
-- **Vault index** — a single Yjs document (`vault id`) holds a map of `path → doc-guid`. This is how file creation/deletion/rename propagates between clients.
+- **Vault index** — a single Yjs document (`vault id`) holds a map of `path → doc-guid` for Markdown files **and** a `path → { hash, size }` map for binary files. This is how file creation/deletion/rename propagates between clients.
 - **Per-file documents** — each Markdown file is its own Yjs document (a `Y.Text` named `contents`) hosted on the y-sweet server, keyed by a stable guid.
+- **Binary files** — synced by content hash, not through the text CRDT (`src/BinarySync.ts`): the bytes go to a content-addressed blob store on the server (`BLOB_DIR/{vaultId}/{hash}`) and only the hash travels through the index. Concurrent edits to the same binary can't be merged, so they're resolved by a keep-local / keep-remote modal on the device that detects the divergence. Large files upload in the background, deferred while notes are actively syncing.
 - **Editor binding** — when a file is open, a CodeMirror 6 view plugin (`src/editor/LiveEdit.ts`) binds the editor to the shared text in both directions. When a file is *not* open, `src/Document.ts` keeps the file on disk in sync with the shared text.
 - **Live cursors** — `src/editor/RemoteSelections.ts` renders each collaborator's caret and selection, labelled with a generated **two-word name** (e.g. "Brave Otter") and a color, broadcast over Yjs awareness.
 

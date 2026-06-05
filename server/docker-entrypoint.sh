@@ -8,6 +8,9 @@ set -euo pipefail
 : "${YSWEET_INTERNAL_PORT:=8080}"
 : "${YSWEET_STORE:=/data/ysweet}"
 : "${PUBLIC_BASE_URL:=http://127.0.0.1:8081}"
+# Store binary blobs on the persistent volume next to the y-sweet data by default.
+: "${BLOB_DIR:=/data/blobs}"
+export BLOB_DIR
 # The auth server reaches y-sweet here; keep it in sync with the internal port.
 export YSWEET_URL="http://127.0.0.1:${YSWEET_INTERNAL_PORT}"
 
@@ -17,7 +20,7 @@ if [[ -z "${YSWEET_AUTH_KEY:-}" ]]; then
   exit 1
 fi
 
-mkdir -p "${YSWEET_STORE}"
+mkdir -p "${YSWEET_STORE}" "${BLOB_DIR}"
 
 # y-sweet bakes --url-prefix (this server's public URL) into the tokens it mints,
 # so clients connect back to /d/* on the auth server, which proxies them here.

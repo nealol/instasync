@@ -1,3 +1,4 @@
+pub mod blobs;
 pub mod config;
 pub mod db;
 pub mod entities;
@@ -13,6 +14,7 @@ pub mod ysweet;
 use std::sync::Arc;
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{any, delete, get, post},
     Router,
 };
@@ -76,6 +78,15 @@ pub fn app(state: AppState) -> Router {
             delete(routes::remove_member),
         )
         .route("/api/vaults/{id}/files", post(routes::upsert_file))
+        // Content-addressed binary blob store. PUT opts out of the default body
+        // cap so large attachments can stream through (it verifies the hash).
+        .route(
+            "/api/vaults/{id}/blobs/{hash}",
+            get(blobs::get_blob)
+                .head(blobs::head_blob)
+                .put(blobs::put_blob)
+                .layer(DefaultBodyLimit::disable()),
+        )
         .route("/api/invites/redeem", post(routes::redeem_invite))
         .route("/api/doc-token", post(routes::doc_token))
         // Reverse-proxy the bundled y-sweet so clients need only this server's URL.
