@@ -265,11 +265,21 @@ impl GitService {
 
         let (author, message) =
             build_commit_meta(vault_id, file_count, contributors, &self.0.config);
+        // Pin the committer to the InstaSync bot via command-scoped (`-c`) config so
+        // it never falls back to the server's *global* git identity — regardless of
+        // what (if anything) is in global config or whether ensure_repo's local
+        // config write ran. The author is the attributed principal (or the bot).
+        let committer_name = format!("user.name={}", self.0.config.git_bot_name);
+        let committer_email = format!("user.email={}", self.0.config.git_bot_email);
         self.git(
             repo,
             &[
                 "-c",
                 "commit.gpgsign=false",
+                "-c",
+                &committer_name,
+                "-c",
+                &committer_email,
                 "commit",
                 "--author",
                 &author,

@@ -666,6 +666,11 @@ async fn git_audit_commits_attributed_to_principal() {
     let log = wait_for_commit(&repo).await;
     assert_eq!(log, "Alice|alice@example.com|Sync 1 file(s)", "author/subject");
 
+    // Committer is pinned to the InstaSync bot (not the server's git identity),
+    // even though the author is the attributed user.
+    let (_, committer) = git_out(&repo, &["log", "-1", "--format=%cn|%ce"]);
+    assert_eq!(committer, "InstaSync|instasync@localhost", "committer identity");
+
     // The note's content was reconstructed from y-sweet, at its real vault path.
     let content = std::fs::read_to_string(repo.join("note.md")).unwrap();
     assert!(content.contains("# Note g1"), "got {content:?}");
