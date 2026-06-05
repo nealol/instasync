@@ -229,7 +229,7 @@ border-radius:6px;text-decoration:none\">Open Obsidian</a> to finish signing in.
 <p>If Obsidian did not open automatically, click the button above, or copy this \
 code into the plugin's <em>paste code</em> field:</p>\
 <pre style=\"padding:1rem;background:#f4f4f4;border-radius:6px;user-select:all\">{token}</pre>\
-<script>setTimeout(function(){{window.location.href=document.getElementById('open').href;}},250);</script>\
+<script>setTimeout(function(){{try{{document.getElementById('open').click();}}catch(e){{}}}},100);</script>\
 </body></html>"
     )
 }

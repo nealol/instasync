@@ -1,366 +1,630 @@
-import { App, Modal, Notice, PluginSettingTab } from "obsidian";
-import { createRoot, type Root } from "react-dom/client";
-import { useEffect, useMemo, useState } from "react";
-import type { ReactNode } from "react";
-import type InstaSyncPlugin from "./main";
-import { normalizeServerUrl, type MemberInfo, type VaultInfo } from "./auth";
-import { generateClientIdentity } from "./names";
+import { App, ExtraButtonComponent, Modal, Notice, PluginSettingTab, ToggleComponent } from 'obsidian'
+import { createRoot, type Root } from 'react-dom/client'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
+import type InstaSyncPlugin from './main'
+import { normalizeServerUrl, type MemberInfo, type VaultInfo } from './auth'
+import { generateClientIdentity } from './names'
 
 export interface InstaSyncSettings {
-	/** Base URL of the InstaSync auth server, e.g. http://127.0.0.1:8081 */
-	authServerUrl: string;
-	/** Opaque session bearer token; empty when logged out. */
-	sessionToken: string;
-	/** Identity from /api/me, cached for status + awareness defaults. */
-	userDisplayName: string;
-	userEmail: string;
-	/** The server vault UUID currently synced into this local vault; "" if none. */
-	activeVaultId: string;
-	/** This client's display name (shown on remote cursors). */
-	clientName: string;
-	/** This client's cursor color. */
-	clientColor: string;
-	clientColorLight: string;
-	/** Whether syncing is enabled. */
-	enabled: boolean;
+    /** Base URL of the InstaSync auth server, e.g. http://127.0.0.1:8081 */
+    authServerUrl: string;
+    /**
+     * Server URL of an in-progress SSO setup login. Used for nothing else:
+     * changing it cancels any pending SSO login (see AuthClient.beginSetupFor).
+     */
+    pendingSetupServerUrl: string;
+    /** Opaque session bearer token; empty when logged out. */
+    sessionToken: string;
+    /** Identity from /api/me, cached for status + awareness defaults. */
+    userDisplayName: string;
+    userEmail: string;
+    /** The server vault UUID currently synced into this local vault; "" if none. */
+    activeVaultId: string;
+    /** This client's display name (shown on remote cursors). */
+    clientName: string;
+    /** This client's cursor color. */
+    clientColor: string;
+    clientColorLight: string;
+    /** Whether syncing is enabled. */
+    enabled: boolean;
 }
 
 export function defaultSettings(): InstaSyncSettings {
-	const identity = generateClientIdentity();
-	return {
-		authServerUrl: "http://127.0.0.1:8081",
-		sessionToken: "",
-		userDisplayName: "",
-		userEmail: "",
-		activeVaultId: "",
-		clientName: identity.name,
-		clientColor: identity.color,
-		clientColorLight: identity.colorLight,
-		enabled: true,
-	};
+    const identity = generateClientIdentity()
+    return {
+        authServerUrl: 'http://127.0.0.1:8081',
+        pendingSetupServerUrl: '',
+        sessionToken: '',
+        userDisplayName: '',
+        userEmail: '',
+        activeVaultId: '',
+        clientName: identity.name,
+        clientColor: identity.color,
+        clientColorLight: identity.colorLight,
+        enabled: true,
+    }
 }
 
 export class InstaSyncSettingTab extends PluginSettingTab {
-	plugin: InstaSyncPlugin;
-	private root: Root | null = null;
+    plugin: InstaSyncPlugin
+    private root: Root | null = null
 
-	constructor(app: App, plugin: InstaSyncPlugin) {
-		super(app, plugin);
-		this.plugin = plugin;
-	}
+    constructor(app: App, plugin: InstaSyncPlugin) {
+        super(app, plugin)
+        this.plugin = plugin
+    }
 
-	display(): void {
-		this.containerEl.empty();
-		this.root?.unmount();
-		this.root = createRoot(this.containerEl);
-		this.root.render(<SettingsView app={this.app} plugin={this.plugin} refresh={() => this.display()} />);
-	}
+    display(): void {
+        this.containerEl.empty()
+        this.root?.unmount()
+        this.root = createRoot(this.containerEl)
+        this.root.render(<SettingsView app={this.app} plugin={this.plugin} refresh={() => this.display()}/>)
+    }
 
-	hide(): void {
-		this.root?.unmount();
-		this.root = null;
-		this.containerEl.empty();
-	}
+    hide(): void {
+        this.root?.unmount()
+        this.root = null
+        this.containerEl.empty()
+    }
 }
 
 function SettingsView({ app, plugin, refresh }: { app: App; plugin: InstaSyncPlugin; refresh: () => void }) {
-	const fullyConfigured = plugin.auth.isLoggedIn && !!plugin.settings.activeVaultId;
-	return fullyConfigured ? <FullSettings app={app} plugin={plugin} refresh={refresh} /> : <SetupView app={app} plugin={plugin} refresh={refresh} />;
+    const fullyConfigured = plugin.auth.isLoggedIn && !!plugin.settings.activeVaultId
+    return fullyConfigured ? <FullSettings app={app} plugin={plugin} refresh={refresh}/> :
+        <SetupView app={app} plugin={plugin} refresh={refresh}/>
 }
 
-type SetupStep = "server" | "choose" | "create" | "existing" | "invite";
+type SetupStep = 'server' | 'choose' | 'create' | 'existing' | 'invite';
 
 function SetupView({ app, plugin, refresh }: { app: App; plugin: InstaSyncPlugin; refresh: () => void }) {
-	const [step, setStep] = useState<SetupStep>(plugin.auth.isLoggedIn ? "choose" : "server");
-	const [serverUrl, setServerUrl] = useState(plugin.settings.authServerUrl);
-	const [busy, setBusy] = useState(false);
-	const [error, setError] = useState("");
+    const [step, setStep] = useState<SetupStep>(plugin.auth.isLoggedIn ? 'choose' : 'server')
+    const [serverUrl, setServerUrl] = useState(plugin.settings.authServerUrl)
+    const [busy, setBusy] = useState(false)
+    const [error, setError] = useState('')
+    // Reveal the paste-code fallback shortly after SSO starts, in case the deep
+    // link back into Obsidian doesn't fire.
+    const showPaste = useDelayedFlag(busy, 2000)
 
-	return (
-		<div className="instasync-setup-wrap">
-			<div className="instasync-setup-card">
-				<h2>Set up InstaSync</h2>
-				{step === "server" ? (
-					<form
-						onSubmit={(event) => {
-							event.preventDefault();
-							void (async () => {
-								setBusy(true);
-								setError("");
-								try {
-									await plugin.auth.loginToServer(serverUrl);
-									await plugin.onLoggedIn();
-									setStep("choose");
-								} catch (e) {
-									setError((e as Error).message);
-								} finally {
-									setBusy(false);
-								}
-							})();
-						}}
-					>
-						<p className="setting-item-description">Enter your InstaSync server URL to start syncing this vault.</p>
-						<input className="instasync-modal-input" type="text" placeholder="https://instasync.example.com" value={serverUrl} onChange={(event) => setServerUrl(event.currentTarget.value)} />
-						{error ? <p className="instasync-error">{error}</p> : null}
-						<button className="mod-cta instasync-wide-button" type="submit" disabled={busy}>{busy ? "Waiting for SSO..." : "Get Started"}</button>
-					</form>
-				) : null}
-				{step === "choose" ? <SetupChoices onCreate={() => setStep("create")} onExisting={() => setStep("existing")} onInvite={() => setStep("invite")} /> : null}
-				{step === "create" ? <CreateVaultStep app={app} plugin={plugin} refresh={refresh} onBack={() => setStep("choose")} /> : null}
-				{step === "existing" ? <ExistingVaultStep plugin={plugin} refresh={refresh} onBack={() => setStep("choose")} /> : null}
-				{step === "invite" ? <InviteVaultStep plugin={plugin} refresh={refresh} onBack={() => setStep("choose")} /> : null}
-			</div>
-		</div>
-	);
+    return (
+        <div className="instasync-setup-wrap">
+            <div className="instasync-setup-card">
+                <h2>Set up InstaSync</h2>
+                {step === 'server' ? (
+                    <form style={{marginTop: '-4px'}}
+                        onSubmit={(event) => {
+                            event.preventDefault()
+                            void (async () => {
+                                setBusy(true)
+                                setError('')
+                                try {
+                                    await plugin.auth.loginToServer(serverUrl)
+                                    await plugin.onLoggedIn()
+                                    setStep('choose')
+                                } catch (e) {
+                                    setError((e as Error).message)
+                                } finally {
+                                    setBusy(false)
+                                }
+                            })()
+                        }}
+                    >
+                        <p className="setting-item-description">Enter your InstaSync server URL to start syncing this
+                            vault.</p>
+                        <input className="instasync-modal-input" type="text" placeholder="https://instasync.example.com"
+                               value={serverUrl} onChange={(event) => setServerUrl(event.currentTarget.value)}/>
+                        {error ? <p className="instasync-error">{error}</p> : null}
+                        <SsoPasteFallback plugin={plugin} visible={showPaste}/>
+                        <button className="mod-cta instasync-wide-button" type="submit"
+                                disabled={busy}>{busy ? 'Waiting for SSO...' : 'Log in with SSO'}</button>
+                    </form>
+                ) : null}
+                {step === 'choose' ?
+                    <SetupChoices onCreate={() => setStep('create')} onExisting={() => setStep('existing')}
+                                  onInvite={() => setStep('invite')}/> : null}
+                {step === 'create' ? <CreateVaultStep app={app} plugin={plugin} refresh={refresh}
+                                                      onBack={() => setStep('choose')}/> : null}
+                {step === 'existing' ?
+                    <ExistingVaultStep plugin={plugin} refresh={refresh} onBack={() => setStep('choose')}/> : null}
+                {step === 'invite' ?
+                    <InviteVaultStep plugin={plugin} refresh={refresh} onBack={() => setStep('choose')}/> : null}
+            </div>
+        </div>
+    )
 }
 
-function SetupChoices({ onCreate, onExisting, onInvite }: { onCreate: () => void; onExisting: () => void; onInvite: () => void }) {
-	return (
-		<div className="instasync-choice-list">
-			<p className="setting-item-description">Choose how this local vault should connect to a remote vault.</p>
-			<button className="instasync-choice" onClick={onCreate}><strong>Create a new Remote Vault</strong><span>Use the Markdown files already in this local vault.</span></button>
-			<button className="instasync-choice" onClick={onExisting}><strong>Initialize an existing Remote Vault</strong><span>Choose a vault you own or belong to, then erase local Markdown and pull it down.</span></button>
-			<button className="instasync-choice" onClick={onInvite}><strong>Join a new Remote Vault</strong><span>Redeem an invite code, then decide whether to adopt that vault locally.</span></button>
-		</div>
-	);
+function SetupChoices({ onCreate, onExisting, onInvite }: {
+    onCreate: () => void;
+    onExisting: () => void;
+    onInvite: () => void
+}) {
+    return (
+        <div className="instasync-choice-list" style={{marginTop: '-16px'}}>
+            <p className="setting-item-description">Choose how this local vault should connect to a remote vault.</p>
+            <button className="instasync-choice" onClick={onCreate}><strong>Create a new Remote Vault</strong><span>Use the Markdown files already in this local vault.</span>
+            </button>
+            <button className="instasync-choice" onClick={onExisting}><strong>Initialize an existing Remote
+                Vault</strong><span>Replace local vault with a synced remote one.</span></button>
+            <button className="instasync-choice" onClick={onInvite}><strong>Join a new Remote Vault</strong><span>Use an invite code to join a vault.</span>
+            </button>
+        </div>
+    )
 }
 
-function CreateVaultStep({ app, plugin, refresh, onBack }: { app: App; plugin: InstaSyncPlugin; refresh: () => void; onBack: () => void }) {
-	const [name, setName] = useState(app.vault.getName());
-	const [busy, setBusy] = useState(false);
-	return (
-		<>
-			<h3>Create Remote Vault</h3>
-			<p className="setting-item-description">Name the remote vault that will be created from this local vault.</p>
-			<input className="instasync-modal-input" value={name} onChange={(event) => setName(event.currentTarget.value)} />
-			<div className="instasync-actions"><button onClick={onBack}>Back</button><button className="mod-cta" disabled={busy || !name.trim()} onClick={() => void runNotice(setBusy, async () => { await plugin.createAndActivateVault(name.trim()); new Notice(`InstaSync: created and syncing "${name.trim()}".`); refresh(); })}>Create & Sync</button></div>
-		</>
-	);
+function CreateVaultStep({ app, plugin, refresh, onBack }: {
+    app: App;
+    plugin: InstaSyncPlugin;
+    refresh: () => void;
+    onBack: () => void
+}) {
+    const [name, setName] = useState(app.vault.getName())
+    const [busy, setBusy] = useState(false)
+    return (
+        <>
+            {/*<h3>Create Remote Vault</h3>*/}
+            <p className="setting-item-description">Name your new remote vault.</p>
+            <input className="instasync-modal-input" type="text" value={name}
+                   onChange={(event) => setName(event.currentTarget.value)}/>
+            <div className="instasync-actions">
+                <button onClick={onBack}>Back</button>
+                <button className="mod-cta" disabled={busy || !name.trim()}
+                        onClick={() => void runNotice(setBusy, async () => {
+                            await plugin.createAndActivateVault(name.trim())
+                            new Notice(`InstaSync: created and syncing "${name.trim()}".`)
+                            refresh()
+                        })}>Create & Sync
+                </button>
+            </div>
+        </>
+    )
 }
 
-function ExistingVaultStep({ plugin, refresh, onBack }: { plugin: InstaSyncPlugin; refresh: () => void; onBack: () => void }) {
-	const { vaults, error, reload } = useVaults(plugin);
-	const [confirm, setConfirm] = useState<VaultInfo | null>(null);
-	return (
-		<>
-			<h3>Initialize Existing Remote Vault</h3>
-			{confirm ? <EraseConfirm vault={confirm} onCancel={() => setConfirm(null)} onConfirm={() => void runNotice(undefined, async () => { await plugin.adoptVault(confirm.id, confirm.name); new Notice(`InstaSync: adopting "${confirm.name}"...`); refresh(); })} /> : null}
-			{!confirm ? <>
-				<p className="setting-item-description">Choose a remote vault. You will confirm before local Markdown is erased.</p>
-				{error ? <p className="instasync-error">{error}</p> : null}
-				{!error && vaults === null ? <p className="setting-item-description">Loading vaults...</p> : null}
-				{vaults?.length === 0 ? <p className="setting-item-description">No remote vaults found.</p> : null}
-				{vaults?.map((vault) => <button key={vault.id} className="instasync-choice" onClick={() => setConfirm(vault)}><strong>{vault.name}</strong><span>Role: {vault.role}{vault.owner ? " * owner" : ""}</span></button>)}
-				<div className="instasync-actions"><button onClick={onBack}>Back</button><button onClick={reload}>Refresh</button></div>
-			</> : null}
-		</>
-	);
+function ExistingVaultStep({ plugin, refresh, onBack }: {
+    plugin: InstaSyncPlugin;
+    refresh: () => void;
+    onBack: () => void
+}) {
+    const { vaults, error, reload } = useVaults(plugin)
+    const [confirm, setConfirm] = useState<VaultInfo | null>(null)
+    return (
+        <>
+            {/*<h3>Initialize Existing Remote Vault</h3>*/}
+            {confirm ? <EraseConfirm vault={confirm} onCancel={() => setConfirm(null)}
+                                     onConfirm={() => void runNotice(undefined, async () => {
+                                         await plugin.adoptVault(confirm.id, confirm.name)
+                                         refresh()
+                                     })}/> : null}
+            {!confirm ? <>
+                <p className="setting-item-description">Choose a remote vault to clone.</p>
+                {error ? <p className="instasync-error">{error}</p> : null}
+                {!error && vaults === null ? <p className="setting-item-description">Loading vaults...</p> : null}
+                {vaults?.length === 0 ? <p className="setting-item-description">No remote vaults found.</p> : null}
+                <div className="instasync-choice-list">
+                    {vaults?.map((vault) => <button key={vault.id} className="instasync-choice"
+                                                    onClick={() => setConfirm(vault)}>
+                        <strong>{vault.name}</strong><span>Role: {vault.role}{vault.owner ? ' (owner)' : ''}</span>
+                    </button>)}
+                </div>
+                <div className="instasync-actions">
+                    <button onClick={onBack}>Back</button>
+                    <button onClick={reload}>Refresh</button>
+                </div>
+            </> : null}
+        </>
+    )
 }
 
-function InviteVaultStep({ plugin, refresh, onBack }: { plugin: InstaSyncPlugin; refresh: () => void; onBack: () => void }) {
-	const [code, setCode] = useState("");
-	const [joined, setJoined] = useState<{ vaultId: string; name: string } | null>(null);
-	const [busy, setBusy] = useState(false);
-	return (
-		<>
-			<h3>Join Remote Vault</h3>
-			{joined ? <EraseConfirm vault={{ id: joined.vaultId, name: joined.name }} onCancel={onBack} onConfirm={() => void runNotice(undefined, async () => { await plugin.adoptVault(joined.vaultId, joined.name); new Notice(`InstaSync: adopting "${joined.name}"...`); refresh(); })} /> : <>
-				<p className="setting-item-description">Enter an invite code. Redeeming it adds you as a member before you decide whether to adopt it locally.</p>
-				<input className="instasync-wide-input" placeholder="four-word-invite-code" value={code} onChange={(event) => setCode(event.currentTarget.value.trim())} />
-				<div className="instasync-actions"><button onClick={onBack}>Back</button><button className="mod-cta" disabled={busy || !code} onClick={() => void runNotice(setBusy, async () => { setJoined(await plugin.auth.redeemInvite(code)); })}>Redeem Invite</button></div>
-			</>}
-		</>
-	);
+function InviteVaultStep({ plugin, refresh, onBack }: {
+    plugin: InstaSyncPlugin;
+    refresh: () => void;
+    onBack: () => void
+}) {
+    const [code, setCode] = useState('')
+    const [joined, setJoined] = useState<{ vaultId: string; name: string } | null>(null)
+    const [busy, setBusy] = useState(false)
+    return (
+        <>
+            {/*<h3>Join Remote Vault</h3>*/}
+            {joined ? <EraseConfirm vault={{ id: joined.vaultId, name: joined.name }} onCancel={onBack}
+                                    onConfirm={() => void runNotice(undefined, async () => {
+                                        await plugin.adoptVault(joined.vaultId, joined.name)
+                                        refresh()
+                                    })}/> : <>
+                <p className="setting-item-description">Enter an invite code from another person.</p>
+                <input className="instasync-modal-input" type="text" placeholder="four-word-invite-code" value={code}
+                       onChange={(event) => setCode(event.currentTarget.value.trim())}/>
+                <div className="instasync-actions">
+                    <button onClick={onBack}>Back</button>
+                    <button className="mod-cta" disabled={busy || !code}
+                            onClick={() => void runNotice(setBusy, async () => {
+                                setJoined(await plugin.auth.redeemInvite(code))
+                            })}>Redeem Invite
+                    </button>
+                </div>
+            </>}
+        </>
+    )
 }
 
-function EraseConfirm({ vault, onConfirm, onCancel }: { vault: Pick<VaultInfo, "id" | "name">; onConfirm: () => void; onCancel: () => void }) {
-	return (
-		<div className="instasync-warning-box">
-			<strong>Erase local Markdown and sync "{vault.name}"?</strong>
-			<p>This deletes all non-conflict-copy Markdown files in this local Obsidian vault and replaces them with the remote vault.</p>
-			<div className="instasync-actions"><button onClick={onCancel}>Cancel</button><button className="mod-warning" onClick={onConfirm}>Erase & Sync</button></div>
-		</div>
-	);
+function EraseConfirm({ vault, onConfirm, onCancel }: {
+    vault: Pick<VaultInfo, 'id' | 'name'>;
+    onConfirm: () => void;
+    onCancel: () => void
+}) {
+    return (
+        <div className="instasync-warning-box">
+            <strong>Erase local Markdown and sync "{vault.name}"?</strong>
+            <p>This deletes all non-conflict-copy Markdown files in this local Obsidian vault and replaces them with the
+                remote vault.</p>
+            <div className="instasync-actions">
+                <button onClick={onCancel}>Cancel</button>
+                <button className="mod-warning" onClick={onConfirm}>Erase & Sync</button>
+            </div>
+        </div>
+    )
 }
 
 function FullSettings({ app, plugin, refresh }: { app: App; plugin: InstaSyncPlugin; refresh: () => void }) {
-	return (
-		<>
-			<h2>InstaSync</h2>
-			<AccountSection plugin={plugin} refresh={refresh} />
-			<PauseSection plugin={plugin} refresh={refresh} />
-			<DeviceSection plugin={plugin} refresh={refresh} />
-			<VaultDetails app={app} plugin={plugin} />
-			<AdvancedSettings app={app} plugin={plugin} refresh={refresh} />
-		</>
-	);
+    return (
+        <>
+            {/*<h2>InstaSync</h2>*/}
+            <AccountSection plugin={plugin} refresh={refresh}/>
+            <EnableSyncSection plugin={plugin} refresh={refresh}/>
+            <DeviceSection plugin={plugin}/>
+            <VaultDetails app={app} plugin={plugin}/>
+            <AdvancedSettings app={app} plugin={plugin} refresh={refresh}/>
+        </>
+    )
 }
 
 function AccountSection({ plugin, refresh }: { plugin: InstaSyncPlugin; refresh: () => void }) {
-	return <><h3>Account</h3><SettingRow name={plugin.settings.userDisplayName || "Signed in"} desc={plugin.settings.userEmail} control={<button className="mod-warning" onClick={() => void runNotice(undefined, async () => { await plugin.logout(); refresh(); })}>Log out</button>} /></>;
+    return <><h3>Account</h3><SettingRow name={plugin.settings.userDisplayName || 'Signed in'}
+                                         desc={plugin.settings.userEmail} control={<button className="mod-warning"
+                                                                                           onClick={() => void runNotice(undefined, async () => {
+                                                                                               await plugin.logout()
+                                                                                               refresh()
+                                                                                           })}>Log out</button>}/></>
 }
 
-function PauseSection({ plugin, refresh }: { plugin: InstaSyncPlugin; refresh: () => void }) {
-	return <SettingRow name="Pause syncing" desc="When enabled, InstaSync stays signed in but stops online sync for this vault." control={<input type="checkbox" checked={!plugin.settings.enabled} onChange={(event) => void runNotice(undefined, async () => { plugin.settings.enabled = !event.currentTarget.checked; await plugin.saveSettings(); await plugin.reloadSync(); refresh(); })} />} />;
+function EnableSyncSection({ plugin, refresh }: { plugin: InstaSyncPlugin; refresh: () => void }) {
+    return <SettingRow name="Enable syncing"
+                       desc="When on, this vault syncs online. Turn off to stay signed in but pause online sync."
+                       control={<Toggle value={plugin.settings.enabled}
+                                        onChange={(value) => void runNotice(undefined, async () => {
+                                            plugin.settings.enabled = value
+                                            await plugin.saveSettings()
+                                            await plugin.reloadSync()
+                                            if (!value) new Notice('InstaSync: syncing disabled for this vault.')
+                                            refresh()
+                                        })}/>}/>
 }
 
-function DeviceSection({ plugin, refresh }: { plugin: InstaSyncPlugin; refresh: () => void }) {
-	return (
-		<>
-			<h3>Your Device</h3>
-			<SettingRow name="Display name" desc="Name shown to other editors on your cursor." control={<><input type="text" defaultValue={plugin.settings.clientName} onChange={(event) => void runNotice(undefined, async () => { plugin.settings.clientName = event.currentTarget.value; await plugin.saveSettings(); plugin.updateLocalAwareness(); })} /><button aria-label="Randomize display name" title="Randomize display name" onClick={() => void runNotice(undefined, async () => { plugin.settings.clientName = generateClientIdentity().name; await plugin.saveSettings(); plugin.updateLocalAwareness(); refresh(); })}>🎲</button></>} />
-			<SettingRow name="Cursor color" desc="The color of your cursor and selection for other editors." control={<><input type="color" value={plugin.settings.clientColor} onChange={(event) => void runNotice(undefined, async () => { plugin.settings.clientColor = event.currentTarget.value; plugin.settings.clientColorLight = event.currentTarget.value + "33"; await plugin.saveSettings(); plugin.updateLocalAwareness(); refresh(); })} /><button aria-label="Randomize cursor color" title="Randomize cursor color" onClick={() => void runNotice(undefined, async () => { const id = generateClientIdentity(); plugin.settings.clientColor = id.color; plugin.settings.clientColorLight = id.colorLight; await plugin.saveSettings(); plugin.updateLocalAwareness(); refresh(); })}>🎲</button></>} />
-		</>
-	);
+/**
+ * Real Obsidian `ToggleComponent` mounted into a React-managed element, so the
+ * switch looks and behaves exactly like a native settings toggle. The value is
+ * applied before the change handler is wired so seeding it can't re-fire it; a
+ * full settings re-render remounts this, so no separate value-sync is needed.
+ */
+function Toggle({ value, onChange }: { value: boolean; onChange: (value: boolean) => void }) {
+    const ref = useRef<HTMLSpanElement>(null)
+    const onChangeRef = useRef(onChange)
+    onChangeRef.current = onChange
+    const initial = useRef(value).current
+    useEffect(() => {
+        const el = ref.current
+        if (!el) return
+        new ToggleComponent(el).setValue(initial).onChange((v) => onChangeRef.current(v))
+        return () => { el.empty() }
+    }, [initial])
+    return <span ref={ref}/>
+}
+
+/**
+ * Real Obsidian `ExtraButtonComponent` mounted into a React-managed element,
+ * giving the muted icon-button display used elsewhere in settings. `onClick` is
+ * read through a ref so a re-render never needs to rebuild the component.
+ */
+function ExtraButton({ icon, tooltip, onClick }: { icon: string; tooltip?: string; onClick: () => void }) {
+    const ref = useRef<HTMLSpanElement>(null)
+    const onClickRef = useRef(onClick)
+    onClickRef.current = onClick
+    useEffect(() => {
+        const el = ref.current
+        if (!el) return
+        const button = new ExtraButtonComponent(el).setIcon(icon).onClick(() => onClickRef.current())
+        if (tooltip) button.setTooltip(tooltip)
+        return () => { el.empty() }
+    }, [icon, tooltip])
+    return <span ref={ref}/>
+}
+
+function DeviceSection({ plugin }: { plugin: InstaSyncPlugin }) {
+    // Local state so randomizing/editing re-renders only this section, instead of
+    // calling the page-level refresh (which reloads the slow vaults/members lists).
+    const [name, setName] = useState(plugin.settings.clientName)
+    const [color, setColor] = useState(plugin.settings.clientColor)
+
+    const applyName = (value: string) => {
+        setName(value)
+        void runNotice(undefined, async () => {
+            plugin.settings.clientName = value
+            await plugin.saveSettings()
+            plugin.updateLocalAwareness()
+        })
+    }
+    const applyColor = (value: string) => {
+        setColor(value)
+        void runNotice(undefined, async () => {
+            plugin.settings.clientColor = value
+            plugin.settings.clientColorLight = value + '33'
+            await plugin.saveSettings()
+            plugin.updateLocalAwareness()
+        })
+    }
+
+    return (
+        <>
+            <h3>Your Device</h3>
+            <SettingRow name="Display name" desc="Name shown to other editors on your cursor."
+                        control={<><input type="text" value={name}
+                                          onChange={(event) => applyName(event.currentTarget.value)}/>
+                            <ExtraButton icon="dice" tooltip="Randomize display name"
+                                         onClick={() => applyName(generateClientIdentity().name)}/>
+                        </>}/>
+            <SettingRow name="Cursor color" desc="The color of your cursor and selection for other editors."
+                        control={<><input type="color" value={color}
+                                          onChange={(event) => applyColor(event.currentTarget.value)}/>
+                            <ExtraButton icon="dice" tooltip="Randomize cursor color"
+                                         onClick={() => applyColor(generateClientIdentity().color)}/>
+                        </>}/>
+        </>
+    )
 }
 
 function VaultDetails({ plugin }: { app: App; plugin: InstaSyncPlugin }) {
-	const { vaults, error: vaultError, reload: reloadVaults } = useVaults(plugin);
-	const activeVault = useMemo(() => vaults?.find((vault) => vault.id === plugin.settings.activeVaultId) ?? null, [plugin.settings.activeVaultId, vaults]);
-	const { members, error: membersError, reload: reloadMembers } = useMembers(plugin, activeVault?.id ?? "");
-	const reloadAll = () => { reloadVaults(); reloadMembers(); };
-	return (
-		<>
-			<h3>Vault Details</h3>
-			{vaultError ? <p className="instasync-error">{vaultError}</p> : null}
-			{activeVault ? <p className="setting-item-description">Syncing <strong>{activeVault.name}</strong>. Your role: {activeVault.role}{activeVault.owner ? " * owner" : ""}.</p> : <p className="setting-item-description">Loading vault details...</p>}
-			{membersError ? <p className="instasync-error">{membersError}</p> : null}
-			{members === null ? <p className="setting-item-description">Loading members...</p> : null}
-			{activeVault && members?.map((member) => <MemberRow key={member.userId} plugin={plugin} vault={activeVault} member={member} reload={reloadAll} />)}
-			{activeVault?.role === "admin" ? <InviteGenerator plugin={plugin} vault={activeVault} /> : null}
-		</>
-	);
+    const { vaults, error: vaultError, reload: reloadVaults } = useVaults(plugin)
+    const activeVault = useMemo(() => vaults?.find((vault) => vault.id === plugin.settings.activeVaultId) ?? null, [plugin.settings.activeVaultId, vaults])
+    const { members, error: membersError, reload: reloadMembers } = useMembers(plugin, activeVault?.id ?? '')
+    const reloadAll = () => {
+        reloadVaults()
+        reloadMembers()
+    }
+    return (
+        <>
+            <h3>Vault Details</h3>
+            {vaultError ? <p className="instasync-error">{vaultError}</p> : null}
+            {activeVault ? <p className="setting-item-description">Syncing <strong>{activeVault.name}</strong>. Your
+                    role: {activeVault.role}{activeVault.owner ? ' (owner)' : ''}.</p> :
+                <p className="setting-item-description">Loading vault details...</p>}
+            {membersError ? <p className="instasync-error">{membersError}</p> : null}
+            {members === null ? <p className="setting-item-description">Loading members...</p> : null}
+            {activeVault && members?.map((member) => <MemberRow key={member.userId} plugin={plugin} vault={activeVault}
+                                                                member={member} reload={reloadAll}/>)}
+            {activeVault?.role === 'admin' ? <InviteGenerator plugin={plugin} vault={activeVault}/> : null}
+        </>
+    )
 }
 
-function MemberRow({ plugin, vault, member, reload }: { plugin: InstaSyncPlugin; vault: VaultInfo; member: MemberInfo; reload: () => void }) {
-	const isSelf = member.email === plugin.settings.userEmail;
-	const canPromote = vault.role === "admin" && member.role !== "admin";
-	const canRemove = !member.owner && !isSelf && (member.role === "member" ? vault.role === "admin" : !!vault.owner);
-	return <SettingRow name={`${member.displayName || member.email}${member.owner ? " (owner)" : ""}`} desc={`${member.email} * ${member.role}`} control={<>{canPromote ? <button onClick={() => void runNotice(undefined, async () => { await plugin.auth.promoteMember(vault.id, member.userId); new Notice("InstaSync: promoted."); reload(); })}>Promote to admin</button> : null}{canRemove ? <button className="mod-warning" onClick={() => void runNotice(undefined, async () => { await plugin.auth.removeMember(vault.id, member.userId); new Notice("InstaSync: member removed."); reload(); })}>Remove</button> : null}</>} />;
+function MemberRow({ plugin, vault, member, reload }: {
+    plugin: InstaSyncPlugin;
+    vault: VaultInfo;
+    member: MemberInfo;
+    reload: () => void
+}) {
+    const isSelf = member.email === plugin.settings.userEmail
+    const canPromote = vault.role === 'admin' && member.role !== 'admin'
+    const canRemove = !member.owner && !isSelf && (member.role === 'member' ? vault.role === 'admin' : !!vault.owner)
+    return <SettingRow name={`${member.displayName || member.email}${member.owner ? ' (owner)' : ''}`}
+                       desc={`${member.email} (${member.role})`}
+                       control={<>{canPromote ? <button onClick={() => void runNotice(undefined, async () => {
+                           await plugin.auth.promoteMember(vault.id, member.userId)
+                           new Notice('InstaSync: promoted.')
+                           reload()
+                       })}>Promote to admin</button> : null}{canRemove ?
+                           <button className="mod-warning" onClick={() => void runNotice(undefined, async () => {
+                               await plugin.auth.removeMember(vault.id, member.userId)
+                               new Notice('InstaSync: member removed.')
+                               reload()
+                           })}>Remove</button> : null}</>}/>
 }
 
 function InviteGenerator({ plugin, vault }: { plugin: InstaSyncPlugin; vault: VaultInfo }) {
-	const [code, setCode] = useState("");
-	return <SettingRow name="Invite code" desc="Generate a single-use invite for this vault." control={<><button onClick={() => void runNotice(undefined, async () => { const invite = await plugin.auth.createInvite(vault.id); setCode(invite.code); void navigator.clipboard?.writeText(invite.code).catch(() => {}); new Notice(`InstaSync invite copied: ${invite.code}`, 15000); })}>Generate invite</button>{code ? <code>{code}</code> : null}</>} />;
+    const [code, setCode] = useState('')
+    return <SettingRow name="Add members" desc="Generate a single-use invite for this vault." control={<>
+        <button onClick={() => void runNotice(undefined, async () => {
+            const invite = await plugin.auth.createInvite(vault.id)
+            setCode(invite.code)
+            void navigator.clipboard?.writeText(invite.code).catch(() => {
+            })
+            new Notice(`InstaSync invite copied: ${invite.code}`, 15000)
+        })}>Generate invite
+        </button>
+        {code ? <code>{code}</code> : null}</>}/>
 }
 
 function AdvancedSettings({ app, plugin, refresh }: { app: App; plugin: InstaSyncPlugin; refresh: () => void }) {
-	return <details className="instasync-advanced"><summary>Advanced settings</summary><p className="setting-item-description">Changing the InstaSync server URL should usually only be done when resetting or migrating the entire vault.</p><SettingRow name="Instasync server URL" desc={plugin.settings.authServerUrl} control={<button onClick={() => new ServerMigrationModal(app, plugin, refresh).open()}>Change server...</button>} /></details>;
+    return <details className="instasync-advanced">
+        <summary>Advanced settings</summary>
+        <p className="setting-item-description">Changing the InstaSync server URL should usually only be done when
+            resetting or migrating the entire vault.</p><SettingRow name="Instasync server URL"
+                                                                    desc={plugin.settings.authServerUrl}
+                                                                    control={<button
+                                                                        onClick={() => new ServerMigrationModal(app, plugin, refresh).open()}>Change
+                                                                        server...</button>}/></details>
 }
 
 class ServerMigrationModal extends Modal {
-	private plugin: InstaSyncPlugin;
-	private refresh: () => void;
-	private root: Root | null = null;
+    private plugin: InstaSyncPlugin
+    private refresh: () => void
+    private root: Root | null = null
 
-	constructor(app: App, plugin: InstaSyncPlugin, refresh: () => void) {
-		super(app);
-		this.plugin = plugin;
-		this.refresh = refresh;
-	}
+    constructor(app: App, plugin: InstaSyncPlugin, refresh: () => void) {
+        super(app)
+        this.plugin = plugin
+        this.refresh = refresh
+    }
 
-	onOpen(): void {
-		this.root = createRoot(this.contentEl);
-		this.root.render(<ServerMigrationView app={this.app} plugin={this.plugin} refresh={this.refresh} close={() => this.close()} />);
-	}
+    onOpen(): void {
+        this.root = createRoot(this.contentEl)
+        this.root.render(<ServerMigrationView app={this.app} plugin={this.plugin} refresh={this.refresh}
+                                              close={() => this.close()}/>)
+    }
 
-	onClose(): void {
-		this.root?.unmount();
-		this.root = null;
-		this.contentEl.empty();
-	}
+    onClose(): void {
+        this.root?.unmount()
+        this.root = null
+        this.contentEl.empty()
+    }
 }
 
-function ServerMigrationView({ app, plugin, refresh, close }: { app: App; plugin: InstaSyncPlugin; refresh: () => void; close: () => void }) {
-	const [url, setUrl] = useState(plugin.settings.authServerUrl);
-	const [busy, setBusy] = useState(false);
-	const [error, setError] = useState("");
-	return (
-		<>
-			<h2>Change InstaSync Server</h2>
-			<p className="setting-item-description">This requires SSO on the new server. The change is only saved if that server has a remote vault named "{app.vault.getName()}".</p>
-			<input className="instasync-wide-input" type="url" value={url} onChange={(event) => setUrl(event.currentTarget.value)} />
-			{error ? <p className="instasync-error">{error}</p> : null}
-			<div className="instasync-actions"><button onClick={close}>Cancel</button><button className="mod-cta" disabled={busy} onClick={() => void (async () => {
-				setBusy(true);
-				setError("");
-				try {
-					const normalized = normalizeServerUrl(url);
-					const { token, me } = await plugin.auth.authenticateAt(normalized);
-					const vaults = await plugin.auth.listVaultsAt(normalized, token);
-					const match = vaults.find((vault) => vault.name === app.vault.getName());
-					if (!match) throw new Error(`No remote vault named "${app.vault.getName()}" was found on that server.`);
-					plugin.settings.activeVaultId = match.id;
-					await plugin.auth.setSessionForServer(normalized, token, me);
-					await plugin.saveSettings();
-					await plugin.reloadSync();
-					new Notice("InstaSync: server updated.");
-					close();
-					refresh();
-				} catch (e) {
-					setError((e as Error).message);
-				} finally {
-					setBusy(false);
-				}
-			})()}>{busy ? "Waiting for SSO..." : "Test with SSO"}</button></div>
-		</>
-	);
+function ServerMigrationView({ app, plugin, refresh, close }: {
+    app: App;
+    plugin: InstaSyncPlugin;
+    refresh: () => void;
+    close: () => void
+}) {
+    const [url, setUrl] = useState(plugin.settings.authServerUrl)
+    const [busy, setBusy] = useState(false)
+    const [error, setError] = useState('')
+    const showPaste = useDelayedFlag(busy, 2000)
+    return (
+        <>
+            <h3>Change InstaSync Server</h3>
+            <p className="setting-item-description">This requires SSO on the new server. The change is only saved if
+                that server has a remote vault named "{app.vault.getName()}".</p>
+            <input className="instasync-modal-input" type="text" value={url}
+                   onChange={(event) => setUrl(event.currentTarget.value)}/>
+            {error ? <p className="instasync-error">{error}</p> : null}
+            <SsoPasteFallback plugin={plugin} visible={showPaste}/>
+            <div className="instasync-actions">
+                <button onClick={close}>Cancel</button>
+                <button className="mod-cta" disabled={busy} onClick={() => void (async () => {
+                    setBusy(true)
+                    setError('')
+                    try {
+                        const normalized = normalizeServerUrl(url)
+                        const { token, me } = await plugin.auth.authenticateAt(normalized)
+                        const vaults = await plugin.auth.listVaultsAt(normalized, token)
+                        const match = vaults.find((vault) => vault.name === app.vault.getName())
+                        if (!match) throw new Error(`No remote vault named "${app.vault.getName()}" was found on that server.`)
+                        plugin.settings.activeVaultId = match.id
+                        await plugin.auth.setSessionForServer(normalized, token, me)
+                        await plugin.saveSettings()
+                        await plugin.reloadSync()
+                        new Notice('InstaSync: server updated.')
+                        close()
+                        refresh()
+                    } catch (e) {
+                        setError((e as Error).message)
+                    } finally {
+                        setBusy(false)
+                    }
+                })()}>{busy ? 'Waiting for SSO...' : 'Test with SSO'}</button>
+            </div>
+        </>
+    )
 }
 
 function useVaults(plugin: InstaSyncPlugin) {
-	const [reloadKey, setReloadKey] = useState(0);
-	const [vaults, setVaults] = useState<VaultInfo[] | null>(null);
-	const [error, setError] = useState("");
-	useEffect(() => {
-		let cancelled = false;
-		setVaults(null);
-		setError("");
-		void (async () => {
-			try {
-				const listed = await plugin.auth.listVaults();
-				if (!cancelled) setVaults(listed);
-			} catch (e) {
-				if (!cancelled) setError(`Could not load vaults: ${(e as Error).message}`);
-			}
-		})();
-		return () => { cancelled = true; };
-	}, [plugin, reloadKey]);
-	return { vaults, error, reload: () => setReloadKey((key) => key + 1) };
+    const [reloadKey, setReloadKey] = useState(0)
+    const [vaults, setVaults] = useState<VaultInfo[] | null>(null)
+    const [error, setError] = useState('')
+    useEffect(() => {
+        let cancelled = false
+        setVaults(null)
+        setError('')
+        void (async () => {
+            try {
+                const listed = await plugin.auth.listVaults()
+                if (!cancelled) setVaults(listed)
+            } catch (e) {
+                if (!cancelled) setError(`Could not load vaults: ${(e as Error).message}`)
+            }
+        })()
+        return () => {
+            cancelled = true
+        }
+    }, [plugin, reloadKey])
+    return { vaults, error, reload: () => setReloadKey((key) => key + 1) }
 }
 
 function useMembers(plugin: InstaSyncPlugin, vaultId: string) {
-	const [reloadKey, setReloadKey] = useState(0);
-	const [members, setMembers] = useState<MemberInfo[] | null>(null);
-	const [error, setError] = useState("");
-	useEffect(() => {
-		if (!vaultId) return;
-		let cancelled = false;
-		setMembers(null);
-		setError("");
-		void (async () => {
-			try {
-				const listed = await plugin.auth.listMembers(vaultId);
-				if (!cancelled) setMembers(listed);
-			} catch (e) {
-				if (!cancelled) setError(`Could not load members: ${(e as Error).message}`);
-			}
-		})();
-		return () => { cancelled = true; };
-	}, [plugin, vaultId, reloadKey]);
-	return { members, error, reload: () => setReloadKey((key) => key + 1) };
+    const [reloadKey, setReloadKey] = useState(0)
+    const [members, setMembers] = useState<MemberInfo[] | null>(null)
+    const [error, setError] = useState('')
+    useEffect(() => {
+        if (!vaultId) return
+        let cancelled = false
+        setMembers(null)
+        setError('')
+        void (async () => {
+            try {
+                const listed = await plugin.auth.listMembers(vaultId)
+                if (!cancelled) setMembers(listed)
+            } catch (e) {
+                if (!cancelled) setError(`Could not load members: ${(e as Error).message}`)
+            }
+        })()
+        return () => {
+            cancelled = true
+        }
+    }, [plugin, vaultId, reloadKey])
+    return { members, error, reload: () => setReloadKey((key) => key + 1) }
+}
+
+/** Becomes true `delayMs` after `active` turns true; resets when it turns false. */
+function useDelayedFlag(active: boolean, delayMs: number): boolean {
+    const [on, setOn] = useState(false)
+    useEffect(() => {
+        if (!active) {
+            setOn(false)
+            return
+        }
+        const id = window.setTimeout(() => setOn(true), delayMs)
+        return () => window.clearTimeout(id)
+    }, [active, delayMs])
+    return on
+}
+
+/**
+ * Backup for SSO when the `obsidian://` deep link doesn't return to Obsidian:
+ * the login page also prints the session code, which the user can paste here to
+ * complete the in-flight login.
+ */
+function SsoPasteFallback({ plugin, visible }: { plugin: InstaSyncPlugin; visible: boolean }) {
+    const [code, setCode] = useState('')
+    if (!visible) return null
+    return (
+        <div className="instasync-paste-fallback">
+            <p className="setting-item-description">Not redirected back to Obsidian? Paste the sign-in code shown in
+                your browser:</p>
+            <div className="instasync-actions">
+                <input className="instasync-modal-input" type="text" placeholder="Paste sign-in code" value={code}
+                       onChange={(event) => setCode(event.currentTarget.value.trim())}/>
+                <button type="button" className="mod-cta" disabled={!code}
+                        onClick={() => plugin.auth.submitPastedCode(code)}>Use code
+                </button>
+            </div>
+        </div>
+    )
 }
 
 async function runNotice(setBusy: ((busy: boolean) => void) | undefined, fn: () => Promise<void>): Promise<void> {
-	try {
-		setBusy?.(true);
-		await fn();
-	} catch (e) {
-		new Notice(`InstaSync: ${(e as Error).message}`);
-	} finally {
-		setBusy?.(false);
-	}
+    try {
+        setBusy?.(true)
+        await fn()
+    } catch (e) {
+        new Notice(`InstaSync: ${(e as Error).message}`)
+    } finally {
+        setBusy?.(false)
+    }
 }
 
 function SettingRow({ name, desc, control }: { name: string; desc?: ReactNode; control: ReactNode }) {
-	return <div className="setting-item"><div className="setting-item-info"><div className="setting-item-name">{name}</div>{desc ? <div className="setting-item-description">{desc}</div> : null}</div><div className="setting-item-control">{control}</div></div>;
+    return <div className="setting-item">
+        <div className="setting-item-info">
+            <div className="setting-item-name">{name}</div>
+            {desc ? <div className="setting-item-description">{desc}</div> : null}</div>
+        <div className="setting-item-control">{control}</div>
+    </div>
 }

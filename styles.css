@@ -3,6 +3,8 @@
 
 .instasync-setup-wrap {
 	display: flex;
+	height: 100%;
+	align-items: flex-start;
 	justify-content: center;
 	padding: 48px 12px;
 }
@@ -18,6 +20,12 @@
 
 .instasync-setup-card h2 {
 	padding-left: 0;
+	/*margin-bottom: -4px;*/
+}
+
+.instasync-setup-card h3 {
+	padding-left: 0;
+	margin-top: 4px;
 }
 
 .instasync-wide-input,
@@ -29,6 +37,7 @@
 	display: flex;
 	flex-direction: column;
 	gap: 10px;
+	margin-bottom: 16px;
 }
 
 .instasync-choice {
@@ -51,7 +60,7 @@
 	display: flex;
 	justify-content: flex-end;
 	gap: 8px;
-	margin-top: 16px;
+	margin-top: 4px;
 }
 
 .instasync-warning-box {
@@ -74,5 +83,15 @@
 
 .instasync-modal-input {
 	width: 100%;
-	margin-bottom: 12px;
+	margin-bottom: 16px;
+}
+
+.instasync-paste-fallback {
+	margin-bottom: 16px;
+	padding-top: 12px;
+	border-top: 1px solid var(--background-modifier-border);
+}
+
+.instasync-paste-fallback .instasync-modal-input {
+	margin-bottom: 8px;
 }

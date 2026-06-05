@@ -35,8 +35,10 @@ export class AuthError extends Error {}
  */
 export class AuthClient {
 	private plugin: InstaSyncPlugin;
-	/** Resolver for an in-flight login call awaiting the deep link. */
+	/** Resolver for an in-flight login call awaiting the deep link / paste code. */
 	private pendingLogin: ((token: string) => void) | null = null;
+	/** Rejecter paired with {@link pendingLogin}, so the wait can be cancelled. */
+	private pendingReject: ((err: Error) => void) | null = null;
 
 	constructor(plugin: InstaSyncPlugin) {
 		this.plugin = plugin;
@@ -145,33 +147,77 @@ export class AuthClient {
 
 	authenticateAt(baseUrl: string): Promise<{ token: string; me: MeResponse }> {
 		const normalized = normalizeServerUrl(baseUrl);
+		// Record which server this SSO attempt targets. Pointing it at a different
+		// server cancels any earlier in-flight login (see beginSetupFor). Must run
+		// before we install the new resolver below so we don't cancel ourselves.
+		this.beginSetupFor(normalized);
 		const redirect = encodeURIComponent("obsidian://instasync-auth");
 		window.open(`${normalized}/auth/login?redirect=${redirect}`);
 		return new Promise<{ token: string; me: MeResponse }>((resolve, reject) => {
+			this.pendingReject = reject;
 			this.pendingLogin = (token: string) => {
 				this.pendingLogin = null;
+				this.pendingReject = null;
 				this.apiAt<MeResponse>(normalized, "/api/me", token)
 					.then((me) => resolve({ token, me }))
 					.catch(reject);
 			};
 			// Abandon the wait after 5 minutes so the promise can't leak forever.
+			// Guard on identity so a stale timer can't reject a newer attempt.
 			window.setTimeout(() => {
-				if (this.pendingLogin) {
+				if (this.pendingReject === reject) {
 					this.pendingLogin = null;
+					this.pendingReject = null;
 					reject(new Error("Login timed out."));
 				}
 			}, 5 * 60 * 1000);
 		});
 	}
 
+	/**
+	 * Record the server an SSO attempt targets in the dedicated
+	 * `pendingSetupServerUrl` setting (used for nothing else). If that value
+	 * changes, any in-flight SSO login is cancelled — switching servers mid-setup
+	 * must not let a stale login resolve against the wrong server.
+	 */
+	private beginSetupFor(baseUrl: string): void {
+		if (this.plugin.settings.pendingSetupServerUrl !== baseUrl) {
+			this.cancelPendingLogin("Sign-in cancelled: setup server changed.");
+			this.plugin.settings.pendingSetupServerUrl = baseUrl;
+			void this.plugin.saveSettings();
+		}
+	}
+
+	/** Reject and clear any in-flight SSO login wait. */
+	private cancelPendingLogin(reason: string): void {
+		const reject = this.pendingReject;
+		this.pendingLogin = null;
+		this.pendingReject = null;
+		reject?.(new Error(reason));
+	}
+
 	/** Called by the registered protocol handler in main.ts. */
 	handleProtocol(params: Record<string, string>): void {
 		const token = params.token;
 		if (!token) return;
+		this.completeWithToken(token);
+	}
+
+	/**
+	 * Paste-code fallback for when the `obsidian://` deep link doesn't fire:
+	 * feed the token shown in the browser straight into the pending login.
+	 */
+	submitPastedCode(token: string): void {
+		const trimmed = token.trim();
+		if (!trimmed) return;
+		this.completeWithToken(trimmed);
+	}
+
+	private completeWithToken(token: string): void {
 		if (this.pendingLogin) {
 			this.pendingLogin(token);
 		} else {
-			// Login completed without an awaiting promise (e.g. app restarted).
+			// No awaiting promise (e.g. app restarted between open and callback).
 			void this.setSession(token);
 		}
 	}

@@ -53,6 +53,8 @@ export class VaultSync {
 	private documents = new Map<string, Document>();
 	private destroyed = false;
 	private initialSynced = false;
+	/** Tracks the live connection so we only notify on a connected→dropped edge. */
+	private wasConnected = false;
 
 	private filesObserver: (event: Y.YMapEvent<string>) => void;
 	private statusListener: (status: YSweetStatus) => void;
@@ -81,12 +83,17 @@ export class VaultSync {
 
 		this.statusListener = (status) => {
 			if (status === STATUS_CONNECTED) {
+				this.wasConnected = true;
 				this.plugin.setStatus("connected");
 				void this.runInitialSync();
 			} else if (status === "connecting" || status === "handshaking") {
+				this.notifyDisconnected();
 				this.plugin.setStatus("connecting");
 			} else if (status === "error") {
+				this.notifyDisconnected();
 				this.plugin.setStatus("error");
+			} else {
+				this.notifyDisconnected();
 			}
 		};
 		this.indexProvider.on(EVENT_CONNECTION_STATUS, this.statusListener);
@@ -114,6 +121,13 @@ export class VaultSync {
 			void this.indexProvider.connect();
 		}
 		for (const doc of this.documents.values()) doc.ensureConnected();
+	}
+
+	/** Notify once when a live connection drops; silent while already offline. */
+	private notifyDisconnected(): void {
+		if (!this.wasConnected) return;
+		this.wasConnected = false;
+		new Notice("InstaSync: disconnected — reconnecting…");
 	}
 
 	// --- Index synchronisation -------------------------------------------------
