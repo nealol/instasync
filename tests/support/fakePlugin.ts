@@ -107,6 +107,7 @@ export interface FakePlugin {
 	registerEvent: (ref: unknown) => void;
 	applyAwarenessTo: (doc: unknown) => void;
 	setStatus: (status: string) => void;
+	setUploadStatus: (status: "idle" | "uploading" | "pending") => void;
 	saveSettings: () => Promise<void>;
 }
 
@@ -135,6 +136,7 @@ export function makeFakePlugin(
 		registerEvent: () => {},
 		applyAwarenessTo: () => {},
 		setStatus: () => {},
+		setUploadStatus: () => {},
 		saveSettings: async () => {},
 	};
 	plugin.auth = new AuthClient(plugin as any);

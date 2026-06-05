@@ -3,6 +3,7 @@ import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { InstaSyncSettings, InstaSyncSettingTab, defaultSettings } from "./settings";
 import { VaultSync, isConflictCopy } from "./VaultSync";
+import type { UploadStatus } from "./BinarySync";
 import { matchesAnyGlob, parseGlobs } from "./glob";
 import type { Document } from "./Document";
 import { AuthClient, AuthError } from "./auth";
@@ -12,11 +13,11 @@ import { yRemoteSelections, yRemoteSelectionsTheme } from "./editor/RemoteSelect
 type ConnectionStatus = "offline" | "connecting" | "connected" | "error" | "signin";
 
 const STATUS_TEXT: Record<ConnectionStatus, string> = {
-	offline: "InstaSync: off",
-	connecting: "InstaSync: connecting…",
-	connected: "InstaSync: live",
-	error: "InstaSync: error",
-	signin: "InstaSync: sign in",
+	offline: "Sync: offline",
+	connecting: "Sync: connecting…",
+	connected: "Sync: live",
+	error: "Sync: offline",
+	signin: "Sync: sign in",
 };
 
 export default class InstaSyncPlugin extends Plugin {
@@ -26,6 +27,8 @@ export default class InstaSyncPlugin extends Plugin {
 	private statusBarEl!: HTMLElement;
 	private statusRoot: Root | null = null;
 	private status: ConnectionStatus = "offline";
+	/** Attachment upload activity; overrides the "live" label when connected. */
+	private uploadStatus: UploadStatus = "idle";
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -127,6 +130,7 @@ export default class InstaSyncPlugin extends Plugin {
 	private stopSync(): void {
 		this.vaultSync?.destroy();
 		this.vaultSync = null;
+		this.uploadStatus = "idle";
 		this.setStatus("offline");
 	}
 
@@ -231,11 +235,24 @@ export default class InstaSyncPlugin extends Plugin {
 		this.renderStatus();
 	}
 
+	/** Reflect attachment upload activity (called by {@link BinarySync}). */
+	setUploadStatus(status: UploadStatus): void {
+		if (this.uploadStatus === status) return;
+		this.uploadStatus = status;
+		this.renderStatus();
+	}
+
 	private renderStatus(): void {
 		if (!this.statusBarEl) return;
 		this.statusRoot ??= createRoot(this.statusBarEl);
+		// Attachment upload activity takes precedence over the plain "live" label.
+		let text = STATUS_TEXT[this.status];
+		if (this.status === "connected") {
+			if (this.uploadStatus === "uploading") text = "Sync: uploading";
+			else if (this.uploadStatus === "pending") text = "Sync: pending upload";
+		}
 		flushSync(() => {
-			this.statusRoot?.render(STATUS_TEXT[this.status]);
+			this.statusRoot?.render(text);
 		});
 	}
 

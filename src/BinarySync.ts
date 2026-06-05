@@ -7,6 +7,15 @@ import { dbg } from "./debug";
 import { ensureParentFolder, getFileByPath, isOpenInWorkspace } from "./vaultHelpers";
 import { openBinaryConflictModal, type ConflictChoice } from "./BinaryConflictModal";
 
+/**
+ * Upload-queue state surfaced to the status bar:
+ *  - `uploading` — a blob transfer is in flight;
+ *  - `pending`   — blobs are queued but deferred (e.g. a large file waiting for
+ *                  note sync to quiet down);
+ *  - `idle`      — nothing queued or in flight.
+ */
+export type UploadStatus = "idle" | "uploading" | "pending";
+
 /** Metadata tracked per binary file in the shared index doc. */
 export interface BinaryMeta {
 	/** Lowercase hex sha256 of the file's bytes — the blob store key. */
@@ -61,7 +70,11 @@ export class BinarySync {
 	/** Background upload queue (latest job per path wins). */
 	private uploadQueue: UploadJob[] = [];
 	private draining = false;
+	/** True only while a single blob transfer is actually in flight. */
+	private activeUpload = false;
 	private drainTimer: number | null = null;
+	/** Last reported upload status (for the status bar); only emit on change. */
+	private uploadStatus: UploadStatus = "idle";
 
 	/** Serializes conflict modals so only one is shown at a time. */
 	private conflictChain: Promise<void> = Promise.resolve();
@@ -319,7 +332,20 @@ export class BinarySync {
 		// Latest job per path wins.
 		this.uploadQueue = this.uploadQueue.filter((j) => j.path !== job.path);
 		this.uploadQueue.push(job);
+		this.refreshUploadStatus();
 		this.scheduleDrain();
+	}
+
+	/** Notify the plugin when the upload status (idle/pending/uploading) changes. */
+	private refreshUploadStatus(): void {
+		let status: UploadStatus;
+		if (this.destroyed) status = "idle";
+		else if (this.activeUpload) status = "uploading";
+		else if (this.uploadQueue.length > 0) status = "pending";
+		else status = "idle";
+		if (status === this.uploadStatus) return;
+		this.uploadStatus = status;
+		this.plugin.setUploadStatus(status);
 	}
 
 	private scheduleDrain(delay = 0): void {
@@ -333,15 +359,19 @@ export class BinarySync {
 	private async drain(): Promise<void> {
 		if (this.draining || this.destroyed) return;
 		this.draining = true;
+		this.refreshUploadStatus();
 		try {
 			while (this.uploadQueue.length && !this.destroyed) {
 				const job = this.uploadQueue[0];
-				// Hold large transfers back while notes are actively syncing.
+				// Hold large transfers back while notes are actively syncing — they
+				// stay queued and surface as "pending" rather than "uploading".
 				if (job.size >= LARGE_FILE_BYTES && this.vaultSync.isTextSyncBusy()) {
 					this.scheduleDrain(DRAIN_RETRY_MS);
 					break;
 				}
 				this.uploadQueue.shift();
+				this.activeUpload = true;
+				this.refreshUploadStatus();
 				try {
 					await this.doUpload(job);
 				} catch (e) {
@@ -354,10 +384,14 @@ export class BinarySync {
 						new Notice(`InstaSync: failed to upload "${job.path}".`);
 					}
 					break;
+				} finally {
+					this.activeUpload = false;
+					this.refreshUploadStatus();
 				}
 			}
 		} finally {
 			this.draining = false;
+			this.refreshUploadStatus();
 		}
 	}
 
@@ -440,5 +474,6 @@ export class BinarySync {
 		}
 		this.uploadQueue = [];
 		this.chains.clear();
+		this.refreshUploadStatus();
 	}
 }

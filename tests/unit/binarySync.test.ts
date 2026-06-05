@@ -44,11 +44,14 @@ function makeDevice(name: string) {
 		indexDoc,
 		{ connect: true, showDebuggerLink: false },
 	);
-	// BinarySync only needs isTextSyncBusy() from its VaultSync.
-	const vaultSyncStub = { isTextSyncBusy: () => false };
+	// Record the upload-status transitions the plugin would render.
+	const uploadStates: string[] = [];
+	plugin.setUploadStatus = (v: string) => uploadStates.push(v);
+	// BinarySync only needs isTextSyncBusy() from its VaultSync; tests can flip it.
+	const vaultSyncStub = { busy: false, isTextSyncBusy() { return this.busy; } };
 	const bs = new BinarySync(plugin as any, vaultSyncStub as any, indexDoc);
 	const binaries = indexDoc.getMap<BinaryMeta>("binaries");
-	return { plugin, vault, indexDoc, provider, bs, binaries };
+	return { plugin, vault, indexDoc, provider, bs, binaries, uploadStates, vaultSyncStub };
 }
 
 const synced = (p: YSweetProvider) =>
@@ -86,6 +89,55 @@ describe("BinarySync", () => {
 			B.bs.destroy();
 			B.provider.destroy();
 			B.indexDoc.destroy();
+		}
+	});
+
+	it("signals uploading then idle around an upload", async () => {
+		const A = makeDevice("A");
+		try {
+			await synced(A.provider);
+			A.vault.binaries.set("small.bin", bytes([4, 5, 6, 7, 8, 9]));
+			A.bs.seedBaseline();
+			await A.bs.reconcileAll(["small.bin"]);
+
+			await waitFor(() => A.uploadStates.at(-1) === "idle", { label: "upload finished" });
+			expect(A.uploadStates).toContain("uploading");
+			expect(A.uploadStates.at(-1)).toBe("idle");
+			await waitFor(() => A.binaries.has("small.bin"), { label: "published" });
+		} finally {
+			A.bs.destroy();
+			A.provider.destroy();
+			A.indexDoc.destroy();
+		}
+	});
+
+	it("reports a large deferred file as pending while text sync is busy", async () => {
+		const A = makeDevice("A");
+		try {
+			await synced(A.provider);
+			// Pretend notes are actively syncing so large uploads are held back.
+			A.vaultSyncStub.busy = true;
+
+			// A >5MB file is queued but must not transfer yet.
+			const big = new Uint8Array(6 * 1024 * 1024);
+			big[0] = 1;
+			A.vault.binaries.set("huge.bin", big.buffer);
+			A.bs.seedBaseline();
+			await A.bs.reconcileAll(["huge.bin"]);
+
+			await waitFor(() => A.uploadStates.at(-1) === "pending", { label: "deferred -> pending" });
+			expect(A.uploadStates).not.toContain("uploading");
+			expect(A.binaries.has("huge.bin")).toBe(false); // not published while deferred
+
+			// Once notes go quiet, it uploads and settles to idle.
+			A.vaultSyncStub.busy = false;
+			await waitFor(() => A.uploadStates.at(-1) === "idle", { timeout: 15_000, label: "drains" });
+			expect(A.uploadStates).toContain("uploading");
+			expect(A.binaries.has("huge.bin")).toBe(true);
+		} finally {
+			A.bs.destroy();
+			A.provider.destroy();
+			A.indexDoc.destroy();
 		}
 	});
 
