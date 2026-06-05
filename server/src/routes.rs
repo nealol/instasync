@@ -8,13 +8,15 @@ use serde_json::Value;
 use crate::entities::{invites, memberships, permissions, users, vault_files, vaults};
 use crate::error::{AppError, AppResult};
 use crate::session::{bearer_token, now_millis, revoke_session, AuthUser};
-use crate::state::AppState;
+use crate::state::{AppState, Principal};
 use crate::words::generate_invite_code;
 use crate::ysweet::{ensure_doc, mint_client_token, Level};
 
 const ROLE_ADMIN: &str = "admin";
 const ROLE_MEMBER: &str = "member";
 const INVITE_TTL_MS: i64 = 1000 * 60 * 60 * 24 * 7;
+/// How long a minted connection token stays attributable to its principal.
+const PRINCIPAL_TTL_MS: i64 = 1000 * 60 * 60 * 24;
 
 // ---------- shared response shapes ----------
 
@@ -458,6 +460,23 @@ pub async fn doc_token(
 
     ensure_doc(&state, &body.doc_id).await?;
     let token = mint_client_token(&state, &body.doc_id, level).await?;
+
+    // Bind this connection token to the principal, so the proxy can attribute
+    // document writes (and thus git audit commits) to an authenticated identity.
+    if let Some(conn_token) = token.get("token").and_then(Value::as_str) {
+        state
+            .record_principal(
+                conn_token.to_string(),
+                Principal {
+                    user_id: user.id.clone(),
+                    display_name: user.display_name.clone(),
+                    email: user.email.clone(),
+                    expires_at_ms: now_millis() + PRINCIPAL_TTL_MS,
+                },
+            )
+            .await;
+    }
+
     Ok(Json(token))
 }
 

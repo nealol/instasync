@@ -23,6 +23,18 @@ pub struct Config {
     pub oidc_redirect_url: Option<String>,
     pub allowed_login_redirects: Vec<String>,
     pub cors_allowed_origins: Vec<String>,
+    /// Directory holding the per-vault git audit/backup repositories.
+    pub git_data_dir: String,
+    /// Master switch for the git audit log (disable to make it a no-op).
+    pub git_enabled: bool,
+    /// Debounce window: edits are coalesced into one commit after this idle gap.
+    pub git_debounce_ms: u64,
+    /// Identity used as the committer (and as the author when none is known).
+    pub git_bot_name: String,
+    pub git_bot_email: String,
+    /// Phase-2 hooks: remote to push each vault repo to (parsed but unused for now).
+    pub git_remote_url: Option<String>,
+    pub git_push_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +75,15 @@ impl Config {
             oidc_redirect_url: opt("OIDC_REDIRECT_URL"),
             allowed_login_redirects: list("ALLOWED_LOGIN_REDIRECTS"),
             cors_allowed_origins: list("CORS_ALLOWED_ORIGINS"),
+            git_data_dir: opt("GIT_DATA_DIR").unwrap_or_else(|| "./git".to_string()),
+            git_enabled: opt("GIT_AUDIT_ENABLED").as_deref() != Some("0"),
+            git_debounce_ms: opt("GIT_DEBOUNCE_MS")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5000),
+            git_bot_name: opt("GIT_BOT_NAME").unwrap_or_else(|| "InstaSync".to_string()),
+            git_bot_email: opt("GIT_BOT_EMAIL").unwrap_or_else(|| "instasync@localhost".to_string()),
+            git_remote_url: opt("GIT_REMOTE_URL"),
+            git_push_enabled: opt("GIT_PUSH_ENABLED").as_deref() == Some("1"),
         }
     }
 

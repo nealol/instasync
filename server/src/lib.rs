@@ -3,6 +3,7 @@ pub mod config;
 pub mod db;
 pub mod entities;
 pub mod error;
+pub mod git;
 pub mod oidc;
 pub mod proxy;
 pub mod routes;
@@ -40,8 +41,10 @@ pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
     let db = Database::connect(&config.database_url).await?;
     db::init_schema(&db).await?;
 
-    let authenticator = Authenticator::new(&config.ysweet_auth_key)
-        .map_err(|e| anyhow::anyhow!("invalid YSWEET_AUTH_KEY: {e}"))?;
+    let authenticator = Arc::new(
+        Authenticator::new(&config.ysweet_auth_key)
+            .map_err(|e| anyhow::anyhow!("invalid YSWEET_AUTH_KEY: {e}"))?,
+    );
 
     let http = reqwest::Client::builder()
         // Following redirects on the token endpoint opens us to SSRF.
@@ -50,12 +53,17 @@ pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
         .timeout(Duration::from_secs(30))
         .build()?;
 
+    let config = Arc::new(config);
+    let git = git::GitService::new(config.clone(), http.clone(), db.clone(), authenticator.clone());
+
     Ok(AppState {
         db,
-        config: Arc::new(config),
-        authenticator: Arc::new(authenticator),
+        config,
+        authenticator,
         http,
         oidc: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        git,
+        principals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     })
 }
 

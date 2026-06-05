@@ -33,6 +33,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 y-sweet-core = "0.9"
+yrs = "0.19"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

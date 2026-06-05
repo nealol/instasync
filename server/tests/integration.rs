@@ -49,6 +49,125 @@ async fn fake_ysweet() -> String {
     format!("http://{addr}")
 }
 
+// ---------- fake y-sweet that also serves /as-update (for the git audit test) ----------
+
+fn text_update(name: &str, value: &str) -> Vec<u8> {
+    use yrs::{Text, Transact};
+    let doc = yrs::Doc::new();
+    let text = doc.get_or_insert_text(name);
+    {
+        let mut txn = doc.transact_mut();
+        text.insert(&mut txn, 0, value);
+    }
+    use yrs::ReadTxn;
+    let u = doc.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+    u
+}
+
+fn files_update(entries: &[(&str, &str)]) -> Vec<u8> {
+    use yrs::{Map, Transact};
+    let doc = yrs::Doc::new();
+    let map = doc.get_or_insert_map("files");
+    {
+        let mut txn = doc.transact_mut();
+        for (path, guid) in entries {
+            map.insert(&mut txn, path.to_string(), guid.to_string());
+        }
+    }
+    use yrs::ReadTxn;
+    let u = doc.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+    u
+}
+
+/// A fake y-sweet whose `/doc/{id}/as-update` returns deterministic state: the
+/// index doc (id without `__`) yields a one-entry `files` map, and each file doc
+/// (`{vault}__{guid}`) yields `contents` text derived from its guid.
+async fn fake_ysweet_as_update() -> String {
+    use axum::extract::Path;
+    use axum::routing::get;
+
+    async fn as_update(Path(doc_id): Path<String>) -> Vec<u8> {
+        match doc_id.split_once("__") {
+            Some((_, guid)) => text_update("contents", &format!("# Note {guid}\n")),
+            None => files_update(&[("note.md", "g1")]),
+        }
+    }
+
+    let router = Router::new().route("/doc/{doc_id}/as-update", get(as_update));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// Build a git-enabled `AppState` plus its repo dir and a synthetic vault id.
+async fn git_state(ysweet_url: &str) -> (instasync_server::state::AppState, std::path::PathBuf, String) {
+    let mut db_path = std::env::temp_dir();
+    db_path.push(format!("instasync-test-{}.db", uuid::Uuid::new_v4()));
+    let mut git_dir = std::env::temp_dir();
+    git_dir.push(format!("instasync-git-{}", uuid::Uuid::new_v4()));
+
+    let config = Config {
+        database_url: format!("sqlite://{}?mode=rwc", db_path.display()),
+        bind_addr: "127.0.0.1:0".into(),
+        public_base_url: "http://auth.test".into(),
+        blob_dir: std::env::temp_dir().display().to_string(),
+        ysweet_url: ysweet_url.to_string(),
+        ysweet_public_url: ysweet_url.to_string(),
+        ysweet_auth_key: gen_auth_key(),
+        oidc_mode: OidcMode::Mock,
+        oidc_issuer: None,
+        oidc_client_id: None,
+        oidc_client_secret: None,
+        oidc_redirect_url: None,
+        allowed_login_redirects: vec![],
+        cors_allowed_origins: vec![],
+        git_data_dir: git_dir.display().to_string(),
+        git_enabled: true,
+        git_debounce_ms: 50,
+        git_bot_name: "InstaSync".into(),
+        git_bot_email: "instasync@localhost".into(),
+        git_remote_url: None,
+        git_push_enabled: false,
+    };
+    let state = build_state(config).await.unwrap();
+    let vault_id = uuid::Uuid::new_v4().to_string();
+    (state, git_dir, vault_id)
+}
+
+fn git_out(repo: &std::path::Path, args: &[&str]) -> (bool, String) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .expect("run git");
+    (out.status.success(), String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Poll the repo until a commit appears (or time out), returning the last log line.
+async fn wait_for_commit(repo: &std::path::Path) -> String {
+    for _ in 0..100 {
+        let (ok, line) = git_out(repo, &["log", "-1", "--format=%an|%ae|%s"]);
+        if ok && !line.is_empty() {
+            return line;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("no commit appeared in repo {}", repo.display());
+}
+
+fn principal(id: &str, name: &str, email: &str) -> instasync_server::state::Principal {
+    instasync_server::state::Principal {
+        user_id: id.into(),
+        display_name: name.into(),
+        email: email.into(),
+        expires_at_ms: i64::MAX,
+    }
+}
+
 // ---------- harness ----------
 
 async fn test_app(ysweet_url: &str, ysweet_public_url: &str) -> Router {
@@ -58,6 +177,9 @@ async fn test_app(ysweet_url: &str, ysweet_public_url: &str) -> Router {
 
     let mut blob_dir = std::env::temp_dir();
     blob_dir.push(format!("instasync-blobs-{}", uuid::Uuid::new_v4()));
+
+    let mut git_dir = std::env::temp_dir();
+    git_dir.push(format!("instasync-git-{}", uuid::Uuid::new_v4()));
 
     let config = Config {
         database_url,
@@ -74,6 +196,14 @@ async fn test_app(ysweet_url: &str, ysweet_public_url: &str) -> Router {
         oidc_redirect_url: None,
         allowed_login_redirects: vec!["http://app".into()],
         cors_allowed_origins: vec!["http://app".into()],
+        git_data_dir: git_dir.display().to_string(),
+        // Off by default; the git-specific test builds its own app with it enabled.
+        git_enabled: false,
+        git_debounce_ms: 50,
+        git_bot_name: "InstaSync".into(),
+        git_bot_email: "instasync@localhost".into(),
+        git_remote_url: None,
+        git_push_enabled: false,
     };
     let state = build_state(config).await.unwrap();
     app(state)
@@ -517,6 +647,42 @@ async fn blob_requires_auth() {
 
     let (status, _) = send_raw(&app, "HEAD", &uri, None, vec![]).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------- git audit log ----------
+
+#[tokio::test]
+async fn git_audit_commits_attributed_to_principal() {
+    let ys = fake_ysweet_as_update().await;
+    let (state, git_dir, vault_id) = git_state(&ys).await;
+    let repo = git_dir.join(&vault_id);
+
+    // A write by Alice triggers a debounced commit materializing the vault tree.
+    state
+        .git
+        .mark_write(&vault_id, &principal("u-alice", "Alice", "alice@example.com"))
+        .await;
+
+    let log = wait_for_commit(&repo).await;
+    assert_eq!(log, "Alice|alice@example.com|Sync 1 file(s)", "author/subject");
+
+    // The note's content was reconstructed from y-sweet, at its real vault path.
+    let content = std::fs::read_to_string(repo.join("note.md")).unwrap();
+    assert!(content.contains("# Note g1"), "got {content:?}");
+
+    // Structured audit trailers are present and parseable.
+    let (_, body) = git_out(&repo, &["log", "-1", "--format=%b"]);
+    assert!(body.contains(&format!("Vault-Id: {vault_id}")), "trailers: {body}");
+    assert!(body.contains("Principal-Id: u-alice"), "trailers: {body}");
+
+    // Idempotent: another write with no content change adds no commit.
+    state
+        .git
+        .mark_write(&vault_id, &principal("u-alice", "Alice", "alice@example.com"))
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let (_, count) = git_out(&repo, &["rev-list", "--count", "HEAD"]);
+    assert_eq!(count, "1", "no-op write must not create a second commit");
 }
 
 #[tokio::test]

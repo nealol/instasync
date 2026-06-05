@@ -45,8 +45,9 @@ RUN set -eux; \
 # --- runtime ---------------------------------------------------------------
 # rustls + webpki roots need ca-certificates to validate the OIDC provider's TLS.
 FROM debian:bookworm-slim AS runtime
+# git is the backend of the per-vault audit log / backup (see src/git.rs).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/instasync-server /usr/local/bin/instasync-server
@@ -66,6 +67,7 @@ ENV BIND_ADDR=0.0.0.0:8081 \
     PUBLIC_BASE_URL=http://127.0.0.1:8081 \
     YSWEET_INTERNAL_PORT=8080 \
     YSWEET_STORE=/data/ysweet \
+    GIT_DATA_DIR=/data/git \
     DATABASE_URL=sqlite:///data/instasync.db?mode=rwc \
     RUST_LOG=instasync_server=info,warn
 

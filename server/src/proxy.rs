@@ -24,7 +24,15 @@ use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as WsMsg};
 use url::Url;
 
-use crate::state::AppState;
+use crate::git::GitService;
+use crate::state::{AppState, Principal};
+
+/// Everything the proxy needs to attribute a write on this connection to a user.
+struct Attribution {
+    vault_id: String,
+    principal: Principal,
+    git: GitService,
+}
 
 /// Hop-by-hop headers must not be forwarded across the proxy.
 const HOP_BY_HOP: &[&str] = &[
@@ -81,13 +89,16 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         .to_string();
 
     if is_websocket_upgrade(&parts.headers) {
+        // Resolve who is on this connection before consuming the request parts, so
+        // content writes can be attributed to an authenticated principal.
+        let attribution = resolve_attribution(&state, &parts.uri).await;
         let ws = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
             Ok(ws) => ws,
             Err(rej) => return rej.into_response(),
         };
         let target = format!("ws://{authority}{path_and_query}");
         return ws.on_upgrade(move |client| async move {
-            if let Err(e) = relay_ws(client, &target).await {
+            if let Err(e) = relay_ws(client, target, attribution).await {
                 tracing::debug!("y-sweet ws proxy closed: {e}");
             }
         });
@@ -145,10 +156,66 @@ async fn proxy_http(
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response()))
 }
 
+/// Resolve the `(vault, principal)` for a sync WebSocket from its docId path and
+/// `?token=` query, returning `None` if the token is unknown/expired (e.g. a
+/// read-only viewer whose writes we simply won't attribute).
+async fn resolve_attribution(state: &AppState, uri: &axum::http::Uri) -> Option<Attribution> {
+    // Path is `/d/{docId}/{docId}`; the first segment after `/d/` is the docId.
+    let doc_id = uri.path().strip_prefix("/d/")?.split('/').next()?;
+    if doc_id.is_empty() {
+        return None;
+    }
+    let token = url::form_urlencoded::parse(uri.query()?.as_bytes())
+        .find(|(k, _)| k == "token")
+        .map(|(_, v)| v.into_owned())?;
+    let principal = state.principal_for_token(&token).await?;
+    // Index docId is the bare vaultId; file docIds are `{vaultId}__{guid}`.
+    let vault_id = doc_id.split("__").next().unwrap_or(doc_id).to_string();
+    Some(Attribution {
+        vault_id,
+        principal,
+        git: state.git.clone(),
+    })
+}
+
+/// Read one unsigned LEB128 varint (lib0 encoding), returning it and the rest.
+fn read_varint(buf: &[u8]) -> Option<(u64, &[u8])> {
+    let mut result: u64 = 0;
+    let mut shift = 0;
+    for (i, &byte) in buf.iter().enumerate() {
+        result |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Some((result, &buf[i + 1..]));
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
+    }
+    None
+}
+
+/// True if a client→server binary frame carries document content: a Yjs sync
+/// message (type 0) of sub-type SyncStep2 (1) or Update (2). Awareness (cursor)
+/// traffic and SyncStep1 (read requests) are deliberately ignored.
+fn is_content_write(data: &[u8]) -> bool {
+    let Some((msg_type, rest)) = read_varint(data) else {
+        return false;
+    };
+    if msg_type != 0 {
+        return false;
+    }
+    matches!(read_varint(rest), Some((sub, _)) if sub == 1 || sub == 2)
+}
+
 /// Open an upstream WebSocket to y-sweet and pump frames in both directions.
-async fn relay_ws(client: WebSocket, target: &str) -> anyhow::Result<()> {
+async fn relay_ws(
+    client: WebSocket,
+    target: String,
+    attribution: Option<Attribution>,
+) -> anyhow::Result<()> {
     // Connect over plain TCP (y-sweet is internal, no TLS) using the target's authority.
-    let request = target.into_client_request()?;
+    let request = target.as_str().into_client_request()?;
     let host = request
         .uri()
         .authority()
@@ -160,10 +227,15 @@ async fn relay_ws(client: WebSocket, target: &str) -> anyhow::Result<()> {
     let (mut up_tx, mut up_rx) = upstream.split();
     let (mut cl_tx, mut cl_rx) = client.split();
 
-    // client -> upstream
+    // client -> upstream (taps content writes for git attribution en route)
     let c2u = async {
         while let Some(msg) = cl_rx.next().await {
             let msg = msg?;
+            if let (Some(attr), AxumMsg::Binary(bytes)) = (&attribution, &msg) {
+                if is_content_write(bytes) {
+                    attr.git.mark_write(&attr.vault_id, &attr.principal).await;
+                }
+            }
             if let Some(out) = axum_to_tungstenite(msg) {
                 up_tx.send(out).await?;
             }

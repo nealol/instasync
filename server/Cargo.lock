@@ -1157,6 +1157,7 @@ dependencies = [
  "url",
  "uuid",
  "y-sweet-core",
+ "yrs",
 ]
 
 [[package]]
