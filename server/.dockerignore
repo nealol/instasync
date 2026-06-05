@@ -1,0 +1,6 @@
+target/
+*.db
+.check.log
+.test.log
+Dockerfile
+.dockerignore
