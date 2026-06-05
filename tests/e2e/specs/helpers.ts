@@ -106,6 +106,72 @@ export async function docTokenStatus(b: any, vaultId: string): Promise<string> {
 	}, vaultId);
 }
 
+// --- Live editing (real CM6 editor) ----------------------------------------
+//
+// The plain vault.modify/read helpers never open a file in an editor, so they
+// can't catch the class of bug where editing an *open* note corrupts content
+// (Obsidian's "modified externally and changes have been merged in" 3-way merge
+// duplicating characters). These helpers drive the actual Obsidian editor.
+
+/** Open a note in an editing (source/live-preview) leaf and make it active. */
+export async function openNoteInEditor(b: any, path: string): Promise<void> {
+	await b.executeObsidian(async ({ app }: any, p: string) => {
+		const f = app.vault.getAbstractFileByPath(p);
+		const leaf = app.workspace.getLeaf(true);
+		await leaf.openFile(f, { active: true, state: { mode: "source" } });
+		app.workspace.setActiveLeaf(leaf, { focus: true });
+	}, path);
+}
+
+/** Type text into the open editor for `path`, one char per CM transaction. */
+export async function typeInEditor(b: any, path: string, text: string): Promise<void> {
+	await b.executeObsidian(
+		async ({ app }: any, p: string, t: string) => {
+			const leaf = app.workspace
+				.getLeavesOfType("markdown")
+				.find((l: any) => l.view?.file?.path === p);
+			const editor = leaf?.view?.editor;
+			if (!editor) throw new Error("no open editor for " + p);
+			const last = editor.lastLine();
+			editor.setCursor({ line: last, ch: editor.getLine(last).length });
+			// Insert character by character so each is its own CM transaction —
+			// this is what a real keystroke stream looks like to LiveEdit.update().
+			for (const ch of t) editor.replaceSelection(ch);
+		},
+		path,
+		text,
+	);
+}
+
+/** Read the live editor buffer (not disk) for an open note. */
+export async function editorText(b: any, path: string): Promise<string | null> {
+	return b.executeObsidian(async ({ app }: any, p: string) => {
+		const leaf = app.workspace
+			.getLeavesOfType("markdown")
+			.find((l: any) => l.view?.file?.path === p);
+		return leaf?.view?.editor ? (leaf.view.editor.getValue() as string) : null;
+	}, path);
+}
+
+/**
+ * Toggle Live Preview ↔ raw Source on the active editor. This reconfigures the
+ * CM6 editor and destroys+recreates its view plugins (including LiveEdit) while
+ * the file stays open — the exact teardown that used to flush stale Y.Text to a
+ * disk that lagged the editor, triggering Obsidian's external-merge duplication.
+ */
+export async function toggleSourceMode(b: any): Promise<void> {
+	await b.executeObsidian(async ({ app }: any) => {
+		(app as any).commands.executeCommandById("editor:toggle-source");
+	});
+}
+
+/** Close every open markdown editor (test isolation). */
+export async function closeAllEditors(b: any): Promise<void> {
+	await b.executeObsidian(async ({ app }: any) => {
+		app.workspace.detachLeavesOfType("markdown");
+	});
+}
+
 export async function readNote(b: any, path: string): Promise<string | null> {
 	return b.executeObsidian(
 		async ({ app }: any, p: string) => {

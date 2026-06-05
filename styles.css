@@ -49,11 +49,23 @@
 	height: auto;
 	padding: 12px;
 	text-align: left;
+	white-space: normal;
+	overflow-wrap: anywhere;
+}
+
+.instasync-choice strong,
+.instasync-choice span {
+	white-space: normal;
+	overflow-wrap: anywhere;
 }
 
 .instasync-choice span {
 	color: var(--text-muted);
 	font-size: var(--font-ui-small);
+}
+
+.is-mobile .instasync-choice {
+	padding: 18px;
 }
 
 .instasync-actions {

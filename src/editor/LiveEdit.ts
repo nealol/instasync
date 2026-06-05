@@ -7,6 +7,8 @@ import type * as Y from "yjs";
 import type { Document } from "../Document";
 import { getDocumentForEditor } from "./context";
 import { ySyncAnnotation } from "./annotations";
+import { applyTextToYText } from "../diff";
+import { dbg, snip } from "../debug";
 
 class LiveEditPluginValue implements PluginValue {
 	private editor: EditorView;
@@ -82,6 +84,7 @@ class LiveEditPluginValue implements PluginValue {
 	private applyTextToEditor(target: string): void {
 		const current = this.editor.state.doc.toString();
 		if (current === target) return;
+		dbg("applyTextToEditor", this.doc?.path, "editor", snip(current), "->ytext", snip(target));
 
 		// Minimal prefix/suffix diff so we don't disturb the local selection.
 		let start = 0;
@@ -112,28 +115,19 @@ class LiveEditPluginValue implements PluginValue {
 			return;
 		}
 		if (!this.ytext || !update.docChanged) return;
-		// Skip changes we produced ourselves from a Yjs update.
-		if (
-			update.transactions.length > 0 &&
-			update.transactions.some((t) => t.annotation(ySyncAnnotation) === this.editor)
-		) {
-			return;
-		}
 
-		const ytext = this.ytext;
-		ytext.doc?.transact(() => {
-			let adj = 0;
-			update.changes.iterChanges((fromA, toA, _fromB, _toB, insert) => {
-				const insertText = insert.sliceString(0, insert.length, "\n");
-				if (fromA !== toA) {
-					ytext.delete(fromA + adj, toA - fromA);
-				}
-				if (insertText.length > 0) {
-					ytext.insert(fromA + adj, insertText);
-				}
-				adj += insertText.length - (toA - fromA);
-			});
-		}, this);
+		// Self-healing reconcile: make ytext match the editor's *current* text via a
+		// minimal prefix/suffix diff, instead of mapping CodeMirror change offsets
+		// onto ytext positions. Offset-mapping silently corrupts (and duplicates
+		// characters) the moment ytext and the editor drift apart — e.g. when a
+		// single ViewUpdate bundles an applied-remote change with a user keystroke.
+		// This approach can't drift: it is idempotent for the remote changes we
+		// ourselves applied (ytext already equals the editor, so it no-ops), which
+		// is also why it needs no annotation filter.
+		const target = update.state.doc.toString();
+		if (this.ytext.toString() === target) return;
+		dbg("local push", this.doc?.path, "ytext", snip(this.ytext.toString()), "->editor", snip(target));
+		applyTextToYText(this.ytext, target, this);
 	}
 
 	destroy(): void {

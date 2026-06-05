@@ -6,6 +6,7 @@ import { TFile, Notice, normalizePath } from "obsidian";
 import type InstaSyncPlugin from "./main";
 import { getClientToken } from "./ysweet";
 import { applyTextToYText } from "./diff";
+import { dbg, snip } from "./debug";
 
 /**
  * Origin tag used on Yjs transactions that originate from this Document writing
@@ -119,14 +120,24 @@ export class Document {
 
 	bindEditor(): void {
 		this.boundEditors++;
+		dbg("bindEditor", this.path, "count", this.boundEditors);
 	}
 
 	unbindEditor(): void {
 		this.boundEditors = Math.max(0, this.boundEditors - 1);
-		// When the last editor closes, make sure disk reflects the shared state.
-		if (this.boundEditors === 0 && !this.destroyed) {
+		dbg("unbindEditor", this.path, "count", this.boundEditors);
+		if (this.boundEditors !== 0 || this.destroyed) return;
+		// Obsidian destroys and immediately recreates the editor's view plugins on
+		// mode switches (Live Preview ↔ Source), splits, and re-layout — all while
+		// the file stays open — transiently dropping the count to zero. Defer a tick
+		// so a rebind cancels the flush, and never write while the file is still
+		// open anywhere: a vault.modify on an open file surfaces to Obsidian as an
+		// external change, which it then 3-way merges into its editor buffer,
+		// duplicating the just-typed text (and that merge gets re-sent to peers).
+		window.setTimeout(() => {
+			if (this.destroyed || this.boundEditors > 0 || this.isOpenInWorkspace()) return;
 			void this.writeToDisk(this.content);
-		}
+		}, 0);
 	}
 
 	get hasBoundEditor(): boolean {
@@ -197,10 +208,9 @@ export class Document {
 				await this.writeConflictCopy(localDisk);
 			}
 
-			// The editor (if bound) already received the merged text via the ytext
-			// observer and Obsidian persists it; only write to disk ourselves when
-			// no editor owns the file.
-			if (!this.hasBoundEditor) {
+			// The editor (if open) receives the merged text via the ytext observer;
+			// writing through vault.modify would make Obsidian merge an external change.
+			if (!this.hasBoundEditor && !this.isOpenInWorkspace()) {
 				await this.writeToDisk(merged);
 			}
 		} catch (e) {
@@ -240,9 +250,9 @@ export class Document {
 
 	private onYTextChanged(): void {
 		if (this.destroyed) return;
-		// While an editor is bound, the editor reflects the change and Obsidian
-		// writes the file; doing it here too would race.
-		if (this.hasBoundEditor) return;
+		// While a note is open, Obsidian owns its editor buffer and persistence;
+		// writing through vault.modify would appear as an external file change.
+		if (this.hasBoundEditor || this.isOpenInWorkspace()) return;
 		this.scheduleWriteToDisk();
 	}
 
@@ -252,16 +262,22 @@ export class Document {
 		}
 		this.writeTimer = window.setTimeout(() => {
 			this.writeTimer = null;
+			// Re-check at fire time, not just when scheduled: the note may have been
+			// opened during the debounce window. Writing through vault.modify onto a
+			// now-open file makes Obsidian report an external change and 3-way-merge
+			// it into the editor buffer, duplicating text (which is then re-sent).
+			if (this.destroyed || this.hasBoundEditor || this.isOpenInWorkspace()) return;
 			void this.writeToDisk(this.content);
 		}, 100);
 	}
 
 	/** Called by VaultSync when the local file changed and no editor is bound. */
 	async onDiskChanged(): Promise<void> {
-		if (this.destroyed || this.writingToDisk || this.hasBoundEditor) return;
+		if (this.destroyed || this.writingToDisk || this.hasBoundEditor || this.isOpenInWorkspace()) return;
 		const disk = await this.readFromDisk();
 		if (disk === null) return;
 		if (disk === this.content) return;
+		dbg("onDiskChanged FOLD disk->ytext", this.path, "disk", snip(disk), "ytext", snip(this.content));
 		this.ydoc.transact(() => {
 			applyTextToYText(this.ytext, disk, DISK_ORIGIN);
 		}, DISK_ORIGIN);
@@ -270,6 +286,20 @@ export class Document {
 	private getFile(): TFile | null {
 		const af = this.plugin.app.vault.getAbstractFileByPath(this.path);
 		return af instanceof TFile ? af : null;
+	}
+
+	private isOpenInWorkspace(): boolean {
+		const workspace = (this.plugin.app as any).workspace;
+		if (workspace?.getActiveFile?.()?.path === this.path) return true;
+
+		let found = false;
+		workspace?.iterateAllLeaves?.((leaf: any) => {
+			if (leaf?.view?.file?.path === this.path) found = true;
+		});
+		if (found) return true;
+
+		const leaves = workspace?.getLeavesOfType?.("markdown") ?? [];
+		return leaves.some((leaf: any) => leaf?.view?.file?.path === this.path);
 	}
 
 	private async readFromDisk(): Promise<string | null> {
@@ -284,7 +314,17 @@ export class Document {
 		try {
 			const file = this.getFile();
 			if (file) {
+				// Never modify a file that is open in an editor — Obsidian owns its
+				// buffer and persistence, and a vault.modify would surface as an
+				// external change it 3-way-merges, duplicating text. This is the last
+				// line of defence behind the callers' own open-state checks (which can
+				// race an open that happens during an awaited read/schedule).
+				if (this.hasBoundEditor || this.isOpenInWorkspace()) {
+					dbg("writeToDisk SKIP (open/bound)", this.path, "bound", this.boundEditors, "open", this.isOpenInWorkspace());
+					return;
+				}
 				if ((await this.plugin.app.vault.read(file)) === text) return;
+				dbg("%cwriteToDisk MODIFY", "color:orange", this.path, snip(text), "bound", this.boundEditors, "open", this.isOpenInWorkspace());
 				await this.plugin.app.vault.modify(file, text);
 			} else {
 				// Remote-created file that does not exist locally yet.

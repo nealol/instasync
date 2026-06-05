@@ -108,6 +108,139 @@ describe("Document sync", () => {
 		}
 	});
 
+	it("does not write remote updates to disk while the note is open", async () => {
+		const guid = freshGuid();
+		const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+			sessionToken: token,
+			activeVaultId: vaultId,
+		});
+		vault.files.set("note.md", "local buffer");
+		(plugin.app.workspace as any).getLeavesOfType = () => [
+			{ view: { file: { path: "note.md" } } },
+		];
+
+		const doc = new Document(plugin as any, "note.md", guid, docId(guid), true);
+		const peer = new Peer(memberPlugin, docId(guid));
+		try {
+			await doc.whenReady();
+			await peer.whenSynced();
+			await waitFor(() => peer.getText() === "local buffer", { label: "seed synced" });
+
+			peer.setText("remote update");
+			await waitFor(() => doc.content === "remote update", { label: "remote reached doc" });
+			await new Promise((r) => setTimeout(r, 250));
+
+			expect(vault.files.get("note.md")).toBe("local buffer");
+		} finally {
+			doc.destroy();
+			peer.destroy();
+		}
+	});
+
+	it("does not ingest disk modify events while the note is open", async () => {
+		const guid = freshGuid();
+		const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+			sessionToken: token,
+			activeVaultId: vaultId,
+		});
+		vault.files.set("note.md", "shared buffer");
+		(plugin.app.workspace as any).getLeavesOfType = () => [
+			{ view: { file: { path: "note.md" } } },
+		];
+
+		const doc = new Document(plugin as any, "note.md", guid, docId(guid), true);
+		const peer = new Peer(memberPlugin, docId(guid));
+		try {
+			await doc.whenReady();
+			await peer.whenSynced();
+			await waitFor(() => peer.getText() === "shared buffer", { label: "seed synced" });
+
+			vault.files.set("note.md", "disk save snapshot");
+			await doc.onDiskChanged();
+			await new Promise((r) => setTimeout(r, 250));
+
+			expect(doc.content).toBe("shared buffer");
+			expect(peer.getText()).toBe("shared buffer");
+		} finally {
+			doc.destroy();
+			peer.destroy();
+		}
+	});
+
+	it("does not write a scheduled disk update if the note opens during the debounce", async () => {
+		// The race behind the "modified externally / changes merged in" bug: a remote
+		// edit arrives while the note is closed and schedules a disk write; the user
+		// opens the note within the 100ms debounce window. The write must re-check at
+		// fire time and skip — otherwise vault.modify hits the open file and Obsidian
+		// 3-way-merges it, duplicating characters.
+		const guid = freshGuid();
+		const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+			sessionToken: token,
+			activeVaultId: vaultId,
+		});
+		vault.files.set("note.md", "base");
+		// Note starts closed: the default workspace mock reports no open leaves.
+
+		const doc = new Document(plugin as any, "note.md", guid, docId(guid), true);
+		const peer = new Peer(memberPlugin, docId(guid));
+		try {
+			await doc.whenReady();
+			await peer.whenSynced();
+			await waitFor(() => peer.getText() === "base", { label: "seed synced" });
+
+			// Remote edit lands -> onYTextChanged schedules a 100ms disk write.
+			peer.setText("base + remote");
+			await waitFor(() => doc.content === "base + remote", { label: "remote reached doc" });
+			// Open the note before the debounce timer fires.
+			(plugin.app.workspace as any).getLeavesOfType = () => [
+				{ view: { file: { path: "note.md" } } },
+			];
+			await new Promise((r) => setTimeout(r, 250));
+
+			expect(vault.files.get("note.md")).toBe("base");
+		} finally {
+			doc.destroy();
+			peer.destroy();
+		}
+	});
+
+	it("does not flush to disk when an editor unbinds while the note stays open", async () => {
+		// Obsidian tears down and immediately recreates the editor's view plugins on
+		// mode switches; the transient unbind must not vault.modify an open file
+		// (that surfaces as an external change Obsidian merges, duplicating text).
+		const guid = freshGuid();
+		const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+			sessionToken: token,
+			activeVaultId: vaultId,
+		});
+		vault.files.set("note.md", "disk lags editor");
+		(plugin.app.workspace as any).getLeavesOfType = () => [
+			{ view: { file: { path: "note.md" } } },
+		];
+
+		const doc = new Document(plugin as any, "note.md", guid, docId(guid), true);
+		const peer = new Peer(memberPlugin, docId(guid));
+		try {
+			await doc.whenReady();
+			await peer.whenSynced();
+			await waitFor(() => peer.getText() === "disk lags editor", { label: "seed synced" });
+
+			// Editor holds newer content than disk (Obsidian hasn't autosaved yet).
+			doc.bindEditor();
+			peer.setText("disk lags editor +typed");
+			await waitFor(() => doc.content === "disk lags editor +typed", { label: "edit reached doc" });
+
+			doc.unbindEditor();
+			await new Promise((r) => setTimeout(r, 250));
+
+			// File still open => no write, so Obsidian never sees an external change.
+			expect(vault.files.get("note.md")).toBe("disk lags editor");
+		} finally {
+			doc.destroy();
+			peer.destroy();
+		}
+	});
+
 	it("startup conflict: merges divergent offline writes and saves a conflict copy", async () => {
 		const guid = freshGuid();
 		const peer = new Peer(memberPlugin, docId(guid));

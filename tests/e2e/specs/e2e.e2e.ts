@@ -7,6 +7,11 @@ import {
 	readNote,
 	writeNote,
 	deleteNote,
+	openNoteInEditor,
+	typeInEditor,
+	editorText,
+	toggleSourceMode,
+	closeAllEditors,
 	listMarkdown,
 	setPluginEnabled,
 	installNetworkShim,
@@ -175,6 +180,112 @@ describe("InstaSync — two isolated Obsidian devices", function () {
 				async () => (await readNote(A, "Paused.md")) === "written while A is paused",
 				{ timeout: 60 * SECONDS, timeoutMsg: "A did not catch up after unpausing" },
 			);
+		});
+	});
+
+	describe("live editing of an open note", function () {
+		// Regression for the character-duplication bug: typing into an *open*
+		// editor while a view-plugin teardown (mode switch) flushes Y.Text to a
+		// disk that lags the editor made Obsidian report "modified externally and
+		// changes have been merged in" and 3-way-merge the just-typed text back
+		// into the buffer, duplicating characters (and re-sending them to peers).
+		// The plain modify/read sync tests can't see this — only a real editor can.
+		it("does not duplicate characters when editing through mode switches", async function () {
+			const text = "The quick brown fox jumps over the lazy dog";
+
+			await writeNote(A, "Live.md", "");
+			await B.waitUntil(async () => (await readNote(B, "Live.md")) === "", {
+				timeout: 60 * SECONDS,
+				timeoutMsg: "B never received the empty Live.md",
+			});
+
+			await openNoteInEditor(A, "Live.md");
+
+			// Interleave typing with view-plugin teardowns while the disk lags the
+			// editor (we never pause for Obsidian's autosave between type + toggle).
+			await typeInEditor(A, "Live.md", "The quick brown fox ");
+			await toggleSourceMode(A); // -> raw source: editor torn down + rebuilt
+			await toggleSourceMode(A); // -> live preview: torn down + rebuilt again
+			await typeInEditor(A, "Live.md", "jumps over the lazy dog");
+			await toggleSourceMode(A);
+			await toggleSourceMode(A);
+
+			try {
+				// The live editor buffer must be exactly what was typed — any
+				// external-merge would have duplicated characters here. (Disk lags:
+				// we never write while the file is open, so assert the buffer.)
+				await A.waitUntil(async () => (await editorText(A, "Live.md")) === text, {
+					timeout: 30 * SECONDS,
+					timeoutMsg: `A's editor buffer was corrupted: "${await editorText(A, "Live.md")}"`,
+				});
+				// And the duplication must not have propagated: B converges to the
+				// exact text, with no extra characters.
+				await B.waitUntil(async () => (await readNote(B, "Live.md")) === text, {
+					timeout: 60 * SECONDS,
+					timeoutMsg: `B did not converge to the typed text: "${await readNote(B, "Live.md")}"`,
+				});
+				// Closing the only editor flushes the (clean) buffer to A's disk.
+				await closeAllEditors(A);
+				await A.waitUntil(async () => (await readNote(A, "Live.md")) === text, {
+					timeout: 30 * SECONDS,
+					timeoutMsg: `A's disk did not match after close: "${await readNote(A, "Live.md")}"`,
+				});
+			} finally {
+				await closeAllEditors(A);
+				await deleteNote(A, "Live.md");
+			}
+		});
+
+		it("converges without duplicating when both devices edit the open note", async function () {
+			// The collaborative case that stresses the editor↔Y.Text binding: both
+			// devices have the note open and type concurrently. A binding that maps
+			// CodeMirror offsets onto stale Y.Text positions duplicates characters
+			// here; a self-healing diff binding converges to exactly the typed chars.
+			await writeNote(A, "Co.md", "");
+			await B.waitUntil(async () => (await readNote(B, "Co.md")) === "", {
+				timeout: 60 * SECONDS,
+				timeoutMsg: "B never received the empty Co.md",
+			});
+
+			await openNoteInEditor(A, "Co.md");
+			await openNoteInEditor(B, "Co.md");
+
+			// Interleave keystrokes on both devices so remote applies and local
+			// pushes land in the same editor update cycles.
+			for (let i = 0; i < 6; i++) {
+				await typeInEditor(A, "Co.md", "aa");
+				await typeInEditor(B, "Co.md", "bb");
+			}
+
+			try {
+				const expectedA = 12;
+				const expectedB = 12;
+				// Both editors must converge to the SAME text...
+				let last = { a: "", b: "" };
+				await A.waitUntil(
+					async () => {
+						last.a = (await editorText(A, "Co.md")) ?? "";
+						last.b = (await editorText(B, "Co.md")) ?? "";
+						return last.a.length > 0 && last.a === last.b;
+					},
+					{
+						timeout: 60 * SECONDS,
+						timeoutMsg: () => `editors never converged: A="${last.a}" B="${last.b}"`,
+					},
+				);
+				// ...and that text must contain exactly the characters typed — no
+				// duplicates (would be >12) and no losses (<12).
+				const converged = last.a;
+				const aCount = converged.split("").filter((c) => c === "a").length;
+				const bCount = converged.split("").filter((c) => c === "b").length;
+				expect(`${aCount}/${bCount}/${converged.length}`).toBe(
+					`${expectedA}/${expectedB}/${expectedA + expectedB}`,
+				);
+			} finally {
+				await closeAllEditors(A);
+				await closeAllEditors(B);
+				await deleteNote(A, "Co.md");
+			}
 		});
 	});
 
