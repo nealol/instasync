@@ -360,7 +360,7 @@ function Toggle({ value, onChange }: { value: boolean; onChange: (value: boolean
  * giving the muted icon-button display used elsewhere in settings. `onClick` is
  * read through a ref so a re-render never needs to rebuild the component.
  */
-function ExtraButton({ icon, tooltip, onClick }: { icon: string; tooltip?: string; onClick: () => void }) {
+function ExtraButton({ icon, tooltip, className, onClick }: { icon: string; tooltip?: string; className?: string; onClick: () => void }) {
     const ref = useRef<HTMLSpanElement>(null)
     const onClickRef = useRef(onClick)
     onClickRef.current = onClick
@@ -371,7 +371,7 @@ function ExtraButton({ icon, tooltip, onClick }: { icon: string; tooltip?: strin
         if (tooltip) button.setTooltip(tooltip)
         return () => { el.empty() }
     }, [icon, tooltip])
-    return <span ref={ref}/>
+    return <span className={className} ref={ref}/>
 }
 
 function DeviceSection({ plugin }: { plugin: InstaSyncPlugin }) {
@@ -427,11 +427,9 @@ function VaultDetails({ plugin }: { app: App; plugin: InstaSyncPlugin }) {
     }
     return (
         <>
-            <h3>Vault Details</h3>
+            <h3>Vault Details{activeVault ? ` - ${activeVault.name}` : ''}</h3>
             {vaultError ? <p className="instasync-error">{vaultError}</p> : null}
-            {activeVault ? <p className="setting-item-description">Syncing <strong>{activeVault.name}</strong>. Your
-                    role: {activeVault.role}{activeVault.owner ? ' (owner)' : ''}.</p> :
-                <p className="setting-item-description">Loading vault details...</p>}
+            {!activeVault ? <p className="setting-item-description">Loading vault details...</p> : null}
             {membersError ? <p className="instasync-error">{membersError}</p> : null}
             {members === null ? <p className="setting-item-description">Loading members...</p> : null}
             {activeVault && members?.map((member) => <MemberRow key={member.userId} plugin={plugin} vault={activeVault}
@@ -498,20 +496,19 @@ function RemoteCursorRow({ plugin, vault, cursor, reload }: {
     cursor: RemoteCursorInfo;
     reload: () => void;
 }) {
-    return <SettingRow name={cursor.name} desc={cursor.mcpUrl} control={<>
-        <button onClick={() => new RemoteCursorNameModal(plugin.app, plugin, vault, reload, cursor).open()}>Edit</button>
+    return <SettingRow name={<span className="instasync-row-title-action">{cursor.name}<ExtraButton icon="pencil" tooltip="Edit remote cursor" onClick={() => new RemoteCursorNameModal(plugin.app, plugin, vault, reload, cursor).open()}/></span>} desc={cursor.mcpUrl} control={<>
         <button onClick={() => void copyText(cursor.mcpUrl, 'InstaSync: MCP URL copied.')}>Copy MCP URL</button>
         <button onClick={() => void runNotice(undefined, async () => {
             if (!confirm(`Regenerate the secret token for "${cursor.name}"? The previous token will stop working.`)) return
             const result = await plugin.auth.regenerateCursorToken(vault.id, cursor.id)
             await copyText(result.secretToken, 'InstaSync: new secret token copied.')
-        })}>Copy secret token</button>
-        <button className="mod-warning" onClick={() => void runNotice(undefined, async () => {
+        })}>Regen API Secret</button>
+        <ExtraButton className="instasync-danger-icon" icon="trash-2" tooltip="Remove remote cursor" onClick={() => void runNotice(undefined, async () => {
             if (!confirm(`Remove remote cursor "${cursor.name}"?`)) return
             await plugin.auth.deleteCursor(vault.id, cursor.id)
             new Notice('InstaSync: remote cursor removed.')
             reload()
-        })}>Remove</button>
+        })}/>
     </>}/>
 }
 
@@ -552,16 +549,18 @@ function RemoteCursorNameView({ plugin, vault, cursor, refresh, close }: {
 }) {
     const [name, setName] = useState(cursor?.name ?? '')
     const [secretToken, setSecretToken] = useState('')
+    const [createdCursor, setCreatedCursor] = useState<RemoteCursorInfo | null>(null)
     const [busy, setBusy] = useState(false)
     const renameMode = !!cursor
     return <>
         <h3>{renameMode ? 'Rename Remote Cursor' : 'Add Remote Cursor'}</h3>
-        <p className="setting-item-description">{renameMode ? 'Update the display name for this remote cursor.' : 'Name this remote cursor. Its secret token is shown only once.'}</p>
+        <p className="setting-item-description">{renameMode ? 'Update the display name for this remote cursor.' : 'Name this remote cursor. MCP servers use the MCP URL for OIDC OAuth. Direct API requests use the secret token as a Bearer token.'}</p>
         <input className="instasync-modal-input" type="text" value={name}
                onChange={(event) => setName(event.currentTarget.value)}/>
         {secretToken ? <div className="instasync-warning-box">
             <strong>Copy this secret token now.</strong>
-            <p>It will not be shown again. Regenerating later invalidates this token.</p>
+            <p>It will not be shown again. Use it as an API Bearer token. Regenerating later invalidates this token.</p>
+            {createdCursor ? <p>MCP URL: <code>{createdCursor.mcpUrl}</code></p> : null}
             <div className="instasync-actions"><code>{secretToken}</code><button onClick={() => void copyText(secretToken, 'InstaSync: secret token copied.')}>Copy</button></div>
         </div> : null}
         <div className="instasync-actions">
@@ -574,6 +573,7 @@ function RemoteCursorNameView({ plugin, vault, cursor, refresh, close }: {
                     close()
                 } else {
                     const created = await plugin.auth.createCursor(vault.id, name.trim())
+                    setCreatedCursor(created)
                     setSecretToken(created.secretToken)
                     await copyText(created.secretToken, 'InstaSync: secret token copied.')
                     refresh()
@@ -799,7 +799,7 @@ async function copyText(text: string, message: string): Promise<void> {
     new Notice(message)
 }
 
-function SettingRow({ name, desc, control }: { name: string; desc?: ReactNode; control: ReactNode }) {
+function SettingRow({ name, desc, control }: { name: ReactNode; desc?: ReactNode; control: ReactNode }) {
     return <div className="setting-item">
         <div className="setting-item-info">
             <div className="setting-item-name">{name}</div>

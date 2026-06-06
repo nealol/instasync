@@ -86,6 +86,16 @@
 	color: var(--text-error);
 }
 
+.instasync-row-title-action {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+}
+
+.instasync-danger-icon .clickable-icon {
+	color: var(--text-error);
+}
+
 .instasync-advanced {
 	margin-top: 24px;
 	border-top: 1px solid var(--background-modifier-border);
