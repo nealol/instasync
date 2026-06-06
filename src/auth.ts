@@ -33,6 +33,12 @@ export interface RemoteCursorInfo {
 	createdAt: number;
 }
 
+/** Stable permalink for a note, returned by the note-permalinks endpoint. */
+export interface PermalinkResponse {
+	kind: string;
+	url: string;
+}
+
 /** Thrown when the server rejects the session; callers should prompt re-login. */
 export class AuthError extends Error {}
 
@@ -337,6 +343,15 @@ export class AuthClient {
 
 	async deleteCursor(vaultId: string, cursorId: string): Promise<void> {
 		await this.api(`/api/vaults/${vaultId}/cursors/${cursorId}`, { method: "DELETE" });
+	}
+
+	/** Resolve a stable, shareable permalink (`…/n/{guid}`) for a note by path. */
+	notePermalink(vaultId: string, path: string): Promise<PermalinkResponse> {
+		const encoded = path.split("/").map(encodeURIComponent).join("/");
+		return this.api<PermalinkResponse>(
+			`/api/vaults/${vaultId}/note-permalinks/${encoded}`,
+			{ method: "POST", body: {} },
+		);
 	}
 
 	/** Best-effort registry update so the server can resolve doc → path for ACLs. */

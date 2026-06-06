@@ -440,7 +440,9 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "Generate a stable permalink for a note")]
+    #[tool(
+        description = "Generate a stable permalink for a note. Returns a URL of the form <public-base>/n/<guid>. Opening it in a browser issues an HTTP redirect to an obsidian://instasync-open deeplink, which opens the note in the user's Obsidian vault via the InstaSync plugin. The permalink tracks the note by stable guid, so it keeps working after the note is renamed or moved. Share this URL as-is; do not rewrite it into an obsidian:// link yourself."
+    )]
     async fn generate_permalink(
         &self,
         context: RequestContext<RoleServer>,

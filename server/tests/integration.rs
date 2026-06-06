@@ -1218,7 +1218,7 @@ async fn note_crud_rest_roundtrip() {
         .to_str()
         .unwrap();
     assert!(loc.starts_with("obsidian://instasync-open?"));
-    assert!(loc.contains(&format!("vault={vault_id}")));
+    assert!(loc.contains(&format!("vaultId={vault_id}")));
     assert!(loc.contains(&format!("guid={guid}")));
 
     let res = app

@@ -20,8 +20,11 @@ pub async fn note_by_guid(
         .one(&state.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    // NB: use `vaultId`, not `vault` — Obsidian reserves the `vault` query
+    // parameter and resolves it to a local Obsidian vault before dispatching to
+    // our protocol handler, failing with "Unable to find a vault for the URL".
     Ok(Redirect::temporary(&format!(
-        "obsidian://instasync-open?vault={}&guid={}",
+        "obsidian://instasync-open?vaultId={}&guid={}",
         encode_component(&file.vault_id),
         encode_component(&file.guid)
     )))
@@ -37,8 +40,11 @@ pub async fn note_by_path(Query(query): Query<PathPermalinkQuery>) -> Response {
     if query.vault.is_empty() || query.path.is_empty() {
         return (StatusCode::BAD_REQUEST, "invalid permalink").into_response();
     }
+    // See note_by_guid: the obsidian deeplink must avoid the reserved `vault`
+    // parameter, so emit `vaultId` even though the public `/p` query still
+    // accepts `vault` for readability.
     Redirect::temporary(&format!(
-        "obsidian://instasync-open?vault={}&path={}",
+        "obsidian://instasync-open?vaultId={}&path={}",
         encode_component(&query.vault),
         encode_component(&query.path)
     ))

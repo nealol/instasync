@@ -1,4 +1,4 @@
-import { Notice, Plugin, TFile } from "obsidian";
+import { Menu, MenuItem, Notice, Plugin, TFile } from "obsidian";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { InstaSyncSettings, InstaSyncSettingTab, defaultSettings } from "./settings";
@@ -88,6 +88,13 @@ export default class InstaSyncPlugin extends Plugin {
 			this.app.workspace.on("active-leaf-change", () => this.vaultSync?.reconnectAll()),
 		);
 
+		// Add "as Instasync Permalink" under the file tree's native "Copy path >" submenu.
+		this.registerEvent(
+			this.app.workspace.on("file-menu", (menu, file) => {
+				if (file instanceof TFile) this.addPermalinkMenuItem(menu, file);
+			}),
+		);
+
 		// Wait for the vault to finish loading before scanning files.
 		this.app.workspace.onLayoutReady(() => void this.maybeStartSync());
 	}
@@ -171,7 +178,10 @@ export default class InstaSyncPlugin extends Plugin {
 
 	private async openInstasyncLink(params: Record<string, string>): Promise<void> {
 		try {
-			const vaultId = params.vault?.trim();
+			// `vault` is reserved by Obsidian's URI router; permalinks pass the
+			// vault id as `vaultId`. Fall back to the legacy `vault` param just in
+			// case one reaches us (older links that slipped past Obsidian).
+			const vaultId = (params.vaultId ?? params.vault)?.trim();
 			if (!vaultId || vaultId !== this.settings.activeVaultId) {
 				new Notice("InstaSync: this link is for a different vault.");
 				return;
@@ -196,6 +206,50 @@ export default class InstaSyncPlugin extends Plugin {
 		} catch (e) {
 			console.error("[InstaSync] failed to open permalink", e);
 			new Notice(`InstaSync: failed to open link: ${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+
+	/**
+	 * Inject "as Instasync Permalink" into the file tree context menu. Obsidian's
+	 * core renders a native "Copy path >" submenu; we slot our option in there when
+	 * we can find it, and otherwise fall back to a top-level "Copy Instasync
+	 * permalink" item so the action is always reachable.
+	 */
+	private addPermalinkMenuItem(menu: Menu, file: TFile): void {
+		const build = (item: MenuItem, title: string) => {
+			item
+				.setTitle(title)
+				.setIcon("link")
+				.onClick(() => void this.copyInstasyncPermalink(file));
+		};
+		const submenu = findCopyPathSubmenu(menu);
+		if (submenu) {
+			submenu.addItem((item) => build(item, "as Instasync Permalink"));
+		} else {
+			menu.addItem((item) => build(item, "Copy Instasync permalink"));
+		}
+	}
+
+	/** Resolve and copy a stable permalink for the given file to the clipboard. */
+	private async copyInstasyncPermalink(file: TFile): Promise<void> {
+		try {
+			const vaultId = this.settings.activeVaultId;
+			if (!vaultId) {
+				new Notice("InstaSync: set up a vault before copying a permalink.");
+				return;
+			}
+			if (!this.auth.isLoggedIn) {
+				new Notice("InstaSync: sign in to copy a permalink.");
+				return;
+			}
+			const { url } = await this.auth.notePermalink(vaultId, file.path);
+			await navigator.clipboard?.writeText(url);
+			new Notice("InstaSync: permalink copied.");
+		} catch (e) {
+			console.error("[InstaSync] failed to copy permalink", e);
+			new Notice(
+				`InstaSync: failed to copy permalink: ${e instanceof Error ? e.message : String(e)}`,
+			);
 		}
 	}
 
@@ -320,6 +374,36 @@ export default class InstaSyncPlugin extends Plugin {
 	applyDiagnosticLoggingSetting(): void {
 		setDiagnosticLoggingEnabled(!!this.settings.diagnosticLogging);
 	}
+}
+
+/**
+ * Obsidian's bundled types don't expose a menu's items or an item's submenu,
+ * but both exist at runtime — the native "Copy path >" entry is a MenuItem with
+ * a populated `submenu`. We read these defensively so a future API change just
+ * trips the top-level fallback instead of throwing.
+ */
+interface InternalMenuItem extends MenuItem {
+	submenu?: Menu | null;
+	titleEl?: HTMLElement;
+	dom?: HTMLElement;
+}
+interface InternalMenu extends Menu {
+	items?: MenuItem[];
+}
+
+/** Locate the native "Copy path" submenu within a file-menu, if present. */
+function findCopyPathSubmenu(menu: Menu): Menu | null {
+	const items = (menu as InternalMenu).items;
+	if (!Array.isArray(items)) return null;
+	for (const raw of items) {
+		const item = raw as InternalMenuItem;
+		if (!item.submenu) continue;
+		const title = (item.titleEl?.textContent ?? item.dom?.textContent ?? "")
+			.trim()
+			.toLowerCase();
+		if (title.includes("copy path")) return item.submenu;
+	}
+	return null;
 }
 
 function sanitizeSettings(raw: unknown): InstaSyncSettings {
