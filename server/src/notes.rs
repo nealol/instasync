@@ -114,20 +114,87 @@ pub(crate) async fn list_notes_inner(
     principal.require_vault(&vault_id)?;
     require_member(&state, &principal.user.id, &vault_id).await?;
 
-    let mut files = vault_files::Entity::find()
-        .filter(vault_files::Column::VaultId.eq(vault_id))
-        .all(&state.db)
-        .await?;
-    files.sort_by(|a, b| a.path.cmp(&b.path));
+    // The y-sweet index doc is the source of truth for which files exist; the
+    // `vault_files` table is a server-side mirror. Reconcile before listing so
+    // files deleted on a client (which only removes them from the index doc,
+    // never calling the server delete API) don't surface as ghost notes.
+    let mut files = reconcile_vault_files(state, vault_id).await?;
+    files.sort_by(|a, b| a.0.cmp(&b.0));
 
     Ok(files
         .into_iter()
-        .map(|file| NoteSummary {
-            permalink: permalink_for_guid(&state, &file.guid),
-            path: file.path,
-            guid: file.guid,
+        .map(|(path, guid)| NoteSummary {
+            permalink: permalink_for_guid(&state, &guid),
+            path,
+            guid,
         })
         .collect())
+}
+
+/// Reconcile the `vault_files` registry against the authoritative y-sweet index
+/// doc (`files` map of path -> guid), returning the live `(path, guid)` entries.
+///
+/// Clients propagate deletions/renames only through the index doc's CRDT, so the
+/// DB registry drifts: deleted files leave orphan rows ("ghosts") and renamed
+/// files leave stale paths. We prune orphan rows and upsert missing/stale ones
+/// so the registry mirrors reality. The index doc is trusted as truth here, the
+/// same way the git audit service materializes commits from it.
+pub(crate) async fn reconcile_vault_files(
+    state: &AppState,
+    vault_id: &str,
+) -> AppResult<Vec<(String, String)>> {
+    let update = ydoc::read_update(state, vault_id).await?;
+    // (path, guid) entries from the live index doc.
+    let index = ydoc::decode_files_map(&update).map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let rows = vault_files::Entity::find()
+        .filter(vault_files::Column::VaultId.eq(vault_id))
+        .all(&state.db)
+        .await?;
+
+    let row_tuples: Vec<(String, String, String)> = rows
+        .iter()
+        .map(|r| (r.id.clone(), r.guid.clone(), r.path.clone()))
+        .collect();
+    let (delete_ids, upserts) = plan_reconcile(&index, &row_tuples);
+
+    for id in delete_ids {
+        vault_files::Entity::delete_by_id(id).exec(&state.db).await?;
+    }
+    for (path, guid) in upserts {
+        ydoc::upsert_vault_file(state, vault_id, &path, &guid).await?;
+    }
+
+    Ok(index)
+}
+
+/// Pure planner for {@link reconcile_vault_files}: given the live index entries
+/// (`path`, `guid`) and the existing DB rows (`id`, `guid`, `path`), decide
+/// which row ids to delete (orphans) and which `(path, guid)` to upsert (missing
+/// or stale-path rows).
+fn plan_reconcile(
+    index: &[(String, String)],
+    rows: &[(String, String, String)],
+) -> (Vec<String>, Vec<(String, String)>) {
+    use std::collections::{HashMap, HashSet};
+
+    let live_guids: HashSet<&str> = index.iter().map(|(_, guid)| guid.as_str()).collect();
+    let row_path_by_guid: HashMap<&str, &str> =
+        rows.iter().map(|(_, guid, path)| (guid.as_str(), path.as_str())).collect();
+
+    let delete_ids = rows
+        .iter()
+        .filter(|(_, guid, _)| !live_guids.contains(guid.as_str()))
+        .map(|(id, _, _)| id.clone())
+        .collect();
+
+    let upserts = index
+        .iter()
+        .filter(|(path, guid)| row_path_by_guid.get(guid.as_str()) != Some(&path.as_str()))
+        .map(|(path, guid)| (path.clone(), guid.clone()))
+        .collect();
+
+    (delete_ids, upserts)
 }
 
 pub async fn create_note(
@@ -723,4 +790,77 @@ fn frontmatter_bounds(content: &str) -> Option<(&str, usize)> {
         after_marker
     };
     Some((yaml, body_start))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn idx(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(path, guid)| (path.to_string(), guid.to_string()))
+            .collect()
+    }
+
+    fn rows(entries: &[(&str, &str, &str)]) -> Vec<(String, String, String)> {
+        entries
+            .iter()
+            .map(|(id, guid, path)| (id.to_string(), guid.to_string(), path.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn prunes_ghost_rows_absent_from_index() {
+        // "a" still exists; "ghost" was deleted on a client (gone from the index).
+        let index = idx(&[("a.md", "guid-a")]);
+        let db = rows(&[("1", "guid-a", "a.md"), ("2", "guid-ghost", "Seed.md")]);
+
+        let (delete_ids, upserts) = plan_reconcile(&index, &db);
+
+        assert_eq!(delete_ids, vec!["2".to_string()]);
+        assert!(upserts.is_empty());
+    }
+
+    #[test]
+    fn upserts_missing_and_stale_path_rows() {
+        // "a" missing from DB entirely; "b" present but with an outdated path.
+        let index = idx(&[("a.md", "guid-a"), ("new/b.md", "guid-b")]);
+        let db = rows(&[("2", "guid-b", "old/b.md")]);
+
+        let (delete_ids, mut upserts) = plan_reconcile(&index, &db);
+        upserts.sort();
+
+        assert!(delete_ids.is_empty());
+        assert_eq!(
+            upserts,
+            vec![
+                ("a.md".to_string(), "guid-a".to_string()),
+                ("new/b.md".to_string(), "guid-b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_op_when_registry_matches_index() {
+        let index = idx(&[("a.md", "guid-a"), ("dir/b.md", "guid-b")]);
+        let db = rows(&[("1", "guid-a", "a.md"), ("2", "guid-b", "dir/b.md")]);
+
+        let (delete_ids, upserts) = plan_reconcile(&index, &db);
+
+        assert!(delete_ids.is_empty());
+        assert!(upserts.is_empty());
+    }
+
+    #[test]
+    fn empty_index_prunes_all_rows() {
+        let index = idx(&[]);
+        let db = rows(&[("1", "guid-a", "a.md"), ("2", "guid-b", "b.md")]);
+
+        let (mut delete_ids, upserts) = plan_reconcile(&index, &db);
+        delete_ids.sort();
+
+        assert_eq!(delete_ids, vec!["1".to_string(), "2".to_string()]);
+        assert!(upserts.is_empty());
+    }
 }

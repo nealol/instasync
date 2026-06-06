@@ -304,7 +304,7 @@ fn common_affixes(old: &str, new: &str) -> (usize, usize, usize) {
     (prefix, old_suffix, new_suffix)
 }
 
-async fn upsert_vault_file(
+pub(crate) async fn upsert_vault_file(
     state: &AppState,
     vault_id: &str,
     path: &str,
