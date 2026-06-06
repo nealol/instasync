@@ -87,12 +87,14 @@ impl GitService {
             return;
         }
         let mut vaults = self.0.vaults.lock().await;
-        let entry = vaults.entry(vault_id.to_string()).or_insert_with(|| VaultState {
-            dirty: false,
-            contributors: Vec::new(),
-            deadline: Instant::now(),
-            running: false,
-        });
+        let entry = vaults
+            .entry(vault_id.to_string())
+            .or_insert_with(|| VaultState {
+                dirty: false,
+                contributors: Vec::new(),
+                deadline: Instant::now(),
+                running: false,
+            });
         entry.dirty = true;
         if !entry.contributors.iter().any(|c| c.user_id == who.user_id) {
             entry.contributors.push(who.clone());
@@ -128,7 +130,9 @@ impl GitService {
             // Claim the pending work.
             let contributors = {
                 let mut vaults = self.0.vaults.lock().await;
-                let Some(s) = vaults.get_mut(&vault_id) else { return };
+                let Some(s) = vaults.get_mut(&vault_id) else {
+                    return;
+                };
                 if !s.dirty {
                     s.running = false;
                     return;
@@ -144,7 +148,9 @@ impl GitService {
             // More writes during the commit? Loop and wait again; otherwise stop.
             {
                 let mut vaults = self.0.vaults.lock().await;
-                let Some(s) = vaults.get_mut(&vault_id) else { return };
+                let Some(s) = vaults.get_mut(&vault_id) else {
+                    return;
+                };
                 if !s.dirty {
                     s.running = false;
                     return;
@@ -184,9 +190,11 @@ impl GitService {
         // 3. Write the tree to disk (and prune anything no longer present).
         let repo_for_blocking = repo.clone();
         let tree_for_blocking = tree.clone();
-        tokio::task::spawn_blocking(move || materialize_tree(&repo_for_blocking, &tree_for_blocking))
-            .await
-            .context("materialize task panicked")??;
+        tokio::task::spawn_blocking(move || {
+            materialize_tree(&repo_for_blocking, &tree_for_blocking)
+        })
+        .await
+        .context("materialize task panicked")??;
 
         // 4. Commit the diff, if any.
         self.commit(&repo, vault_id, tree.len(), contributors).await
@@ -202,9 +210,15 @@ impl GitService {
             .await
             .with_context(|| format!("create repo dir {}", repo.display()))?;
         self.git(&repo, &["init", "-q"]).await?;
-        self.git(&repo, &["config", "core.autocrlf", "false"]).await?;
-        self.git(&repo, &["config", "user.name", &self.0.config.git_bot_name]).await?;
-        self.git(&repo, &["config", "user.email", &self.0.config.git_bot_email]).await?;
+        self.git(&repo, &["config", "core.autocrlf", "false"])
+            .await?;
+        self.git(&repo, &["config", "user.name", &self.0.config.git_bot_name])
+            .await?;
+        self.git(
+            &repo,
+            &["config", "user.email", &self.0.config.git_bot_email],
+        )
+        .await?;
         Ok(repo)
     }
 
@@ -351,7 +365,10 @@ fn build_commit_meta(
         message.push_str("Principal-Type: user\n");
     }
     for p in contributors.iter().skip(1) {
-        message.push_str(&format!("Co-authored-by: {} <{}>\n", p.display_name, p.email));
+        message.push_str(&format!(
+            "Co-authored-by: {} <{}>\n",
+            p.display_name, p.email
+        ));
     }
     (author, message)
 }
@@ -460,7 +477,9 @@ mod tests {
             let mut txn = doc.transact_mut();
             text.insert(&mut txn, 0, value);
         }
-        let update = doc.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        let update = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
         update
     }
 
@@ -473,7 +492,9 @@ mod tests {
                 map.insert(&mut txn, path.to_string(), guid.to_string());
             }
         }
-        let update = doc.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        let update = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
         update
     }
 
@@ -504,15 +525,28 @@ mod tests {
         assert!(safe_rel_path("a/../b").is_err());
         assert!(safe_rel_path("a\\b").is_err());
         assert!(safe_rel_path("").is_err());
-        assert_eq!(safe_rel_path("a/b.md").unwrap(), PathBuf::from("a").join("b.md"));
+        assert_eq!(
+            safe_rel_path("a/b.md").unwrap(),
+            PathBuf::from("a").join("b.md")
+        );
     }
 
     #[test]
     fn commit_meta_uses_primary_author_and_coauthors() {
         let config = test_config();
         let contributors = vec![
-            Principal { user_id: "u1".into(), display_name: "Alice".into(), email: "a@x".into(), expires_at_ms: 0 },
-            Principal { user_id: "u2".into(), display_name: "Bob".into(), email: "b@x".into(), expires_at_ms: 0 },
+            Principal {
+                user_id: "u1".into(),
+                display_name: "Alice".into(),
+                email: "a@x".into(),
+                expires_at_ms: 0,
+            },
+            Principal {
+                user_id: "u2".into(),
+                display_name: "Bob".into(),
+                email: "b@x".into(),
+                expires_at_ms: 0,
+            },
         ];
         let (author, message) = build_commit_meta("v1", 2, &contributors, &config);
         assert_eq!(author, "Alice <a@x>");

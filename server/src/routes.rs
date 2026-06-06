@@ -5,9 +5,11 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, Tran
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::entities::{invites, memberships, permissions, users, vault_files, vaults};
+use crate::entities::{
+    invites, memberships, permissions, remote_cursors, users, vault_files, vaults,
+};
 use crate::error::{AppError, AppResult};
-use crate::session::{bearer_token, now_millis, revoke_session, AuthUser};
+use crate::session::{bearer_token, hash_token, now_millis, revoke_session, AuthUser};
 use crate::state::{AppState, Principal};
 use crate::words::generate_invite_code;
 use crate::ysweet::{ensure_doc, mint_client_token, Level};
@@ -205,7 +207,9 @@ pub async fn create_invite(
             Err(_) => continue, // unique violation -> new code
         }
     }
-    Err(AppError::Internal("could not generate a unique invite".into()))
+    Err(AppError::Internal(
+        "could not generate a unique invite".into(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -231,7 +235,10 @@ pub async fn redeem_invite(
         .await?
         .ok_or(AppError::NotFound)?;
 
-    if invite.expires_at.is_some_and(|expires| expires < now_millis()) {
+    if invite
+        .expires_at
+        .is_some_and(|expires| expires < now_millis())
+    {
         return Err(AppError::NotFound);
     }
 
@@ -241,7 +248,10 @@ pub async fn redeem_invite(
         .ok_or(AppError::NotFound)?;
 
     // Already a member: idempotent success without consuming the invite.
-    if membership(&state, &user.id, &invite.vault_id).await?.is_some() {
+    if membership(&state, &user.id, &invite.vault_id)
+        .await?
+        .is_some()
+    {
         return Ok(Json(RedeemResponse {
             vault_id: vault.id,
             name: vault.name,
@@ -252,11 +262,21 @@ pub async fn redeem_invite(
 
     // Atomic single-use claim: only succeeds while used_by IS NULL and unexpired.
     let claimed = invites::Entity::update_many()
-        .col_expr(invites::Column::UsedBy, sea_orm::sea_query::Expr::value(user.id.clone()))
-        .col_expr(invites::Column::UsedAt, sea_orm::sea_query::Expr::value(now_millis()))
+        .col_expr(
+            invites::Column::UsedBy,
+            sea_orm::sea_query::Expr::value(user.id.clone()),
+        )
+        .col_expr(
+            invites::Column::UsedAt,
+            sea_orm::sea_query::Expr::value(now_millis()),
+        )
         .filter(invites::Column::Code.eq(&body.code))
         .filter(invites::Column::UsedBy.is_null())
-        .filter(invites::Column::ExpiresAt.is_null().or(invites::Column::ExpiresAt.gt(now_millis())))
+        .filter(
+            invites::Column::ExpiresAt
+                .is_null()
+                .or(invites::Column::ExpiresAt.gt(now_millis())),
+        )
         .exec(&txn)
         .await?;
 
@@ -386,6 +406,184 @@ pub async fn remove_member(
         .await?;
 
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// ---------- remote cursors ----------
+
+#[derive(Deserialize)]
+pub struct CursorNameBody {
+    pub name: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteCursorResponse {
+    pub id: String,
+    pub app_id: String,
+    pub name: String,
+    pub mcp_url: String,
+    pub created_at: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatedRemoteCursorResponse {
+    pub id: String,
+    pub app_id: String,
+    pub name: String,
+    pub mcp_url: String,
+    pub created_at: i64,
+    pub secret_token: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretTokenResponse {
+    pub secret_token: String,
+}
+
+pub async fn list_cursors(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(vault_id): Path<String>,
+) -> AppResult<Json<Vec<RemoteCursorResponse>>> {
+    require_admin(&state, &user.id, &vault_id).await?;
+
+    let cursors = remote_cursors::Entity::find()
+        .filter(remote_cursors::Column::VaultId.eq(&vault_id))
+        .all(&state.db)
+        .await?;
+
+    Ok(Json(
+        cursors
+            .into_iter()
+            .map(|cursor| remote_cursor_response(&state, cursor))
+            .collect(),
+    ))
+}
+
+pub async fn create_cursor(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(vault_id): Path<String>,
+    Json(body): Json<CursorNameBody>,
+) -> AppResult<Json<CreatedRemoteCursorResponse>> {
+    require_admin(&state, &user.id, &vault_id).await?;
+    let name = clean_cursor_name(body.name)?;
+    let secret_token = random_cursor_token();
+    let now = now_millis();
+
+    for _ in 0..5 {
+        let model = remote_cursors::ActiveModel {
+            id: Set(uuid::Uuid::new_v4().to_string()),
+            vault_id: Set(vault_id.clone()),
+            app_id: Set(nanoid::nanoid!()),
+            name: Set(name.clone()),
+            token_hash: Set(hash_token(&secret_token)),
+            created_by: Set(user.id.clone()),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+
+        if let Ok(cursor) = model.insert(&state.db).await {
+            return Ok(Json(CreatedRemoteCursorResponse {
+                id: cursor.id,
+                app_id: cursor.app_id.clone(),
+                name: cursor.name,
+                mcp_url: mcp_url(&state, &cursor.app_id),
+                created_at: cursor.created_at,
+                secret_token,
+            }));
+        }
+    }
+
+    Err(AppError::Internal(
+        "could not generate a unique cursor id".into(),
+    ))
+}
+
+pub async fn rename_cursor(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((vault_id, cursor_id)): Path<(String, String)>,
+    Json(body): Json<CursorNameBody>,
+) -> AppResult<Json<RemoteCursorResponse>> {
+    require_admin(&state, &user.id, &vault_id).await?;
+    let cursor = cursor_in_vault(&state, &vault_id, &cursor_id).await?;
+    let mut active: remote_cursors::ActiveModel = cursor.into();
+    active.name = Set(clean_cursor_name(body.name)?);
+    active.updated_at = Set(now_millis());
+    let updated = active.update(&state.db).await?;
+    Ok(Json(remote_cursor_response(&state, updated)))
+}
+
+pub async fn regenerate_cursor_token(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((vault_id, cursor_id)): Path<(String, String)>,
+) -> AppResult<Json<SecretTokenResponse>> {
+    require_admin(&state, &user.id, &vault_id).await?;
+    let cursor = cursor_in_vault(&state, &vault_id, &cursor_id).await?;
+    let secret_token = random_cursor_token();
+    let mut active: remote_cursors::ActiveModel = cursor.into();
+    active.token_hash = Set(hash_token(&secret_token));
+    active.updated_at = Set(now_millis());
+    active.update(&state.db).await?;
+    Ok(Json(SecretTokenResponse { secret_token }))
+}
+
+pub async fn delete_cursor(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((vault_id, cursor_id)): Path<(String, String)>,
+) -> AppResult<Json<Value>> {
+    require_admin(&state, &user.id, &vault_id).await?;
+    let cursor = cursor_in_vault(&state, &vault_id, &cursor_id).await?;
+    remote_cursors::Entity::delete_by_id(cursor.id)
+        .exec(&state.db)
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+fn remote_cursor_response(state: &AppState, cursor: remote_cursors::Model) -> RemoteCursorResponse {
+    RemoteCursorResponse {
+        id: cursor.id,
+        app_id: cursor.app_id.clone(),
+        name: cursor.name,
+        mcp_url: mcp_url(state, &cursor.app_id),
+        created_at: cursor.created_at,
+    }
+}
+
+async fn cursor_in_vault(
+    state: &AppState,
+    vault_id: &str,
+    cursor_id: &str,
+) -> AppResult<remote_cursors::Model> {
+    remote_cursors::Entity::find_by_id(cursor_id.to_string())
+        .filter(remote_cursors::Column::VaultId.eq(vault_id))
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)
+}
+
+fn clean_cursor_name(name: String) -> AppResult<String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(AppError::BadRequest("cursor name is required".into()));
+    }
+    Ok(name)
+}
+
+fn random_cursor_token() -> String {
+    nanoid::nanoid!(48)
+}
+
+fn mcp_url(state: &AppState, app_id: &str) -> String {
+    format!(
+        "{}/mcp/i/{app_id}",
+        state.config.public_base_url.trim_end_matches('/')
+    )
 }
 
 // ---------- file registry ----------

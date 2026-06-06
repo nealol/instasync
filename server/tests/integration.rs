@@ -60,7 +60,9 @@ fn text_update(name: &str, value: &str) -> Vec<u8> {
         text.insert(&mut txn, 0, value);
     }
     use yrs::ReadTxn;
-    let u = doc.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+    let u = doc
+        .transact()
+        .encode_state_as_update_v1(&yrs::StateVector::default());
     u
 }
 
@@ -75,7 +77,9 @@ fn files_update(entries: &[(&str, &str)]) -> Vec<u8> {
         }
     }
     use yrs::ReadTxn;
-    let u = doc.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+    let u = doc
+        .transact()
+        .encode_state_as_update_v1(&yrs::StateVector::default());
     u
 }
 
@@ -103,7 +107,13 @@ async fn fake_ysweet_as_update() -> String {
 }
 
 /// Build a git-enabled `AppState` plus its repo dir and a synthetic vault id.
-async fn git_state(ysweet_url: &str) -> (instasync_server::state::AppState, std::path::PathBuf, String) {
+async fn git_state(
+    ysweet_url: &str,
+) -> (
+    instasync_server::state::AppState,
+    std::path::PathBuf,
+    String,
+) {
     let mut db_path = std::env::temp_dir();
     db_path.push(format!("instasync-test-{}.db", uuid::Uuid::new_v4()));
     let mut git_dir = std::env::temp_dir();
@@ -144,7 +154,10 @@ fn git_out(repo: &std::path::Path, args: &[&str]) -> (bool, String) {
         .args(args)
         .output()
         .expect("run git");
-    (out.status.success(), String::from_utf8_lossy(&out.stdout).trim().to_string())
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+    )
 }
 
 /// Poll the repo until a commit appears (or time out), returning the last log line.
@@ -255,7 +268,12 @@ async fn login(app: &Router, sub: &str) -> String {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::SEE_OTHER, "login should redirect");
-    let loc = res.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+    let loc = res
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
     let state = url::Url::parse(&format!("http://x{loc}"))
         .unwrap()
         .query_pairs()
@@ -275,8 +293,17 @@ async fn login(app: &Router, sub: &str) -> String {
         )
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::SEE_OTHER, "callback should redirect");
-    let loc = res.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::SEE_OTHER,
+        "callback should redirect"
+    );
+    let loc = res
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
     url::Url::parse(loc)
         .unwrap()
         .query_pairs()
@@ -341,8 +368,14 @@ async fn create_list_vault() {
     let app = test_app(&ys, &ys).await;
     let token = login(&app, "alice").await;
 
-    let (status, vault) =
-        send(&app, "POST", "/api/vaults", Some(&token), Some(json!({"name": "Notes"}))).await;
+    let (status, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&token),
+        Some(json!({"name": "Notes"})),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(vault["role"], "admin");
     assert_eq!(vault["owner"], true);
@@ -361,8 +394,14 @@ async fn invite_is_single_use_and_grants_membership() {
     let bob = login(&app, "bob").await;
     let carol = login(&app, "carol").await;
 
-    let (_, vault) =
-        send(&app, "POST", "/api/vaults", Some(&admin), Some(json!({"name": "Shared"}))).await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&admin),
+        Some(json!({"name": "Shared"})),
+    )
+    .await;
     let vault_id = vault["id"].as_str().unwrap().to_string();
 
     // Non-admin cannot invite.
@@ -389,14 +428,26 @@ async fn invite_is_single_use_and_grants_membership() {
     assert_eq!(code.split('-').count(), 4);
 
     // Bob redeems successfully.
-    let (status, redeem) =
-        send(&app, "POST", "/api/invites/redeem", Some(&bob), Some(json!({"code": code}))).await;
+    let (status, redeem) = send(
+        &app,
+        "POST",
+        "/api/invites/redeem",
+        Some(&bob),
+        Some(json!({"code": code})),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(redeem["vaultId"], vault_id);
 
     // Carol cannot reuse the same single-use code.
-    let (status, _) =
-        send(&app, "POST", "/api/invites/redeem", Some(&carol), Some(json!({"code": code}))).await;
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/invites/redeem",
+        Some(&carol),
+        Some(json!({"code": code})),
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT);
 }
 
@@ -411,8 +462,14 @@ async fn promote_member_to_admin() {
         .unwrap()
         .to_string();
 
-    let (_, vault) =
-        send(&app, "POST", "/api/vaults", Some(&admin), Some(json!({"name": "V"}))).await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&admin),
+        Some(json!({"name": "V"})),
+    )
+    .await;
     let vault_id = vault["id"].as_str().unwrap().to_string();
     let (_, invite) = send(
         &app,
@@ -423,11 +480,24 @@ async fn promote_member_to_admin() {
     )
     .await;
     let code = invite["code"].as_str().unwrap().to_string();
-    send(&app, "POST", "/api/invites/redeem", Some(&bob), Some(json!({"code": code}))).await;
+    send(
+        &app,
+        "POST",
+        "/api/invites/redeem",
+        Some(&bob),
+        Some(json!({"code": code})),
+    )
+    .await;
 
     // Bob (member) can list members; promotion still succeeds.
-    let (status, _) =
-        send(&app, "GET", &format!("/api/vaults/{vault_id}/members"), Some(&bob), None).await;
+    let (status, _) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/members"),
+        Some(&bob),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     let (status, _) = send(
@@ -440,8 +510,14 @@ async fn promote_member_to_admin() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, _) =
-        send(&app, "GET", &format!("/api/vaults/{vault_id}/members"), Some(&bob), None).await;
+    let (status, _) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/members"),
+        Some(&bob),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -467,8 +543,14 @@ async fn remove_member_permissions() {
         .unwrap()
         .to_string();
 
-    let (_, vault) =
-        send(&app, "POST", "/api/vaults", Some(&owner), Some(json!({"name": "V"}))).await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&owner),
+        Some(json!({"name": "V"})),
+    )
+    .await;
     let vault_id = vault["id"].as_str().unwrap().to_string();
 
     for token in [&admin, &member] {
@@ -481,8 +563,14 @@ async fn remove_member_permissions() {
         )
         .await;
         let code = invite["code"].as_str().unwrap().to_string();
-        send(&app, "POST", "/api/invites/redeem", Some(token), Some(json!({"code": code})))
-            .await;
+        send(
+            &app,
+            "POST",
+            "/api/invites/redeem",
+            Some(token),
+            Some(json!({"code": code})),
+        )
+        .await;
     }
 
     let (status, _) = send(
@@ -503,7 +591,11 @@ async fn remove_member_permissions() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "admin cannot remove another admin");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "admin cannot remove another admin"
+    );
 
     let (status, _) = send(
         &app,
@@ -533,7 +625,11 @@ async fn remove_member_permissions() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "owner cannot remove themselves");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "owner cannot remove themselves"
+    );
 
     let (status, _) = send(
         &app,
@@ -543,7 +639,11 @@ async fn remove_member_permissions() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "outsider cannot remove anyone");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "outsider cannot remove anyone"
+    );
 }
 
 // ---------- blob store ----------
@@ -581,8 +681,14 @@ async fn blob_put_head_get_roundtrip() {
     let alice = login(&app, "alice").await;
     let bob = login(&app, "bob").await;
 
-    let (_, vault) =
-        send(&app, "POST", "/api/vaults", Some(&alice), Some(json!({"name": "V"}))).await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&alice),
+        Some(json!({"name": "V"})),
+    )
+    .await;
     let vault_id = vault["id"].as_str().unwrap().to_string();
 
     let content = b"\x00\x01\x02 binary payload \xff\xfe".to_vec();
@@ -620,8 +726,14 @@ async fn blob_rejects_bad_hash_and_mismatch() {
     let ys = fake_ysweet().await;
     let app = test_app(&ys, &ys).await;
     let alice = login(&app, "alice").await;
-    let (_, vault) =
-        send(&app, "POST", "/api/vaults", Some(&alice), Some(json!({"name": "V"}))).await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&alice),
+        Some(json!({"name": "V"})),
+    )
+    .await;
     let vault_id = vault["id"].as_str().unwrap().to_string();
 
     // Non-hex / wrong-length hash is rejected before touching the filesystem.
@@ -640,8 +752,14 @@ async fn blob_requires_auth() {
     let ys = fake_ysweet().await;
     let app = test_app(&ys, &ys).await;
     let alice = login(&app, "alice").await;
-    let (_, vault) =
-        send(&app, "POST", "/api/vaults", Some(&alice), Some(json!({"name": "V"}))).await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&alice),
+        Some(json!({"name": "V"})),
+    )
+    .await;
     let vault_id = vault["id"].as_str().unwrap().to_string();
     let uri = format!("/api/vaults/{vault_id}/blobs/{}", "b".repeat(64));
 
@@ -660,16 +778,25 @@ async fn git_audit_commits_attributed_to_principal() {
     // A write by Alice triggers a debounced commit materializing the vault tree.
     state
         .git
-        .mark_write(&vault_id, &principal("u-alice", "Alice", "alice@example.com"))
+        .mark_write(
+            &vault_id,
+            &principal("u-alice", "Alice", "alice@example.com"),
+        )
         .await;
 
     let log = wait_for_commit(&repo).await;
-    assert_eq!(log, "Alice|alice@example.com|Sync 1 file(s)", "author/subject");
+    assert_eq!(
+        log, "Alice|alice@example.com|Sync 1 file(s)",
+        "author/subject"
+    );
 
     // Committer is pinned to the InstaSync bot (not the server's git identity),
     // even though the author is the attributed user.
     let (_, committer) = git_out(&repo, &["log", "-1", "--format=%cn|%ce"]);
-    assert_eq!(committer, "InstaSync|instasync@localhost", "committer identity");
+    assert_eq!(
+        committer, "InstaSync|instasync@localhost",
+        "committer identity"
+    );
 
     // The note's content was reconstructed from y-sweet, at its real vault path.
     let content = std::fs::read_to_string(repo.join("note.md")).unwrap();
@@ -677,13 +804,19 @@ async fn git_audit_commits_attributed_to_principal() {
 
     // Structured audit trailers are present and parseable.
     let (_, body) = git_out(&repo, &["log", "-1", "--format=%b"]);
-    assert!(body.contains(&format!("Vault-Id: {vault_id}")), "trailers: {body}");
+    assert!(
+        body.contains(&format!("Vault-Id: {vault_id}")),
+        "trailers: {body}"
+    );
     assert!(body.contains("Principal-Id: u-alice"), "trailers: {body}");
 
     // Idempotent: another write with no content change adds no commit.
     state
         .git
-        .mark_write(&vault_id, &principal("u-alice", "Alice", "alice@example.com"))
+        .mark_write(
+            &vault_id,
+            &principal("u-alice", "Alice", "alice@example.com"),
+        )
         .await;
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     let (_, count) = git_out(&repo, &["rev-list", "--count", "HEAD"]);
@@ -698,8 +831,14 @@ async fn doc_token_scopes_and_mints() {
     let alice = login(&app, "alice").await;
     let bob = login(&app, "bob").await;
 
-    let (_, vault) =
-        send(&app, "POST", "/api/vaults", Some(&alice), Some(json!({"name": "V"}))).await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&alice),
+        Some(json!({"name": "V"})),
+    )
+    .await;
     let vault_id = vault["id"].as_str().unwrap().to_string();
 
     // Non-member is refused.
@@ -735,7 +874,10 @@ async fn doc_token_scopes_and_mints() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        token["url"].as_str().unwrap().contains("public.example:9999"),
+        token["url"]
+            .as_str()
+            .unwrap()
+            .contains("public.example:9999"),
         "host should be rewritten to public url, got {}",
         token["url"]
     );

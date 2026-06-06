@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type InstaSyncPlugin from './main'
-import { normalizeServerUrl, type MemberInfo, type VaultInfo } from './auth'
+import { normalizeServerUrl, type MemberInfo, type RemoteCursorInfo, type VaultInfo } from './auth'
 import { generateClientIdentity } from './names'
 
 export interface InstaSyncSettings {
@@ -14,8 +14,6 @@ export interface InstaSyncSettings {
      * changing it cancels any pending SSO login (see AuthClient.beginSetupFor).
      */
     pendingSetupServerUrl: string;
-    /** Opaque session bearer token; empty when logged out. */
-    sessionToken: string;
     /** Identity from /api/me, cached for status + awareness defaults. */
     userDisplayName: string;
     userEmail: string;
@@ -44,7 +42,6 @@ export function defaultSettings(): InstaSyncSettings {
     return {
         authServerUrl: 'http://127.0.0.1:8081',
         pendingSetupServerUrl: '',
-        sessionToken: '',
         userDisplayName: '',
         userEmail: '',
         activeVaultId: '',
@@ -440,6 +437,7 @@ function VaultDetails({ plugin }: { app: App; plugin: InstaSyncPlugin }) {
             {activeVault && members?.map((member) => <MemberRow key={member.userId} plugin={plugin} vault={activeVault}
                                                                 member={member} reload={reloadAll}/>)}
             {activeVault?.role === 'admin' ? <InviteGenerator plugin={plugin} vault={activeVault}/> : null}
+            {activeVault?.role === 'admin' ? <RemoteCursors plugin={plugin} vault={activeVault}/> : null}
         </>
     )
 }
@@ -479,6 +477,110 @@ function InviteGenerator({ plugin, vault }: { plugin: InstaSyncPlugin; vault: Va
         })}>Generate invite
         </button>
         {code ? <code>{code}</code> : null}</>}/>
+}
+
+function RemoteCursors({ plugin, vault }: { plugin: InstaSyncPlugin; vault: VaultInfo }) {
+    const { cursors, error, reload } = useRemoteCursors(plugin, vault.id)
+    return <>
+        <h3>Remote Cursors</h3>
+        {error ? <p className="instasync-error">{error}</p> : null}
+        {!error && cursors === null ? <p className="setting-item-description">Loading remote cursors...</p> : null}
+        {cursors?.length === 0 ? <p className="setting-item-description">No remote cursors yet.</p> : null}
+        {cursors?.map((cursor) => <RemoteCursorRow key={cursor.id} plugin={plugin} vault={vault} cursor={cursor} reload={reload}/>) }
+        <SettingRow name="Add remote cursor" desc="Create an app-specific MCP URL and secret token."
+                    control={<button onClick={() => new RemoteCursorNameModal(plugin.app, plugin, vault, reload).open()}>Add remote cursor</button>}/>
+    </>
+}
+
+function RemoteCursorRow({ plugin, vault, cursor, reload }: {
+    plugin: InstaSyncPlugin;
+    vault: VaultInfo;
+    cursor: RemoteCursorInfo;
+    reload: () => void;
+}) {
+    return <SettingRow name={cursor.name} desc={cursor.mcpUrl} control={<>
+        <button onClick={() => new RemoteCursorNameModal(plugin.app, plugin, vault, reload, cursor).open()}>Edit</button>
+        <button onClick={() => void copyText(cursor.mcpUrl, 'InstaSync: MCP URL copied.')}>Copy MCP URL</button>
+        <button onClick={() => void runNotice(undefined, async () => {
+            if (!confirm(`Regenerate the secret token for "${cursor.name}"? The previous token will stop working.`)) return
+            const result = await plugin.auth.regenerateCursorToken(vault.id, cursor.id)
+            await copyText(result.secretToken, 'InstaSync: new secret token copied.')
+        })}>Copy secret token</button>
+        <button className="mod-warning" onClick={() => void runNotice(undefined, async () => {
+            if (!confirm(`Remove remote cursor "${cursor.name}"?`)) return
+            await plugin.auth.deleteCursor(vault.id, cursor.id)
+            new Notice('InstaSync: remote cursor removed.')
+            reload()
+        })}>Remove</button>
+    </>}/>
+}
+
+class RemoteCursorNameModal extends Modal {
+    private plugin: InstaSyncPlugin
+    private vault: VaultInfo
+    private refresh: () => void
+    private cursor?: RemoteCursorInfo
+    private root: Root | null = null
+
+    constructor(app: App, plugin: InstaSyncPlugin, vault: VaultInfo, refresh: () => void, cursor?: RemoteCursorInfo) {
+        super(app)
+        this.plugin = plugin
+        this.vault = vault
+        this.refresh = refresh
+        this.cursor = cursor
+    }
+
+    onOpen(): void {
+        this.root = createRoot(this.contentEl)
+        this.root.render(<RemoteCursorNameView plugin={this.plugin} vault={this.vault} cursor={this.cursor}
+                                               refresh={this.refresh} close={() => this.close()}/>)
+    }
+
+    onClose(): void {
+        this.root?.unmount()
+        this.root = null
+        this.contentEl.empty()
+    }
+}
+
+function RemoteCursorNameView({ plugin, vault, cursor, refresh, close }: {
+    plugin: InstaSyncPlugin;
+    vault: VaultInfo;
+    cursor?: RemoteCursorInfo;
+    refresh: () => void;
+    close: () => void;
+}) {
+    const [name, setName] = useState(cursor?.name ?? '')
+    const [secretToken, setSecretToken] = useState('')
+    const [busy, setBusy] = useState(false)
+    const renameMode = !!cursor
+    return <>
+        <h3>{renameMode ? 'Rename Remote Cursor' : 'Add Remote Cursor'}</h3>
+        <p className="setting-item-description">{renameMode ? 'Update the display name for this remote cursor.' : 'Name this remote cursor. Its secret token is shown only once.'}</p>
+        <input className="instasync-modal-input" type="text" value={name}
+               onChange={(event) => setName(event.currentTarget.value)}/>
+        {secretToken ? <div className="instasync-warning-box">
+            <strong>Copy this secret token now.</strong>
+            <p>It will not be shown again. Regenerating later invalidates this token.</p>
+            <div className="instasync-actions"><code>{secretToken}</code><button onClick={() => void copyText(secretToken, 'InstaSync: secret token copied.')}>Copy</button></div>
+        </div> : null}
+        <div className="instasync-actions">
+            <button onClick={close}>{secretToken ? 'Close' : 'Cancel'}</button>
+            {!secretToken ? <button className="mod-cta" disabled={busy || !name.trim()} onClick={() => void runNotice(setBusy, async () => {
+                if (cursor) {
+                    await plugin.auth.renameCursor(vault.id, cursor.id, name.trim())
+                    new Notice('InstaSync: remote cursor renamed.')
+                    refresh()
+                    close()
+                } else {
+                    const created = await plugin.auth.createCursor(vault.id, name.trim())
+                    setSecretToken(created.secretToken)
+                    await copyText(created.secretToken, 'InstaSync: secret token copied.')
+                    refresh()
+                }
+            })}>{renameMode ? 'Rename' : 'Create'}</button> : null}
+        </div>
+    </>
 }
 
 function AdvancedSettings({ app, plugin, refresh }: { app: App; plugin: InstaSyncPlugin; refresh: () => void }) {
@@ -620,6 +722,30 @@ function useMembers(plugin: InstaSyncPlugin, vaultId: string) {
     return { members, error, reload: () => setReloadKey((key) => key + 1) }
 }
 
+function useRemoteCursors(plugin: InstaSyncPlugin, vaultId: string) {
+    const [reloadKey, setReloadKey] = useState(0)
+    const [cursors, setCursors] = useState<RemoteCursorInfo[] | null>(null)
+    const [error, setError] = useState('')
+    useEffect(() => {
+        if (!vaultId) return
+        let cancelled = false
+        setCursors(null)
+        setError('')
+        void (async () => {
+            try {
+                const listed = await plugin.auth.listCursors(vaultId)
+                if (!cancelled) setCursors(listed)
+            } catch (e) {
+                if (!cancelled) setError(`Could not load remote cursors: ${(e as Error).message}`)
+            }
+        })()
+        return () => {
+            cancelled = true
+        }
+    }, [plugin, vaultId, reloadKey])
+    return { cursors, error, reload: () => setReloadKey((key) => key + 1) }
+}
+
 /** Becomes true `delayMs` after `active` turns true; resets when it turns false. */
 function useDelayedFlag(active: boolean, delayMs: number): boolean {
     const [on, setOn] = useState(false)
@@ -666,6 +792,11 @@ async function runNotice(setBusy: ((busy: boolean) => void) | undefined, fn: () 
     } finally {
         setBusy?.(false)
     }
+}
+
+async function copyText(text: string, message: string): Promise<void> {
+    await navigator.clipboard?.writeText(text)
+    new Notice(message)
 }
 
 function SettingRow({ name, desc, control }: { name: string; desc?: ReactNode; control: ReactNode }) {

@@ -22,13 +22,15 @@ impl Level {
 
 /// Strip the scheme from a base URL, returning the `host[:port]` authority.
 fn authority(url: &str) -> Option<String> {
-    Url::parse(url).ok().and_then(|u| u.host_str().map(|host| {
-        if let Some(port) = u.port() {
-            format!("{host}:{port}")
-        } else {
-            host.to_string()
-        }
-    }))
+    Url::parse(url).ok().and_then(|u| {
+        u.host_str().map(|host| {
+            if let Some(port) = u.port() {
+                format!("{host}:{port}")
+            } else {
+                host.to_string()
+            }
+        })
+    })
 }
 
 /// Rewrite the internal y-sweet authority in a minted token URL to the public one.
@@ -107,13 +109,17 @@ mod tests {
 
     #[test]
     fn authority_strips_scheme_and_trailing_slash() {
-        assert_eq!(authority("http://127.0.0.1:8080/").unwrap(), "127.0.0.1:8080");
+        assert_eq!(
+            authority("http://127.0.0.1:8080/").unwrap(),
+            "127.0.0.1:8080"
+        );
         assert_eq!(authority("ws://example.com").unwrap(), "example.com");
     }
 
     #[test]
     fn rewrite_swaps_authority() {
-        let mut v = json!({ "url": "ws://127.0.0.1:8080/d/abc", "baseUrl": "http://127.0.0.1:8080/d/abc" });
+        let mut v =
+            json!({ "url": "ws://127.0.0.1:8080/d/abc", "baseUrl": "http://127.0.0.1:8080/d/abc" });
         rewrite_host(&mut v, "url", "127.0.0.1:8080", "sync.example.com");
         rewrite_host(&mut v, "baseUrl", "127.0.0.1:8080", "sync.example.com");
         assert_eq!(v["url"], "ws://sync.example.com/d/abc");

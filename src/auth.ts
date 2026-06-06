@@ -25,6 +25,14 @@ export interface MemberInfo {
 	owner?: boolean;
 }
 
+export interface RemoteCursorInfo {
+	id: string;
+	appId: string;
+	name: string;
+	mcpUrl: string;
+	createdAt: number;
+}
+
 /** Thrown when the server rejects the session; callers should prompt re-login. */
 export class AuthError extends Error {}
 
@@ -49,15 +57,22 @@ export class AuthClient {
 		return normalizeServerUrl(this.plugin.settings.authServerUrl);
 	}
 
+	private getToken(): string {
+		return this.plugin.app.secretStorage.getSecret('instasync-session-token') ?? '';
+	}
+
+	private setToken(value: string): void {
+		this.plugin.app.secretStorage.setSecret('instasync-session-token', value);
+	}
+
 	get isLoggedIn(): boolean {
-		return !!this.plugin.settings.sessionToken;
+		return !!this.getToken();
 	}
 
 	// --- low-level request -----------------------------------------------------
 
 	private async api<T>(path: string, init?: { method?: string; body?: unknown }): Promise<T> {
-		const token = this.plugin.settings.sessionToken;
-		return this.apiAt<T>(this.baseUrl, path, token, init);
+		return this.apiAt<T>(this.baseUrl, path, this.getToken(), init);
 	}
 
 	async apiAt<T>(baseUrl: string, path: string, token?: string, init?: { method?: string; body?: unknown }): Promise<T> {
@@ -85,7 +100,7 @@ export class AuthClient {
 
 	/** Store a session token, then fetch identity and seed defaults. */
 	async setSession(token: string): Promise<MeResponse> {
-		this.plugin.settings.sessionToken = token;
+		this.setToken(token);
 		await this.plugin.saveSettings();
 
 		const me = await this.me();
@@ -99,7 +114,7 @@ export class AuthClient {
 	}
 
 	private async applySession(token: string, me: MeResponse): Promise<void> {
-		this.plugin.settings.sessionToken = token;
+		this.setToken(token);
 		this.plugin.settings.userDisplayName = me.displayName;
 		this.plugin.settings.userEmail = me.email;
 		// Default the cursor name to the SSO display name on first login.
@@ -110,7 +125,7 @@ export class AuthClient {
 	}
 
 	private async clearSession(): Promise<void> {
-		this.plugin.settings.sessionToken = "";
+		this.setToken("");
 		this.plugin.settings.userDisplayName = "";
 		this.plugin.settings.userEmail = "";
 		await this.plugin.saveSettings();
@@ -127,7 +142,7 @@ export class AuthClient {
 	/** Log out: drop the session and the active vault binding. */
 	async logout(): Promise<void> {
 		try {
-			if (this.plugin.settings.sessionToken) {
+			if (this.getToken()) {
 				await this.api("/api/logout", { method: "POST", body: {} });
 			}
 		} catch (e) {
@@ -295,6 +310,35 @@ export class AuthClient {
 		await this.api(`/api/vaults/${vaultId}/members/${userId}`, { method: "DELETE" });
 	}
 
+	listCursors(vaultId: string): Promise<RemoteCursorInfo[]> {
+		return this.api<RemoteCursorInfo[]>(`/api/vaults/${vaultId}/cursors`);
+	}
+
+	createCursor(vaultId: string, name: string): Promise<RemoteCursorInfo & { secretToken: string }> {
+		return this.api<RemoteCursorInfo & { secretToken: string }>(`/api/vaults/${vaultId}/cursors`, {
+			method: "POST",
+			body: { name },
+		});
+	}
+
+	renameCursor(vaultId: string, cursorId: string, name: string): Promise<RemoteCursorInfo> {
+		return this.api<RemoteCursorInfo>(`/api/vaults/${vaultId}/cursors/${cursorId}`, {
+			method: "POST",
+			body: { name },
+		});
+	}
+
+	regenerateCursorToken(vaultId: string, cursorId: string): Promise<{ secretToken: string }> {
+		return this.api<{ secretToken: string }>(`/api/vaults/${vaultId}/cursors/${cursorId}/token`, {
+			method: "POST",
+			body: {},
+		});
+	}
+
+	async deleteCursor(vaultId: string, cursorId: string): Promise<void> {
+		await this.api(`/api/vaults/${vaultId}/cursors/${cursorId}`, { method: "DELETE" });
+	}
+
 	/** Best-effort registry update so the server can resolve doc → path for ACLs. */
 	async registerFile(vaultId: string, guid: string, path: string): Promise<void> {
 		try {
@@ -326,7 +370,7 @@ export class AuthClient {
 	}
 
 	private get authHeaders(): Record<string, string> {
-		const token = this.plugin.settings.sessionToken;
+		const token = this.getToken();
 		return token ? { Authorization: `Bearer ${token}` } : {};
 	}
 

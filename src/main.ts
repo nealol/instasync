@@ -268,7 +268,14 @@ export default class InstaSyncPlugin extends Plugin {
 	// --- Settings persistence --------------------------------------------------
 
 	async loadSettings(): Promise<void> {
-		this.settings = sanitizeSettings(await this.loadData());
+		const raw = await this.loadData();
+		this.settings = sanitizeSettings(raw);
+		// Migrate legacy plaintext token from data.json to SecretStorage.
+		const legacy = raw && typeof raw === "object" ? (raw as Record<string, unknown>).sessionToken : undefined;
+		if (typeof legacy === "string" && legacy) {
+			this.app.secretStorage.setSecret("instasync-session-token", legacy);
+			await this.saveSettings();
+		}
 		this.applyDiagnosticLoggingSetting();
 	}
 
@@ -290,7 +297,6 @@ function sanitizeSettings(raw: unknown): InstaSyncSettings {
 	settings.pendingSetupServerUrl = data.pendingSetupServerUrl
 		? sanitizeUrl(data.pendingSetupServerUrl, "")
 		: "";
-	settings.sessionToken = typeof data.sessionToken === "string" ? data.sessionToken.trim() : "";
 	settings.userDisplayName = typeof data.userDisplayName === "string" ? data.userDisplayName : "";
 	settings.userEmail = typeof data.userEmail === "string" ? data.userEmail : "";
 	settings.activeVaultId = typeof data.activeVaultId === "string" ? data.activeVaultId.trim() : "";

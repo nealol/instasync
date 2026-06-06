@@ -81,7 +81,8 @@ impl Config {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(5000),
             git_bot_name: opt("GIT_BOT_NAME").unwrap_or_else(|| "InstaSync".to_string()),
-            git_bot_email: opt("GIT_BOT_EMAIL").unwrap_or_else(|| "instasync@localhost".to_string()),
+            git_bot_email: opt("GIT_BOT_EMAIL")
+                .unwrap_or_else(|| "instasync@localhost".to_string()),
             git_remote_url: opt("GIT_REMOTE_URL"),
             git_push_enabled: opt("GIT_PUSH_ENABLED").as_deref() == Some("1"),
         }
@@ -89,14 +90,23 @@ impl Config {
 
     /// Where the IdP should redirect back to after login.
     pub fn redirect_url(&self) -> String {
-        self.oidc_redirect_url
-            .clone()
-            .unwrap_or_else(|| format!("{}/auth/callback", self.public_base_url.trim_end_matches('/')))
+        self.oidc_redirect_url.clone().unwrap_or_else(|| {
+            format!(
+                "{}/auth/callback",
+                self.public_base_url.trim_end_matches('/')
+            )
+        })
     }
 }
 
 fn list(name: &str) -> Vec<String> {
     opt(name)
-        .map(|s| s.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default()
 }

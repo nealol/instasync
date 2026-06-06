@@ -27,7 +27,7 @@ fn random_token() -> String {
 
 /// Upsert a user by (issuer, subject); refreshes email / display name on login.
 pub async fn upsert_user(
-	db: &impl ConnectionTrait,
+    db: &impl ConnectionTrait,
     issuer: &str,
     subject: &str,
     email: &str,
@@ -72,18 +72,22 @@ pub async fn create_session(db: &impl ConnectionTrait, user_id: &str) -> Result<
     Ok(token)
 }
 
-fn hash_token(token: &str) -> String {
+pub(crate) fn hash_token(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub async fn revoke_session(db: &impl ConnectionTrait, token: &str) -> Result<(), AppError> {
-    sessions::Entity::delete_by_id(hash_token(token)).exec(db).await?;
+    sessions::Entity::delete_by_id(hash_token(token))
+        .exec(db)
+        .await?;
     Ok(())
 }
 
 pub fn bearer_token(header: &str) -> Option<&str> {
-    header.strip_prefix("Bearer ").or_else(|| header.strip_prefix("bearer "))
+    header
+        .strip_prefix("Bearer ")
+        .or_else(|| header.strip_prefix("bearer "))
 }
 
 /// Authenticated user, extracted from the `Authorization: Bearer <token>` header.

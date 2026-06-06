@@ -148,3 +148,27 @@ pub mod permissions {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+pub mod remote_cursors {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "remote_cursors")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub vault_id: String,
+        #[sea_orm(unique)]
+        pub app_id: String,
+        pub name: String,
+        pub token_hash: String,
+        pub created_by: String,
+        pub created_at: i64,
+        pub updated_at: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}

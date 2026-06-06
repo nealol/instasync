@@ -54,7 +54,12 @@ pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
         .build()?;
 
     let config = Arc::new(config);
-    let git = git::GitService::new(config.clone(), http.clone(), db.clone(), authenticator.clone());
+    let git = git::GitService::new(
+        config.clone(),
+        http.clone(),
+        db.clone(),
+        authenticator.clone(),
+    );
 
     Ok(AppState {
         db,
@@ -81,7 +86,10 @@ pub fn app(state: AppState) -> Router {
             .iter()
             .filter_map(|origin| origin.parse().ok())
             .collect();
-        CorsLayer::new().allow_origin(origins).allow_methods(Any).allow_headers(Any)
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods(Any)
+            .allow_headers(Any)
     };
 
     Router::new()
@@ -89,8 +97,23 @@ pub fn app(state: AppState) -> Router {
         .route("/auth/callback", get(oidc::callback))
         .route("/api/me", get(routes::me))
         .route("/api/logout", post(routes::logout))
-        .route("/api/vaults", get(routes::list_vaults).post(routes::create_vault))
+        .route(
+            "/api/vaults",
+            get(routes::list_vaults).post(routes::create_vault),
+        )
         .route("/api/vaults/{id}/invites", post(routes::create_invite))
+        .route(
+            "/api/vaults/{id}/cursors",
+            get(routes::list_cursors).post(routes::create_cursor),
+        )
+        .route(
+            "/api/vaults/{id}/cursors/{cursor_id}",
+            post(routes::rename_cursor).delete(routes::delete_cursor),
+        )
+        .route(
+            "/api/vaults/{id}/cursors/{cursor_id}/token",
+            post(routes::regenerate_cursor_token),
+        )
         .route("/api/vaults/{id}/members", get(routes::list_members))
         .route(
             "/api/vaults/{id}/members/{user_id}/promote",

@@ -74,6 +74,8 @@ impl AppState {
     /// Resolve a connection token to its (unexpired) principal, if known.
     pub async fn principal_for_token(&self, token: &str) -> Option<Principal> {
         let map = self.principals.lock().await;
-        map.get(token).filter(|p| p.expires_at_ms > now_millis()).cloned()
+        map.get(token)
+            .filter(|p| p.expires_at_ms > now_millis())
+            .cloned()
     }
 }

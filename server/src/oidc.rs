@@ -9,8 +9,8 @@ use serde::Deserialize;
 
 use crate::config::OidcMode;
 use crate::error::{AppError, AppResult};
-use crate::session::{create_session, upsert_user};
 use crate::session::now_millis;
+use crate::session::{create_session, upsert_user};
 use crate::state::{AppState, MockIdentity, OidcFlow};
 
 #[derive(Debug, Deserialize)]
@@ -126,7 +126,11 @@ pub async fn callback(
     if flow.redirect.is_empty() {
         Ok(Html(token_page(&token)).into_response())
     } else {
-        let sep = if flow.redirect.contains('?') { '&' } else { '?' };
+        let sep = if flow.redirect.contains('?') {
+            '&'
+        } else {
+            '?'
+        };
         let dest = format!("{}{}token={}", flow.redirect, sep, token);
         let is_web = dest.starts_with("http://") || dest.starts_with("https://");
         if is_web {
@@ -144,7 +148,9 @@ pub async fn callback(
 }
 
 fn validate_login_redirect(state: &AppState, redirect: Option<&str>) -> AppResult<String> {
-    let Some(redirect) = redirect else { return Ok(String::new()); };
+    let Some(redirect) = redirect else {
+        return Ok(String::new());
+    };
     if redirect.is_empty() || redirect == "obsidian://instasync-auth" {
         return Ok(redirect.to_string());
     }
@@ -223,7 +229,12 @@ async fn resolve_oidc_identity(
 /// inferred (openidconnect v4 encodes "endpoint set" in the type).
 async fn discover(
     state: &AppState,
-) -> AppResult<(CoreProviderMetadata, ClientId, Option<ClientSecret>, RedirectUrl)> {
+) -> AppResult<(
+    CoreProviderMetadata,
+    ClientId,
+    Option<ClientSecret>,
+    RedirectUrl,
+)> {
     let cfg = &state.config;
     let issuer = cfg
         .oidc_issuer
