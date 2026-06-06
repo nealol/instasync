@@ -36,6 +36,25 @@ pub async fn login(
     Query(params): Query<LoginParams>,
 ) -> AppResult<Response> {
     let redirect = validate_login_redirect(&state, params.redirect.as_deref())?;
+    begin_login(
+        state,
+        redirect,
+        params.mock_sub,
+        params.mock_email,
+        params.mock_name,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn begin_login(
+    state: AppState,
+    redirect: String,
+    mock_sub: Option<String>,
+    mock_email: Option<String>,
+    mock_name: Option<String>,
+    oauth_flow_key: Option<String>,
+) -> AppResult<Response> {
     prune_oidc_flows(&state).await;
 
     match state.config.oidc_mode {
@@ -43,11 +62,9 @@ pub async fn login(
             let csrf = CsrfToken::new_random();
             let identity = MockIdentity {
                 issuer: "mock".to_string(),
-                subject: params.mock_sub.unwrap_or_else(|| "mock-user".to_string()),
-                email: params
-                    .mock_email
-                    .unwrap_or_else(|| "mock@example.com".to_string()),
-                name: params.mock_name.unwrap_or_else(|| "Mock User".to_string()),
+                subject: mock_sub.unwrap_or_else(|| "mock-user".to_string()),
+                email: mock_email.unwrap_or_else(|| "mock@example.com".to_string()),
+                name: mock_name.unwrap_or_else(|| "Mock User".to_string()),
             };
             state.oidc.lock().await.insert(
                 csrf.secret().clone(),
@@ -57,6 +74,7 @@ pub async fn login(
                     redirect,
                     created_at: now_millis(),
                     mock: Some(identity),
+                    oauth_flow_key,
                 },
             );
             let url = format!("/auth/callback?state={}", csrf.secret());
@@ -86,6 +104,7 @@ pub async fn login(
                     redirect,
                     created_at: now_millis(),
                     mock: None,
+                    oauth_flow_key,
                 },
             );
             Ok(Redirect::to(auth_url.as_str()).into_response())
@@ -121,6 +140,9 @@ pub async fn callback(
     };
 
     let user = upsert_user(&state.db, &issuer, &subject, &email, &name).await?;
+    if let Some(oauth_flow_key) = flow.oauth_flow_key {
+        return crate::oauth::finish_authorize(state, oauth_flow_key, user).await;
+    }
     let token = create_session(&state.db, &user.id).await?;
 
     if flow.redirect.is_empty() {

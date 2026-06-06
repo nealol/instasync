@@ -22,17 +22,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use sea_orm::DatabaseConnection;
 use tokio::sync::Mutex;
-use y_sweet_core::api_types::Authorization;
-use y_sweet_core::auth::{Authenticator, ExpirationTimeEpochMillis};
-use yrs::types::ToJson;
-use yrs::updates::decoder::Decode;
-use yrs::{Any, Doc, GetString, Transact, Update};
+use y_sweet_core::auth::Authenticator;
 
 use crate::config::Config;
-use crate::state::Principal;
+use crate::state::{Principal, PrincipalActor};
+use crate::ydoc::{decode_files_map, decode_text};
 
 /// A principal seen contributing to a vault during one debounce window.
 type Contributor = Principal;
@@ -50,6 +47,7 @@ struct VaultState {
 
 struct Inner {
     config: Arc<Config>,
+    #[allow(dead_code)]
     http: reqwest::Client,
     #[allow(dead_code)] // reserved for future per-doc lookups / catch-up sweeps
     db: DatabaseConnection,
@@ -96,7 +94,12 @@ impl GitService {
                 running: false,
             });
         entry.dirty = true;
-        if !entry.contributors.iter().any(|c| c.user_id == who.user_id) {
+        let actor_key = who.actor_key();
+        if !entry
+            .contributors
+            .iter()
+            .any(|c| c.actor_key() == actor_key)
+        {
             entry.contributors.push(who.clone());
         }
         entry.deadline = Instant::now() + self.debounce();
@@ -237,28 +240,9 @@ impl GitService {
     /// Fetch a document's full state as a Yjs v1 update, authorizing with an
     /// in-process read-only doc token signed by the shared y-sweet key.
     async fn fetch_as_update(&self, doc_id: &str) -> Result<Vec<u8>> {
-        let token = self.0.authenticator.gen_doc_token(
-            doc_id,
-            Authorization::ReadOnly,
-            ExpirationTimeEpochMillis::max(),
-        );
-        let url = format!(
-            "{}/doc/{}/as-update",
-            self.0.config.ysweet_url.trim_end_matches('/'),
-            doc_id
-        );
-        let res = self
-            .0
-            .http
-            .get(&url)
-            .bearer_auth(token)
-            .send()
+        crate::ydoc::read_update_with(&self.0.config, &self.0.http, &self.0.authenticator, doc_id)
             .await
-            .with_context(|| format!("GET {url}"))?;
-        if !res.status().is_success() {
-            bail!("as-update {doc_id} returned {}", res.status());
-        }
-        Ok(res.bytes().await?.to_vec())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
     }
 
     /// Stage everything and commit if the working tree actually changed.
@@ -353,58 +337,59 @@ fn build_commit_meta(
     config: &Config,
 ) -> (String, String) {
     let (author_name, author_email) = match contributors.first() {
-        Some(p) => (p.display_name.as_str(), p.email.as_str()),
-        None => (config.git_bot_name.as_str(), config.git_bot_email.as_str()),
+        Some(p) => author_identity(p, config),
+        None => (config.git_bot_name.clone(), config.git_bot_email.clone()),
     };
     let author = format!("{author_name} <{author_email}>");
 
     let mut message = format!("Sync {file_count} file(s)\n\n");
     message.push_str(&format!("Vault-Id: {vault_id}\n"));
     if let Some(p) = contributors.first() {
-        message.push_str(&format!("Principal-Id: {}\n", p.user_id));
-        message.push_str("Principal-Type: user\n");
+        append_principal_trailers(&mut message, p);
     }
     for p in contributors.iter().skip(1) {
-        message.push_str(&format!(
-            "Co-authored-by: {} <{}>\n",
-            p.display_name, p.email
-        ));
+        let (name, email) = author_identity(p, config);
+        message.push_str(&format!("Co-authored-by: {} <{}>\n", name, email));
+        append_principal_trailers(&mut message, p);
     }
     (author, message)
 }
 
-/// Decode a named root `Y.Text` from a full-state update into a String.
-fn decode_text(update: &[u8], name: &str) -> Result<String> {
-    let doc = Doc::new();
-    let update = Update::decode_v1(update).map_err(|e| anyhow!("decode update: {e:?}"))?;
-    {
-        let mut txn = doc.transact_mut();
-        txn.apply_update(update);
+fn author_identity(principal: &Principal, config: &Config) -> (String, String) {
+    match &principal.actor {
+        PrincipalActor::User => (principal.display_name.clone(), principal.email.clone()),
+        PrincipalActor::Cursor {
+            app_id,
+            cursor_name,
+            ..
+        } => (
+            cursor_name.clone(),
+            format!("cursor+{app_id}@{}", config.cursor_email_domain),
+        ),
     }
-    let text = doc.get_or_insert_text(name);
-    let txn = doc.transact();
-    Ok(text.get_string(&txn))
 }
 
-/// Decode the vault index doc's `files` map (path -> guid) from a full-state update.
-fn decode_files_map(update: &[u8]) -> Result<Vec<(String, String)>> {
-    let doc = Doc::new();
-    let update = Update::decode_v1(update).map_err(|e| anyhow!("decode index: {e:?}"))?;
-    {
-        let mut txn = doc.transact_mut();
-        txn.apply_update(update);
-    }
-    let map = doc.get_or_insert_map("files");
-    let txn = doc.transact();
-    let mut out = Vec::new();
-    if let Any::Map(entries) = map.to_json(&txn) {
-        for (path, value) in entries.iter() {
-            if let Any::String(guid) = value {
-                out.push((path.clone(), guid.to_string()));
-            }
+fn append_principal_trailers(message: &mut String, principal: &Principal) {
+    match &principal.actor {
+        PrincipalActor::User => {
+            message.push_str(&format!("Principal-Id: {}\n", principal.user_id));
+            message.push_str("Principal-Type: user\n");
+        }
+        PrincipalActor::Cursor {
+            cursor_id,
+            cursor_name,
+            ..
+        } => {
+            message.push_str("Principal-Type: cursor\n");
+            message.push_str(&format!("Cursor-Id: {cursor_id}\n"));
+            message.push_str(&format!("Cursor-Name: {cursor_name}\n"));
+            message.push_str(&format!(
+                "On-Behalf-Of: {} <{}>\n",
+                principal.display_name, principal.email
+            ));
+            message.push_str(&format!("Authorized-User-Id: {}\n", principal.user_id));
         }
     }
-    Ok(out)
 }
 
 /// Validate a vault-relative path and turn it into a safe relative `PathBuf`.
@@ -468,7 +453,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yrs::{Map, ReadTxn, Text, Transact};
+    use yrs::{Doc, Map, ReadTxn, Text, Transact};
 
     fn text_update(name: &str, value: &str) -> Vec<u8> {
         let doc = Doc::new();
@@ -539,12 +524,14 @@ mod tests {
                 user_id: "u1".into(),
                 display_name: "Alice".into(),
                 email: "a@x".into(),
+                actor: PrincipalActor::User,
                 expires_at_ms: 0,
             },
             Principal {
                 user_id: "u2".into(),
                 display_name: "Bob".into(),
                 email: "b@x".into(),
+                actor: PrincipalActor::User,
                 expires_at_ms: 0,
             },
         ];
@@ -561,6 +548,30 @@ mod tests {
         let (author, message) = build_commit_meta("v1", 0, &[], &config);
         assert_eq!(author, "InstaSync <instasync@localhost>");
         assert!(!message.contains("Principal-Id"));
+    }
+
+    #[test]
+    fn commit_meta_attributes_cursor_author_on_behalf_of_user() {
+        let config = test_config();
+        let contributors = vec![Principal {
+            user_id: "u1".into(),
+            display_name: "Alice".into(),
+            email: "a@x".into(),
+            actor: PrincipalActor::Cursor {
+                cursor_id: "c1".into(),
+                app_id: "app123".into(),
+                cursor_name: "Claude".into(),
+            },
+            expires_at_ms: 0,
+        }];
+
+        let (author, message) = build_commit_meta("v1", 2, &contributors, &config);
+        assert_eq!(author, "Claude <cursor+app123@localhost>");
+        assert!(message.contains("Principal-Type: cursor"));
+        assert!(message.contains("Cursor-Id: c1"));
+        assert!(message.contains("Cursor-Name: Claude"));
+        assert!(message.contains("On-Behalf-Of: Alice <a@x>"));
+        assert!(message.contains("Authorized-User-Id: u1"));
     }
 
     fn test_config() -> Config {
@@ -584,8 +595,29 @@ mod tests {
             git_debounce_ms: 5000,
             git_bot_name: "InstaSync".into(),
             git_bot_email: "instasync@localhost".into(),
+            cursor_email_domain: "localhost".into(),
             git_remote_url: None,
             git_push_enabled: false,
+            daily_note_path_template: "Daily Notes/{{YYYY-MM-DD}}.md".into(),
+            weekly_note_path_template: None,
+            monthly_note_path_template: None,
+            quarterly_note_path_template: None,
+            yearly_note_path_template: None,
+            attachment_fetch_host_allowlist: vec![],
+            attachment_allowed_extensions: vec![
+                "png".into(),
+                "jpg".into(),
+                "jpeg".into(),
+                "gif".into(),
+                "webp".into(),
+                "svg".into(),
+                "pdf".into(),
+                "txt".into(),
+            ],
+            attachment_max_bytes: crate::blobs::MAX_BLOB_BYTES,
+            attachments_path_mode: "relative".into(),
+            attachments_subfolder: None,
+            upload_token: "test-upload-token".into(),
         }
     }
 }

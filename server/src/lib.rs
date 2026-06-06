@@ -1,15 +1,22 @@
+pub mod attachments;
 pub mod blobs;
 pub mod config;
 pub mod db;
 pub mod entities;
 pub mod error;
 pub mod git;
+pub mod mcp;
+pub mod notes;
+pub mod oauth;
 pub mod oidc;
+pub mod openapi;
+pub mod permalink;
 pub mod proxy;
 pub mod routes;
 pub mod session;
 pub mod state;
 pub mod words;
+pub mod ydoc;
 pub mod ysweet;
 
 use std::sync::Arc;
@@ -23,6 +30,8 @@ use axum::{
 use sea_orm::Database;
 use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 use y_sweet_core::auth::Authenticator;
 
 use crate::config::Config;
@@ -67,6 +76,7 @@ pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
         authenticator,
         http,
         oidc: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         git,
         principals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     })
@@ -93,8 +103,32 @@ pub fn app(state: AppState) -> Router {
     };
 
     Router::new()
+        .merge(SwaggerUi::new("/docs").url("/openapi.json", openapi::ApiDoc::openapi()))
+        .merge(mcp::router(state.clone()))
         .route("/auth/login", get(oidc::login))
         .route("/auth/callback", get(oidc::callback))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth::protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp/i/{app_id}",
+            get(oauth::protected_resource_app),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oauth::authorization_server),
+        )
+        .route("/oauth/register", post(oauth::register_client))
+        .route("/oauth/authorize", get(oauth::authorize))
+        .route("/oauth/token", post(oauth::token))
+        .route(
+            "/upload",
+            post(attachments::public_upload)
+                .layer(DefaultBodyLimit::max(blobs::MAX_BLOB_BYTES as usize)),
+        )
+        .route("/n/{guid}", get(permalink::note_by_guid))
+        .route("/p", get(permalink::note_by_path))
         .route("/api/me", get(routes::me))
         .route("/api/logout", post(routes::logout))
         .route(
@@ -124,6 +158,61 @@ pub fn app(state: AppState) -> Router {
             delete(routes::remove_member),
         )
         .route("/api/vaults/{id}/files", post(routes::upsert_file))
+        .route(
+            "/api/vaults/{id}/notes",
+            get(notes::list_notes).post(notes::create_note),
+        )
+        .route(
+            "/api/vaults/{id}/notes/{*path}",
+            get(notes::read_note)
+                .put(notes::replace_note)
+                .patch(notes::patch_note)
+                .delete(notes::delete_note),
+        )
+        .route(
+            "/api/vaults/{id}/note-moves/{*path}",
+            post(notes::move_note),
+        )
+        .route(
+            "/api/vaults/{id}/note-permalinks/{*path}",
+            post(notes::note_permalink),
+        )
+        .route(
+            "/api/vaults/{id}/note-frontmatter/{*path}",
+            get(notes::parse_frontmatter).patch(notes::patch_frontmatter),
+        )
+        .route(
+            "/api/vaults/{id}/periodic/{period}",
+            post(notes::periodic_note_get_or_create),
+        )
+        .route(
+            "/api/vaults/{id}/periodic/{period}/append",
+            post(notes::periodic_note_append),
+        )
+        .route(
+            "/api/vaults/{id}/attachments",
+            get(attachments::list_attachments),
+        )
+        .route(
+            "/api/vaults/{id}/attachments/from-url",
+            post(attachments::upload_attachment_url),
+        )
+        .route(
+            "/api/vaults/{id}/attachments/upload-link",
+            post(attachments::create_upload_link),
+        )
+        .route(
+            "/api/vaults/{id}/attachments/{*path}",
+            get(attachments::read_attachment)
+                .head(attachments::head_attachment)
+                .put(attachments::upload_attachment)
+                .delete(attachments::delete_attachment)
+                .layer(DefaultBodyLimit::max(blobs::MAX_BLOB_BYTES as usize)),
+        )
+        .route(
+            "/api/vaults/{id}/attachment-moves/{*path}",
+            post(attachments::move_attachment),
+        )
         // Content-addressed binary blob store. PUT opts out of the default body
         // cap so large attachments can stream through (it verifies the hash).
         .route(

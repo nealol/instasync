@@ -10,16 +10,37 @@ use crate::session::now_millis;
 use crate::config::Config;
 use crate::git::GitService;
 
-/// An authenticated principal (an OIDC user today; an API-key application in the
-/// future) bound to a y-sweet connection token at mint time, used to attribute
-/// git audit commits. See [`crate::git`] and the proxy attribution tap.
+/// The actor that initiated a write attributed to a real authenticated user.
+#[derive(Clone, Debug)]
+pub enum PrincipalActor {
+    User,
+    Cursor {
+        cursor_id: String,
+        app_id: String,
+        cursor_name: String,
+    },
+}
+
+/// An authenticated principal bound to a y-sweet connection token at mint time,
+/// used to attribute git audit commits. Cursor writes retain the real user in
+/// `user_id` / `display_name` / `email` and store the cursor as `actor`.
 #[derive(Clone, Debug)]
 pub struct Principal {
     pub user_id: String,
     pub display_name: String,
     pub email: String,
+    pub actor: PrincipalActor,
     /// Epoch millis after which this token->principal mapping is evicted.
     pub expires_at_ms: i64,
+}
+
+impl Principal {
+    pub fn actor_key(&self) -> String {
+        match &self.actor {
+            PrincipalActor::User => format!("user:{}", self.user_id),
+            PrincipalActor::Cursor { cursor_id, .. } => format!("cursor:{cursor_id}"),
+        }
+    }
 }
 
 /// A synthetic identity used by the mock OIDC issuer (test mode).
@@ -39,9 +60,26 @@ pub struct OidcFlow {
     pub created_at: i64,
     /// Present only in mock mode; lets the callback skip the IdP round-trip.
     pub mock: Option<MockIdentity>,
+    pub oauth_flow_key: Option<String>,
 }
 
 impl OidcFlow {
+    pub fn is_expired(&self) -> bool {
+        now_millis() - self.created_at > 5 * 60 * 1000
+    }
+}
+
+pub struct OAuthFlow {
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub code_challenge: String,
+    pub scope: String,
+    pub state: Option<String>,
+    pub app_id: String,
+    pub created_at: i64,
+}
+
+impl OAuthFlow {
     pub fn is_expired(&self) -> bool {
         now_millis() - self.created_at > 5 * 60 * 1000
     }
@@ -54,6 +92,7 @@ pub struct AppState {
     pub authenticator: Arc<Authenticator>,
     pub http: reqwest::Client,
     pub oidc: Arc<Mutex<HashMap<String, OidcFlow>>>,
+    pub oauth_flows: Arc<Mutex<HashMap<String, OAuthFlow>>>,
     /// Per-vault git audit log + backup engine.
     pub git: GitService,
     /// Maps a minted y-sweet connection token to the principal it was issued to,

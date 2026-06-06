@@ -485,7 +485,7 @@ function RemoteCursors({ plugin, vault }: { plugin: InstaSyncPlugin; vault: Vaul
         {!error && cursors === null ? <p className="setting-item-description">Loading remote cursors...</p> : null}
         {cursors?.length === 0 ? <p className="setting-item-description">No remote cursors yet.</p> : null}
         {cursors?.map((cursor) => <RemoteCursorRow key={cursor.id} plugin={plugin} vault={vault} cursor={cursor} reload={reload}/>) }
-        <SettingRow name="Add remote cursor" desc="Create an app-specific MCP URL and secret token."
+        <SettingRow name="Add remote cursor" desc="Create an app-specific MCP URL with OAuth support and a secret token for direct bearer API calls."
                     control={<button onClick={() => new RemoteCursorNameModal(plugin.app, plugin, vault, reload).open()}>Add remote cursor</button>}/>
     </>
 }

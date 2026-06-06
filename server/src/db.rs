@@ -2,7 +2,8 @@ use sea_orm::sea_query::{Index, IndexCreateStatement};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, Schema};
 
 use crate::entities::{
-    invites, memberships, permissions, remote_cursors, sessions, users, vault_files, vaults,
+    invites, memberships, oauth_clients, oauth_codes, oauth_tokens, permissions, remote_cursors,
+    sessions, upload_jtis, users, vault_files, vaults,
 };
 
 /// Create all tables (and the composite-unique indexes) if they do not exist.
@@ -28,8 +29,12 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
     create!(vault_files::Entity);
     create!(permissions::Entity);
     create!(remote_cursors::Entity);
+    create!(oauth_clients::Entity);
+    create!(oauth_codes::Entity);
+    create!(oauth_tokens::Entity);
+    create!(upload_jtis::Entity);
 
-    let indexes: [IndexCreateStatement; 4] = [
+    let indexes: [IndexCreateStatement; 7] = [
         Index::create()
             .if_not_exists()
             .name("idx_users_issuer_subject")
@@ -60,6 +65,25 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
             .table(remote_cursors::Entity)
             .col(remote_cursors::Column::AppId)
             .unique()
+            .to_owned(),
+        Index::create()
+            .if_not_exists()
+            .name("idx_oauth_codes_expires_at")
+            .table(oauth_codes::Entity)
+            .col(oauth_codes::Column::ExpiresAt)
+            .to_owned(),
+        Index::create()
+            .if_not_exists()
+            .name("idx_oauth_tokens_refresh_hash")
+            .table(oauth_tokens::Entity)
+            .col(oauth_tokens::Column::RefreshHash)
+            .unique()
+            .to_owned(),
+        Index::create()
+            .if_not_exists()
+            .name("idx_upload_jtis_expires_at")
+            .table(upload_jtis::Entity)
+            .col(upload_jtis::Column::ExpiresAt)
             .to_owned(),
     ];
     for idx in indexes {

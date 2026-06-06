@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", features = ["ws", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = [
     "connect",
@@ -20,6 +20,8 @@ sea-orm = { version = "1.1", default-features = false, features = [
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",
@@ -35,6 +37,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 y-sweet-core = "0.9"
 yrs = "0.19"
+rmcp = { version = "1.7", features = ["server", "transport-streamable-http-server", "macros"] }
+schemars = "1"
+utoipa = "5"
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+hmac = "0.12"
+base64 = "0.22"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

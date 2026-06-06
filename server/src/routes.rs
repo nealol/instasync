@@ -10,7 +10,7 @@ use crate::entities::{
 };
 use crate::error::{AppError, AppResult};
 use crate::session::{bearer_token, hash_token, now_millis, revoke_session, AuthUser};
-use crate::state::{AppState, Principal};
+use crate::state::{AppState, Principal, PrincipalActor};
 use crate::words::generate_invite_code;
 use crate::ysweet::{ensure_doc, mint_client_token, Level};
 
@@ -579,7 +579,7 @@ fn random_cursor_token() -> String {
     nanoid::nanoid!(48)
 }
 
-fn mcp_url(state: &AppState, app_id: &str) -> String {
+pub(crate) fn mcp_url(state: &AppState, app_id: &str) -> String {
     format!(
         "{}/mcp/i/{app_id}",
         state.config.public_base_url.trim_end_matches('/')
@@ -669,6 +669,7 @@ pub async fn doc_token(
                     user_id: user.id.clone(),
                     display_name: user.display_name.clone(),
                     email: user.email.clone(),
+                    actor: PrincipalActor::User,
                     expires_at_ms: now_millis() + PRINCIPAL_TTL_MS,
                 },
             )
@@ -696,7 +697,7 @@ fn safe_doc_id(doc_id: &str) -> bool {
 }
 
 /// Resolve the docId to a path and evaluate the (currently allow-all) ACL.
-async fn authorize_doc(
+pub(crate) async fn authorize_doc(
     state: &AppState,
     user: &users::Model,
     vault_id: &str,

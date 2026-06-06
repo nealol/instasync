@@ -133,6 +133,13 @@ export class VaultSync {
 		for (const doc of this.documents.values()) doc.ensureConnected();
 	}
 
+	pathForGuid(guid: string): string | null {
+		for (const [path, value] of this.files.entries()) {
+			if (value === guid) return path;
+		}
+		return null;
+	}
+
 	/** Notify once when a live connection drops; silent while already offline. */
 	private notifyDisconnected(): void {
 		if (!this.wasConnected) return;

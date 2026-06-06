@@ -1,0 +1,726 @@
+use axum::extract::{Path, State};
+use axum::Json;
+use chrono::{Datelike, NaiveDate};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map as JsonMap, Value};
+
+use crate::entities::vault_files;
+use crate::error::{AppError, AppResult};
+use crate::routes::{authorize_doc, require_member};
+use crate::session::{now_millis, ApiPrincipal};
+use crate::state::AppState;
+use crate::ydoc;
+use crate::ysweet::{ensure_doc, Level};
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteSummary {
+    pub path: String,
+    pub guid: String,
+    pub permalink: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteResponse {
+    pub path: String,
+    pub guid: String,
+    pub content: String,
+    pub permalink: String,
+}
+
+#[derive(Deserialize)]
+pub struct CreateNoteBody {
+    pub path: String,
+    #[serde(default)]
+    pub content: String,
+}
+
+#[derive(Deserialize)]
+pub struct ReplaceNoteBody {
+    pub content: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchNoteBody {
+    pub old: String,
+    pub new: String,
+    #[serde(default)]
+    pub replace_all: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveNoteBody {
+    pub to_path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrontmatterResponse {
+    pub path: String,
+    pub frontmatter: Value,
+}
+
+#[derive(Deserialize)]
+pub struct PatchFrontmatterBody {
+    #[serde(default)]
+    pub set: JsonMap<String, Value>,
+    #[serde(default)]
+    pub unset: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub struct PeriodicPath {
+    pub id: String,
+    pub period: String,
+}
+
+#[derive(Deserialize)]
+pub struct PeriodicBody {
+    pub date: Option<String>,
+    #[serde(default)]
+    pub content: String,
+}
+
+#[derive(Deserialize)]
+pub struct PeriodicAppendBody {
+    pub date: Option<String>,
+    pub text: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermalinkResponse {
+    pub kind: String,
+    pub url: String,
+}
+
+pub async fn list_notes(
+    State(state): State<AppState>,
+    principal: ApiPrincipal,
+    Path(vault_id): Path<String>,
+) -> AppResult<Json<Vec<NoteSummary>>> {
+    Ok(Json(list_notes_inner(&state, &principal, &vault_id).await?))
+}
+
+pub(crate) async fn list_notes_inner(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+) -> AppResult<Vec<NoteSummary>> {
+    principal.require_vault(&vault_id)?;
+    require_member(&state, &principal.user.id, &vault_id).await?;
+
+    let mut files = vault_files::Entity::find()
+        .filter(vault_files::Column::VaultId.eq(vault_id))
+        .all(&state.db)
+        .await?;
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(files
+        .into_iter()
+        .map(|file| NoteSummary {
+            permalink: permalink_for_guid(&state, &file.guid),
+            path: file.path,
+            guid: file.guid,
+        })
+        .collect())
+}
+
+pub async fn create_note(
+    State(state): State<AppState>,
+    principal: ApiPrincipal,
+    Path(vault_id): Path<String>,
+    Json(body): Json<CreateNoteBody>,
+) -> AppResult<Json<NoteResponse>> {
+    Ok(Json(
+        create_note_inner(&state, &principal, &vault_id, body).await?,
+    ))
+}
+
+pub(crate) async fn create_note_inner(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+    body: CreateNoteBody,
+) -> AppResult<NoteResponse> {
+    principal.require_vault(&vault_id)?;
+    require_member(&state, &principal.user.id, &vault_id).await?;
+    validate_note_path(&body.path)?;
+
+    if file_by_path(&state, &vault_id, &body.path).await?.is_some() {
+        return Err(AppError::Conflict("note already exists".into()));
+    }
+
+    let guid = uuid::Uuid::new_v4().to_string();
+    let doc_id = doc_id(&vault_id, &guid);
+    ensure_doc(&state, &doc_id).await?;
+    ydoc::set_text(&state, &doc_id, &body.content).await?;
+    ydoc::index_set_file(&state, &vault_id, &body.path, &guid).await?;
+    state
+        .git
+        .mark_write(
+            &vault_id,
+            &principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000),
+        )
+        .await;
+
+    Ok(NoteResponse {
+        permalink: permalink_for_guid(&state, &guid),
+        path: body.path,
+        guid,
+        content: body.content,
+    })
+}
+
+pub async fn read_note(
+    State(state): State<AppState>,
+    principal: ApiPrincipal,
+    Path((vault_id, path)): Path<(String, String)>,
+) -> AppResult<Json<NoteResponse>> {
+    Ok(Json(
+        read_note_inner(&state, &principal, &vault_id, &path).await?,
+    ))
+}
+
+pub(crate) async fn read_note_inner(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+    path: &str,
+) -> AppResult<NoteResponse> {
+    let file = require_note_access(&state, &principal, &vault_id, &path, false).await?;
+    let doc_id = doc_id(&vault_id, &file.guid);
+    let update = ydoc::read_update(&state, &doc_id).await?;
+    let content =
+        ydoc::decode_text(&update, "contents").map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(NoteResponse {
+        permalink: permalink_for_guid(&state, &file.guid),
+        path: file.path,
+        guid: file.guid,
+        content,
+    })
+}
+
+pub async fn replace_note(
+    State(state): State<AppState>,
+    principal: ApiPrincipal,
+    Path((vault_id, path)): Path<(String, String)>,
+    Json(body): Json<ReplaceNoteBody>,
+) -> AppResult<Json<NoteResponse>> {
+    Ok(Json(
+        replace_note_inner(&state, &principal, &vault_id, &path, body).await?,
+    ))
+}
+
+pub(crate) async fn replace_note_inner(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+    path: &str,
+    body: ReplaceNoteBody,
+) -> AppResult<NoteResponse> {
+    let file = require_note_access(&state, &principal, &vault_id, &path, true).await?;
+    let doc_id = doc_id(&vault_id, &file.guid);
+    ydoc::set_text(&state, &doc_id, &body.content).await?;
+    state
+        .git
+        .mark_write(
+            &vault_id,
+            &principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000),
+        )
+        .await;
+
+    Ok(NoteResponse {
+        permalink: permalink_for_guid(&state, &file.guid),
+        path: file.path,
+        guid: file.guid,
+        content: body.content,
+    })
+}
+
+pub async fn patch_note(
+    State(state): State<AppState>,
+    principal: ApiPrincipal,
+    Path((vault_id, path)): Path<(String, String)>,
+    Json(body): Json<PatchNoteBody>,
+) -> AppResult<Json<NoteResponse>> {
+    Ok(Json(
+        patch_note_inner(&state, &principal, &vault_id, &path, body).await?,
+    ))
+}
+
+pub(crate) async fn patch_note_inner(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+    path: &str,
+    body: PatchNoteBody,
+) -> AppResult<NoteResponse> {
+    if body.old.is_empty() {
+        return Err(AppError::BadRequest("old text is required".into()));
+    }
+    let file = require_note_access(&state, &principal, &vault_id, &path, true).await?;
+    let doc_id = doc_id(&vault_id, &file.guid);
+    let update = ydoc::read_update(&state, &doc_id).await?;
+    let content =
+        ydoc::decode_text(&update, "contents").map_err(|e| AppError::Internal(e.to_string()))?;
+    let matches = content.matches(&body.old).count();
+    if matches == 0 {
+        return Err(AppError::BadRequest("anchor_not_found".into()));
+    }
+    if matches > 1 && !body.replace_all {
+        return Err(AppError::Conflict("ambiguous".into()));
+    }
+
+    let new_content = if body.replace_all {
+        content.replace(&body.old, &body.new)
+    } else {
+        content.replacen(&body.old, &body.new, 1)
+    };
+    if new_content == content {
+        return Err(AppError::Conflict("no_op".into()));
+    }
+
+    ydoc::set_text(&state, &doc_id, &new_content).await?;
+    mark_note_write(&state, &vault_id, &principal).await;
+    Ok(NoteResponse {
+        permalink: permalink_for_guid(&state, &file.guid),
+        path: file.path,
+        guid: file.guid,
+        content: new_content,
+    })
+}
+
+pub async fn move_note(
+    State(state): State<AppState>,
+    principal: ApiPrincipal,
+    Path((vault_id, path)): Path<(String, String)>,
+    Json(body): Json<MoveNoteBody>,
+) -> AppResult<Json<NoteResponse>> {
+    Ok(Json(
+        move_note_inner(&state, &principal, &vault_id, &path, body).await?,
+    ))
+}
+
+pub(crate) async fn move_note_inner(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+    path: &str,
+    body: MoveNoteBody,
+) -> AppResult<NoteResponse> {
+    validate_note_path(&body.to_path)?;
+    if path == body.to_path {
+        return Err(AppError::Conflict("same_path".into()));
+    }
+    let file = require_note_access(&state, &principal, &vault_id, &path, true).await?;
+    if file_by_path(&state, &vault_id, &body.to_path)
+        .await?
+        .is_some()
+    {
+        return Err(AppError::Conflict("exists".into()));
+    }
+
+    ydoc::index_rename(&state, &vault_id, &file.path, &body.to_path).await?;
+    let doc_id = doc_id(&vault_id, &file.guid);
+    let update = ydoc::read_update(&state, &doc_id).await?;
+    let content =
+        ydoc::decode_text(&update, "contents").map_err(|e| AppError::Internal(e.to_string()))?;
+    mark_note_write(&state, &vault_id, &principal).await;
+    Ok(NoteResponse {
+        permalink: permalink_for_guid(&state, &file.guid),
+        path: body.to_path,
+        guid: file.guid,
+        content,
+    })
+}
+
+pub async fn delete_note(
+    State(state): State<AppState>,
+    principal: ApiPrincipal,
+    Path((vault_id, path)): Path<(String, String)>,
+) -> AppResult<Json<serde_json::Value>> {
+    delete_note_inner(&state, &principal, &vault_id, &path).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+pub(crate) async fn delete_note_inner(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+    path: &str,
+) -> AppResult<()> {
+    let file = require_note_access(&state, &principal, &vault_id, &path, true).await?;
+    ydoc::index_remove_file(&state, &vault_id, &file.path).await?;
+    mark_note_write(&state, &vault_id, &principal).await;
+    Ok(())
+}
+
+async fn mark_note_write(state: &AppState, vault_id: &str, principal: &ApiPrincipal) {
+    state
+        .git
+        .mark_write(
+            vault_id,
+            &principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000),
+        )
+        .await;
+}
+
+pub async fn note_permalink(
+    State(state): State<AppState>,
+    principal: ApiPrincipal,
+    Path((vault_id, path)): Path<(String, String)>,
+) -> AppResult<Json<PermalinkResponse>> {
+    Ok(Json(
+        note_permalink_inner(&state, &principal, &vault_id, &path).await?,
+    ))
+}
+
+pub(crate) async fn note_permalink_inner(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+    path: &str,
+) -> AppResult<PermalinkResponse> {
+    let file = require_note_access(&state, &principal, &vault_id, &path, false).await?;
+    Ok(PermalinkResponse {
+        kind: "id".into(),
+        url: permalink_for_guid(&state, &file.guid),
+    })
+}
+
+pub async fn parse_frontmatter(
+    State(state): State<AppState>,
+    principal: ApiPrincipal,
+    Path((vault_id, path)): Path<(String, String)>,
+) -> AppResult<Json<FrontmatterResponse>> {
+    Ok(Json(
+        parse_frontmatter_inner(&state, &principal, &vault_id, &path).await?,
+    ))
+}
+
+pub(crate) async fn parse_frontmatter_inner(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+    path: &str,
+) -> AppResult<FrontmatterResponse> {
+    let (file, content) = read_note_content(&state, &principal, &vault_id, &path, false).await?;
+    Ok(FrontmatterResponse {
+        path: file.path,
+        frontmatter: parse_frontmatter_value(&content)?,
+    })
+}
+
+pub async fn patch_frontmatter(
+    State(state): State<AppState>,
+    principal: ApiPrincipal,
+    Path((vault_id, path)): Path<(String, String)>,
+    Json(body): Json<PatchFrontmatterBody>,
+) -> AppResult<Json<NoteResponse>> {
+    Ok(Json(
+        patch_frontmatter_inner(&state, &principal, &vault_id, &path, body).await?,
+    ))
+}
+
+pub(crate) async fn patch_frontmatter_inner(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+    path: &str,
+    body: PatchFrontmatterBody,
+) -> AppResult<NoteResponse> {
+    let (file, content) = read_note_content(&state, &principal, &vault_id, &path, true).await?;
+    let new_content = patch_frontmatter_content(&content, body)?;
+    let doc_id = doc_id(&vault_id, &file.guid);
+    ydoc::set_text(&state, &doc_id, &new_content).await?;
+    mark_note_write(&state, &vault_id, &principal).await;
+    Ok(NoteResponse {
+        permalink: permalink_for_guid(&state, &file.guid),
+        path: file.path,
+        guid: file.guid,
+        content: new_content,
+    })
+}
+
+pub(crate) async fn replace_body_inner(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+    path: &str,
+    body: String,
+) -> AppResult<NoteResponse> {
+    let (file, content) = read_note_content(state, principal, vault_id, path, true).await?;
+    let new_content = if let Some((_yaml, body_start)) = frontmatter_bounds(&content) {
+        format!("{}{}", &content[..body_start], body)
+    } else {
+        body
+    };
+    ydoc::set_text(state, &doc_id(vault_id, &file.guid), &new_content).await?;
+    mark_note_write(state, vault_id, principal).await;
+    Ok(NoteResponse {
+        permalink: permalink_for_guid(state, &file.guid),
+        path: file.path,
+        guid: file.guid,
+        content: new_content,
+    })
+}
+
+pub async fn periodic_note_get_or_create(
+    State(state): State<AppState>,
+    principal: ApiPrincipal,
+    Path(path): Path<PeriodicPath>,
+    Json(body): Json<PeriodicBody>,
+) -> AppResult<Json<NoteResponse>> {
+    Ok(Json(
+        periodic_note_get_or_create_inner(&state, &principal, &path.id, &path.period, body).await?,
+    ))
+}
+
+pub(crate) async fn periodic_note_get_or_create_inner(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+    period: &str,
+    body: PeriodicBody,
+) -> AppResult<NoteResponse> {
+    principal.require_vault(vault_id)?;
+    require_member(&state, &principal.user.id, vault_id).await?;
+    let note_path = periodic_path(&state, period, body.date.as_deref())?;
+    if let Some(file) = file_by_path(&state, vault_id, &note_path).await? {
+        // Honor per-path ACLs on the existing periodic note (deny -> Forbidden).
+        authorize_doc(state, &principal.user, vault_id, &doc_id(vault_id, &file.guid)).await?;
+        let update = ydoc::read_update(&state, &doc_id(vault_id, &file.guid)).await?;
+        let content = ydoc::decode_text(&update, "contents")
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        return Ok(NoteResponse {
+            permalink: permalink_for_guid(&state, &file.guid),
+            path: file.path,
+            guid: file.guid,
+            content,
+        });
+    }
+
+    validate_note_path(&note_path)?;
+    let guid = uuid::Uuid::new_v4().to_string();
+    let doc_id = doc_id(vault_id, &guid);
+    ensure_doc(&state, &doc_id).await?;
+    ydoc::set_text(&state, &doc_id, &body.content).await?;
+    ydoc::index_set_file(&state, vault_id, &note_path, &guid).await?;
+    mark_note_write(&state, vault_id, &principal).await;
+    Ok(NoteResponse {
+        permalink: permalink_for_guid(&state, &guid),
+        path: note_path,
+        guid,
+        content: body.content,
+    })
+}
+
+pub async fn periodic_note_append(
+    State(state): State<AppState>,
+    principal: ApiPrincipal,
+    Path(path): Path<PeriodicPath>,
+    Json(body): Json<PeriodicAppendBody>,
+) -> AppResult<Json<NoteResponse>> {
+    Ok(Json(
+        periodic_note_append_inner(&state, &principal, &path.id, &path.period, body).await?,
+    ))
+}
+
+pub(crate) async fn periodic_note_append_inner(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+    period: &str,
+    body: PeriodicAppendBody,
+) -> AppResult<NoteResponse> {
+    let get_body = PeriodicBody {
+        date: body.date.clone(),
+        content: String::new(),
+    };
+    let existing =
+        periodic_note_get_or_create_inner(state, principal, vault_id, period, get_body).await?;
+    let file = file_by_path(&state, vault_id, &existing.path)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    // Appending is a write; reject when the per-path ACL is read-only or deny.
+    let level = authorize_doc(state, &principal.user, vault_id, &doc_id(vault_id, &file.guid)).await?;
+    if level == Level::ReadOnly {
+        return Err(AppError::Forbidden);
+    }
+    let mut content = existing.content;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(&body.text);
+    ydoc::set_text(&state, &doc_id(vault_id, &file.guid), &content).await?;
+    mark_note_write(&state, vault_id, &principal).await;
+    Ok(NoteResponse {
+        permalink: permalink_for_guid(&state, &file.guid),
+        path: existing.path,
+        guid: file.guid,
+        content,
+    })
+}
+
+async fn read_note_content(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+    path: &str,
+    write: bool,
+) -> AppResult<(vault_files::Model, String)> {
+    let file = require_note_access(state, principal, vault_id, path, write).await?;
+    let update = ydoc::read_update(state, &doc_id(vault_id, &file.guid)).await?;
+    let content =
+        ydoc::decode_text(&update, "contents").map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok((file, content))
+}
+
+async fn require_note_access(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+    path: &str,
+    write: bool,
+) -> AppResult<vault_files::Model> {
+    principal.require_vault(vault_id)?;
+    require_member(state, &principal.user.id, vault_id).await?;
+    validate_note_path(path)?;
+    let file = file_by_path(state, vault_id, path)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let level = authorize_doc(
+        state,
+        &principal.user,
+        vault_id,
+        &doc_id(vault_id, &file.guid),
+    )
+    .await?;
+    if write && level == Level::ReadOnly {
+        return Err(AppError::Forbidden);
+    }
+    Ok(file)
+}
+
+async fn file_by_path(
+    state: &AppState,
+    vault_id: &str,
+    path: &str,
+) -> AppResult<Option<vault_files::Model>> {
+    Ok(vault_files::Entity::find()
+        .filter(vault_files::Column::VaultId.eq(vault_id))
+        .filter(vault_files::Column::Path.eq(path))
+        .one(&state.db)
+        .await?)
+}
+
+fn validate_note_path(path: &str) -> AppResult<()> {
+    if path.is_empty() || path.contains('\\') || !path.ends_with(".md") {
+        return Err(AppError::BadRequest("invalid note path".into()));
+    }
+    for component in path.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(AppError::BadRequest("invalid note path".into()));
+        }
+    }
+    Ok(())
+}
+
+fn doc_id(vault_id: &str, guid: &str) -> String {
+    format!("{vault_id}__{guid}")
+}
+
+fn permalink_for_guid(state: &AppState, guid: &str) -> String {
+    format!(
+        "{}/n/{guid}",
+        state.config.public_base_url.trim_end_matches('/')
+    )
+}
+
+fn periodic_path(state: &AppState, period: &str, date: Option<&str>) -> AppResult<String> {
+    let date = match date {
+        Some(value) => NaiveDate::parse_from_str(value, "%Y-%m-%d")
+            .map_err(|_| AppError::BadRequest("invalid date".into()))?,
+        None => chrono::Local::now().date_naive(),
+    };
+    let template = match period {
+        "daily" => Some(state.config.daily_note_path_template.as_str()),
+        "weekly" => state.config.weekly_note_path_template.as_deref(),
+        "monthly" => state.config.monthly_note_path_template.as_deref(),
+        "quarterly" => state.config.quarterly_note_path_template.as_deref(),
+        "yearly" => state.config.yearly_note_path_template.as_deref(),
+        _ => return Err(AppError::BadRequest("invalid period".into())),
+    }
+    .ok_or_else(|| AppError::BadRequest("period_not_configured".into()))?;
+    Ok(render_periodic_template(template, date))
+}
+
+fn render_periodic_template(template: &str, date: NaiveDate) -> String {
+    let iso = date.iso_week();
+    let quarter = (date.month0() / 3) + 1;
+    template
+        .replace("{{YYYY-MM-DD}}", &date.format("%Y-%m-%d").to_string())
+        .replace("{{YYYY}}", &format!("{:04}", date.year()))
+        .replace("{{MM}}", &format!("{:02}", date.month()))
+        .replace("{{DD}}", &format!("{:02}", date.day()))
+        .replace("{{Q}}", &quarter.to_string())
+        .replace("{{WW}}", &format!("{:02}", iso.week()))
+        .replace("{{GGGG}}", &format!("{:04}", iso.year()))
+}
+
+fn parse_frontmatter_value(content: &str) -> AppResult<Value> {
+    let Some((yaml, _body_start)) = frontmatter_bounds(content) else {
+        return Ok(Value::Object(JsonMap::new()));
+    };
+    let parsed: Value = serde_yaml::from_str(yaml)
+        .map_err(|e| AppError::BadRequest(format!("invalid frontmatter: {e}")))?;
+    Ok(parsed
+        .as_object()
+        .cloned()
+        .map(Value::Object)
+        .unwrap_or(Value::Object(JsonMap::new())))
+}
+
+fn patch_frontmatter_content(content: &str, patch: PatchFrontmatterBody) -> AppResult<String> {
+    let (existing, body_start) = match frontmatter_bounds(content) {
+        Some((yaml, body_start)) => (yaml, body_start),
+        None => ("", 0),
+    };
+    let mut map = match serde_yaml::from_str::<Value>(existing) {
+        Ok(Value::Object(map)) => map,
+        Ok(_) | Err(_) => JsonMap::new(),
+    };
+    for key in patch.unset {
+        map.remove(&key);
+    }
+    for (key, value) in patch.set {
+        map.insert(key, value);
+    }
+    let body = &content[body_start..];
+    // An empty map means no frontmatter — emit the bare body rather than `---\n{}\n---`.
+    if map.is_empty() {
+        return Ok(body.to_string());
+    }
+    let yaml = serde_yaml::to_string(&Value::Object(map))
+        .map_err(|e| AppError::Internal(format!("serialize frontmatter: {e}")))?;
+    Ok(format!("---\n{}\n---\n{}", yaml.trim_end(), body))
+}
+
+fn frontmatter_bounds(content: &str) -> Option<(&str, usize)> {
+    let rest = content.strip_prefix("---\n")?;
+    let end = rest.find("\n---")?;
+    let yaml = &rest[..end];
+    let after_marker = 4 + end + "\n---".len();
+    let body_start = if content[after_marker..].starts_with('\n') {
+        after_marker + 1
+    } else {
+        after_marker
+    };
+    Some((yaml, body_start))
+}

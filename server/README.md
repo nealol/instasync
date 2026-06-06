@@ -22,11 +22,16 @@ The auth server holds the **same private key** as y-sweet (via `y-sweet-core`'s
 **Binary files** (images, PDFs, and other non-Markdown attachments) do not go
 through y-sweet — that's a text CRDT and would bloat. Instead the plugin syncs only
 a `path → sha256` mapping through the CRDT index and stores the bytes in a
-**content-addressed blob store** served by this server under
-`/api/vaults/{id}/blobs/{hash}` (HEAD to check, GET to download, PUT to upload).
-Blobs live on disk at `BLOB_DIR/{vaultId}/{hash}`, alongside the y-sweet data;
-uploads are content-verified (the streamed bytes must hash to the claimed `hash`)
-and access is vault-scoped.
+**content-addressed blob store** served by this server. The raw sync blob store is
+under `/api/vaults/{id}/blobs/{hash}` for the matching plugin, while consumer-facing
+attachment APIs live under `/api/vaults/{id}/attachments/*`. Attachments enforce an
+extension allowlist, an attachment-specific size cap, SSRF checks for from-URL
+fetches, and signed single-use public upload links via `/upload`.
+
+**Remote Cursors / MCP** expose a vault-scoped MCP resource at `/mcp/i/{appId}`.
+MCP clients can use OAuth 2.1 against this server, and direct REST automation can
+use the generated cursor secret as a bearer token. Both paths attribute writes to
+the owning user and cursor in the git audit log.
 
 ## Running with Docker (recommended)
 
@@ -93,12 +98,39 @@ in the Obsidian plugin's **Auth server URL** and you're done.
 | `YSWEET_AUTH_KEY` | — | shared private key (same as `y-sweet serve --auth`) |
 | `OIDC_MODE` | `oidc` | `oidc` for a real IdP, `mock` for the in-process test issuer |
 | `OIDC_ISSUER` / `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URL` | — | OIDC config (real mode) |
+| `ALLOWED_LOGIN_REDIRECTS` | — | Comma-separated web origins allowed for login redirects; the public origin is always allowed |
+| `CORS_ALLOWED_ORIGINS` | Obsidian app origin | Comma-separated allowed CORS origins |
+| `GIT_DATA_DIR` | `./git` (`/data/git` in Docker) | Per-vault git audit/backup repository directory |
+| `GIT_AUDIT_ENABLED` | enabled | Set `0` to disable git audit commits |
+| `GIT_DEBOUNCE_MS` | `5000` | Idle debounce before writing a git audit commit |
+| `GIT_BOT_NAME` / `GIT_BOT_EMAIL` | `InstaSync` / `instasync@localhost` | Git committer identity and fallback author |
+| `CURSOR_EMAIL_DOMAIN` | domain from `GIT_BOT_EMAIL`, else `localhost` | Synthetic email domain for cursor-attributed git authors |
+| `GIT_REMOTE_URL` / `GIT_PUSH_ENABLED` | — / disabled | Parsed remote push config for future backup workflows |
+| `DAILY_NOTE_PATH_TEMPLATE` | `Daily Notes/{{YYYY-MM-DD}}.md` | Daily periodic note template |
+| `WEEKLY_NOTE_PATH_TEMPLATE` / `MONTHLY_NOTE_PATH_TEMPLATE` / `QUARTERLY_NOTE_PATH_TEMPLATE` / `YEARLY_NOTE_PATH_TEMPLATE` | — | Optional periodic note templates |
+| `ATTACHMENT_FETCH_HOST_ALLOWLIST` | — | Comma-separated hostnames allowed for server-side attachment fetches from URL |
+| `ATTACHMENT_ALLOWED_EXTENSIONS` | common images, `pdf`, `txt` | Comma-separated allowed attachment extensions |
+| `ATTACHMENT_MAX_BYTES` | raw blob max | Per-attachment upload/fetch size cap |
+| `ATTACHMENTS_PATH_MODE` | `relative` | `relative` or `subfolder`; `subfolder` requires attachment paths under `ATTACHMENTS_SUBFOLDER` |
+| `ATTACHMENTS_SUBFOLDER` | — | Required for subfolder path mode and used as the default signed-upload landing directory |
+| `UPLOAD_TOKEN` | `dev-upload-token-change-me` | HMAC key for signed single-use browser upload links; set a long random secret in production |
 
 In the bundled Docker setup, `docker-entrypoint.sh` starts y-sweet on
 `YSWEET_INTERNAL_PORT` (default 8080) with a `FileSystemStore` at `YSWEET_STORE`
 (`/data/ysweet`) and `--url-prefix $PUBLIC_BASE_URL`. The auth server then
 reverse-proxies the sync WebSocket and document HTTP endpoints under `/d/*`, so
 no second port or URL is ever exposed.
+
+## OAuth, MCP, and API docs
+
+The server is also an OAuth 2.1 authorization server for MCP clients. Discovery is
+available at `/.well-known/oauth-authorization-server`, and MCP protected resource
+metadata is available at `/.well-known/oauth-protected-resource/mcp/i/{appId}`.
+Tokens are opaque, hashed in SQLite, and scoped to the remote cursor's vault.
+
+Swagger UI is served at `/docs`, with the OpenAPI JSON at `/openapi.json`. The spec
+covers consumer-facing REST/auth/OAuth/upload/permalink routes and intentionally
+excludes `/mcp`, `/d/*`, raw blob storage, and `/api/doc-token`.
 
 ## Mock OIDC (tests/dev)
 

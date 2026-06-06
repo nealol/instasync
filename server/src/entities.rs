@@ -172,3 +172,92 @@ pub mod remote_cursors {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+pub mod oauth_clients {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "oauth_clients")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub client_secret_hash: Option<String>,
+        pub redirect_uris: String,
+        pub app_id: Option<String>,
+        pub created_at: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod oauth_codes {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "oauth_codes")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub code_hash: String,
+        pub client_id: String,
+        pub user_id: String,
+        pub app_id: String,
+        pub vault_id: String,
+        pub code_challenge: String,
+        pub redirect_uri: String,
+        pub scope: String,
+        pub expires_at: i64,
+        pub created_at: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod oauth_tokens {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "oauth_tokens")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub access_hash: String,
+        #[sea_orm(unique)]
+        pub refresh_hash: Option<String>,
+        pub client_id: String,
+        pub user_id: String,
+        pub app_id: String,
+        pub vault_id: String,
+        pub scope: String,
+        pub access_expires_at: i64,
+        pub refresh_expires_at: i64,
+        pub created_at: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod upload_jtis {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "upload_jtis")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub jti: String,
+        pub expires_at: i64,
+        pub created_at: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}

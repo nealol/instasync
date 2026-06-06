@@ -1,4 +1,4 @@
-import { Notice, Plugin } from "obsidian";
+import { Notice, Plugin, TFile } from "obsidian";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { InstaSyncSettings, InstaSyncSettingTab, defaultSettings } from "./settings";
@@ -55,6 +55,10 @@ export default class InstaSyncPlugin extends Plugin {
 					new Notice(`InstaSync: sign-in failed: ${e instanceof Error ? e.message : String(e)}`);
 				}
 			})();
+		});
+
+		this.registerObsidianProtocolHandler("instasync-open", (params) => {
+			void this.openInstasyncLink(params as Record<string, string>);
 		});
 
 		this.addCommand({
@@ -163,6 +167,36 @@ export default class InstaSyncPlugin extends Plugin {
 		this.stopSync();
 		await this.auth.logout();
 		this.setStatus("signin");
+	}
+
+	private async openInstasyncLink(params: Record<string, string>): Promise<void> {
+		try {
+			const vaultId = params.vault?.trim();
+			if (!vaultId || vaultId !== this.settings.activeVaultId) {
+				new Notice("InstaSync: this link is for a different vault.");
+				return;
+			}
+
+			let path = params.path?.trim() || "";
+			const guid = params.guid?.trim();
+			if (!path && guid) {
+				path = this.vaultSync?.pathForGuid(guid) ?? "";
+			}
+			if (!path) {
+				new Notice("InstaSync: note link is not available locally yet.");
+				return;
+			}
+
+			const file = this.app.vault.getAbstractFileByPath(path);
+			if (!(file instanceof TFile)) {
+				new Notice(`InstaSync: note not found: ${path}`);
+				return;
+			}
+			await this.app.workspace.getLeaf(false).openFile(file);
+		} catch (e) {
+			console.error("[InstaSync] failed to open permalink", e);
+			new Notice(`InstaSync: failed to open link: ${e instanceof Error ? e.message : String(e)}`);
+		}
 	}
 
 	/** Create a new server vault from the current local files and start syncing it. */

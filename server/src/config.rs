@@ -32,9 +32,22 @@ pub struct Config {
     /// Identity used as the committer (and as the author when none is known).
     pub git_bot_name: String,
     pub git_bot_email: String,
+    /// Domain used for synthetic cursor authors in git audit commits.
+    pub cursor_email_domain: String,
     /// Phase-2 hooks: remote to push each vault repo to (parsed but unused for now).
     pub git_remote_url: Option<String>,
     pub git_push_enabled: bool,
+    pub daily_note_path_template: String,
+    pub weekly_note_path_template: Option<String>,
+    pub monthly_note_path_template: Option<String>,
+    pub quarterly_note_path_template: Option<String>,
+    pub yearly_note_path_template: Option<String>,
+    pub attachment_fetch_host_allowlist: Vec<String>,
+    pub attachment_allowed_extensions: Vec<String>,
+    pub attachment_max_bytes: u64,
+    pub attachments_path_mode: String,
+    pub attachments_subfolder: Option<String>,
+    pub upload_token: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,8 +96,52 @@ impl Config {
             git_bot_name: opt("GIT_BOT_NAME").unwrap_or_else(|| "InstaSync".to_string()),
             git_bot_email: opt("GIT_BOT_EMAIL")
                 .unwrap_or_else(|| "instasync@localhost".to_string()),
+            cursor_email_domain: opt("CURSOR_EMAIL_DOMAIN").unwrap_or_else(|| {
+                opt("GIT_BOT_EMAIL")
+                    .and_then(|email| email.split_once('@').map(|(_, domain)| domain.to_string()))
+                    .unwrap_or_else(|| "localhost".to_string())
+            }),
             git_remote_url: opt("GIT_REMOTE_URL"),
             git_push_enabled: opt("GIT_PUSH_ENABLED").as_deref() == Some("1"),
+            daily_note_path_template: opt("DAILY_NOTE_PATH_TEMPLATE")
+                .unwrap_or_else(|| "Daily Notes/{{YYYY-MM-DD}}.md".to_string()),
+            weekly_note_path_template: opt("WEEKLY_NOTE_PATH_TEMPLATE"),
+            monthly_note_path_template: opt("MONTHLY_NOTE_PATH_TEMPLATE"),
+            quarterly_note_path_template: opt("QUARTERLY_NOTE_PATH_TEMPLATE"),
+            yearly_note_path_template: opt("YEARLY_NOTE_PATH_TEMPLATE"),
+            attachment_fetch_host_allowlist: list("ATTACHMENT_FETCH_HOST_ALLOWLIST"),
+            attachment_allowed_extensions: {
+                let configured = list("ATTACHMENT_ALLOWED_EXTENSIONS");
+                let values = if configured.is_empty() {
+                    vec![
+                        "png".into(),
+                        "jpg".into(),
+                        "jpeg".into(),
+                        "gif".into(),
+                        "webp".into(),
+                        "svg".into(),
+                        "pdf".into(),
+                        "txt".into(),
+                    ]
+                } else {
+                    configured
+                };
+                values
+                    .into_iter()
+                    .map(|ext| ext.trim_start_matches('.').to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .filter(|ext| !ext.is_empty())
+                    .collect()
+            },
+            attachment_max_bytes: opt("ATTACHMENT_MAX_BYTES")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(crate::blobs::MAX_BLOB_BYTES),
+            attachments_path_mode: opt("ATTACHMENTS_PATH_MODE")
+                .unwrap_or_else(|| "relative".to_string()),
+            attachments_subfolder: opt("ATTACHMENTS_SUBFOLDER"),
+            upload_token: opt("UPLOAD_TOKEN")
+                .unwrap_or_else(|| "dev-upload-token-change-me".to_string()),
         }
     }
 
