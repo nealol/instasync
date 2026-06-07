@@ -5,7 +5,7 @@ import { InstaSyncSettings, InstaSyncSettingTab, defaultSettings } from "./setti
 import { VaultSync, isConflictCopy } from "./VaultSync";
 import type { UploadStatus } from "./BinarySync";
 import { matchesAnyGlob, parseGlobs } from "./glob";
-import type { Document } from "./Document";
+import type { SyncedDoc } from "./SyncedDoc";
 import { AuthClient, AuthError, normalizeServerUrl } from "./auth";
 import { liveEdit } from "./editor/LiveEdit";
 import { yRemoteSelections, yRemoteSelectionsTheme } from "./editor/RemoteSelections";
@@ -85,7 +85,10 @@ export default class InstaSyncPlugin extends Plugin {
 			if (document.visibilityState === "visible") this.vaultSync?.reconnectAll();
 		});
 		this.registerEvent(
-			this.app.workspace.on("active-leaf-change", () => this.vaultSync?.reconnectAll()),
+			this.app.workspace.on("active-leaf-change", () => {
+				this.vaultSync?.reconnectAll();
+				this.vaultSync?.bindOpenCanvases();
+			}),
 		);
 
 		// Add "as Instasync Permalink" under the file tree's native "Copy path >" submenu.
@@ -287,15 +290,16 @@ export default class InstaSyncPlugin extends Plugin {
 	 */
 	private async wipeLocalSyncedFiles(): Promise<void> {
 		const excludes = parseGlobs(this.settings.binaryExcludeGlobs);
-		const targets = this.settings.syncBinaries
-			? this.app.vault.getFiles()
-			: this.app.vault.getMarkdownFiles();
+		const targets = this.app.vault.getFiles();
 		for (const file of targets) {
 			if (isConflictCopy(file.path)) continue;
-			if (
-				file.extension !== "md" &&
-				(!this.settings.syncBinaries || matchesAnyGlob(file.path, excludes))
-			) {
+			if (file.extension === "md") {
+				// Always synced through the text CRDT.
+			} else if (file.extension === "canvas" && this.settings.syncCanvases) {
+				// Synced through the structured CRDT.
+			} else if (file.extension === "base" && this.settings.syncBases) {
+				// Synced through the structured CRDT.
+			} else if (!this.settings.syncBinaries || matchesAnyGlob(file.path, excludes)) {
 				continue;
 			}
 			try {
@@ -309,7 +313,7 @@ export default class InstaSyncPlugin extends Plugin {
 	// --- Awareness / identity --------------------------------------------------
 
 	/** Sets this client's cursor identity on a single document's awareness. */
-	applyAwarenessTo(doc: Document): void {
+	applyAwarenessTo(doc: SyncedDoc): void {
 		doc.awareness.setLocalStateField("user", {
 			name: this.settings.clientName,
 			color: this.settings.clientColor,
@@ -425,6 +429,8 @@ function sanitizeSettings(raw: unknown): InstaSyncSettings {
 	settings.clientColorLight = sanitizeColor(data.clientColorLight, defaults.clientColorLight);
 	settings.enabled = typeof data.enabled === "boolean" ? data.enabled : defaults.enabled;
 	settings.syncBinaries = typeof data.syncBinaries === "boolean" ? data.syncBinaries : defaults.syncBinaries;
+	settings.syncCanvases = typeof data.syncCanvases === "boolean" ? data.syncCanvases : defaults.syncCanvases;
+	settings.syncBases = typeof data.syncBases === "boolean" ? data.syncBases : defaults.syncBases;
 	settings.binaryExcludeGlobs = typeof data.binaryExcludeGlobs === "string" ? data.binaryExcludeGlobs : "";
 	settings.syncConfigEnabled = typeof data.syncConfigEnabled === "boolean" ? data.syncConfigEnabled : false;
 	settings.configIncludeGlobs = Array.isArray(data.configIncludeGlobs)

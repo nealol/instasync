@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use y_sweet_core::auth::Authenticator;
@@ -353,6 +354,52 @@ pub fn decode_files_map(update: &[u8]) -> Result<Vec<(String, String)>> {
     decode_string_map(update, "files")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredIndexEntry {
+    pub path: String,
+    pub guid: String,
+    pub kind: String,
+}
+
+/// Decode the vault index doc's `structured` map (path -> { guid, kind }).
+pub fn decode_structured_index(update: &[u8]) -> Result<Vec<StructuredIndexEntry>> {
+    let doc = Doc::new();
+    let update = Update::decode_v1(update).map_err(|e| anyhow!("decode index: {e:?}"))?;
+    {
+        let mut txn = doc.transact_mut();
+        txn.apply_update(update);
+    }
+    let map = doc.get_or_insert_map("structured");
+    let txn = doc.transact();
+    let mut out = Vec::new();
+    if let Any::Map(entries) = map.to_json(&txn) {
+        for (path, value) in entries.iter() {
+            let Any::Map(meta) = value else { continue };
+            let Some(Any::String(guid)) = meta.get("guid") else { continue };
+            let Some(Any::String(kind)) = meta.get("kind") else { continue };
+            out.push(StructuredIndexEntry {
+                path: path.clone(),
+                guid: guid.to_string(),
+                kind: kind.to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Decode a structured document rooted at `Y.Map("root")` into JSON.
+pub fn decode_structured(update: &[u8]) -> Result<JsonValue> {
+    let doc = Doc::new();
+    let update = Update::decode_v1(update).map_err(|e| anyhow!("decode update: {e:?}"))?;
+    {
+        let mut txn = doc.transact_mut();
+        txn.apply_update(update);
+    }
+    let root = doc.get_or_insert_map("root");
+    let txn = doc.transact();
+    Ok(any_to_json(&root.to_json(&txn)))
+}
+
 /// Decode the vault index doc's `binaries` map (path -> JSON metadata) from a full-state update.
 pub fn decode_binaries_map(update: &[u8]) -> Result<Vec<(String, Any)>> {
     let doc = Doc::new();
@@ -392,6 +439,25 @@ fn decode_string_map(update: &[u8], name: &str) -> Result<Vec<(String, String)>>
     Ok(out)
 }
 
+fn any_to_json(value: &Any) -> JsonValue {
+    match value {
+        Any::Null | Any::Undefined => JsonValue::Null,
+        Any::Bool(v) => JsonValue::Bool(*v),
+        Any::Number(v) => JsonNumber::from_f64(*v).map(JsonValue::Number).unwrap_or(JsonValue::Null),
+        Any::BigInt(v) => JsonValue::Number(JsonNumber::from(*v)),
+        Any::String(v) => JsonValue::String(v.to_string()),
+        Any::Buffer(v) => JsonValue::Array(v.iter().map(|b| JsonValue::Number(JsonNumber::from(*b))).collect()),
+        Any::Array(values) => JsonValue::Array(values.iter().map(any_to_json).collect()),
+        Any::Map(entries) => {
+            let mut out = JsonMap::new();
+            for (key, child) in entries.iter() {
+                out.insert(key.clone(), any_to_json(child));
+            }
+            JsonValue::Object(out)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +484,39 @@ mod tests {
             for (path, guid) in entries {
                 map.insert(&mut txn, path.to_string(), guid.to_string());
             }
+        }
+        let update = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        update
+    }
+
+    fn structured_index_update(entries: &[(&str, &str, &str)]) -> Vec<u8> {
+        let doc = Doc::new();
+        let map = doc.get_or_insert_map("structured");
+        {
+            let mut txn = doc.transact_mut();
+            for (path, guid, kind) in entries {
+                let meta = HashMap::from([
+                    ("guid".to_string(), Any::String((*guid).into())),
+                    ("kind".to_string(), Any::String((*kind).into())),
+                ]);
+                map.insert(&mut txn, path.to_string(), meta);
+            }
+        }
+        let update = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        update
+    }
+
+    fn structured_doc_update() -> Vec<u8> {
+        let doc = Doc::new();
+        let root = doc.get_or_insert_map("root");
+        {
+            let mut txn = doc.transact_mut();
+            root.insert(&mut txn, "title".to_string(), "Inbox".to_string());
+            root.insert(&mut txn, "count".to_string(), 2.0);
         }
         let update = doc
             .transact()
@@ -455,6 +554,28 @@ mod tests {
                 ("a.md".to_string(), "guid-a".to_string()),
                 ("dir/b.md".to_string(), "guid-b".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn decode_structured_index_roundtrips() {
+        let update = structured_index_update(&[("board.canvas", "guid-c", "canvas")]);
+        assert_eq!(
+            decode_structured_index(&update).unwrap(),
+            vec![StructuredIndexEntry {
+                path: "board.canvas".into(),
+                guid: "guid-c".into(),
+                kind: "canvas".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn decode_structured_roundtrips_root_map() {
+        let update = structured_doc_update();
+        assert_eq!(
+            decode_structured(&update).unwrap(),
+            serde_json::json!({ "title": "Inbox", "count": 2.0 })
         );
     }
 

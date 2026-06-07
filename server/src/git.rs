@@ -24,12 +24,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use sea_orm::DatabaseConnection;
+use serde_json::{json, Value as JsonValue};
 use tokio::sync::Mutex;
 use y_sweet_core::auth::Authenticator;
 
 use crate::config::Config;
 use crate::state::{Principal, PrincipalActor};
-use crate::ydoc::{decode_files_map, decode_text};
+use crate::ydoc::{decode_files_map, decode_structured, decode_structured_index, decode_text};
 
 /// A principal seen contributing to a vault during one debounce window.
 type Contributor = Principal;
@@ -169,9 +170,10 @@ impl GitService {
         // 1. Authoritative file set from the vault index doc's `files` map.
         let index_update = self.fetch_as_update(vault_id).await?;
         let files = decode_files_map(&index_update)?; // Vec<(path, guid)>
+        let structured = decode_structured_index(&index_update)?;
 
-        // 2. Reconstruct each markdown file's text from its own doc.
-        let mut tree: Vec<(PathBuf, String)> = Vec::with_capacity(files.len());
+        // 2. Reconstruct each markdown/structured file from its own doc.
+        let mut tree: Vec<(PathBuf, String)> = Vec::with_capacity(files.len() + structured.len());
         for (path, guid) in &files {
             let rel = match safe_rel_path(path) {
                 Ok(rel) => rel,
@@ -185,6 +187,25 @@ impl GitService {
                 Ok(update) => match decode_text(&update, "contents") {
                     Ok(content) => tree.push((rel, content)),
                     Err(e) => tracing::warn!("git audit: decode {path} failed: {e}"),
+                },
+                Err(e) => tracing::warn!("git audit: fetch {doc_id} failed: {e}"),
+            }
+        }
+        for entry in &structured {
+            let rel = match safe_rel_path(&entry.path) {
+                Ok(rel) => rel,
+                Err(e) => {
+                    tracing::warn!("git audit: skipping unsafe path {:?}: {e}", entry.path);
+                    continue;
+                }
+            };
+            let doc_id = format!("{vault_id}__{}", entry.guid);
+            match self.fetch_as_update(&doc_id).await {
+                Ok(update) => match decode_structured(&update)
+                    .and_then(|value| serialize_structured_for_git(&entry.kind, value))
+                {
+                    Ok(content) => tree.push((rel, content)),
+                    Err(e) => tracing::warn!("git audit: decode {} failed: {e}", entry.path),
                 },
                 Err(e) => tracing::warn!("git audit: fetch {doc_id} failed: {e}"),
             }
@@ -408,6 +429,51 @@ fn safe_rel_path(path: &str) -> Result<PathBuf> {
     Ok(rel)
 }
 
+fn serialize_structured_for_git(kind: &str, value: JsonValue) -> Result<String> {
+    match kind {
+        "canvas" => Ok(format!("{}\n", serde_json::to_string_pretty(&canvas_to_file_json(value))?)),
+        "base" => Ok(serde_yaml::to_string(&value)?),
+        other => bail!("unknown structured document kind {other}"),
+    }
+}
+
+fn canvas_to_file_json(value: JsonValue) -> JsonValue {
+    let Some(root) = value.as_object() else {
+        return json!({ "nodes": [], "edges": [] });
+    };
+    let nodes = root.get("nodes").and_then(JsonValue::as_object);
+    let edges = root.get("edges").and_then(JsonValue::as_object);
+    let node_order = root.get("nodeOrder").and_then(JsonValue::as_array);
+    let edge_order = root.get("edgeOrder").and_then(JsonValue::as_array);
+    json!({
+        "nodes": ordered_canvas_items(nodes, node_order),
+        "edges": ordered_canvas_items(edges, edge_order),
+    })
+}
+
+fn ordered_canvas_items(
+    items: Option<&serde_json::Map<String, JsonValue>>,
+    order: Option<&Vec<JsonValue>>,
+) -> Vec<JsonValue> {
+    let Some(items) = items else { return Vec::new() };
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(order) = order {
+        for id in order.iter().filter_map(JsonValue::as_str) {
+            if let Some(item) = items.get(id) {
+                out.push(item.clone());
+                seen.insert(id.to_string());
+            }
+        }
+    }
+    for (id, item) in items {
+        if !seen.contains(id) {
+            out.push(item.clone());
+        }
+    }
+    out
+}
+
 /// Write every file in `tree` and delete any working-tree file not present in it.
 /// Runs on a blocking thread (synchronous fs walk).
 fn materialize_tree(repo: &Path, tree: &[(PathBuf, String)]) -> Result<()> {
@@ -514,6 +580,41 @@ mod tests {
             safe_rel_path("a/b.md").unwrap(),
             PathBuf::from("a").join("b.md")
         );
+    }
+
+    #[test]
+    fn serializes_structured_canvas_for_git() {
+        let value = json!({
+            "nodes": {
+                "n2": { "id": "n2", "type": "text", "text": "second" },
+                "n1": { "id": "n1", "type": "text", "text": "first" }
+            },
+            "edges": {
+                "e1": { "id": "e1", "fromNode": "n1", "toNode": "n2" }
+            },
+            "nodeOrder": ["n1", "n2"],
+            "edgeOrder": ["e1"]
+        });
+        let serialized = serialize_structured_for_git("canvas", value).unwrap();
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&serialized).unwrap(),
+            json!({
+                "nodes": [
+                    { "id": "n1", "type": "text", "text": "first" },
+                    { "id": "n2", "type": "text", "text": "second" }
+                ],
+                "edges": [
+                    { "id": "e1", "fromNode": "n1", "toNode": "n2" }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_structured_base_for_git() {
+        let serialized = serialize_structured_for_git("base", json!({ "views": [{ "type": "table" }] })).unwrap();
+        assert!(serialized.contains("views:"));
+        assert!(serialized.contains("type: table"));
     }
 
     #[test]

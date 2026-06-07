@@ -106,11 +106,15 @@ export interface FakePlugin {
 		clientColorLight: string;
 		enabled: boolean;
 		syncBinaries: boolean;
+		syncCanvases: boolean;
+		syncBases: boolean;
 		binaryExcludeGlobs: string;
+		syncConfigEnabled: boolean;
+		configIncludeGlobs: string[];
 		diagnosticLogging: boolean;
 	};
 	auth: AuthClient;
-	app: { vault: FakeVault; workspace: { on: () => unknown } };
+	app: { vault: FakeVault; workspace: { on: () => unknown }; secretStorage: { getSecret: (key: string) => string | null; setSecret: (key: string, value: string) => void; deleteSecret: (key: string) => void } };
 	registerEvent: (ref: unknown) => void;
 	applyAwarenessTo: (doc: unknown) => void;
 	setStatus: (status: string) => void;
@@ -124,6 +128,7 @@ export function makeFakePlugin(
 	opts: { sessionToken: string; activeVaultId: string; clientName?: string },
 ): { plugin: FakePlugin; vault: FakeVault } {
 	const vault = new FakeVault();
+	const secrets = new Map<string, string>([["instasync-session-token", opts.sessionToken]]);
 	const plugin: FakePlugin = {
 		settings: {
 			authServerUrl,
@@ -136,12 +141,24 @@ export function makeFakePlugin(
 			clientColorLight: "#ffffff33",
 			enabled: true,
 			syncBinaries: true,
+			syncCanvases: true,
+			syncBases: true,
 			binaryExcludeGlobs: "",
+			syncConfigEnabled: false,
+			configIncludeGlobs: [],
 			diagnosticLogging: false,
 		},
 		// Set just below, once the object exists (AuthClient needs the plugin).
 		auth: undefined as unknown as AuthClient,
-		app: { vault, workspace: { on: () => ({}) } },
+		app: {
+			vault,
+			workspace: { on: () => ({}) },
+			secretStorage: {
+				getSecret: (key) => secrets.get(key) ?? null,
+				setSecret: (key, value) => { secrets.set(key, value); },
+				deleteSecret: (key) => { secrets.delete(key); },
+			},
+		},
 		registerEvent: () => {},
 		applyAwarenessTo: () => {},
 		setStatus: () => {},

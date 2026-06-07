@@ -12,9 +12,16 @@ import { TFile, TAbstractFile, Notice, type EventRef } from "obsidian";
 import type InstaSyncPlugin from "./main";
 import { getClientToken } from "./ysweet";
 import { Document } from "./Document";
+import { CanvasDocument } from "./CanvasDocument";
+import { BaseDocument } from "./BaseDocument";
+import type { StructuredDocument } from "./StructuredDocument";
 import { BinarySync } from "./BinarySync";
 import { ConfigSync } from "./ConfigSync";
 import { matchesAnyGlob, parseGlobs } from "./glob";
+
+type FileKind = "text" | "structured" | "binary" | "ignore";
+type StructuredKind = "canvas" | "base";
+interface StructuredMeta { guid: string; kind: StructuredKind }
 
 /** Matches the sibling backups written on conflict; these must never sync. */
 const CONFLICT_COPY_RE = / \(conflicted copy .+\)$/;
@@ -52,12 +59,15 @@ export class VaultSync {
 	private indexPersistence: IndexeddbPersistence;
 	/** Shared map of vault-relative path -> document guid. */
 	private files: Y.Map<string>;
+	/** Shared map of vault-relative structured path -> document metadata. */
+	private structured: Y.Map<StructuredMeta>;
 	/** Sibling sync path for binary (non-Markdown) files; shares the index doc. */
 	private binarySync: BinarySync;
 	/** Per-device opt-in sync for whitelisted files under `.obsidian`. */
 	private configSync: ConfigSync;
 
 	private documents = new Map<string, Document>();
+	private structuredDocuments = new Map<string, StructuredDocument>();
 	private destroyed = false;
 	private initialSynced = false;
 	/** Last time a text document synced (ms epoch); gates background blob uploads. */
@@ -66,6 +76,7 @@ export class VaultSync {
 	private wasConnected = false;
 
 	private filesObserver: (event: Y.YMapEvent<string>) => void;
+	private structuredObserver: (event: Y.YMapEvent<StructuredMeta>) => void;
 	private statusListener: (status: YSweetStatus) => void;
 	private vaultEvents: EventRef[] = [];
 
@@ -74,6 +85,7 @@ export class VaultSync {
 
 		this.indexDoc = new Y.Doc();
 		this.files = this.indexDoc.getMap("files");
+		this.structured = this.indexDoc.getMap("structured");
 		this.binarySync = new BinarySync(plugin, this, this.indexDoc);
 		this.configSync = new ConfigSync(plugin, this.indexDoc);
 
@@ -92,6 +104,8 @@ export class VaultSync {
 
 		this.filesObserver = this.onFilesChanged.bind(this);
 		this.files.observe(this.filesObserver);
+		this.structuredObserver = this.onStructuredChanged.bind(this);
+		this.structured.observe(this.structuredObserver);
 
 		this.statusListener = (status) => {
 			if (status === STATUS_CONNECTED) {
@@ -136,11 +150,15 @@ export class VaultSync {
 			void this.indexProvider.connect();
 		}
 		for (const doc of this.documents.values()) doc.ensureConnected();
+		for (const doc of this.structuredDocuments.values()) doc.ensureConnected();
 	}
 
 	pathForGuid(guid: string): string | null {
 		for (const [path, value] of this.files.entries()) {
 			if (value === guid) return path;
+		}
+		for (const [path, meta] of this.structured.entries()) {
+			if (meta.guid === guid) return path;
 		}
 		return null;
 	}
@@ -162,11 +180,33 @@ export class VaultSync {
 		for (const [path, guid] of this.files.entries()) {
 			this.ensureDocument(path, guid, false);
 		}
+		for (const [path, meta] of this.structured.entries()) {
+			this.ensureStructuredDocument(path, meta.guid, meta.kind, false);
+		}
 
-		// Add any local Markdown files that aren't tracked yet.
-		const mdFiles = this.plugin.app.vault.getMarkdownFiles();
-		for (const file of mdFiles) {
+		// Add any local text or structured files that aren't tracked yet.
+		const syncFiles = this.plugin.app.vault.getFiles().filter((file) => {
+			const kind = this.classify(file);
+			return kind === "text" || kind === "structured";
+		});
+		for (const file of syncFiles) {
 			if (isConflictCopy(file.path)) continue;
+			const kind = this.classify(file);
+			if (kind === "structured") {
+				const structuredKind = this.structuredKindForExtension(file.extension);
+				if (!structuredKind) continue;
+				if (!this.structured.has(file.path)) {
+					const guid = newGuid();
+					this.indexDoc.transact(() => {
+						this.structured.set(file.path, { guid, kind: structuredKind });
+					});
+					this.ensureStructuredDocument(file.path, guid, structuredKind, true);
+				} else {
+					const meta = this.structured.get(file.path)!;
+					this.ensureStructuredDocument(file.path, meta.guid, meta.kind, false);
+				}
+				continue;
+			}
 			if (!this.files.has(file.path)) {
 				const guid = newGuid();
 				this.indexDoc.transact(() => {
@@ -179,7 +219,7 @@ export class VaultSync {
 			}
 		}
 
-		new Notice(`InstaSync: connected, syncing ${this.documents.size} files.`);
+		new Notice(`InstaSync: connected, syncing ${this.documents.size + this.structuredDocuments.size} files.`);
 
 		// Reconcile binary files against the blob store (after the text pass so
 		// note sync wins the bandwidth while binaries settle in the background).
@@ -209,12 +249,25 @@ export class VaultSync {
 		});
 	}
 
+	private onStructuredChanged(event: Y.YMapEvent<StructuredMeta>): void {
+		if (this.destroyed) return;
+		event.changes.keys.forEach((change, path) => {
+			if (change.action === "add" || change.action === "update") {
+				const meta = this.structured.get(path);
+				if (meta) this.ensureStructuredDocument(path, meta.guid, meta.kind, false);
+			} else if (change.action === "delete") {
+				this.handleRemoteDelete(path);
+			}
+		});
+	}
+
 	private async handleRemoteDelete(path: string): Promise<void> {
 		if (this.destroyed) return;
 		// A remote delete is authoritative: drop our Document and remove the local
 		// file. We deliberately do not gate on local edits or whether the file is
 		// open — the index is the source of truth, so the delete propagates.
 		this.removeDocument(path);
+		this.removeStructuredDocument(path);
 		const file = this.plugin.app.vault.getAbstractFileByPath(path);
 		if (file instanceof TFile) {
 			try {
@@ -252,6 +305,28 @@ export class VaultSync {
 		}
 	}
 
+	private ensureStructuredDocument(path: string, guid: string, kind: StructuredKind, isCreator: boolean): StructuredDocument {
+		const existing = this.structuredDocuments.get(path);
+		if (existing && existing.guid === guid) return existing;
+		if (existing) this.removeStructuredDocument(path);
+
+		const serverDocId = `${this.plugin.settings.activeVaultId}__${guid}`;
+		const doc = kind === "canvas"
+			? new CanvasDocument(this.plugin, path, guid, serverDocId, isCreator)
+			: new BaseDocument(this.plugin, path, guid, serverDocId, isCreator);
+		this.structuredDocuments.set(path, doc);
+		this.plugin.applyAwarenessTo(doc);
+		return doc;
+	}
+
+	private removeStructuredDocument(path: string): void {
+		const doc = this.structuredDocuments.get(path);
+		if (doc) {
+			doc.destroy();
+			this.structuredDocuments.delete(path);
+		}
+	}
+
 	/** Record that a text document just synced (called by {@link Document}). */
 	noteTextActivity(): void {
 		this.lastTextActivityAt = Date.now();
@@ -271,8 +346,14 @@ export class VaultSync {
 		return this.documents.get(path);
 	}
 
-	allDocuments(): Document[] {
-		return Array.from(this.documents.values());
+	allDocuments(): Array<Document | StructuredDocument> {
+		return [...this.documents.values(), ...this.structuredDocuments.values()];
+	}
+
+	bindOpenCanvases(): void {
+		for (const doc of this.structuredDocuments.values()) {
+			if (doc instanceof CanvasDocument) doc.tryBindLiveCanvas();
+		}
 	}
 
 	// --- Local vault events ----------------------------------------------------
@@ -294,10 +375,12 @@ export class VaultSync {
 	 * (folders, conflict copies, and — when binary sync is off or excluded — the
 	 * non-Markdown files).
 	 */
-	private classify(file: TAbstractFile): "text" | "binary" | "ignore" {
+	private classify(file: TAbstractFile): FileKind {
 		if (!(file instanceof TFile)) return "ignore";
 		if (isConflictCopy(file.path)) return "ignore";
 		if (file.extension === "md") return "text";
+		if (file.extension === "canvas" && this.plugin.settings.syncCanvases) return "structured";
+		if (file.extension === "base" && this.plugin.settings.syncBases) return "structured";
 		if (!this.plugin.settings.syncBinaries) return "ignore";
 		if (matchesAnyGlob(file.path, parseGlobs(this.plugin.settings.binaryExcludeGlobs))) {
 			return "ignore";
@@ -305,11 +388,32 @@ export class VaultSync {
 		return "binary";
 	}
 
+	private structuredKindForExtension(extension: string): StructuredKind | null {
+		if (extension === "canvas") return "canvas";
+		if (extension === "base") return "base";
+		return null;
+	}
+
 	private onLocalCreate(file: TAbstractFile): void {
 		if (this.destroyed || !this.initialSynced) return;
 		const kind = this.classify(file);
 		if (kind === "binary") {
 			this.binarySync.onLocalChanged(file.path);
+			return;
+		}
+		if (kind === "structured" && file instanceof TFile) {
+			const structuredKind = this.structuredKindForExtension(file.extension);
+			if (!structuredKind) return;
+			if (this.structured.has(file.path)) {
+				const meta = this.structured.get(file.path)!;
+				this.ensureStructuredDocument(file.path, meta.guid, meta.kind, false);
+				return;
+			}
+			const guid = newGuid();
+			this.indexDoc.transact(() => {
+				this.structured.set(file.path, { guid, kind: structuredKind });
+			});
+			this.ensureStructuredDocument(file.path, guid, structuredKind, true);
 			return;
 		}
 		if (kind !== "text") return;
@@ -338,6 +442,15 @@ export class VaultSync {
 			}
 			return;
 		}
+		if (this.structuredDocuments.has(path) || this.structured.has(path)) {
+			this.removeStructuredDocument(path);
+			if (this.structured.has(path)) {
+				this.indexDoc.transact(() => {
+					this.structured.delete(path);
+				});
+			}
+			return;
+		}
 		// Binary (or formerly-binary) file: let BinarySync propagate the delete.
 		this.binarySync.onLocalDeleted(path);
 	}
@@ -349,9 +462,15 @@ export class VaultSync {
 		// Drop tracking of the old path on the text side.
 		const wasTracked = this.files.has(oldPath);
 		const guid = this.files.get(oldPath) ?? this.documents.get(oldPath)?.guid;
+		const wasStructuredTracked = this.structured.has(oldPath);
+		const oldStructured = this.structured.get(oldPath) ?? this.structuredDocuments.get(oldPath);
 		this.removeDocument(oldPath);
+		this.removeStructuredDocument(oldPath);
 		if (wasTracked) {
 			this.indexDoc.transact(() => this.files.delete(oldPath));
+		}
+		if (wasStructuredTracked) {
+			this.indexDoc.transact(() => this.structured.delete(oldPath));
 		}
 
 		const kind = this.classify(file);
@@ -362,6 +481,14 @@ export class VaultSync {
 			});
 			this.registerFile(newPath, finalGuid);
 			this.ensureDocument(newPath, finalGuid, !wasTracked);
+		} else if (kind === "structured") {
+			const structuredKind = this.structuredKindForExtension(file.extension);
+			if (!structuredKind) return;
+			const finalGuid = oldStructured?.guid ?? newGuid();
+			this.indexDoc.transact(() => {
+				this.structured.set(newPath, { guid: finalGuid, kind: structuredKind });
+			});
+			this.ensureStructuredDocument(newPath, finalGuid, structuredKind, !wasStructuredTracked);
 		} else if (kind === "binary") {
 			// Reconcile both old (now gone) and new paths on the binary side.
 			this.binarySync.onLocalRenamed(file, oldPath);
@@ -376,6 +503,11 @@ export class VaultSync {
 		const kind = this.classify(file);
 		if (kind === "binary") {
 			this.binarySync.onLocalChanged(file.path);
+			return;
+		}
+		if (kind === "structured") {
+			const doc = this.structuredDocuments.get(file.path);
+			if (doc) void doc.onDiskChanged();
 			return;
 		}
 		if (kind !== "text") return;
@@ -394,9 +526,12 @@ export class VaultSync {
 		this.binarySync.destroy();
 		this.configSync.destroy();
 		this.files.unobserve(this.filesObserver);
+		this.structured.unobserve(this.structuredObserver);
 		this.indexProvider.off(EVENT_CONNECTION_STATUS, this.statusListener);
 		for (const doc of this.documents.values()) doc.destroy();
 		this.documents.clear();
+		for (const doc of this.structuredDocuments.values()) doc.destroy();
+		this.structuredDocuments.clear();
 		this.indexProvider.destroy();
 		void this.indexPersistence.destroy();
 		this.indexDoc.destroy();

@@ -28,6 +28,10 @@ export interface InstaSyncSettings {
     enabled: boolean;
     /** Whether to sync binary (non-Markdown) files via the content-addressed blob store. */
     syncBinaries: boolean;
+    /** Whether to sync Obsidian Canvas files as structured CRDT documents. */
+    syncCanvases: boolean;
+    /** Whether to sync Obsidian Bases files as structured CRDT documents. */
+    syncBases: boolean;
     /**
      * Comma-separated globs (matched against the vault-relative path) of binary
      * files to exclude from sync, e.g. `*.tmp, .obsidian/**`. Empty syncs all.
@@ -54,6 +58,8 @@ export function defaultSettings(): InstaSyncSettings {
         clientColorLight: identity.colorLight,
         enabled: true,
         syncBinaries: true,
+        syncCanvases: true,
+        syncBases: true,
         binaryExcludeGlobs: '',
         syncConfigEnabled: false,
         configIncludeGlobs: [],
@@ -285,6 +291,7 @@ function FullSettings({ app, plugin, refresh }: { app: App; plugin: InstaSyncPlu
             {/*<h2>InstaSync</h2>*/}
             <AccountSection plugin={plugin} refresh={refresh}/>
             <EnableSyncSection plugin={plugin} refresh={refresh}/>
+            <StructuredSyncSection plugin={plugin} refresh={refresh}/>
             <BinarySyncSection plugin={plugin} refresh={refresh}/>
             <DeviceSection plugin={plugin}/>
             <VaultDetails app={app} plugin={plugin}/>
@@ -313,6 +320,29 @@ function EnableSyncSection({ plugin, refresh }: { plugin: InstaSyncPlugin; refre
                                             if (!value) new Notice('InstaSync: syncing disabled for this vault.')
                                             refresh()
                                         })}/>}/>
+}
+
+function StructuredSyncSection({ plugin, refresh }: { plugin: InstaSyncPlugin; refresh: () => void }) {
+    return <>
+        <SettingRow name="Sync canvases"
+                    desc="Sync .canvas files as structured CRDT documents. Live canvas updates use Obsidian's private canvas API when available, with disk write-through fallback."
+                    control={<Toggle value={plugin.settings.syncCanvases}
+                                     onChange={(value) => void runNotice(undefined, async () => {
+                                         plugin.settings.syncCanvases = value
+                                         await plugin.saveSettings()
+                                         await plugin.reloadSync()
+                                         refresh()
+                                     })}/>}/>
+        <SettingRow name="Sync bases"
+                    desc="Sync .base files as structured YAML CRDT documents. YAML formatting may be normalized when remote changes write back to disk."
+                    control={<Toggle value={plugin.settings.syncBases}
+                                     onChange={(value) => void runNotice(undefined, async () => {
+                                         plugin.settings.syncBases = value
+                                         await plugin.saveSettings()
+                                         await plugin.reloadSync()
+                                         refresh()
+                                     })}/>}/>
+    </>
 }
 
 function BinarySyncSection({ plugin, refresh }: { plugin: InstaSyncPlugin; refresh: () => void }) {
