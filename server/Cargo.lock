@@ -1236,45 +1236,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "instasync-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "chrono",
- "futures-util",
- "hmac",
- "http-body-util",
- "nanoid",
- "openidconnect",
- "rand 0.8.6",
- "regex",
- "reqwest",
- "rmcp",
- "schemars 1.2.1",
- "sea-orm",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "thiserror 1.0.69",
- "tokio",
- "tokio-tungstenite 0.24.0",
- "tokio-util",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "url",
- "utoipa",
- "utoipa-swagger-ui",
- "uuid",
- "y-sweet-core",
- "yrs",
-]
-
-[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1981,6 +1942,45 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "realtime-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "futures-util",
+ "hmac",
+ "http-body-util",
+ "nanoid",
+ "openidconnect",
+ "rand 0.8.6",
+ "regex",
+ "reqwest",
+ "rmcp",
+ "schemars 1.2.1",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tokio-util",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "utoipa",
+ "utoipa-swagger-ui",
+ "uuid",
+ "y-sweet-core",
+ "yrs",
+]
 
 [[package]]
 name = "redox_syscall"

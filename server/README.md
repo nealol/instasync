@@ -1,4 +1,4 @@
-# InstaSync auth server
+# Realtime auth server
 
 A small [axum](https://github.com/tokio-rs/axum) service that owns SSO accounts,
 vaults, sharing/invites, and **mints y-sweet document tokens** after access
@@ -40,16 +40,16 @@ and the plugin only needs **one URL** (this server's `PUBLIC_BASE_URL`).
 
 ```sh
 # 1. Generate the shared key once:
-docker run --rm --entrypoint y-sweet ghcr.io/<owner>/instasync-server gen-auth --json
+docker run --rm --entrypoint y-sweet ghcr.io/<owner>/realtime-server gen-auth --json
 
 # 2. Run the server (y-sweet starts internally and is proxied under /d/*):
-docker run -p 8081:8081 -v instasync-data:/data \
+docker run -p 8081:8081 -v realtime-data:/data \
   -e YSWEET_AUTH_KEY=<private_key> \
   -e PUBLIC_BASE_URL=https://sync.example.com \
   -e OIDC_MODE=oidc \
   -e OIDC_ISSUER=https://id.example.com \
   -e OIDC_CLIENT_ID=... -e OIDC_CLIENT_SECRET=... \
-  ghcr.io/<owner>/instasync-server
+  ghcr.io/<owner>/realtime-server
 ```
 
 Set `PUBLIC_BASE_URL` to the URL clients reach this server at — it is baked into
@@ -89,7 +89,7 @@ in the Obsidian plugin's **Auth server URL** and you're done.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `DATABASE_URL` | `sqlite://instasync.db?mode=rwc` | SeaORM sqlite URL |
+| `DATABASE_URL` | `sqlite://realtime.db?mode=rwc` | SeaORM sqlite URL |
 | `BIND_ADDR` | `127.0.0.1:8081` | listen address |
 | `PUBLIC_BASE_URL` | `http://127.0.0.1:8081` | this server's public URL; OIDC redirect default **and** the URL baked into minted client tokens (clients connect to `/d/*` here) |
 | `YSWEET_URL` | `http://127.0.0.1:8080` | internal URL used to reach (and proxy to) y-sweet |
@@ -103,7 +103,7 @@ in the Obsidian plugin's **Auth server URL** and you're done.
 | `GIT_DATA_DIR` | `./git` (`/data/git` in Docker) | Per-vault git audit/backup repository directory |
 | `GIT_AUDIT_ENABLED` | enabled | Set `0` to disable git audit commits |
 | `GIT_DEBOUNCE_MS` | `5000` | Idle debounce before writing a git audit commit |
-| `GIT_BOT_NAME` / `GIT_BOT_EMAIL` | `InstaSync` / `instasync@localhost` | Git committer identity and fallback author |
+| `GIT_BOT_NAME` / `GIT_BOT_EMAIL` | `Realtime` / `realtime@localhost` | Git committer identity and fallback author |
 | `CURSOR_EMAIL_DOMAIN` | domain from `GIT_BOT_EMAIL`, else `localhost` | Synthetic email domain for cursor-attributed git authors |
 | `GIT_REMOTE_URL` / `GIT_PUSH_ENABLED` | — / disabled | Parsed remote push config for future backup workflows |
 | `DAILY_NOTE_PATH_TEMPLATE` | `Daily Notes/{{YYYY-MM-DD}}.md` | Daily periodic note template |

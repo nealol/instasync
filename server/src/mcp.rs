@@ -27,6 +27,7 @@ use crate::notes::{
 use crate::search;
 use crate::session::{bearer_token, hash_token, now_millis, ApiActor, ApiPrincipal};
 use crate::state::AppState;
+use crate::{SERVER_NAME, SERVER_SLUG};
 
 #[derive(Clone)]
 pub(crate) struct ToolCtx {
@@ -447,7 +448,7 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Generate a stable permalink for a note. Returns a URL of the form <public-base>/n/<guid>. Opening it in a browser issues an HTTP redirect to an obsidian://instasync-open deeplink, which opens the note in the user's Obsidian vault via the InstaSync plugin. The permalink tracks the note by stable guid, so it keeps working after the note is renamed or moved. Share this URL as-is; do not rewrite it into an obsidian:// link yourself."
+        description = "Generate a stable permalink for a note. Returns a URL of the form <public-base>/n/<guid>. Opening it in a browser issues an HTTP redirect to an obsidian://realtime-open deeplink, which opens the note in the user's Obsidian vault via the Realtime plugin. The permalink tracks the note by stable guid, so it keeps working after the note is renamed or moved. Share this URL as-is; do not rewrite it into an obsidian:// link yourself."
     )]
     async fn generate_permalink(
         &self,
@@ -704,7 +705,7 @@ impl InstaMcp {
 impl ServerHandler for InstaMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("instasync", env!("CARGO_PKG_VERSION")))
-            .with_instructions("InstaSync vault tools")
+            .with_server_info(Implementation::new(SERVER_SLUG, env!("CARGO_PKG_VERSION")))
+            .with_instructions(format!("{SERVER_NAME} vault tools"))
     }
 }

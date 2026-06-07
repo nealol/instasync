@@ -5,7 +5,7 @@
 
 import { mockLogin, apiCreateInvite } from "../../support/authServer.js";
 
-// --- InstaSync auth / vault onboarding (Tier-3) ----------------------------
+// --- Realtime auth / vault onboarding (Tier-3) ----------------------------
 
 /**
  * Sign a device in: mint a mock-OIDC session (Node side) for a distinct user,
@@ -16,7 +16,7 @@ export async function signInDevice(b: any, authUrl: string, sub: string): Promis
 	const token = await mockLogin(authUrl, sub);
 	await b.executeObsidian(
 		async ({ app }: any, url: string, tok: string) => {
-			const p = (app as any).plugins.plugins.instasync;
+			const p = (app as any).plugins.plugins.realtime;
 			p.settings.authServerUrl = url;
 			p.settings.enabled = true;
 			await p.auth.setSession(tok);
@@ -30,7 +30,7 @@ export async function signInDevice(b: any, authUrl: string, sub: string): Promis
 /** Create a vault from the device's local files and start syncing it. */
 export async function createVaultFromLocal(b: any, name: string): Promise<string> {
 	return b.executeObsidian(async ({ app }: any, n: string) => {
-		const p = (app as any).plugins.plugins.instasync;
+		const p = (app as any).plugins.plugins.realtime;
 		await p.createAndActivateVault(n);
 		return p.settings.activeVaultId as string;
 	}, name);
@@ -48,7 +48,7 @@ export function generateInvite(authUrl: string, adminToken: string, vaultId: str
  */
 export async function redeemAndAdopt(b: any, code: string): Promise<string> {
 	return b.executeObsidian(async ({ app }: any, c: string) => {
-		const p = (app as any).plugins.plugins.instasync;
+		const p = (app as any).plugins.plugins.realtime;
 		const { vaultId } = await p.auth.redeemInvite(c);
 		for (const f of app.vault.getMarkdownFiles()) {
 			try {
@@ -67,7 +67,7 @@ export async function redeemAndAdopt(b: any, code: string): Promise<string> {
 /** Redeem an invite but leave the local vault bound to its current remote. */
 export async function redeemInviteOnly(b: any, code: string): Promise<{ vaultId: string; activeVaultId: string }> {
 	return b.executeObsidian(async ({ app }: any, c: string) => {
-		const p = (app as any).plugins.plugins.instasync;
+		const p = (app as any).plugins.plugins.realtime;
 		const { vaultId } = await p.auth.redeemInvite(c);
 		return { vaultId, activeVaultId: p.settings.activeVaultId as string };
 	}, code);
@@ -75,19 +75,19 @@ export async function redeemInviteOnly(b: any, code: string): Promise<{ vaultId:
 
 export async function activeVaultId(b: any): Promise<string> {
 	return b.executeObsidian(async ({ app }: any) => {
-		return (app as any).plugins.plugins.instasync.settings.activeVaultId as string;
+		return (app as any).plugins.plugins.realtime.settings.activeVaultId as string;
 	});
 }
 
 export async function listedVaultIds(b: any): Promise<string[]> {
 	return b.executeObsidian(async ({ app }: any) => {
-		return ((await (app as any).plugins.plugins.instasync.auth.listVaults()) as { id: string }[]).map((v) => v.id);
+		return ((await (app as any).plugins.plugins.realtime.auth.listVaults()) as { id: string }[]).map((v) => v.id);
 	});
 }
 
 export async function setSyncPaused(b: any, paused: boolean): Promise<void> {
 	await b.executeObsidian(async ({ app }: any, p: boolean) => {
-		const plugin = (app as any).plugins.plugins.instasync;
+		const plugin = (app as any).plugins.plugins.realtime;
 		plugin.settings.enabled = !p;
 		await plugin.saveSettings();
 		await plugin.reloadSync();
@@ -98,7 +98,7 @@ export async function setSyncPaused(b: any, paused: boolean): Promise<void> {
 export async function docTokenStatus(b: any, vaultId: string): Promise<string> {
 	return b.executeObsidian(async ({ app }: any, vid: string) => {
 		try {
-			await (app as any).plugins.plugins.instasync.auth.docToken(vid, vid);
+			await (app as any).plugins.plugins.realtime.auth.docToken(vid, vid);
 			return "ok";
 		} catch {
 			return "refused";
@@ -209,8 +209,8 @@ export async function listMarkdown(b: any): Promise<string[]> {
 
 export async function setPluginEnabled(b: any, enabled: boolean): Promise<void> {
 	await b.executeObsidian(async ({ app }: any, on: boolean) => {
-		if (on) await app.plugins.enablePlugin("instasync");
-		else await app.plugins.disablePlugin("instasync");
+		if (on) await app.plugins.enablePlugin("realtime");
+		else await app.plugins.disablePlugin("realtime");
 	}, enabled);
 }
 
@@ -268,11 +268,11 @@ export async function setNetworkOffline(b: any, offline: boolean): Promise<void>
 	}, offline);
 }
 
-/** Reads the InstaSync status-bar text from the renderer. */
+/** Reads the Realtime status-bar text from the renderer. */
 export async function statusText(b: any): Promise<string> {
 	return b.executeObsidian(() => {
 		const el = Array.from(document.querySelectorAll(".status-bar-item")).find((e) =>
-			(e.textContent ?? "").includes("InstaSync"),
+			(e.textContent ?? "").includes("Realtime"),
 		);
 		return el?.textContent ?? "";
 	});

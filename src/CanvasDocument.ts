@@ -1,4 +1,4 @@
-import type InstaSyncPlugin from "./main";
+import type RealtimePlugin from "./main";
 import { StructuredDocument } from "./StructuredDocument";
 import { CanvasBinding, CANVAS_LOCAL_ORIGIN } from "./editor/CanvasBinding";
 import { parseCanvas, serializeCanvas } from "./structured/canvas";
@@ -7,7 +7,7 @@ import type { JsonValue } from "./structured/reconcile";
 export class CanvasDocument extends StructuredDocument {
 	private binding: CanvasBinding;
 
-	constructor(plugin: InstaSyncPlugin, path: string, guid: string, serverDocId: string, isCreator: boolean) {
+	constructor(plugin: RealtimePlugin, path: string, guid: string, serverDocId: string, isCreator: boolean) {
 		super(plugin, path, guid, serverDocId, isCreator);
 		this.binding = new CanvasBinding(plugin, this);
 		this.binding.tryBind();

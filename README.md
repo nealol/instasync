@@ -1,4 +1,4 @@
-# InstaSync
+# Realtime
 
 Google-Docs-style collaborative editing for Obsidian, powered by [Yjs](https://github.com/yjs/yjs) and a [y-sweet](https://github.com/drifting-in-space/y-sweet) server.
 
@@ -21,7 +21,7 @@ plugin only ever needs **one URL** (`PUBLIC_BASE_URL`). No separate y-sweet
 process or second URL to manage.
 
 ```
-                          ┌──────── instasync-server container ────────┐
+                          ┌──────── realtime-server container ────────┐
 Obsidian ──HTTPS/WSS──▶   │ auth + /d/* proxy ──▶ y-sweet (127.0.0.1)   │
                           │ SQLite + y-sweet store on the /data volume  │
                           └─────────────────────────────────────────────┘
@@ -33,7 +33,7 @@ The image bundles a correctly-built y-sweet binary, so generate the key straight
 from it (this avoids the broken Windows `npx y-sweet` launcher):
 
 ```bash
-docker run --rm --entrypoint y-sweet ghcr.io/nealol/instasync-server:latest gen-auth --json
+docker run --rm --entrypoint y-sweet ghcr.io/nealol/realtime-server:latest gen-auth --json
 # prints { "private_key": "...", ... } — copy the private_key value
 ```
 
@@ -41,16 +41,16 @@ docker run --rm --entrypoint y-sweet ghcr.io/nealol/instasync-server:latest gen-
 
 ```bash
 docker run -d \
-  --name instasync-server \
+  --name realtime-server \
   -p 8081:8081 \
-  -v instasync-data:/data \
+  -v realtime-data:/data \
   -e OIDC_MODE=oidc \
   -e OIDC_ISSUER=https://id.example.com \       # your PocketID base URL (no trailing slash)
   -e OIDC_CLIENT_ID=<uuid from PocketID> \
   -e OIDC_CLIENT_SECRET=<secret shown once> \
   -e PUBLIC_BASE_URL=https://sync.example.com \ # how clients reach this server (baked into tokens)
   -e YSWEET_AUTH_KEY=<private_key from step 1> \
-  ghcr.io/nealol/instasync-server:latest
+  ghcr.io/nealol/realtime-server:latest
 ```
 
 Put a TLS-terminating reverse proxy (Caddy, nginx, Traefik, …) in front and point
@@ -74,7 +74,7 @@ The SQLite database **and** the y-sweet document store both live under the
 | `PUBLIC_BASE_URL` | `http://127.0.0.1:8081` | How clients reach this server; baked into minted sync tokens |
 | `YSWEET_AUTH_KEY` | — | Shared private key from step 1 (used by both the internal y-sweet and the auth server) |
 | `BIND_ADDR` | `0.0.0.0:8081` | Listen address inside the container |
-| `DATABASE_URL` | `sqlite:///data/instasync.db?mode=rwc` | SeaORM SQLite URL |
+| `DATABASE_URL` | `sqlite:///data/realtime.db?mode=rwc` | SeaORM SQLite URL |
 | `UPLOAD_TOKEN` | `dev-upload-token-change-me` | HMAC key for signed single-use browser upload links; set a long random secret in production |
 | `ATTACHMENT_ALLOWED_EXTENSIONS` | common images, `pdf`, `txt` | Comma-separated allowed attachment extensions, without or with leading dots |
 | `ATTACHMENT_MAX_BYTES` | raw blob max | Per-attachment upload/fetch size cap; separate from the raw content-addressed blob store cap |
@@ -97,19 +97,19 @@ and `/api/doc-token`.
 
 ## Plugin setup
 
-1. Install via [BRAT](https://github.com/TfTHacker/obsidian42-brat): add `nealol/instasync` as a beta plugin, or build manually:
+1. Install via [BRAT](https://github.com/TfTHacker/obsidian42-brat): add `nealol/realtime` as a beta plugin, or build manually:
    ```bash
    npm install
    npm run build
    ```
    Then copy `main.js`, `manifest.json`, and `styles.css` into
-   `<your-vault>/.obsidian/plugins/instasync/`.
-2. Enable **InstaSync** in Obsidian's *Community plugins* settings.
-3. Open **Settings → InstaSync**, set the **Auth server URL** (e.g. `https://auth.example.com`), and sign in.
-4. Create or join a vault from the InstaSync settings. All collaborators must join the same vault.
+   `<your-vault>/.obsidian/plugins/realtime/`.
+2. Enable **Realtime** in Obsidian's *Community plugins* settings.
+3. Open **Settings → Realtime**, set the **Auth server URL** (e.g. `https://auth.example.com`), and sign in.
+4. Create or join a vault from the Realtime settings. All collaborators must join the same vault.
 5. Each client gets a random two-word cursor name; reroll it with the dice button.
 
-The status bar shows `InstaSync: connecting… / live / error`.
+The status bar shows `Realtime: connecting… / live / error`.
 
 ## Development
 

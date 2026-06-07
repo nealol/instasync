@@ -6,8 +6,8 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
 use http_body_util::BodyExt;
-use instasync_server::config::{Config, OidcMode};
-use instasync_server::{app, build_state, gen_auth_key};
+use realtime_server::config::{Config, OidcMode};
+use realtime_server::{app, build_state, gen_auth_key};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -243,14 +243,14 @@ async fn fake_attachment_source() -> String {
 async fn git_state(
     ysweet_url: &str,
 ) -> (
-    instasync_server::state::AppState,
+    realtime_server::state::AppState,
     std::path::PathBuf,
     String,
 ) {
     let mut db_path = std::env::temp_dir();
-    db_path.push(format!("instasync-test-{}.db", uuid::Uuid::new_v4()));
+    db_path.push(format!("realtime-test-{}.db", uuid::Uuid::new_v4()));
     let mut git_dir = std::env::temp_dir();
-    git_dir.push(format!("instasync-git-{}", uuid::Uuid::new_v4()));
+    git_dir.push(format!("realtime-git-{}", uuid::Uuid::new_v4()));
 
     let config = Config {
         database_url: format!("sqlite://{}?mode=rwc", db_path.display()),
@@ -270,8 +270,8 @@ async fn git_state(
         git_data_dir: git_dir.display().to_string(),
         git_enabled: true,
         git_debounce_ms: 50,
-        git_bot_name: "InstaSync".into(),
-        git_bot_email: "instasync@localhost".into(),
+        git_bot_name: "Realtime".into(),
+        git_bot_email: "realtime@localhost".into(),
         cursor_email_domain: "localhost".into(),
         git_remote_url: None,
         git_push_enabled: false,
@@ -291,7 +291,7 @@ async fn git_state(
             "pdf".into(),
             "txt".into(),
         ],
-        attachment_max_bytes: instasync_server::blobs::MAX_BLOB_BYTES,
+        attachment_max_bytes: realtime_server::blobs::MAX_BLOB_BYTES,
         attachments_path_mode: "relative".into(),
         attachments_subfolder: None,
         upload_token: "test-upload-token".into(),
@@ -326,12 +326,12 @@ async fn wait_for_commit(repo: &std::path::Path) -> String {
     panic!("no commit appeared in repo {}", repo.display());
 }
 
-fn principal(id: &str, name: &str, email: &str) -> instasync_server::state::Principal {
-    instasync_server::state::Principal {
+fn principal(id: &str, name: &str, email: &str) -> realtime_server::state::Principal {
+    realtime_server::state::Principal {
         user_id: id.into(),
         display_name: name.into(),
         email: email.into(),
-        actor: instasync_server::state::PrincipalActor::User,
+        actor: realtime_server::state::PrincipalActor::User,
         expires_at_ms: i64::MAX,
     }
 }
@@ -342,7 +342,7 @@ async fn test_app(ysweet_url: &str, ysweet_public_url: &str) -> Router {
     test_app_with_attachment_max(
         ysweet_url,
         ysweet_public_url,
-        instasync_server::blobs::MAX_BLOB_BYTES,
+        realtime_server::blobs::MAX_BLOB_BYTES,
     )
     .await
 }
@@ -353,14 +353,14 @@ async fn test_app_with_attachment_max(
     attachment_max_bytes: u64,
 ) -> Router {
     let mut path = std::env::temp_dir();
-    path.push(format!("instasync-test-{}.db", uuid::Uuid::new_v4()));
+    path.push(format!("realtime-test-{}.db", uuid::Uuid::new_v4()));
     let database_url = format!("sqlite://{}?mode=rwc", path.display());
 
     let mut blob_dir = std::env::temp_dir();
-    blob_dir.push(format!("instasync-blobs-{}", uuid::Uuid::new_v4()));
+    blob_dir.push(format!("realtime-blobs-{}", uuid::Uuid::new_v4()));
 
     let mut git_dir = std::env::temp_dir();
-    git_dir.push(format!("instasync-git-{}", uuid::Uuid::new_v4()));
+    git_dir.push(format!("realtime-git-{}", uuid::Uuid::new_v4()));
 
     let config = Config {
         database_url,
@@ -381,8 +381,8 @@ async fn test_app_with_attachment_max(
         // Off by default; the git-specific test builds its own app with it enabled.
         git_enabled: false,
         git_debounce_ms: 50,
-        git_bot_name: "InstaSync".into(),
-        git_bot_email: "instasync@localhost".into(),
+        git_bot_name: "Realtime".into(),
+        git_bot_email: "realtime@localhost".into(),
         cursor_email_domain: "localhost".into(),
         git_remote_url: None,
         git_push_enabled: false,
@@ -449,7 +449,7 @@ async fn multipart_upload(
     content_type: &str,
     bytes: &[u8],
 ) -> (StatusCode, Value) {
-    let boundary = format!("----instasync-{}", uuid::Uuid::new_v4());
+    let boundary = format!("----realtime-{}", uuid::Uuid::new_v4());
     let mut body = Vec::new();
     body.extend_from_slice(
         format!("--{boundary}\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\n{path}\r\n")
@@ -1233,7 +1233,7 @@ async fn note_crud_rest_roundtrip() {
         .unwrap()
         .to_str()
         .unwrap();
-    assert!(loc.starts_with("obsidian://instasync-open?"));
+    assert!(loc.starts_with("obsidian://realtime-open?"));
     assert!(loc.contains(&format!("vaultId={vault_id}")));
     assert!(loc.contains(&format!("guid={guid}")));
 
@@ -2054,11 +2054,11 @@ async fn git_audit_commits_attributed_to_principal() {
         "author/subject"
     );
 
-    // Committer is pinned to the InstaSync bot (not the server's git identity),
+    // Committer is pinned to the Realtime bot (not the server's git identity),
     // even though the author is the attributed user.
     let (_, committer) = git_out(&repo, &["log", "-1", "--format=%cn|%ce"]);
     assert_eq!(
-        committer, "InstaSync|instasync@localhost",
+        committer, "Realtime|realtime@localhost",
         "committer identity"
     );
 

@@ -2,12 +2,13 @@ import { App, ExtraButtonComponent, Modal, Notice, PluginSettingTab, ToggleCompo
 import { createRoot, type Root } from 'react-dom/client'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import type InstaSyncPlugin from './main'
+import type RealtimePlugin from './main'
 import { normalizeServerUrl, type MemberInfo, type RemoteCursorInfo, type VaultInfo } from './auth'
+import { PLUGIN_NAME } from './brand'
 import { generateClientIdentity } from './names'
 
-export interface InstaSyncSettings {
-    /** Base URL of the InstaSync auth server, e.g. http://127.0.0.1:8081 */
+export interface RealtimeSettings {
+    /** Base URL of the Realtime auth server, e.g. http://127.0.0.1:8081 */
     authServerUrl: string;
     /**
      * Stable id of the server at {@link authServerUrl}, from `/api/server-info`.
@@ -52,7 +53,7 @@ export interface InstaSyncSettings {
     diagnosticLogging: boolean;
 }
 
-export function defaultSettings(): InstaSyncSettings {
+export function defaultSettings(): RealtimeSettings {
     const identity = generateClientIdentity()
     return {
         authServerUrl: 'http://127.0.0.1:8081',
@@ -75,11 +76,11 @@ export function defaultSettings(): InstaSyncSettings {
     }
 }
 
-export class InstaSyncSettingTab extends PluginSettingTab {
-    plugin: InstaSyncPlugin
+export class RealtimeSettingTab extends PluginSettingTab {
+    plugin: RealtimePlugin
     private root: Root | null = null
 
-    constructor(app: App, plugin: InstaSyncPlugin) {
+    constructor(app: App, plugin: RealtimePlugin) {
         super(app, plugin)
         this.plugin = plugin
     }
@@ -98,7 +99,7 @@ export class InstaSyncSettingTab extends PluginSettingTab {
     }
 }
 
-function SettingsView({ app, plugin, refresh }: { app: App; plugin: InstaSyncPlugin; refresh: () => void }) {
+function SettingsView({ app, plugin, refresh }: { app: App; plugin: RealtimePlugin; refresh: () => void }) {
     const fullyConfigured = plugin.auth.isLoggedIn && !!plugin.settings.activeVaultId
     return fullyConfigured ? <FullSettings app={app} plugin={plugin} refresh={refresh}/> :
         <SetupView app={app} plugin={plugin} refresh={refresh}/>
@@ -106,7 +107,7 @@ function SettingsView({ app, plugin, refresh }: { app: App; plugin: InstaSyncPlu
 
 type SetupStep = 'server' | 'choose' | 'create' | 'existing' | 'invite';
 
-function SetupView({ app, plugin, refresh }: { app: App; plugin: InstaSyncPlugin; refresh: () => void }) {
+function SetupView({ app, plugin, refresh }: { app: App; plugin: RealtimePlugin; refresh: () => void }) {
     const [step, setStep] = useState<SetupStep>(plugin.auth.isLoggedIn ? 'choose' : 'server')
     const [serverUrl, setServerUrl] = useState(plugin.settings.authServerUrl)
     const [busy, setBusy] = useState(false)
@@ -116,9 +117,9 @@ function SetupView({ app, plugin, refresh }: { app: App; plugin: InstaSyncPlugin
     const showPaste = useDelayedFlag(busy, 2000)
 
     return (
-        <div className="instasync-setup-wrap">
-            <div className="instasync-setup-card">
-                <h2>Set up InstaSync</h2>
+        <div className="realtime-setup-wrap">
+            <div className="realtime-setup-card">
+                <h2>Set up {PLUGIN_NAME}</h2>
                 {step === 'server' ? (
                     <form style={{marginTop: '-4px'}}
                         onSubmit={(event) => {
@@ -138,13 +139,13 @@ function SetupView({ app, plugin, refresh }: { app: App; plugin: InstaSyncPlugin
                             })()
                         }}
                     >
-                        <p className="setting-item-description">Enter your InstaSync server URL to start syncing this
+                        <p className="setting-item-description">Enter your Realtime server URL to start syncing this
                             vault.</p>
-                        <input className="instasync-modal-input" type="text" placeholder="https://instasync.example.com"
+                        <input className="realtime-modal-input" type="text" placeholder="https://realtime.example.com"
                                value={serverUrl} onChange={(event) => setServerUrl(event.currentTarget.value)}/>
-                        {error ? <p className="instasync-error">{error}</p> : null}
+                        {error ? <p className="realtime-error">{error}</p> : null}
                         <SsoPasteFallback plugin={plugin} visible={showPaste}/>
-                        <button className="mod-cta instasync-wide-button" type="submit"
+                        <button className="mod-cta realtime-wide-button" type="submit"
                                 disabled={busy}>{busy ? 'Waiting for SSO...' : 'Log in with SSO'}</button>
                     </form>
                 ) : null}
@@ -168,13 +169,13 @@ function SetupChoices({ onCreate, onExisting, onInvite }: {
     onInvite: () => void
 }) {
     return (
-        <div className="instasync-choice-list" style={{marginTop: '-16px'}}>
+        <div className="realtime-choice-list" style={{marginTop: '-16px'}}>
             <p className="setting-item-description">Choose how this local vault should connect to a remote vault.</p>
-            <button className="instasync-choice" onClick={onCreate}><strong>Create a new Remote Vault</strong><span>Use the Markdown files already in this local vault.</span>
+            <button className="realtime-choice" onClick={onCreate}><strong>Create a new Remote Vault</strong><span>Use the Markdown files already in this local vault.</span>
             </button>
-            <button className="instasync-choice" onClick={onExisting}><strong>Initialize an existing Remote
+            <button className="realtime-choice" onClick={onExisting}><strong>Initialize an existing Remote
                 Vault</strong><span>Replace local vault with a synced remote one.</span></button>
-            <button className="instasync-choice" onClick={onInvite}><strong>Join a new Remote Vault</strong><span>Use an invite code to join a vault.</span>
+            <button className="realtime-choice" onClick={onInvite}><strong>Join a new Remote Vault</strong><span>Use an invite code to join a vault.</span>
             </button>
         </div>
     )
@@ -182,7 +183,7 @@ function SetupChoices({ onCreate, onExisting, onInvite }: {
 
 function CreateVaultStep({ app, plugin, refresh, onBack }: {
     app: App;
-    plugin: InstaSyncPlugin;
+    plugin: RealtimePlugin;
     refresh: () => void;
     onBack: () => void
 }) {
@@ -192,14 +193,14 @@ function CreateVaultStep({ app, plugin, refresh, onBack }: {
         <>
             {/*<h3>Create Remote Vault</h3>*/}
             <p className="setting-item-description">Name your new remote vault.</p>
-            <input className="instasync-modal-input" type="text" value={name}
+            <input className="realtime-modal-input" type="text" value={name}
                    onChange={(event) => setName(event.currentTarget.value)}/>
-            <div className="instasync-actions">
+            <div className="realtime-actions">
                 <button onClick={onBack}>Back</button>
                 <button className="mod-cta" disabled={busy || !name.trim()}
                         onClick={() => void runNotice(setBusy, async () => {
                             await plugin.createAndActivateVault(name.trim())
-                            new Notice(`InstaSync: created and syncing "${name.trim()}".`)
+                            new Notice(`${PLUGIN_NAME}: created and syncing "${name.trim()}".`)
                             refresh()
                         })}>Create & Sync
                 </button>
@@ -209,7 +210,7 @@ function CreateVaultStep({ app, plugin, refresh, onBack }: {
 }
 
 function ExistingVaultStep({ plugin, refresh, onBack }: {
-    plugin: InstaSyncPlugin;
+    plugin: RealtimePlugin;
     refresh: () => void;
     onBack: () => void
 }) {
@@ -225,16 +226,16 @@ function ExistingVaultStep({ plugin, refresh, onBack }: {
                                      })}/> : null}
             {!confirm ? <>
                 <p className="setting-item-description">Choose a remote vault to clone.</p>
-                {error ? <p className="instasync-error">{error}</p> : null}
+                {error ? <p className="realtime-error">{error}</p> : null}
                 {!error && vaults === null ? <p className="setting-item-description">Loading vaults...</p> : null}
                 {vaults?.length === 0 ? <p className="setting-item-description">No remote vaults found.</p> : null}
-                <div className="instasync-choice-list">
-                    {vaults?.map((vault) => <button key={vault.id} className="instasync-choice"
+                <div className="realtime-choice-list">
+                    {vaults?.map((vault) => <button key={vault.id} className="realtime-choice"
                                                     onClick={() => setConfirm(vault)}>
                         <strong>{vault.name}</strong><span>Role: {vault.role}{vault.owner ? ' (owner)' : ''}</span>
                     </button>)}
                 </div>
-                <div className="instasync-actions">
+                <div className="realtime-actions">
                     <button onClick={onBack}>Back</button>
                     <button onClick={reload}>Refresh</button>
                 </div>
@@ -244,7 +245,7 @@ function ExistingVaultStep({ plugin, refresh, onBack }: {
 }
 
 function InviteVaultStep({ plugin, refresh, onBack }: {
-    plugin: InstaSyncPlugin;
+    plugin: RealtimePlugin;
     refresh: () => void;
     onBack: () => void
 }) {
@@ -260,9 +261,9 @@ function InviteVaultStep({ plugin, refresh, onBack }: {
                                         refresh()
                                     })}/> : <>
                 <p className="setting-item-description">Enter an invite code from another person.</p>
-                <input className="instasync-modal-input" type="text" placeholder="four-word-invite-code" value={code}
+                <input className="realtime-modal-input" type="text" placeholder="four-word-invite-code" value={code}
                        onChange={(event) => setCode(event.currentTarget.value.trim())}/>
-                <div className="instasync-actions">
+                <div className="realtime-actions">
                     <button onClick={onBack}>Back</button>
                     <button className="mod-cta" disabled={busy || !code}
                             onClick={() => void runNotice(setBusy, async () => {
@@ -281,11 +282,11 @@ function EraseConfirm({ vault, onConfirm, onCancel }: {
     onCancel: () => void
 }) {
     return (
-        <div className="instasync-warning-box">
+        <div className="realtime-warning-box">
             <strong>Erase local Markdown and sync "{vault.name}"?</strong>
             <p>This deletes all non-conflict-copy Markdown files in this local Obsidian vault and replaces them with the
                 remote vault.</p>
-            <div className="instasync-actions">
+            <div className="realtime-actions">
                 <button onClick={onCancel}>Cancel</button>
                 <button className="mod-warning" onClick={onConfirm}>Erase & Sync</button>
             </div>
@@ -293,10 +294,10 @@ function EraseConfirm({ vault, onConfirm, onCancel }: {
     )
 }
 
-function FullSettings({ app, plugin, refresh }: { app: App; plugin: InstaSyncPlugin; refresh: () => void }) {
+function FullSettings({ app, plugin, refresh }: { app: App; plugin: RealtimePlugin; refresh: () => void }) {
     return (
         <>
-            {/*<h2>InstaSync</h2>*/}
+            {/*<h2>Realtime</h2>*/}
             <AccountSection plugin={plugin} refresh={refresh}/>
             <EnableSyncSection plugin={plugin} refresh={refresh}/>
             <StructuredSyncSection plugin={plugin} refresh={refresh}/>
@@ -308,7 +309,7 @@ function FullSettings({ app, plugin, refresh }: { app: App; plugin: InstaSyncPlu
     )
 }
 
-function AccountSection({ plugin, refresh }: { plugin: InstaSyncPlugin; refresh: () => void }) {
+function AccountSection({ plugin, refresh }: { plugin: RealtimePlugin; refresh: () => void }) {
     return <><h3>Account</h3><SettingRow name={plugin.settings.userDisplayName || 'Signed in'}
                                          desc={plugin.settings.userEmail} control={<button className="mod-warning"
                                                                                            onClick={() => void runNotice(undefined, async () => {
@@ -317,7 +318,7 @@ function AccountSection({ plugin, refresh }: { plugin: InstaSyncPlugin; refresh:
                                                                                            })}>Log out</button>}/></>
 }
 
-function EnableSyncSection({ plugin, refresh }: { plugin: InstaSyncPlugin; refresh: () => void }) {
+function EnableSyncSection({ plugin, refresh }: { plugin: RealtimePlugin; refresh: () => void }) {
     return <SettingRow name="Enable syncing"
                        desc="When on, this vault syncs online. Turn off to stay signed in but pause online sync."
                        control={<Toggle value={plugin.settings.enabled}
@@ -325,12 +326,12 @@ function EnableSyncSection({ plugin, refresh }: { plugin: InstaSyncPlugin; refre
                                             plugin.settings.enabled = value
                                             await plugin.saveSettings()
                                             await plugin.reloadSync()
-                                            if (!value) new Notice('InstaSync: syncing disabled for this vault.')
+                                            if (!value) new Notice(`${PLUGIN_NAME}: syncing disabled for this vault.`)
                                             refresh()
                                         })}/>}/>
 }
 
-function StructuredSyncSection({ plugin, refresh }: { plugin: InstaSyncPlugin; refresh: () => void }) {
+function StructuredSyncSection({ plugin, refresh }: { plugin: RealtimePlugin; refresh: () => void }) {
     return <>
         <SettingRow name="Sync canvases"
                     desc="Sync .canvas files as structured CRDT documents. Live canvas updates use Obsidian's private canvas API when available, with disk write-through fallback."
@@ -353,7 +354,7 @@ function StructuredSyncSection({ plugin, refresh }: { plugin: InstaSyncPlugin; r
     </>
 }
 
-function BinarySyncSection({ plugin, refresh }: { plugin: InstaSyncPlugin; refresh: () => void }) {
+function BinarySyncSection({ plugin, refresh }: { plugin: RealtimePlugin; refresh: () => void }) {
     const [globs, setGlobs] = useState(plugin.settings.binaryExcludeGlobs)
     return <>
         <SettingRow name="Sync attachments"
@@ -367,7 +368,7 @@ function BinarySyncSection({ plugin, refresh }: { plugin: InstaSyncPlugin; refre
                                      })}/>}/>
         {plugin.settings.syncBinaries ? <SettingRow name="Attachment exclusions"
                     desc="Comma-separated globs (matched on the file path) to skip, e.g. *.tmp, private/**."
-                    control={<input className="instasync-modal-input" type="text" value={globs}
+                    control={<input className="realtime-modal-input" type="text" value={globs}
                                     placeholder="*.tmp, private/**"
                                     onChange={(e) => setGlobs(e.currentTarget.value)}
                                     onBlur={() => void (async () => {
@@ -418,7 +419,7 @@ function ExtraButton({ icon, tooltip, className, onClick }: { icon: string; tool
     return <span className={className} ref={ref}/>
 }
 
-function DeviceSection({ plugin }: { plugin: InstaSyncPlugin }) {
+function DeviceSection({ plugin }: { plugin: RealtimePlugin }) {
     // Local state so randomizing/editing re-renders only this section, instead of
     // calling the page-level refresh (which reloads the slow vaults/members lists).
     const [name, setName] = useState(plugin.settings.clientName)
@@ -461,7 +462,7 @@ function DeviceSection({ plugin }: { plugin: InstaSyncPlugin }) {
     )
 }
 
-function VaultDetails({ plugin }: { app: App; plugin: InstaSyncPlugin }) {
+function VaultDetails({ plugin }: { app: App; plugin: RealtimePlugin }) {
     const { vaults, error: vaultError, reload: reloadVaults } = useVaults(plugin)
     const activeVault = useMemo(() => vaults?.find((vault) => vault.id === plugin.settings.activeVaultId) ?? null, [plugin.settings.activeVaultId, vaults])
     const { members, error: membersError, reload: reloadMembers } = useMembers(plugin, activeVault?.id ?? '')
@@ -472,9 +473,9 @@ function VaultDetails({ plugin }: { app: App; plugin: InstaSyncPlugin }) {
     return (
         <>
             <h3>Vault Details{activeVault ? ` - ${activeVault.name}` : ''}</h3>
-            {vaultError ? <p className="instasync-error">{vaultError}</p> : null}
+            {vaultError ? <p className="realtime-error">{vaultError}</p> : null}
             {!activeVault ? <p className="setting-item-description">Loading vault details...</p> : null}
-            {membersError ? <p className="instasync-error">{membersError}</p> : null}
+            {membersError ? <p className="realtime-error">{membersError}</p> : null}
             {members === null ? <p className="setting-item-description">Loading members...</p> : null}
             {activeVault && members?.map((member) => <MemberRow key={member.userId} plugin={plugin} vault={activeVault}
                                                                 member={member} reload={reloadAll}/>)}
@@ -485,7 +486,7 @@ function VaultDetails({ plugin }: { app: App; plugin: InstaSyncPlugin }) {
 }
 
 function MemberRow({ plugin, vault, member, reload }: {
-    plugin: InstaSyncPlugin;
+    plugin: RealtimePlugin;
     vault: VaultInfo;
     member: MemberInfo;
     reload: () => void
@@ -497,17 +498,17 @@ function MemberRow({ plugin, vault, member, reload }: {
                        desc={`${member.email} (${member.role})`}
                        control={<>{canPromote ? <button onClick={() => void runNotice(undefined, async () => {
                            await plugin.auth.promoteMember(vault.id, member.userId)
-                           new Notice('InstaSync: promoted.')
+                            new Notice(`${PLUGIN_NAME}: promoted.`)
                            reload()
                        })}>Promote to admin</button> : null}{canRemove ?
                            <button className="mod-warning" onClick={() => void runNotice(undefined, async () => {
                                await plugin.auth.removeMember(vault.id, member.userId)
-                               new Notice('InstaSync: member removed.')
+                                new Notice(`${PLUGIN_NAME}: member removed.`)
                                reload()
                            })}>Remove</button> : null}</>}/>
 }
 
-function InviteGenerator({ plugin, vault }: { plugin: InstaSyncPlugin; vault: VaultInfo }) {
+function InviteGenerator({ plugin, vault }: { plugin: RealtimePlugin; vault: VaultInfo }) {
     const [code, setCode] = useState('')
     return <SettingRow name="Add members" desc="Generate a single-use invite for this vault." control={<>
         <button onClick={() => void runNotice(undefined, async () => {
@@ -515,17 +516,17 @@ function InviteGenerator({ plugin, vault }: { plugin: InstaSyncPlugin; vault: Va
             setCode(invite.code)
             void navigator.clipboard?.writeText(invite.code).catch(() => {
             })
-            new Notice(`InstaSync invite copied: ${invite.code}`, 15000)
+            new Notice(`${PLUGIN_NAME} invite copied: ${invite.code}`, 15000)
         })}>Generate invite
         </button>
         {code ? <code>{code}</code> : null}</>}/>
 }
 
-function RemoteCursors({ plugin, vault }: { plugin: InstaSyncPlugin; vault: VaultInfo }) {
+function RemoteCursors({ plugin, vault }: { plugin: RealtimePlugin; vault: VaultInfo }) {
     const { cursors, error, reload } = useRemoteCursors(plugin, vault.id)
     return <>
         <h3>Remote Cursors</h3>
-        {error ? <p className="instasync-error">{error}</p> : null}
+        {error ? <p className="realtime-error">{error}</p> : null}
         {!error && cursors === null ? <p className="setting-item-description">Loading remote cursors...</p> : null}
         {cursors?.length === 0 ? <p className="setting-item-description">No remote cursors yet.</p> : null}
         {cursors?.map((cursor) => <RemoteCursorRow key={cursor.id} plugin={plugin} vault={vault} cursor={cursor} reload={reload}/>) }
@@ -535,35 +536,35 @@ function RemoteCursors({ plugin, vault }: { plugin: InstaSyncPlugin; vault: Vaul
 }
 
 function RemoteCursorRow({ plugin, vault, cursor, reload }: {
-    plugin: InstaSyncPlugin;
+    plugin: RealtimePlugin;
     vault: VaultInfo;
     cursor: RemoteCursorInfo;
     reload: () => void;
 }) {
-    return <SettingRow name={<span className="instasync-row-title-action">{cursor.name}<ExtraButton icon="pencil" tooltip="Edit remote cursor" onClick={() => new RemoteCursorNameModal(plugin.app, plugin, vault, reload, cursor).open()}/></span>} desc={cursor.mcpUrl} control={<>
-        <button onClick={() => void copyText(cursor.mcpUrl, 'InstaSync: MCP URL copied.')}>Copy MCP URL</button>
+    return <SettingRow name={<span className="realtime-row-title-action">{cursor.name}<ExtraButton icon="pencil" tooltip="Edit remote cursor" onClick={() => new RemoteCursorNameModal(plugin.app, plugin, vault, reload, cursor).open()}/></span>} desc={cursor.mcpUrl} control={<>
+        <button onClick={() => void copyText(cursor.mcpUrl, `${PLUGIN_NAME}: MCP URL copied.`)}>Copy MCP URL</button>
         <button onClick={() => void runNotice(undefined, async () => {
             if (!confirm(`Regenerate the secret token for "${cursor.name}"? The previous token will stop working.`)) return
             const result = await plugin.auth.regenerateCursorToken(vault.id, cursor.id)
-            await copyText(result.secretToken, 'InstaSync: new secret token copied.')
+            await copyText(result.secretToken, `${PLUGIN_NAME}: new secret token copied.`)
         })}>Regen API Secret</button>
-        <ExtraButton className="instasync-danger-icon" icon="trash-2" tooltip="Remove remote cursor" onClick={() => void runNotice(undefined, async () => {
+        <ExtraButton className="realtime-danger-icon" icon="trash-2" tooltip="Remove remote cursor" onClick={() => void runNotice(undefined, async () => {
             if (!confirm(`Remove remote cursor "${cursor.name}"?`)) return
             await plugin.auth.deleteCursor(vault.id, cursor.id)
-            new Notice('InstaSync: remote cursor removed.')
+            new Notice(`${PLUGIN_NAME}: remote cursor removed.`)
             reload()
         })}/>
     </>}/>
 }
 
 class RemoteCursorNameModal extends Modal {
-    private plugin: InstaSyncPlugin
+    private plugin: RealtimePlugin
     private vault: VaultInfo
     private refresh: () => void
     private cursor?: RemoteCursorInfo
     private root: Root | null = null
 
-    constructor(app: App, plugin: InstaSyncPlugin, vault: VaultInfo, refresh: () => void, cursor?: RemoteCursorInfo) {
+    constructor(app: App, plugin: RealtimePlugin, vault: VaultInfo, refresh: () => void, cursor?: RemoteCursorInfo) {
         super(app)
         this.plugin = plugin
         this.vault = vault
@@ -585,7 +586,7 @@ class RemoteCursorNameModal extends Modal {
 }
 
 function RemoteCursorNameView({ plugin, vault, cursor, refresh, close }: {
-    plugin: InstaSyncPlugin;
+    plugin: RealtimePlugin;
     vault: VaultInfo;
     cursor?: RemoteCursorInfo;
     refresh: () => void;
@@ -599,27 +600,27 @@ function RemoteCursorNameView({ plugin, vault, cursor, refresh, close }: {
     return <>
         <h3>{renameMode ? 'Rename Remote Cursor' : 'Add Remote Cursor'}</h3>
         <p className="setting-item-description">{renameMode ? 'Update the display name for this remote cursor.' : 'Name this remote cursor. MCP servers use the MCP URL for OIDC OAuth. Direct API requests use the secret token as a Bearer token.'}</p>
-        <input className="instasync-modal-input" type="text" value={name}
+        <input className="realtime-modal-input" type="text" value={name}
                onChange={(event) => setName(event.currentTarget.value)}/>
-        {secretToken ? <div className="instasync-warning-box">
+        {secretToken ? <div className="realtime-warning-box">
             <strong>Copy this secret token now.</strong>
             <p>It will not be shown again. Use it as an API Bearer token. Regenerating later invalidates this token.</p>
             {createdCursor ? <p>MCP URL: <code>{createdCursor.mcpUrl}</code></p> : null}
-            <div className="instasync-actions"><code>{secretToken}</code><button onClick={() => void copyText(secretToken, 'InstaSync: secret token copied.')}>Copy</button></div>
+            <div className="realtime-actions"><code>{secretToken}</code><button onClick={() => void copyText(secretToken, `${PLUGIN_NAME}: secret token copied.`)}>Copy</button></div>
         </div> : null}
-        <div className="instasync-actions">
+        <div className="realtime-actions">
             <button onClick={close}>{secretToken ? 'Close' : 'Cancel'}</button>
             {!secretToken ? <button className="mod-cta" disabled={busy || !name.trim()} onClick={() => void runNotice(setBusy, async () => {
                 if (cursor) {
                     await plugin.auth.renameCursor(vault.id, cursor.id, name.trim())
-                    new Notice('InstaSync: remote cursor renamed.')
+                    new Notice(`${PLUGIN_NAME}: remote cursor renamed.`)
                     refresh()
                     close()
                 } else {
                     const created = await plugin.auth.createCursor(vault.id, name.trim())
                     setCreatedCursor(created)
                     setSecretToken(created.secretToken)
-                    await copyText(created.secretToken, 'InstaSync: secret token copied.')
+                    await copyText(created.secretToken, `${PLUGIN_NAME}: secret token copied.`)
                     refresh()
                 }
             })}>{renameMode ? 'Rename' : 'Create'}</button> : null}
@@ -642,7 +643,7 @@ let nextGlobRowId = 1
  * Obsidian components — so React fully owns the dynamic list and reconciliation
  * can't hit a stale `removeChild`.
  */
-function ConfigSyncSection({ plugin }: { plugin: InstaSyncPlugin }) {
+function ConfigSyncSection({ plugin }: { plugin: RealtimePlugin }) {
     const [enabled, setEnabled] = useState(plugin.settings.syncConfigEnabled)
     const [rows, setRows] = useState<GlobRow[]>(() =>
         plugin.settings.configIncludeGlobs.map((value) => ({ id: nextGlobRowId++, value })))
@@ -664,10 +665,10 @@ function ConfigSyncSection({ plugin }: { plugin: InstaSyncPlugin }) {
                                          await plugin.reloadSync()
                                      })}/>}/>
         {enabled ? <SettingRow name="Config include globs"
-                    desc="Matched relative to your config folder, e.g. snippets/*.css or hotkeys.json. Uses picomatch. The Instasync plugin folder and all node_modules folders are hard excluded."
-                    control={<div className="instasync-choice-list">
-                        {rows.map((row) => <div className="instasync-actions" key={row.id}>
-                            <input className="instasync-modal-input" type="text" value={row.value}
+                    desc="Matched relative to your config folder, e.g. snippets/*.css or hotkeys.json. Uses picomatch. The Realtime plugin folder and all node_modules folders are hard excluded."
+                    control={<div className="realtime-choice-list">
+                        {rows.map((row) => <div className="realtime-actions" key={row.id}>
+                            <input className="realtime-modal-input" type="text" value={row.value}
                                    placeholder="snippets/*.css"
                                    onChange={(event) => {
                                        const value = event.currentTarget.value
@@ -685,12 +686,12 @@ function ConfigSyncSection({ plugin }: { plugin: InstaSyncPlugin }) {
     </>
 }
 
-function AdvancedSettings({ app, plugin, refresh }: { app: App; plugin: InstaSyncPlugin; refresh: () => void }) {
-    return <details className="instasync-advanced">
+function AdvancedSettings({ app, plugin, refresh }: { app: App; plugin: RealtimePlugin; refresh: () => void }) {
+    return <details className="realtime-advanced">
         <summary>Advanced settings</summary>
         <ConfigSyncSection plugin={plugin}/>
         <SettingRow name="Diagnostic logging"
-                    desc="Write verbose InstaSync diagnostics to the developer console. Keep this off unless troubleshooting."
+                    desc="Write verbose Realtime diagnostics to the developer console. Keep this off unless troubleshooting."
                     control={<Toggle value={plugin.settings.diagnosticLogging}
                                      onChange={(value) => void runNotice(undefined, async () => {
                                          plugin.settings.diagnosticLogging = value
@@ -698,8 +699,8 @@ function AdvancedSettings({ app, plugin, refresh }: { app: App; plugin: InstaSyn
                                          plugin.applyDiagnosticLoggingSetting()
                                          refresh()
                                      })}/>}/>
-        <p className="setting-item-description">Changing the InstaSync server URL should usually only be done when
-            resetting or migrating the entire vault.</p><SettingRow name="Instasync server URL"
+        <p className="setting-item-description">Changing the Realtime server URL should usually only be done when
+            resetting or migrating the entire vault.</p><SettingRow name="Realtime server URL"
                                                                     desc={plugin.settings.authServerUrl}
                                                                     control={<button
                                                                         onClick={() => new ServerMigrationModal(app, plugin, refresh).open()}>Change
@@ -707,11 +708,11 @@ function AdvancedSettings({ app, plugin, refresh }: { app: App; plugin: InstaSyn
 }
 
 class ServerMigrationModal extends Modal {
-    private plugin: InstaSyncPlugin
+    private plugin: RealtimePlugin
     private refresh: () => void
     private root: Root | null = null
 
-    constructor(app: App, plugin: InstaSyncPlugin, refresh: () => void) {
+    constructor(app: App, plugin: RealtimePlugin, refresh: () => void) {
         super(app)
         this.plugin = plugin
         this.refresh = refresh
@@ -732,7 +733,7 @@ class ServerMigrationModal extends Modal {
 
 function ServerMigrationView({ app, plugin, refresh, close }: {
     app: App;
-    plugin: InstaSyncPlugin;
+    plugin: RealtimePlugin;
     refresh: () => void;
     close: () => void
 }) {
@@ -742,14 +743,14 @@ function ServerMigrationView({ app, plugin, refresh, close }: {
     const showPaste = useDelayedFlag(busy, 2000)
     return (
         <>
-            <h3>Change InstaSync Server</h3>
+            <h3>Change Realtime Server</h3>
             <p className="setting-item-description">This requires SSO on the new server. The change is only saved if
                 that server has a remote vault named "{app.vault.getName()}".</p>
-            <input className="instasync-modal-input" type="text" value={url}
+            <input className="realtime-modal-input" type="text" value={url}
                    onChange={(event) => setUrl(event.currentTarget.value)}/>
-            {error ? <p className="instasync-error">{error}</p> : null}
+            {error ? <p className="realtime-error">{error}</p> : null}
             <SsoPasteFallback plugin={plugin} visible={showPaste}/>
-            <div className="instasync-actions">
+            <div className="realtime-actions">
                 <button onClick={close}>Cancel</button>
                 <button className="mod-cta" disabled={busy} onClick={() => void (async () => {
                     setBusy(true)
@@ -764,7 +765,7 @@ function ServerMigrationView({ app, plugin, refresh, close }: {
                         await plugin.auth.setSessionForServer(normalized, token, me)
                         await plugin.saveSettings()
                         await plugin.reloadSync()
-                        new Notice('InstaSync: server updated.')
+                        new Notice(`${PLUGIN_NAME}: server updated.`)
                         close()
                         refresh()
                     } catch (e) {
@@ -778,7 +779,7 @@ function ServerMigrationView({ app, plugin, refresh, close }: {
     )
 }
 
-function useVaults(plugin: InstaSyncPlugin) {
+function useVaults(plugin: RealtimePlugin) {
     const [reloadKey, setReloadKey] = useState(0)
     const [vaults, setVaults] = useState<VaultInfo[] | null>(null)
     const [error, setError] = useState('')
@@ -801,7 +802,7 @@ function useVaults(plugin: InstaSyncPlugin) {
     return { vaults, error, reload: () => setReloadKey((key) => key + 1) }
 }
 
-function useMembers(plugin: InstaSyncPlugin, vaultId: string) {
+function useMembers(plugin: RealtimePlugin, vaultId: string) {
     const [reloadKey, setReloadKey] = useState(0)
     const [members, setMembers] = useState<MemberInfo[] | null>(null)
     const [error, setError] = useState('')
@@ -825,7 +826,7 @@ function useMembers(plugin: InstaSyncPlugin, vaultId: string) {
     return { members, error, reload: () => setReloadKey((key) => key + 1) }
 }
 
-function useRemoteCursors(plugin: InstaSyncPlugin, vaultId: string) {
+function useRemoteCursors(plugin: RealtimePlugin, vaultId: string) {
     const [reloadKey, setReloadKey] = useState(0)
     const [cursors, setCursors] = useState<RemoteCursorInfo[] | null>(null)
     const [error, setError] = useState('')
@@ -868,15 +869,15 @@ function useDelayedFlag(active: boolean, delayMs: number): boolean {
  * the login page also prints the session code, which the user can paste here to
  * complete the in-flight login.
  */
-function SsoPasteFallback({ plugin, visible }: { plugin: InstaSyncPlugin; visible: boolean }) {
+function SsoPasteFallback({ plugin, visible }: { plugin: RealtimePlugin; visible: boolean }) {
     const [code, setCode] = useState('')
     if (!visible) return null
     return (
-        <div className="instasync-paste-fallback">
+        <div className="realtime-paste-fallback">
             <p className="setting-item-description">Not redirected back to Obsidian? Paste the sign-in code shown in
                 your browser:</p>
-            <div className="instasync-actions">
-                <input className="instasync-modal-input" type="text" placeholder="Paste sign-in code" value={code}
+            <div className="realtime-actions">
+                <input className="realtime-modal-input" type="text" placeholder="Paste sign-in code" value={code}
                        onChange={(event) => setCode(event.currentTarget.value.trim())}/>
                 <button type="button" className="mod-cta" disabled={!code}
                         onClick={() => plugin.auth.submitPastedCode(code)}>Use code
@@ -891,7 +892,7 @@ async function runNotice(setBusy: ((busy: boolean) => void) | undefined, fn: () 
         setBusy?.(true)
         await fn()
     } catch (e) {
-        new Notice(`InstaSync: ${(e as Error).message}`)
+        new Notice(`${PLUGIN_NAME}: ${(e as Error).message}`)
     } finally {
         setBusy?.(false)
     }

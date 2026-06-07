@@ -1,5 +1,5 @@
 import { requestUrl } from "obsidian";
-import type InstaSyncPlugin from "./main";
+import type RealtimePlugin from "./main";
 import type { ClientToken } from "./ysweet";
 
 /** Identity returned by `GET /api/me`. */
@@ -61,19 +61,19 @@ export interface PermalinkResponse {
 export class AuthError extends Error {}
 
 /**
- * Talks to the InstaSync auth server: SSO login (via an `obsidian://` deep link,
+ * Talks to the Realtime auth server: SSO login (via an `obsidian://` deep link,
  * with a paste-code fallback), session management, and the vault/sharing/token
  * endpoints. Uses Obsidian's `requestUrl` so it works around desktop CORS.
  */
 export class AuthClient {
-	private plugin: InstaSyncPlugin;
+	private plugin: RealtimePlugin;
 	/** Resolver for an in-flight login call awaiting the deep link / paste code. */
 	private pendingLogin: ((token: string) => Promise<MeResponse>) | null = null;
 	/** Rejecter paired with {@link pendingLogin}, so the wait can be cancelled. */
 	private pendingReject: ((err: Error) => void) | null = null;
 	private pendingTimer: number | null = null;
 
-	constructor(plugin: InstaSyncPlugin) {
+	constructor(plugin: RealtimePlugin) {
 		this.plugin = plugin;
 	}
 
@@ -234,7 +234,7 @@ export class AuthClient {
 				await this.api("/api/logout", { method: "POST", body: {} });
 			}
 		} catch (e) {
-			console.warn("[InstaSync] server logout failed", e);
+			console.warn("[Realtime] server logout failed", e);
 		}
 		this.plugin.settings.activeVaultId = "";
 		await this.clearSession();
@@ -248,7 +248,7 @@ export class AuthClient {
 
 	/**
 	 * Open the browser to the SSO login page and resolve once the auth server
-	 * redirects back to `obsidian://instasync-auth?token=…`. The settings tab also
+	 * redirects back to `obsidian://realtime-auth?token=…`. The settings tab also
 	 * offers a paste-code fallback that calls {@link setSession} directly.
 	 */
 	async login(): Promise<MeResponse> {
@@ -270,7 +270,7 @@ export class AuthClient {
 		// server cancels any earlier in-flight login (see beginSetupFor). Must run
 		// before we install the new resolver below so we don't cancel ourselves.
 		this.beginSetupFor(normalized);
-		const redirect = encodeURIComponent("obsidian://instasync-auth");
+		const redirect = encodeURIComponent("obsidian://realtime-auth");
 		window.open(`${normalized}/auth/login?redirect=${redirect}`);
 		return new Promise<{ token: string; me: MeResponse }>((resolve, reject) => {
 			this.pendingReject = reject;
@@ -459,7 +459,7 @@ export class AuthClient {
 				body: { guid, path },
 			});
 		} catch (e) {
-			console.warn("[InstaSync] file registry update failed", e);
+			console.warn("[Realtime] file registry update failed", e);
 		}
 	}
 
@@ -559,7 +559,7 @@ function blobErrorMessage(res: { status: number; text?: string }): string {
 }
 
 /** Legacy, un-namespaced SecretStorage key (single global session token). */
-const LEGACY_TOKEN_KEY = "instasync-session-token";
+const LEGACY_TOKEN_KEY = "realtime-session-token";
 
 /**
  * SecretStorage key for a server's session token, namespaced by host + the

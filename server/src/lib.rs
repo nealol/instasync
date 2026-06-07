@@ -20,6 +20,10 @@ pub mod words;
 pub mod ydoc;
 pub mod ysweet;
 
+pub const SERVER_NAME: &str = "Realtime";
+pub const SERVER_SLUG: &str = "realtime";
+pub const SERVER_BOT_EMAIL: &str = "realtime@localhost";
+
 use std::sync::Arc;
 
 use axum::{

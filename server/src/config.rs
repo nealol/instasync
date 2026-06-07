@@ -1,5 +1,7 @@
 use std::env;
 
+use crate::{SERVER_BOT_EMAIL, SERVER_NAME};
+
 /// Runtime configuration, read from the environment. See README for the full list.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -71,7 +73,7 @@ impl Config {
         }
         Config {
             database_url: opt("DATABASE_URL")
-                .unwrap_or_else(|| "sqlite://instasync.db?mode=rwc".to_string()),
+                .unwrap_or_else(|| "sqlite://realtime.db?mode=rwc".to_string()),
             bind_addr: opt("BIND_ADDR").unwrap_or_else(|| "127.0.0.1:8081".to_string()),
             public_base_url: opt("PUBLIC_BASE_URL")
                 .unwrap_or_else(|| "http://127.0.0.1:8081".to_string()),
@@ -93,9 +95,9 @@ impl Config {
             git_debounce_ms: opt("GIT_DEBOUNCE_MS")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(5000),
-            git_bot_name: opt("GIT_BOT_NAME").unwrap_or_else(|| "InstaSync".to_string()),
+            git_bot_name: opt("GIT_BOT_NAME").unwrap_or_else(|| SERVER_NAME.to_string()),
             git_bot_email: opt("GIT_BOT_EMAIL")
-                .unwrap_or_else(|| "instasync@localhost".to_string()),
+                .unwrap_or_else(|| SERVER_BOT_EMAIL.to_string()),
             cursor_email_domain: opt("CURSOR_EMAIL_DOMAIN").unwrap_or_else(|| {
                 opt("GIT_BOT_EMAIL")
                     .and_then(|email| email.split_once('@').map(|(_, domain)| domain.to_string()))

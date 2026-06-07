@@ -61,7 +61,7 @@ let vaultId: string;
 let adminToken: string;
 let bobToken: string;
 
-describe("InstaSync — two isolated Obsidian devices", function () {
+describe("Realtime — two isolated Obsidian devices", function () {
 	before(async function () {
 		A = browser;
 		B = await startWdioSession({

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the internal y-sweet sync server and the InstaSync auth server side by side
+# Run the internal y-sweet sync server and the Realtime auth server side by side
 # in one container. The auth server reverse-proxies y-sweet under /d/*, so only
 # this container's single port (BIND_ADDR / 8081) needs to be exposed and the
 # only URL the Obsidian plugin needs is this server's.
@@ -35,7 +35,7 @@ y-sweet serve "${YSWEET_STORE}" \
   --prod &
 YSWEET_PID=$!
 
-instasync-server &
+realtime-server &
 SERVER_PID=$!
 
 # Take the whole container down if either process exits, and forward signals.

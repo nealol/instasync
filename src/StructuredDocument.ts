@@ -1,11 +1,11 @@
 import * as Y from "yjs";
 import { Notice, normalizePath, TFile } from "obsidian";
-import type InstaSyncPlugin from "./main";
+import type RealtimePlugin from "./main";
 import { SyncedDoc } from "./SyncedDoc";
 import { ensureParentFolder, getFileByPath, isOpenInWorkspace } from "./vaultHelpers";
 import { reconcileInto, toValue, type JsonValue } from "./structured/reconcile";
 
-const DISK_ORIGIN = Symbol("instasync-structured-disk");
+const DISK_ORIGIN = Symbol("realtime-structured-disk");
 
 export abstract class StructuredDocument extends SyncedDoc {
 	readonly root: Y.Map<any>;
@@ -18,7 +18,7 @@ export abstract class StructuredDocument extends SyncedDoc {
 	private localChangedAtStartup = false;
 
 	protected constructor(
-		plugin: InstaSyncPlugin,
+		plugin: RealtimePlugin,
 		path: string,
 		guid: string,
 		serverDocId: string,
@@ -53,7 +53,7 @@ export abstract class StructuredDocument extends SyncedDoc {
 			}
 			if (!this.isOpen()) await this.writeToDisk(this.serialize(this.value));
 		} catch (e) {
-			console.error(`[InstaSync] structured startup reconcile failed for ${this.path}`, e);
+			console.error(`[Realtime] structured startup reconcile failed for ${this.path}`, e);
 		} finally {
 			this.resolveWhenReady();
 		}
@@ -102,8 +102,8 @@ export abstract class StructuredDocument extends SyncedDoc {
 		try {
 			return this.parse(await this.plugin.app.vault.read(file));
 		} catch (e) {
-			console.error(`[InstaSync] failed to parse ${this.path}`, e);
-			new Notice(`InstaSync: could not parse ${this.path}; keeping the last synced version.`);
+			console.error(`[Realtime] failed to parse ${this.path}`, e);
+			new Notice(`Realtime: could not parse ${this.path}; keeping the last synced version.`);
 			return null;
 		}
 	}
@@ -123,7 +123,7 @@ export abstract class StructuredDocument extends SyncedDoc {
 				await this.plugin.app.vault.create(path, text);
 			}
 		} catch (e) {
-			console.error(`[InstaSync] structured writeToDisk failed for ${this.path}`, e);
+			console.error(`[Realtime] structured writeToDisk failed for ${this.path}`, e);
 		} finally {
 			window.setTimeout(() => {
 				this.writingToDisk = false;

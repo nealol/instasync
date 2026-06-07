@@ -2,7 +2,7 @@ import * as Y from "yjs";
 import { YSweetProvider, STATUS_ERROR, STATUS_OFFLINE } from "@y-sweet/client";
 import type { Awareness } from "y-protocols/awareness";
 import { IndexeddbPersistence } from "y-indexeddb";
-import type InstaSyncPlugin from "./main";
+import type RealtimePlugin from "./main";
 import { getClientToken } from "./ysweet";
 
 export abstract class SyncedDoc {
@@ -14,7 +14,7 @@ export abstract class SyncedDoc {
 	readonly awareness: Awareness;
 	isCreator: boolean;
 
-	protected readonly plugin: InstaSyncPlugin;
+	protected readonly plugin: RealtimePlugin;
 	protected destroyed = false;
 	protected readonly persistence: IndexeddbPersistence;
 
@@ -23,7 +23,7 @@ export abstract class SyncedDoc {
 	private syncedListener: (synced: boolean) => void;
 
 	protected constructor(
-		plugin: InstaSyncPlugin,
+		plugin: RealtimePlugin,
 		path: string,
 		guid: string,
 		serverDocId: string,
@@ -78,7 +78,7 @@ export abstract class SyncedDoc {
 			await this.persistence.whenSynced;
 			if (!this.destroyed) await this.afterPersistenceSynced();
 		} catch (e) {
-			console.error(`[InstaSync] init failed for ${this.path}`, e);
+			console.error(`[Realtime] init failed for ${this.path}`, e);
 			this.resolveWhenReady();
 		}
 

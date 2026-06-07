@@ -1,6 +1,6 @@
 import * as Y from "yjs";
 import { TFile, Notice, normalizePath } from "obsidian";
-import type InstaSyncPlugin from "./main";
+import type RealtimePlugin from "./main";
 import { applyTextToYText } from "./diff";
 import { dbg, snip } from "./debug";
 import { ensureParentFolder, getFileByPath, isOpenInWorkspace } from "./vaultHelpers";
@@ -11,7 +11,7 @@ import { SyncedDoc } from "./SyncedDoc";
  * Origin tag used on Yjs transactions that originate from this Document writing
  * disk content into the shared text, so our own ytext observer can ignore them.
  */
-const DISK_ORIGIN = Symbol("instasync-disk");
+const DISK_ORIGIN = Symbol("realtime-disk");
 
 /**
  * A single collaboratively-edited Markdown file. Owns its own Y.Doc and
@@ -45,7 +45,7 @@ export class Document extends SyncedDoc {
 	private writeTimer: number | null = null;
 
 	constructor(
-		plugin: InstaSyncPlugin,
+		plugin: RealtimePlugin,
 		path: string,
 		guid: string,
 		serverDocId: string,
@@ -135,9 +135,9 @@ export class Document extends SyncedDoc {
 				if (this.destroyed) return;
 				if (choice === "local") {
 					this.applyText(localDisk);
-					new Notice(`InstaSync: kept your local version of "${this.path}".`);
+					new Notice(`Realtime: kept your local version of "${this.path}".`);
 				} else {
-					new Notice(`InstaSync: kept the remote version of "${this.path}".`);
+					new Notice(`Realtime: kept the remote version of "${this.path}".`);
 				}
 			} else if (this.localChangedAtStartup && localDisk !== null && !remoteChanged) {
 				this.applyText(localDisk);
@@ -149,7 +149,7 @@ export class Document extends SyncedDoc {
 				await this.writeToDisk(this.content);
 			}
 		} catch (e) {
-			console.error(`[InstaSync] startup reconcile failed for ${this.path}`, e);
+			console.error(`[Realtime] startup reconcile failed for ${this.path}`, e);
 		} finally {
 			this.resolveWhenReady();
 		}
@@ -239,7 +239,7 @@ export class Document extends SyncedDoc {
 				await this.plugin.app.vault.create(path, text);
 			}
 		} catch (e) {
-			console.error(`[InstaSync] writeToDisk failed for ${this.path}`, e);
+			console.error(`[Realtime] writeToDisk failed for ${this.path}`, e);
 		} finally {
 			// Release on the next tick so the resulting vault 'modify' event,
 			// which is dispatched asynchronously, is still treated as our own.

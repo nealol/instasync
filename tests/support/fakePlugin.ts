@@ -128,7 +128,7 @@ export function makeFakePlugin(
 	opts: { sessionToken: string; activeVaultId: string; clientName?: string },
 ): { plugin: FakePlugin; vault: FakeVault } {
 	const vault = new FakeVault();
-	const secrets = new Map<string, string>([["instasync-session-token", opts.sessionToken]]);
+	const secrets = new Map<string, string>([["realtime-session-token", opts.sessionToken]]);
 	const plugin: FakePlugin = {
 		settings: {
 			authServerUrl,

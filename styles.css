@@ -1,7 +1,7 @@
-/* InstaSync — remote cursor styles are defined as a CodeMirror baseTheme in
+/* Realtime — remote cursor styles are defined as a CodeMirror baseTheme in
    src/editor/RemoteSelections.ts. */
 
-.instasync-setup-wrap {
+.realtime-setup-wrap {
 	display: flex;
 	height: 100%;
 	align-items: flex-start;
@@ -9,7 +9,7 @@
 	padding: 48px 12px;
 }
 
-.instasync-setup-card {
+.realtime-setup-card {
 	width: min(100%, 420px);
 	border: 1px solid var(--background-modifier-border);
 	border-radius: 12px;
@@ -18,29 +18,29 @@
 	box-shadow: 0 12px 32px rgba(0, 0, 0, 0.12);
 }
 
-.instasync-setup-card h2 {
+.realtime-setup-card h2 {
 	padding-left: 0;
 	/*margin-bottom: -4px;*/
 }
 
-.instasync-setup-card h3 {
+.realtime-setup-card h3 {
 	padding-left: 0;
 	margin-top: 4px;
 }
 
-.instasync-wide-input,
-.instasync-wide-button {
+.realtime-wide-input,
+.realtime-wide-button {
 	width: 100%;
 }
 
-.instasync-choice-list {
+.realtime-choice-list {
 	display: flex;
 	flex-direction: column;
 	gap: 10px;
 	margin-bottom: 16px;
 }
 
-.instasync-choice {
+.realtime-choice {
 	display: flex;
 	width: 100%;
 	flex-direction: column;
@@ -53,72 +53,72 @@
 	overflow-wrap: anywhere;
 }
 
-.instasync-choice strong,
-.instasync-choice span {
+.realtime-choice strong,
+.realtime-choice span {
 	white-space: normal;
 	overflow-wrap: anywhere;
 }
 
-.instasync-choice span {
+.realtime-choice span {
 	color: var(--text-muted);
 	font-size: var(--font-ui-small);
 }
 
-.is-mobile .instasync-choice {
+.is-mobile .realtime-choice {
 	padding: 18px;
 }
 
-.instasync-actions {
+.realtime-actions {
 	display: flex;
 	justify-content: flex-end;
 	gap: 8px;
 	margin-top: 4px;
 }
 
-.instasync-warning-box {
+.realtime-warning-box {
 	border: 1px solid var(--background-modifier-error);
 	border-radius: 8px;
 	padding: 12px;
 	background: var(--background-secondary);
 }
 
-.instasync-error {
+.realtime-error {
 	color: var(--text-error);
 }
 
-.instasync-row-title-action {
+.realtime-row-title-action {
 	display: inline-flex;
 	align-items: center;
 	gap: 6px;
 }
 
-.instasync-danger-icon .clickable-icon {
+.realtime-danger-icon .clickable-icon {
 	color: var(--text-error);
 }
 
-.instasync-advanced {
+.realtime-advanced {
 	margin-top: 24px;
 	border-top: 1px solid var(--background-modifier-border);
 	padding-top: 16px;
 }
 
 
-.instasync-modal-input {
+.realtime-modal-input {
 	width: 100%;
 	margin-bottom: 16px;
 }
 
-.instasync-paste-fallback {
+.realtime-paste-fallback {
 	margin-bottom: 16px;
 	padding-top: 12px;
 	border-top: 1px solid var(--background-modifier-border);
 }
 
-.instasync-paste-fallback .instasync-modal-input {
+.realtime-paste-fallback .realtime-modal-input {
 	margin-bottom: 8px;
 }
 
-.modal.instasync-conflict-modal {
+.modal.realtime-conflict-modal {
 	width: min(100vw - 24px, 1400px);
 	height: min(100vh - 24px, 980px);
 	max-width: none;
@@ -126,41 +126,41 @@
 	padding: 0;
 }
 
-.instasync-conflict-modal .modal-content,
-.instasync-conflict-modal .modal-content > div,
-.instasync-conflict-shell {
+.realtime-conflict-modal .modal-content,
+.realtime-conflict-modal .modal-content > div,
+.realtime-conflict-shell {
 	height: 100%;
 }
 
-.instasync-conflict-shell {
+.realtime-conflict-shell {
 	display: flex;
 	flex-direction: column;
 	min-height: 0;
 	background: var(--background-primary);
 }
 
-.instasync-conflict-header {
+.realtime-conflict-header {
 	padding: 20px 24px 12px;
 	border-bottom: 1px solid var(--background-modifier-border);
 }
 
-.instasync-conflict-header h2 {
+.realtime-conflict-header h2 {
 	margin: 0 0 8px;
 	padding: 0;
 }
 
-.instasync-conflict-diff {
+.realtime-conflict-diff {
 	flex: 1;
 	min-height: 0;
 	overflow: auto;
 	padding: 16px 16px 88px;
 }
 
-.instasync-conflict-diff pre {
+.realtime-conflict-diff pre {
 	font-family: var(--font-monospace);
 }
 
-.instasync-conflict-actions {
+.realtime-conflict-actions {
 	position: absolute;
 	right: 0;
 	bottom: 0;
@@ -174,24 +174,24 @@
 	box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.18);
 }
 
-.is-mobile .modal.instasync-conflict-modal {
+.is-mobile .modal.realtime-conflict-modal {
 	width: 100vw;
 	height: 100vh;
 	border-radius: 0;
 }
 
-.is-mobile .instasync-conflict-diff {
+.is-mobile .realtime-conflict-diff {
 	padding: 12px 8px 96px;
 }
 
-.is-mobile .instasync-conflict-diff [data-diff-style="split"] {
+.is-mobile .realtime-conflict-diff [data-diff-style="split"] {
 	display: block;
 }
 
-.is-mobile .instasync-conflict-actions {
+.is-mobile .realtime-conflict-actions {
 	justify-content: stretch;
 }
 
-.is-mobile .instasync-conflict-actions button {
+.is-mobile .realtime-conflict-actions button {
 	flex: 1;
 }

@@ -9,7 +9,7 @@ import {
 } from "@y-sweet/client";
 import { IndexeddbPersistence } from "y-indexeddb";
 import { TFile, TAbstractFile, Notice, type EventRef } from "obsidian";
-import type InstaSyncPlugin from "./main";
+import type RealtimePlugin from "./main";
 import { getClientToken } from "./ysweet";
 import { Document } from "./Document";
 import { CanvasDocument } from "./CanvasDocument";
@@ -53,7 +53,7 @@ function newGuid(): string {
  * One vault maps to one y-sweet server (configured by URL + vault id).
  */
 export class VaultSync {
-	private plugin: InstaSyncPlugin;
+	private plugin: RealtimePlugin;
 	private indexDoc: Y.Doc;
 	private indexProvider: YSweetProvider;
 	private indexPersistence: IndexeddbPersistence;
@@ -80,7 +80,7 @@ export class VaultSync {
 	private statusListener: (status: YSweetStatus) => void;
 	private vaultEvents: EventRef[] = [];
 
-	constructor(plugin: InstaSyncPlugin) {
+	constructor(plugin: RealtimePlugin) {
 		this.plugin = plugin;
 
 		this.indexDoc = new Y.Doc();
@@ -133,7 +133,7 @@ export class VaultSync {
 		try {
 			await this.indexPersistence.whenSynced;
 		} catch (e) {
-			console.error("[InstaSync] index persistence failed to load", e);
+			console.error("[Realtime] index persistence failed to load", e);
 		}
 		if (this.destroyed) return;
 		// Capture the persisted (pre-merge) binary baseline before connecting.
@@ -167,7 +167,7 @@ export class VaultSync {
 	private notifyDisconnected(): void {
 		if (!this.wasConnected) return;
 		this.wasConnected = false;
-		new Notice("InstaSync: disconnected — reconnecting…");
+		new Notice("Realtime: disconnected — reconnecting…");
 	}
 
 	// --- Index synchronisation -------------------------------------------------
@@ -219,7 +219,7 @@ export class VaultSync {
 			}
 		}
 
-		new Notice(`InstaSync: connected, syncing ${this.documents.size + this.structuredDocuments.size} files.`);
+		new Notice(`Realtime: connected, syncing ${this.documents.size + this.structuredDocuments.size} files.`);
 
 		// Reconcile binary files against the blob store (after the text pass so
 		// note sync wins the bandwidth while binaries settle in the background).
@@ -273,7 +273,7 @@ export class VaultSync {
 			try {
 				await this.plugin.app.vault.delete(file);
 			} catch (e) {
-				console.error(`[InstaSync] failed to apply remote delete for ${path}`, e);
+				console.error(`[Realtime] failed to apply remote delete for ${path}`, e);
 			}
 		}
 	}

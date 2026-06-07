@@ -284,7 +284,7 @@ impl GitService {
 
         let (author, message) =
             build_commit_meta(vault_id, file_count, contributors, &self.0.config);
-        // Pin the committer to the InstaSync bot via command-scoped (`-c`) config so
+        // Pin the committer to the Realtime bot via command-scoped (`-c`) config so
         // it never falls back to the server's *global* git identity — regardless of
         // what (if anything) is in global config or whether ensure_repo's local
         // config write ran. The author is the attributed principal (or the bot).
@@ -647,7 +647,7 @@ mod tests {
     fn commit_meta_falls_back_to_bot() {
         let config = test_config();
         let (author, message) = build_commit_meta("v1", 0, &[], &config);
-        assert_eq!(author, "InstaSync <instasync@localhost>");
+        assert_eq!(author, "Realtime <realtime@localhost>");
         assert!(!message.contains("Principal-Id"));
     }
 
@@ -694,8 +694,8 @@ mod tests {
             git_data_dir: ".".into(),
             git_enabled: true,
             git_debounce_ms: 5000,
-            git_bot_name: "InstaSync".into(),
-            git_bot_email: "instasync@localhost".into(),
+            git_bot_name: "Realtime".into(),
+            git_bot_email: "realtime@localhost".into(),
             cursor_email_domain: "localhost".into(),
             git_remote_url: None,
             git_push_enabled: false,

@@ -12,10 +12,11 @@ use crate::error::{AppError, AppResult};
 use crate::session::now_millis;
 use crate::session::{create_session, upsert_user};
 use crate::state::{AppState, MockIdentity, OidcFlow};
+use crate::SERVER_NAME;
 
 #[derive(Debug, Deserialize)]
 pub struct LoginParams {
-    /// Where to send the browser after login (e.g. `obsidian://instasync-auth`).
+    /// Where to send the browser after login (e.g. `obsidian://realtime-auth`).
     pub redirect: Option<String>,
     // Mock-mode only: lets tests choose distinct identities.
     pub mock_sub: Option<String>,
@@ -173,7 +174,7 @@ fn validate_login_redirect(state: &AppState, redirect: Option<&str>) -> AppResul
     let Some(redirect) = redirect else {
         return Ok(String::new());
     };
-    if redirect.is_empty() || redirect == "obsidian://instasync-auth" {
+    if redirect.is_empty() || redirect == "obsidian://realtime-auth" {
         return Ok(redirect.to_string());
     }
 
@@ -290,9 +291,9 @@ async fn discover(
 fn redirect_page(dest: &str, token: &str) -> String {
     let href = html_escape(dest);
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>InstaSync</title></head>\
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{SERVER_NAME}</title></head>\
 <body style=\"font-family:system-ui;max-width:40rem;margin:3rem auto\">\
-<h2>InstaSync sign-in complete</h2>\
+<h2>{SERVER_NAME} sign-in complete</h2>\
 <p><a id=\"open\" href=\"{href}\" \
 style=\"display:inline-block;padding:.6rem 1rem;background:#7c3aed;color:#fff;\
 border-radius:6px;text-decoration:none\">Open Obsidian</a> to finish signing in.</p>\
@@ -315,9 +316,9 @@ fn html_escape(s: &str) -> String {
 
 fn token_page(token: &str) -> String {
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>InstaSync</title></head>\
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{SERVER_NAME}</title></head>\
 <body style=\"font-family:system-ui;max-width:40rem;margin:3rem auto\">\
-<h2>InstaSync sign-in complete</h2>\
+<h2>{SERVER_NAME} sign-in complete</h2>\
 <p>If Obsidian did not open automatically, copy this code into the plugin's \
 <em>paste code</em> field:</p>\
 <pre style=\"padding:1rem;background:#f4f4f4;border-radius:6px;user-select:all\">{token}</pre>\

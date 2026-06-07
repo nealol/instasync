@@ -1,13 +1,13 @@
 import type { EditorView } from "@codemirror/view";
 import { editorInfoField } from "obsidian";
-import type InstaSyncPlugin from "../main";
+import type RealtimePlugin from "../main";
 import type { Document } from "../Document";
 
-export function getPlugin(editor: EditorView): InstaSyncPlugin | null {
+export function getPlugin(editor: EditorView): RealtimePlugin | null {
 	const info = editor.state.field(editorInfoField, false);
 	// app is attached to the editor info in Obsidian.
 	const app = (info as any)?.app;
-	return app?.plugins?.plugins?.["instasync"] ?? null;
+	return app?.plugins?.plugins?.["realtime"] ?? null;
 }
 
 export function getDocumentForEditor(editor: EditorView): Document | null {

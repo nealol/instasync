@@ -1,4 +1,4 @@
-// Spawns the InstaSync auth server (Rust) in mock-OIDC mode plus a y-sweet
+// Spawns the Realtime auth server (Rust) in mock-OIDC mode plus a y-sweet
 // server started with the matching --auth key, for Tier-2 / Tier-3 tests.
 //
 // The Rust binary is built once (cargo build) and then run as a child process.
@@ -95,7 +95,7 @@ function freePort(): Promise<number> {
 
 function serverBinary(): string {
 	const exe = process.platform === "win32" ? ".exe" : "";
-	return path.join(repoRoot, "server", "target", "debug", `instasync-server${exe}`);
+	return path.join(repoRoot, "server", "target", "debug", `realtime-server${exe}`);
 }
 
 let built = false;
@@ -122,8 +122,8 @@ export async function startAuthServer(opts: {
 
 	const port = opts.port ?? (await freePort());
 	const url = `http://127.0.0.1:${port}`;
-	const dbPath = path.join(os.tmpdir(), `instasync-test-${Date.now()}-${port}.db`);
-	const blobDir = path.join(os.tmpdir(), `instasync-blobs-${Date.now()}-${port}`);
+	const dbPath = path.join(os.tmpdir(), `realtime-test-${Date.now()}-${port}.db`);
+	const blobDir = path.join(os.tmpdir(), `realtime-blobs-${Date.now()}-${port}`);
 
 	const child: ChildProcess = spawn(serverBinary(), [], {
 		stdio: ["ignore", "pipe", "pipe"],
@@ -140,7 +140,7 @@ export async function startAuthServer(opts: {
 			ALLOW_MOCK_OIDC: "1",
 			ALLOWED_LOGIN_REDIRECTS: "http://app",
 			// The readiness probe waits for the "listening on" info log.
-			RUST_LOG: "instasync_server=info,warn",
+			RUST_LOG: "realtime_server=info,warn",
 		},
 	});
 

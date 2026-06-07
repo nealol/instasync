@@ -1,4 +1,4 @@
-use instasync_server::{app, build_state, config::Config};
+use realtime_server::{app, build_state, config::Config, SERVER_NAME};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -11,7 +11,8 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env();
     let bind_addr = config.bind_addr.clone();
     tracing::info!(
-        "InstaSync auth server: oidc_mode={:?}, ysweet={}",
+        "{} auth server: oidc_mode={:?}, ysweet={}",
+        SERVER_NAME,
         config.oidc_mode,
         config.ysweet_url
     );

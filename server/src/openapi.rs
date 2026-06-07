@@ -8,9 +8,9 @@ use utoipa::{Modify, OpenApi};
 #[derive(OpenApi)]
 #[openapi(
     info(
-        title = "InstaSync API",
+        title = "Realtime API",
         version = env!("CARGO_PKG_VERSION"),
-        description = "REST, OAuth, auth, permalink, and public upload surfaces for InstaSync. MCP JSON-RPC, y-sweet proxy, raw blob store, and doc-token endpoints are intentionally excluded."
+        description = "REST, OAuth, auth, permalink, and public upload surfaces for Realtime. MCP JSON-RPC, y-sweet proxy, raw blob store, and doc-token endpoints are intentionally excluded."
     ),
     modifiers(&SecurityAddon),
     paths(

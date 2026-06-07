@@ -23,7 +23,7 @@ const notesIdx = args.indexOf("--notes");
 const notes =
   notesIdx !== -1 && args[notesIdx + 1]
     ? args[notesIdx + 1]
-    : `Release ${version}. Install or update via BRAT (nealol/instasync).`;
+    : `Release ${version}. Install or update via BRAT (nealol/realtime).`;
 
 if (!version || !/^\d+\.\d+\.\d+(-[\w.]+)?$/.test(version)) {
   console.error("Usage: node release.mjs <version> [--prerelease] [--notes \"...\"]");

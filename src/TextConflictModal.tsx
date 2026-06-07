@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { FileDiff } from "@pierre/diffs/react";
 import { parseDiffFromFile } from "@pierre/diffs";
-import type InstaSyncPlugin from "./main";
+import type RealtimePlugin from "./main";
 
 export type TextConflictChoice = "local" | "remote";
 
@@ -14,7 +14,7 @@ interface TextConflictInfo {
 }
 
 export function openTextConflictModal(
-	plugin: InstaSyncPlugin,
+	plugin: RealtimePlugin,
 	info: TextConflictInfo,
 ): Promise<TextConflictChoice> {
 	return new Promise((resolve) => {
@@ -42,7 +42,7 @@ class TextConflictModal extends Modal {
 	}
 
 	onOpen(): void {
-		this.modalEl.addClass("instasync-conflict-modal");
+		this.modalEl.addClass("realtime-conflict-modal");
 		this.root = createRoot(this.contentEl);
 		this.root.render(
 			<TextConflictView
@@ -89,15 +89,15 @@ function TextConflictView({
 	);
 
 	return (
-		<div className="instasync-conflict-shell">
-			<div className="instasync-conflict-header">
+		<div className="realtime-conflict-shell">
+			<div className="realtime-conflict-header">
 				<h2>Markdown file conflict</h2>
 				<p className="setting-item-description">
 					"{info.path}" was changed both here and on another device. Pick which
 					version should become the canonical remote version.
 				</p>
 			</div>
-			<div className="instasync-conflict-diff" aria-label="Local and remote diff">
+			<div className="realtime-conflict-diff" aria-label="Local and remote diff">
 				<FileDiff
 					fileDiff={fileDiff}
 					disableWorkerPool
@@ -110,7 +110,7 @@ function TextConflictView({
 					}}
 				/>
 			</div>
-			<div className="instasync-conflict-actions">
+			<div className="realtime-conflict-actions">
 				<button onClick={onLocal}>Accept Local</button>
 				<button className="mod-cta" onClick={onRemote}>
 					Accept Remote

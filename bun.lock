@@ -3,7 +3,7 @@
   "configVersion": 0,
   "workspaces": {
     "": {
-      "name": "instasync",
+      "name": "realtime",
       "dependencies": {
         "@pierre/diffs": "^1.2.7",
         "@y-sweet/client": "^0.9.1",

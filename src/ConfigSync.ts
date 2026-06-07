@@ -1,5 +1,5 @@
 import * as Y from "yjs";
-import type InstaSyncPlugin from "./main";
+import type RealtimePlugin from "./main";
 import { sha256Hex } from "./hash";
 import { matchesConfigGlobs } from "./glob";
 import { dbg } from "./debug";
@@ -14,7 +14,7 @@ const POLL_MS = 15_000;
 const RETRY_MS = 2_000;
 
 export class ConfigSync {
-	private plugin: InstaSyncPlugin;
+	private plugin: RealtimePlugin;
 	private indexDoc: Y.Doc;
 	private configFiles: Y.Map<ConfigMeta>;
 	private globs: string[] = [];
@@ -27,7 +27,7 @@ export class ConfigSync {
 	private observer: (event: Y.YMapEvent<ConfigMeta>) => void;
 	private focusHandler = () => void this.reconcileAll();
 
-	constructor(plugin: InstaSyncPlugin, indexDoc: Y.Doc) {
+	constructor(plugin: RealtimePlugin, indexDoc: Y.Doc) {
 		this.plugin = plugin;
 		this.indexDoc = indexDoc;
 		this.configFiles = indexDoc.getMap<ConfigMeta>("configFiles");
@@ -46,7 +46,7 @@ export class ConfigSync {
 
 	/** The plugin's own folder, always excluded to avoid sync feedback loops. */
 	private get hardExcludeDir(): string {
-		return `${this.configRoot}/plugins/instasync`;
+		return `${this.configRoot}/plugins/realtime`;
 	}
 
 	seedBaseline(): void {
@@ -94,7 +94,7 @@ export class ConfigSync {
 		if (this.writing.has(path)) return Promise.resolve();
 		const prev = this.chains.get(path) ?? Promise.resolve();
 		const next = prev.then(() => this.reconcileNow(path)).catch((e) => {
-			console.error(`[InstaSync] config reconcile failed for ${path}`, e);
+			console.error(`[Realtime] config reconcile failed for ${path}`, e);
 		});
 		this.chains.set(path, next);
 		void next.finally(() => {
@@ -166,7 +166,7 @@ export class ConfigSync {
 			const stat = await this.plugin.app.vault.adapter.stat(path);
 			return { hash: await sha256Hex(bytes), size: bytes.byteLength, mtime: stat?.mtime ?? Date.now() };
 		} catch (e) {
-			console.error(`[InstaSync] failed to read config ${path}`, e);
+			console.error(`[Realtime] failed to read config ${path}`, e);
 			return undefined;
 		}
 	}
@@ -191,7 +191,7 @@ export class ConfigSync {
 			bytes = await this.plugin.auth.getBlob(this.vaultId, meta.hash);
 		} catch (e) {
 			if (this.destroyed) return;
-			console.error(`[InstaSync] config blob download failed for ${path}`, e);
+			console.error(`[Realtime] config blob download failed for ${path}`, e);
 			window.setTimeout(() => void this.reconcile(path), RETRY_MS);
 			return;
 		}

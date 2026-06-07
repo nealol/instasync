@@ -1,4 +1,4 @@
-import type InstaSyncPlugin from "../main";
+import type RealtimePlugin from "../main";
 import type { CanvasDocument } from "../CanvasDocument";
 
 /**
@@ -7,7 +7,7 @@ import type { CanvasDocument } from "../CanvasDocument";
  * observer uses it to avoid re-importing our own edit back into the live canvas,
  * which would disrupt the in-progress selection/drag.
  */
-export const CANVAS_LOCAL_ORIGIN = Symbol("instasync-canvas-request-save");
+export const CANVAS_LOCAL_ORIGIN = Symbol("realtime-canvas-request-save");
 let loggedUnsupported = false;
 
 interface InternalCanvas {
@@ -18,13 +18,13 @@ interface InternalCanvas {
 }
 
 export class CanvasBinding {
-	private plugin: InstaSyncPlugin;
+	private plugin: RealtimePlugin;
 	private doc: CanvasDocument;
 	private canvas: InternalCanvas | null = null;
 	private originalRequestSave: InternalCanvas["requestSave"] | null = null;
 	private applyingRemote = false;
 
-	constructor(plugin: InstaSyncPlugin, doc: CanvasDocument) {
+	constructor(plugin: RealtimePlugin, doc: CanvasDocument) {
 		this.plugin = plugin;
 		this.doc = doc;
 	}
@@ -55,7 +55,7 @@ export class CanvasBinding {
 			this.canvas.importData(this.doc.canvasData());
 			this.canvas.requestFrame?.();
 		} catch (e) {
-			console.error(`[InstaSync] failed to apply canvas update for ${this.doc.path}`, e);
+			console.error(`[Realtime] failed to apply canvas update for ${this.doc.path}`, e);
 		} finally {
 			this.applyingRemote = false;
 		}
@@ -79,7 +79,7 @@ export class CanvasBinding {
 			const data = this.canvas?.getData();
 			if (data) this.doc.reconcileFromCanvasData(data, CANVAS_LOCAL_ORIGIN);
 		} catch (e) {
-			console.error(`[InstaSync] failed to capture canvas update for ${this.doc.path}`, e);
+			console.error(`[Realtime] failed to capture canvas update for ${this.doc.path}`, e);
 		}
 	}
 
@@ -93,7 +93,7 @@ export class CanvasBinding {
 			if (isInternalCanvas(canvas)) found = canvas;
 			else if (!loggedUnsupported) {
 				loggedUnsupported = true;
-				console.warn("[InstaSync] Obsidian canvas private API shape is unsupported; using disk write-through fallback.");
+				console.warn("[Realtime] Obsidian canvas private API shape is unsupported; using disk write-through fallback.");
 			}
 		};
 
