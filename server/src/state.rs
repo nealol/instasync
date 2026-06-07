@@ -9,6 +9,7 @@ use crate::session::now_millis;
 
 use crate::config::Config;
 use crate::git::GitService;
+use crate::search::SearchService;
 
 /// The actor that initiated a write attributed to a real authenticated user.
 #[derive(Clone, Debug)]
@@ -95,6 +96,8 @@ pub struct AppState {
     pub oauth_flows: Arc<Mutex<HashMap<String, OAuthFlow>>>,
     /// Per-vault git audit log + backup engine.
     pub git: GitService,
+    /// Per-vault debounced search indexer.
+    pub search: SearchService,
     /// Maps a minted y-sweet connection token to the principal it was issued to,
     /// so the proxy can attribute document writes to an authenticated identity.
     pub principals: Arc<Mutex<HashMap<String, Principal>>>,

@@ -24,6 +24,7 @@ use crate::notes::{
     self, CreateNoteBody, MoveNoteBody, PatchFrontmatterBody, PatchNoteBody, PeriodicAppendBody,
     PeriodicBody, ReplaceNoteBody,
 };
+use crate::search;
 use crate::session::{bearer_token, hash_token, now_millis, ApiActor, ApiPrincipal};
 use crate::state::AppState;
 
@@ -176,12 +177,6 @@ fn tool_unit(result: crate::error::AppResult<()>) -> Result<CallToolResult, Erro
     }
 }
 
-fn not_implemented(name: &str) -> Result<CallToolResult, ErrorData> {
-    Ok(CallToolResult::structured_error(
-        json!({ "ok": false, "reason": "not_implemented", "tool": name }),
-    ))
-}
-
 #[derive(Deserialize, JsonSchema)]
 struct PathArgs {
     path: String,
@@ -274,6 +269,17 @@ struct AttachmentFromUrlArgs {
 struct CreateUploadLinkArgs {
     landing_dir: Option<String>,
     expires_in_seconds: Option<i64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SearchArgs {
+    query: String,
+    limit: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct BacklinksArgs {
+    path: String,
 }
 
 #[tool_router]
@@ -655,24 +661,42 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "Search notes (not implemented)")]
-    async fn search_notes(&self) -> Result<CallToolResult, ErrorData> {
-        not_implemented("search_notes")
+    #[tool(description = "Search notes")]
+    async fn search_notes(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<SearchArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(search::search_notes_inner(&c.state, &c.principal, &c.vault_id, &args.query, args.limit).await)
     }
 
-    #[tool(description = "List tags (not implemented)")]
-    async fn list_tags(&self) -> Result<CallToolResult, ErrorData> {
-        not_implemented("list_tags")
+    #[tool(description = "List tags")]
+    async fn list_tags(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(search::list_tags_inner(&c.state, &c.principal, &c.vault_id).await)
     }
 
-    #[tool(description = "List backlinks (not implemented)")]
-    async fn list_backlinks(&self) -> Result<CallToolResult, ErrorData> {
-        not_implemented("list_backlinks")
+    #[tool(description = "List backlinks")]
+    async fn list_backlinks(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<BacklinksArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(search::list_backlinks_inner(&c.state, &c.principal, &c.vault_id, &args.path).await)
     }
 
-    #[tool(description = "Backfill note ids (not implemented)")]
-    async fn backfill_ids(&self) -> Result<CallToolResult, ErrorData> {
-        not_implemented("backfill_ids")
+    #[tool(description = "Backfill note ids")]
+    async fn backfill_ids(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(search::reindex_inner(&c.state, &c.principal, &c.vault_id).await)
     }
 }
 

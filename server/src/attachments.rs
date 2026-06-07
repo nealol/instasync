@@ -117,9 +117,9 @@ pub(crate) async fn list_attachments_inner(
     principal: &ApiPrincipal,
     vault_id: &str,
 ) -> AppResult<Vec<AttachmentSummary>> {
-    principal.require_vault(&vault_id)?;
-    require_member(&state, &principal.user.id, &vault_id).await?;
-    let update = ydoc::read_update(&state, &vault_id).await?;
+    principal.require_vault(vault_id)?;
+    require_member(state, &principal.user.id, vault_id).await?;
+    let update = ydoc::read_update(state, vault_id).await?;
     let mut out = Vec::new();
     for (path, meta) in
         ydoc::decode_binaries_map(&update).map_err(|e| AppError::Internal(e.to_string()))?
@@ -152,7 +152,7 @@ pub(crate) async fn head_attachment_inner(
     path: &str,
 ) -> AppResult<bool> {
     let meta = require_attachment(state, principal, vault_id, path).await?;
-    let blob = blob_path(&state, &vault_id, &meta.hash)?;
+    let blob = blob_path(state, vault_id, &meta.hash)?;
     Ok(tokio::fs::metadata(blob).await.is_ok())
 }
 
@@ -209,18 +209,18 @@ pub(crate) async fn upload_attachment_bytes_inner(
     path: &str,
     bytes: &[u8],
 ) -> AppResult<UploadAttachmentResponse> {
-    principal.require_vault(&vault_id)?;
-    require_member(&state, &principal.user.id, &vault_id).await?;
+    principal.require_vault(vault_id)?;
+    require_member(state, &principal.user.id, vault_id).await?;
     validate_attachment_path(state, path)?;
     if bytes.len() as u64 > state.config.attachment_max_bytes {
         return Err(AppError::PayloadTooLarge);
     }
-    let (hash, size) = store_bytes(&state, &vault_id, bytes).await?;
-    ydoc::index_set_binary(&state, &vault_id, &path, &hash, size).await?;
+    let (hash, size) = store_bytes(state, vault_id, bytes).await?;
+    ydoc::index_set_binary(state, vault_id, path, &hash, size).await?;
     state
         .git
         .mark_write(
-            &vault_id,
+            vault_id,
             &principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000),
         )
         .await;
@@ -246,12 +246,12 @@ pub(crate) async fn delete_attachment_inner(
     vault_id: &str,
     path: &str,
 ) -> AppResult<()> {
-    require_attachment(&state, &principal, &vault_id, &path).await?;
-    ydoc::index_remove_binary(&state, &vault_id, &path).await?;
+    require_attachment(state, principal, vault_id, path).await?;
+    ydoc::index_remove_binary(state, vault_id, path).await?;
     state
         .git
         .mark_write(
-            &vault_id,
+            vault_id,
             &principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000),
         )
         .await;
@@ -279,19 +279,19 @@ pub(crate) async fn move_attachment_inner(
     if body.update_embeds {
         return Err(AppError::BadRequest("update_embeds_not_supported".into()));
     }
-    let meta = require_attachment(&state, &principal, &vault_id, &path).await?;
+    let meta = require_attachment(state, principal, vault_id, path).await?;
     validate_attachment_path(state, &body.to_path)?;
     if path == body.to_path {
         return Err(AppError::Conflict("same_path".into()));
     }
-    if attachment_exists(&state, &principal, &vault_id, &body.to_path).await? {
+    if attachment_exists(state, principal, vault_id, &body.to_path).await? {
         return Err(AppError::Conflict("exists".into()));
     }
-    ydoc::index_rename_binary(&state, &vault_id, &path, &body.to_path).await?;
+    ydoc::index_rename_binary(state, vault_id, path, &body.to_path).await?;
     state
         .git
         .mark_write(
-            &vault_id,
+            vault_id,
             &principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000),
         )
         .await;
@@ -319,10 +319,10 @@ pub(crate) async fn upload_attachment_url_inner(
     vault_id: &str,
     body: UploadFromUrlBody,
 ) -> AppResult<UploadAttachmentResponse> {
-    principal.require_vault(&vault_id)?;
-    require_member(&state, &principal.user.id, &vault_id).await?;
+    principal.require_vault(vault_id)?;
+    require_member(state, &principal.user.id, vault_id).await?;
     validate_attachment_path(state, &body.path)?;
-    let url = validate_source_url(&state, &body.source_url)?;
+    let url = validate_source_url(state, &body.source_url)?;
     let res = state
         .http
         .get(url.clone())
@@ -350,12 +350,12 @@ pub(crate) async fn upload_attachment_url_inner(
     if bytes.len() as u64 > state.config.attachment_max_bytes {
         return Err(AppError::PayloadTooLarge);
     }
-    let (hash, size) = store_bytes(&state, &vault_id, &bytes).await?;
-    ydoc::index_set_binary(&state, &vault_id, &body.path, &hash, size).await?;
+    let (hash, size) = store_bytes(state, vault_id, &bytes).await?;
+    ydoc::index_set_binary(state, vault_id, &body.path, &hash, size).await?;
     state
         .git
         .mark_write(
-            &vault_id,
+            vault_id,
             &principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000),
         )
         .await;
@@ -574,7 +574,7 @@ async fn store_bytes(state: &AppState, vault_id: &str, bytes: &[u8]) -> AppResul
         let mut file = tokio::fs::File::create(&tmp)
             .await
             .map_err(|e| AppError::Internal(format!("blob create: {e}")))?;
-        file.write_all(&bytes)
+        file.write_all(bytes)
             .await
             .map_err(|e| AppError::Internal(format!("blob write: {e}")))?;
         file.flush()
@@ -593,6 +593,7 @@ async fn store_bytes(state: &AppState, vault_id: &str, bytes: &[u8]) -> AppResul
 ///   2. IP-literal denylist (private/loopback/link-local/unspecified/ULA) for
 ///      hosts written as raw IPs.
 ///   3. HTTPS-only (HTTP permitted solely for loopback dev hosts).
+///
 /// Redirects are disabled globally (the reqwest client uses `Policy::none()`),
 /// so there is no cross-redirect re-validation to perform.
 ///
@@ -855,7 +856,7 @@ fn sign_payload<T: Serialize>(state: &AppState, payload: &T) -> AppResult<String
 fn verify_payload<T: DeserializeOwned>(state: &AppState, token: &str) -> AppResult<T> {
     let (payload, sig) = token
         .split_once('.')
-        .ok_or_else(|| AppError::Unauthorized)?;
+        .ok_or(AppError::Unauthorized)?;
     let expected = sign_bytes(state, payload.as_bytes())?;
     if !constant_time_eq(expected.as_bytes(), sig.as_bytes()) {
         return Err(AppError::Unauthorized);

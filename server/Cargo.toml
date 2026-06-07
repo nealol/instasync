@@ -43,6 +43,7 @@ utoipa = "5"
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
 hmac = "0.12"
 base64 = "0.22"
+regex = "1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

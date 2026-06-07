@@ -24,14 +24,13 @@ use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as WsMsg};
 use url::Url;
 
-use crate::git::GitService;
 use crate::state::{AppState, Principal};
 
 /// Everything the proxy needs to attribute a write on this connection to a user.
 struct Attribution {
     vault_id: String,
     principal: Principal,
-    git: GitService,
+    state: AppState,
 }
 
 /// Hop-by-hop headers must not be forwarded across the proxy.
@@ -186,7 +185,7 @@ async fn resolve_attribution(state: &AppState, uri: &axum::http::Uri) -> Option<
     Some(Attribution {
         vault_id,
         principal,
-        git: state.git.clone(),
+        state: state.clone(),
     })
 }
 
@@ -249,7 +248,14 @@ async fn relay_ws(
             let msg = msg?;
             if let (Some(attr), AxumMsg::Binary(bytes)) = (&attribution, &msg) {
                 if is_content_write(bytes) {
-                    attr.git.mark_write(&attr.vault_id, &attr.principal).await;
+                    attr.state
+                        .git
+                        .mark_write(&attr.vault_id, &attr.principal)
+                        .await;
+                    attr.state
+                        .search
+                        .mark_write(attr.state.clone(), &attr.vault_id, &attr.principal)
+                        .await;
                 }
             }
             if let Some(out) = axum_to_tungstenite(msg) {

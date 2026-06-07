@@ -111,8 +111,8 @@ pub(crate) async fn list_notes_inner(
     principal: &ApiPrincipal,
     vault_id: &str,
 ) -> AppResult<Vec<NoteSummary>> {
-    principal.require_vault(&vault_id)?;
-    require_member(&state, &principal.user.id, &vault_id).await?;
+    principal.require_vault(vault_id)?;
+    require_member(state, &principal.user.id, vault_id).await?;
 
     // The y-sweet index doc is the source of truth for which files exist; the
     // `vault_files` table is a server-side mirror. Reconcile before listing so
@@ -124,7 +124,7 @@ pub(crate) async fn list_notes_inner(
     Ok(files
         .into_iter()
         .map(|(path, guid)| NoteSummary {
-            permalink: permalink_for_guid(&state, &guid),
+            permalink: permalink_for_guid(state, &guid),
             path,
             guid,
         })
@@ -214,29 +214,30 @@ pub(crate) async fn create_note_inner(
     vault_id: &str,
     body: CreateNoteBody,
 ) -> AppResult<NoteResponse> {
-    principal.require_vault(&vault_id)?;
-    require_member(&state, &principal.user.id, &vault_id).await?;
+    principal.require_vault(vault_id)?;
+    require_member(state, &principal.user.id, vault_id).await?;
     validate_note_path(&body.path)?;
 
-    if file_by_path(&state, &vault_id, &body.path).await?.is_some() {
+    if file_by_path(state, vault_id, &body.path).await?.is_some() {
         return Err(AppError::Conflict("note already exists".into()));
     }
 
     let guid = uuid::Uuid::new_v4().to_string();
-    let doc_id = doc_id(&vault_id, &guid);
-    ensure_doc(&state, &doc_id).await?;
-    ydoc::set_text(&state, &doc_id, &body.content).await?;
-    ydoc::index_set_file(&state, &vault_id, &body.path, &guid).await?;
+    let doc_id = doc_id(vault_id, &guid);
+    ensure_doc(state, &doc_id).await?;
+    ydoc::set_text(state, &doc_id, &body.content).await?;
+    ydoc::index_set_file(state, vault_id, &body.path, &guid).await?;
+    best_effort_index(state, vault_id, &guid, &body.path, &body.content).await;
     state
         .git
         .mark_write(
-            &vault_id,
+            vault_id,
             &principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000),
         )
         .await;
 
     Ok(NoteResponse {
-        permalink: permalink_for_guid(&state, &guid),
+        permalink: permalink_for_guid(state, &guid),
         path: body.path,
         guid,
         content: body.content,
@@ -259,14 +260,14 @@ pub(crate) async fn read_note_inner(
     vault_id: &str,
     path: &str,
 ) -> AppResult<NoteResponse> {
-    let file = require_note_access(&state, &principal, &vault_id, &path, false).await?;
-    let doc_id = doc_id(&vault_id, &file.guid);
-    let update = ydoc::read_update(&state, &doc_id).await?;
+    let file = require_note_access(state, principal, vault_id, path, false).await?;
+    let doc_id = doc_id(vault_id, &file.guid);
+    let update = ydoc::read_update(state, &doc_id).await?;
     let content =
         ydoc::decode_text(&update, "contents").map_err(|e| AppError::Internal(e.to_string()))?;
 
     Ok(NoteResponse {
-        permalink: permalink_for_guid(&state, &file.guid),
+        permalink: permalink_for_guid(state, &file.guid),
         path: file.path,
         guid: file.guid,
         content,
@@ -291,19 +292,20 @@ pub(crate) async fn replace_note_inner(
     path: &str,
     body: ReplaceNoteBody,
 ) -> AppResult<NoteResponse> {
-    let file = require_note_access(&state, &principal, &vault_id, &path, true).await?;
-    let doc_id = doc_id(&vault_id, &file.guid);
-    ydoc::set_text(&state, &doc_id, &body.content).await?;
+    let file = require_note_access(state, principal, vault_id, path, true).await?;
+    let doc_id = doc_id(vault_id, &file.guid);
+    ydoc::set_text(state, &doc_id, &body.content).await?;
+    best_effort_index(state, vault_id, &file.guid, &file.path, &body.content).await;
     state
         .git
         .mark_write(
-            &vault_id,
+            vault_id,
             &principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000),
         )
         .await;
 
     Ok(NoteResponse {
-        permalink: permalink_for_guid(&state, &file.guid),
+        permalink: permalink_for_guid(state, &file.guid),
         path: file.path,
         guid: file.guid,
         content: body.content,
@@ -331,9 +333,9 @@ pub(crate) async fn patch_note_inner(
     if body.old.is_empty() {
         return Err(AppError::BadRequest("old text is required".into()));
     }
-    let file = require_note_access(&state, &principal, &vault_id, &path, true).await?;
-    let doc_id = doc_id(&vault_id, &file.guid);
-    let update = ydoc::read_update(&state, &doc_id).await?;
+    let file = require_note_access(state, principal, vault_id, path, true).await?;
+    let doc_id = doc_id(vault_id, &file.guid);
+    let update = ydoc::read_update(state, &doc_id).await?;
     let content =
         ydoc::decode_text(&update, "contents").map_err(|e| AppError::Internal(e.to_string()))?;
     let matches = content.matches(&body.old).count();
@@ -353,10 +355,11 @@ pub(crate) async fn patch_note_inner(
         return Err(AppError::Conflict("no_op".into()));
     }
 
-    ydoc::set_text(&state, &doc_id, &new_content).await?;
-    mark_note_write(&state, &vault_id, &principal).await;
+    ydoc::set_text(state, &doc_id, &new_content).await?;
+    best_effort_index(state, vault_id, &file.guid, &file.path, &new_content).await;
+    mark_note_write(state, vault_id, principal).await;
     Ok(NoteResponse {
-        permalink: permalink_for_guid(&state, &file.guid),
+        permalink: permalink_for_guid(state, &file.guid),
         path: file.path,
         guid: file.guid,
         content: new_content,
@@ -385,22 +388,24 @@ pub(crate) async fn move_note_inner(
     if path == body.to_path {
         return Err(AppError::Conflict("same_path".into()));
     }
-    let file = require_note_access(&state, &principal, &vault_id, &path, true).await?;
-    if file_by_path(&state, &vault_id, &body.to_path)
+    let file = require_note_access(state, principal, vault_id, path, true).await?;
+    if file_by_path(state, vault_id, &body.to_path)
         .await?
         .is_some()
     {
         return Err(AppError::Conflict("exists".into()));
     }
 
-    ydoc::index_rename(&state, &vault_id, &file.path, &body.to_path).await?;
-    let doc_id = doc_id(&vault_id, &file.guid);
-    let update = ydoc::read_update(&state, &doc_id).await?;
+    ydoc::index_rename(state, vault_id, &file.path, &body.to_path).await?;
+    let doc_id = doc_id(vault_id, &file.guid);
+    let update = ydoc::read_update(state, &doc_id).await?;
     let content =
         ydoc::decode_text(&update, "contents").map_err(|e| AppError::Internal(e.to_string()))?;
-    mark_note_write(&state, &vault_id, &principal).await;
+    best_effort_index(state, vault_id, &file.guid, &body.to_path, &content).await;
+    rewrite_backlinks_after_move(state, vault_id, &file.guid, &file.path, &body.to_path).await;
+    mark_note_write(state, vault_id, principal).await;
     Ok(NoteResponse {
-        permalink: permalink_for_guid(&state, &file.guid),
+        permalink: permalink_for_guid(state, &file.guid),
         path: body.to_path,
         guid: file.guid,
         content,
@@ -422,20 +427,84 @@ pub(crate) async fn delete_note_inner(
     vault_id: &str,
     path: &str,
 ) -> AppResult<()> {
-    let file = require_note_access(&state, &principal, &vault_id, &path, true).await?;
-    ydoc::index_remove_file(&state, &vault_id, &file.path).await?;
-    mark_note_write(&state, &vault_id, &principal).await;
+    let file = require_note_access(state, principal, vault_id, path, true).await?;
+    ydoc::index_remove_file(state, vault_id, &file.path).await?;
+    if let Err(e) = crate::search::remove_note(state, vault_id, &file.guid).await {
+        tracing::warn!("search remove failed for {}: {e}", file.path);
+    }
+    mark_note_write(state, vault_id, principal).await;
     Ok(())
 }
 
 async fn mark_note_write(state: &AppState, vault_id: &str, principal: &ApiPrincipal) {
+    let git_principal = principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000);
     state
         .git
-        .mark_write(
-            vault_id,
-            &principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000),
-        )
+        .mark_write(vault_id, &git_principal)
         .await;
+    state
+        .search
+        .mark_write(state.clone(), vault_id, &git_principal)
+        .await;
+}
+
+async fn best_effort_index(
+    state: &AppState,
+    vault_id: &str,
+    guid: &str,
+    path: &str,
+    content: &str,
+) {
+    if let Err(e) = crate::search::index_note(state, vault_id, guid, path, content).await {
+        tracing::warn!("search index failed for {path}: {e}");
+    }
+}
+
+async fn rewrite_backlinks_after_move(
+    state: &AppState,
+    vault_id: &str,
+    moved_guid: &str,
+    old_path: &str,
+    new_path: &str,
+) {
+    match crate::search::candidate_backlinks(state, vault_id, old_path).await {
+        Ok(candidates) => {
+            let mut count = 0usize;
+            for cand in candidates {
+                if cand.guid == moved_guid {
+                    continue;
+                }
+                let doc_id = doc_id(vault_id, &cand.guid);
+                let update = match ydoc::read_update(state, &doc_id).await {
+                    Ok(update) => update,
+                    Err(e) => {
+                        tracing::warn!("read backlink candidate {} failed: {e}", cand.path);
+                        continue;
+                    }
+                };
+                let content = match ydoc::decode_text(&update, "contents") {
+                    Ok(content) => content,
+                    Err(e) => {
+                        tracing::warn!("decode backlink candidate {} failed: {e}", cand.path);
+                        continue;
+                    }
+                };
+                let (new_content, changed) = crate::search::rewrite_links(&content, old_path, new_path);
+                if changed {
+                    if let Err(e) = ydoc::set_text(state, &doc_id, &new_content).await {
+                        tracing::warn!("rewrite backlink {} failed: {e}", cand.path);
+                        continue;
+                    }
+                    best_effort_index(state, vault_id, &cand.guid, &cand.path, &new_content).await;
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                tracing::info!("rewrote {count} backlinks for note move {old_path} -> {new_path}");
+            }
+        }
+        Err(e) => tracing::warn!("backlink candidate search failed for {old_path}: {e}"),
+    }
 }
 
 pub async fn note_permalink(
@@ -454,10 +523,10 @@ pub(crate) async fn note_permalink_inner(
     vault_id: &str,
     path: &str,
 ) -> AppResult<PermalinkResponse> {
-    let file = require_note_access(&state, &principal, &vault_id, &path, false).await?;
+    let file = require_note_access(state, principal, vault_id, path, false).await?;
     Ok(PermalinkResponse {
         kind: "id".into(),
-        url: permalink_for_guid(&state, &file.guid),
+        url: permalink_for_guid(state, &file.guid),
     })
 }
 
@@ -477,7 +546,7 @@ pub(crate) async fn parse_frontmatter_inner(
     vault_id: &str,
     path: &str,
 ) -> AppResult<FrontmatterResponse> {
-    let (file, content) = read_note_content(&state, &principal, &vault_id, &path, false).await?;
+    let (file, content) = read_note_content(state, principal, vault_id, path, false).await?;
     Ok(FrontmatterResponse {
         path: file.path,
         frontmatter: parse_frontmatter_value(&content)?,
@@ -502,13 +571,14 @@ pub(crate) async fn patch_frontmatter_inner(
     path: &str,
     body: PatchFrontmatterBody,
 ) -> AppResult<NoteResponse> {
-    let (file, content) = read_note_content(&state, &principal, &vault_id, &path, true).await?;
+    let (file, content) = read_note_content(state, principal, vault_id, path, true).await?;
     let new_content = patch_frontmatter_content(&content, body)?;
-    let doc_id = doc_id(&vault_id, &file.guid);
-    ydoc::set_text(&state, &doc_id, &new_content).await?;
-    mark_note_write(&state, &vault_id, &principal).await;
+    let doc_id = doc_id(vault_id, &file.guid);
+    ydoc::set_text(state, &doc_id, &new_content).await?;
+    best_effort_index(state, vault_id, &file.guid, &file.path, &new_content).await;
+    mark_note_write(state, vault_id, principal).await;
     Ok(NoteResponse {
-        permalink: permalink_for_guid(&state, &file.guid),
+        permalink: permalink_for_guid(state, &file.guid),
         path: file.path,
         guid: file.guid,
         content: new_content,
@@ -529,6 +599,7 @@ pub(crate) async fn replace_body_inner(
         body
     };
     ydoc::set_text(state, &doc_id(vault_id, &file.guid), &new_content).await?;
+    best_effort_index(state, vault_id, &file.guid, &file.path, &new_content).await;
     mark_note_write(state, vault_id, principal).await;
     Ok(NoteResponse {
         permalink: permalink_for_guid(state, &file.guid),
@@ -557,16 +628,16 @@ pub(crate) async fn periodic_note_get_or_create_inner(
     body: PeriodicBody,
 ) -> AppResult<NoteResponse> {
     principal.require_vault(vault_id)?;
-    require_member(&state, &principal.user.id, vault_id).await?;
-    let note_path = periodic_path(&state, period, body.date.as_deref())?;
-    if let Some(file) = file_by_path(&state, vault_id, &note_path).await? {
+    require_member(state, &principal.user.id, vault_id).await?;
+    let note_path = periodic_path(state, period, body.date.as_deref())?;
+    if let Some(file) = file_by_path(state, vault_id, &note_path).await? {
         // Honor per-path ACLs on the existing periodic note (deny -> Forbidden).
         authorize_doc(state, &principal.user, vault_id, &doc_id(vault_id, &file.guid)).await?;
-        let update = ydoc::read_update(&state, &doc_id(vault_id, &file.guid)).await?;
+        let update = ydoc::read_update(state, &doc_id(vault_id, &file.guid)).await?;
         let content = ydoc::decode_text(&update, "contents")
             .map_err(|e| AppError::Internal(e.to_string()))?;
         return Ok(NoteResponse {
-            permalink: permalink_for_guid(&state, &file.guid),
+            permalink: permalink_for_guid(state, &file.guid),
             path: file.path,
             guid: file.guid,
             content,
@@ -576,12 +647,13 @@ pub(crate) async fn periodic_note_get_or_create_inner(
     validate_note_path(&note_path)?;
     let guid = uuid::Uuid::new_v4().to_string();
     let doc_id = doc_id(vault_id, &guid);
-    ensure_doc(&state, &doc_id).await?;
-    ydoc::set_text(&state, &doc_id, &body.content).await?;
-    ydoc::index_set_file(&state, vault_id, &note_path, &guid).await?;
-    mark_note_write(&state, vault_id, &principal).await;
+    ensure_doc(state, &doc_id).await?;
+    ydoc::set_text(state, &doc_id, &body.content).await?;
+    ydoc::index_set_file(state, vault_id, &note_path, &guid).await?;
+    best_effort_index(state, vault_id, &guid, &note_path, &body.content).await;
+    mark_note_write(state, vault_id, principal).await;
     Ok(NoteResponse {
-        permalink: permalink_for_guid(&state, &guid),
+        permalink: permalink_for_guid(state, &guid),
         path: note_path,
         guid,
         content: body.content,
@@ -612,7 +684,7 @@ pub(crate) async fn periodic_note_append_inner(
     };
     let existing =
         periodic_note_get_or_create_inner(state, principal, vault_id, period, get_body).await?;
-    let file = file_by_path(&state, vault_id, &existing.path)
+    let file = file_by_path(state, vault_id, &existing.path)
         .await?
         .ok_or(AppError::NotFound)?;
     // Appending is a write; reject when the per-path ACL is read-only or deny.
@@ -625,10 +697,11 @@ pub(crate) async fn periodic_note_append_inner(
         content.push('\n');
     }
     content.push_str(&body.text);
-    ydoc::set_text(&state, &doc_id(vault_id, &file.guid), &content).await?;
-    mark_note_write(&state, vault_id, &principal).await;
+    ydoc::set_text(state, &doc_id(vault_id, &file.guid), &content).await?;
+    best_effort_index(state, vault_id, &file.guid, &existing.path, &content).await;
+    mark_note_write(state, vault_id, principal).await;
     Ok(NoteResponse {
-        permalink: permalink_for_guid(&state, &file.guid),
+        permalink: permalink_for_guid(state, &file.guid),
         path: existing.path,
         guid: file.guid,
         content,

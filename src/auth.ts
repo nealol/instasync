@@ -33,6 +33,19 @@ export interface RemoteCursorInfo {
 	createdAt: number;
 }
 
+export interface SearchHit {
+	path: string;
+	guid: string;
+	title: string;
+	permalink: string;
+	snippet: string;
+}
+
+export interface TagCount {
+	tag: string;
+	count: number;
+}
+
 /** Stable permalink for a note, returned by the note-permalinks endpoint. */
 export interface PermalinkResponse {
 	kind: string;
@@ -352,6 +365,21 @@ export class AuthClient {
 			`/api/vaults/${vaultId}/note-permalinks/${encoded}`,
 			{ method: "POST", body: {} },
 		);
+	}
+
+	search(vaultId: string, q: string, limit?: number): Promise<SearchHit[]> {
+		const params = new URLSearchParams({ q });
+		if (limit !== undefined) params.set("limit", String(limit));
+		return this.api<SearchHit[]>(`/api/vaults/${vaultId}/search?${params.toString()}`);
+	}
+
+	listTags(vaultId: string): Promise<TagCount[]> {
+		return this.api<TagCount[]>(`/api/vaults/${vaultId}/tags`);
+	}
+
+	backlinks(vaultId: string, path: string): Promise<SearchHit[]> {
+		const encoded = path.split("/").map(encodeURIComponent).join("/");
+		return this.api<SearchHit[]>(`/api/vaults/${vaultId}/backlinks/${encoded}`);
 	}
 
 	/** Best-effort registry update so the server can resolve doc → path for ACLs. */

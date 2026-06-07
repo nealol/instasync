@@ -1,0 +1,504 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use axum::extract::{Path, Query, State};
+use axum::Json;
+use regex::Regex;
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, Statement, Value,
+};
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+
+use crate::config::Config;
+use crate::entities::{note_search, vaults};
+use crate::error::{AppError, AppResult};
+use crate::routes::require_member;
+use crate::session::{now_millis, ApiPrincipal};
+use crate::state::{AppState, Principal};
+use crate::ydoc;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedNote {
+    pub title: String,
+    pub tags: Vec<String>,
+    pub links: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub path: String,
+    pub guid: String,
+    pub title: String,
+    pub permalink: String,
+    pub snippet: String,
+}
+
+#[derive(Serialize)]
+pub struct TagCount {
+    pub tag: String,
+    pub count: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReindexResponse {
+    pub count: usize,
+}
+
+#[derive(Deserialize)]
+pub struct SearchQuery {
+    pub q: String,
+    pub limit: Option<u32>,
+}
+
+pub fn parse_note(content: &str, path: &str) -> ParsedNote {
+    let frontmatter = frontmatter_value(content);
+    let title = frontmatter
+        .as_ref()
+        .and_then(|v| v.get("title"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| stem(path).to_string());
+
+    let mut tags = Vec::new();
+    if let Some(v) = frontmatter.as_ref().and_then(|v| v.get("tags")) {
+        collect_yaml_tags(v, &mut tags);
+    }
+    let inline = Regex::new(r"(^|\s)#([A-Za-z0-9_/-]+)").unwrap();
+    for cap in inline.captures_iter(content) {
+        tags.push(cap[2].to_ascii_lowercase());
+    }
+    tags.sort();
+    tags.dedup();
+
+    let mut links = Vec::new();
+    let wiki = Regex::new(r"!?\[\[([^\]|#]+)(#[^\]|]+)?(?:\|[^\]]*)?\]\]").unwrap();
+    for cap in wiki.captures_iter(content) {
+        push_link_keys(&mut links, cap[1].trim());
+    }
+    let md = Regex::new(r"\[[^\]]+\]\(([^)]+\.md)(?:#[^)]+)?\)").unwrap();
+    for cap in md.captures_iter(content) {
+        push_link_keys(&mut links, cap[1].trim());
+    }
+    links.sort();
+    links.dedup();
+
+    ParsedNote { title, tags, links }
+}
+
+pub fn rewrite_links(content: &str, old_path: &str, new_path: &str) -> (String, bool) {
+    let old_keys = target_keys(old_path);
+    let new_base = stem(new_path).to_string();
+    let wiki = Regex::new(r"(!?\[\[)([^\]|#]+)(#[^\]|]+)?(\|[^\]]*)?(\]\])").unwrap();
+    let mut changed = false;
+    let out = wiki
+        .replace_all(content, |cap: &regex::Captures| {
+            if old_keys.contains(&normalize_key(&cap[2])) {
+                changed = true;
+                format!("{}{}{}{}{}", &cap[1], new_base, cap.get(3).map_or("", |m| m.as_str()), cap.get(4).map_or("", |m| m.as_str()), &cap[5])
+            } else {
+                cap[0].to_string()
+            }
+        })
+        .to_string();
+
+    let md = Regex::new(r"(\[[^\]]+\]\()([^)#]+\.md)(#[^)]+)?(\))").unwrap();
+    let out = md
+        .replace_all(&out, |cap: &regex::Captures| {
+            if old_keys.contains(&normalize_key(&cap[2])) {
+                changed = true;
+                format!("{}{}{}{}", &cap[1], new_path, cap.get(3).map_or("", |m| m.as_str()), &cap[4])
+            } else {
+                cap[0].to_string()
+            }
+        })
+        .to_string();
+    (out, changed)
+}
+
+pub async fn index_note(
+    state: &AppState,
+    vault_id: &str,
+    guid: &str,
+    path: &str,
+    content: &str,
+) -> AppResult<()> {
+    let parsed = parse_note(content, path);
+    let tags = serde_json::to_string(&parsed.tags).map_err(|e| AppError::Internal(e.to_string()))?;
+    let links = serde_json::to_string(&parsed.links).map_err(|e| AppError::Internal(e.to_string()))?;
+    let now = now_millis();
+    let existing = note_search::Entity::find()
+        .filter(note_search::Column::VaultId.eq(vault_id))
+        .filter(note_search::Column::Guid.eq(guid))
+        .one(&state.db)
+        .await?;
+    if let Some(model) = existing {
+        let mut active: note_search::ActiveModel = model.into();
+        active.path = Set(path.to_string());
+        active.title = Set(parsed.title.clone());
+        active.tags = Set(tags.clone());
+        active.links = Set(links);
+        active.updated_at = Set(now);
+        active.update(&state.db).await?;
+    } else {
+        note_search::ActiveModel {
+            id: Set(uuid::Uuid::new_v4().to_string()),
+            vault_id: Set(vault_id.to_string()),
+            guid: Set(guid.to_string()),
+            path: Set(path.to_string()),
+            title: Set(parsed.title.clone()),
+            tags: Set(tags.clone()),
+            links: Set(links),
+            updated_at: Set(now),
+        }
+        .insert(&state.db)
+        .await?;
+    }
+    let tag_text = parsed.tags.join(" ");
+    let backend = state.db.get_database_backend();
+    state
+        .db
+        .execute(Statement::from_sql_and_values(
+            backend,
+            "DELETE FROM note_fts WHERE vault_id = ? AND guid = ?",
+            [Value::from(vault_id), Value::from(guid)],
+        ))
+        .await?;
+    state
+        .db
+        .execute(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO note_fts(vault_id,guid,path,title,tags,body) VALUES (?,?,?,?,?,?)",
+            [
+                Value::from(vault_id),
+                Value::from(guid),
+                Value::from(path),
+                Value::from(parsed.title.as_str()),
+                Value::from(tag_text.as_str()),
+                Value::from(content),
+            ],
+        ))
+        .await?;
+    Ok(())
+}
+
+pub async fn remove_note(state: &AppState, vault_id: &str, guid: &str) -> AppResult<()> {
+    note_search::Entity::delete_many()
+        .filter(note_search::Column::VaultId.eq(vault_id))
+        .filter(note_search::Column::Guid.eq(guid))
+        .exec(&state.db)
+        .await?;
+    state
+        .db
+        .execute(Statement::from_sql_and_values(
+            state.db.get_database_backend(),
+            "DELETE FROM note_fts WHERE vault_id = ? AND guid = ?",
+            [Value::from(vault_id), Value::from(guid)],
+        ))
+        .await?;
+    Ok(())
+}
+
+pub async fn reindex_vault(state: &AppState, vault_id: &str) -> AppResult<usize> {
+    let update = ydoc::read_update(state, vault_id).await?;
+    let files = ydoc::decode_files_map(&update).map_err(|e| AppError::Internal(e.to_string()))?;
+    let live: HashSet<String> = files.iter().map(|(_, guid)| guid.clone()).collect();
+    let mut count = 0;
+    for (path, guid) in files {
+        let doc_id = format!("{vault_id}__{guid}");
+        let update = match ydoc::read_update(state, &doc_id).await {
+            Ok(update) => update,
+            Err(e) => { tracing::warn!("search reindex: read {doc_id} failed: {e}"); continue; }
+        };
+        let content = match ydoc::decode_text(&update, "contents") {
+            Ok(content) => content,
+            Err(e) => { tracing::warn!("search reindex: decode {path} failed: {e}"); continue; }
+        };
+        index_note(state, vault_id, &guid, &path, &content).await?;
+        count += 1;
+    }
+    let rows = note_search::Entity::find()
+        .filter(note_search::Column::VaultId.eq(vault_id))
+        .all(&state.db)
+        .await?;
+    for row in rows {
+        if !live.contains(&row.guid) {
+            remove_note(state, vault_id, &row.guid).await?;
+        }
+    }
+    Ok(count)
+}
+
+pub async fn search_notes_inner(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+    query: &str,
+    limit: Option<u32>,
+) -> AppResult<Vec<SearchHit>> {
+    principal.require_vault(vault_id)?;
+    require_member(state, &principal.user.id, vault_id).await?;
+    let limit = limit.unwrap_or(20).min(100);
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let backend = state.db.get_database_backend();
+    let rows = if query.chars().count() >= 3 {
+        state
+            .db
+            .query_all(Statement::from_sql_and_values(
+                backend,
+                "SELECT guid,path,title,snippet(note_fts, 5, '<mark>', '</mark>', '...', 12) AS snippet \
+                 FROM note_fts WHERE vault_id = ? AND note_fts MATCH ? ORDER BY bm25(note_fts) LIMIT ?",
+                [
+                    Value::from(vault_id),
+                    Value::from(fts_phrase(query)),
+                    Value::from(limit as i64),
+                ],
+            ))
+            .await?
+    } else {
+        let like = format!("%{}%", like_escape(&query.to_ascii_lowercase()));
+        state
+            .db
+            .query_all(Statement::from_sql_and_values(
+                backend,
+                "SELECT guid,path,title,'' AS snippet FROM note_search \
+                 WHERE vault_id = ? AND (lower(path) LIKE ? ESCAPE '\\' OR lower(title) LIKE ? ESCAPE '\\' \
+                 OR lower(tags) LIKE ? ESCAPE '\\') LIMIT ?",
+                [
+                    Value::from(vault_id),
+                    Value::from(like.as_str()),
+                    Value::from(like.as_str()),
+                    Value::from(like.as_str()),
+                    Value::from(limit as i64),
+                ],
+            ))
+            .await?
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        let guid: String = row.try_get("", "guid")?;
+        out.push(SearchHit {
+            permalink: permalink_for_guid(state, &guid),
+            guid,
+            path: row.try_get("", "path")?,
+            title: row.try_get("", "title")?,
+            snippet: row.try_get("", "snippet")?,
+        });
+    }
+    Ok(out)
+}
+
+pub async fn list_tags_inner(state: &AppState, principal: &ApiPrincipal, vault_id: &str) -> AppResult<Vec<TagCount>> {
+    principal.require_vault(vault_id)?;
+    require_member(state, &principal.user.id, vault_id).await?;
+    let rows = note_search::Entity::find().filter(note_search::Column::VaultId.eq(vault_id)).all(&state.db).await?;
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for row in rows {
+        if let Ok(tags) = serde_json::from_str::<Vec<String>>(&row.tags) {
+            for tag in tags { *counts.entry(tag).or_default() += 1; }
+        }
+    }
+    let mut out: Vec<_> = counts.into_iter().map(|(tag, count)| TagCount { tag, count }).collect();
+    out.sort_by(|a, b| a.tag.cmp(&b.tag));
+    Ok(out)
+}
+
+pub async fn list_backlinks_inner(state: &AppState, principal: &ApiPrincipal, vault_id: &str, path: &str) -> AppResult<Vec<SearchHit>> {
+    principal.require_vault(vault_id)?;
+    require_member(state, &principal.user.id, vault_id).await?;
+    let keys = target_keys(path);
+    let rows = note_search::Entity::find().filter(note_search::Column::VaultId.eq(vault_id)).all(&state.db).await?;
+    let mut out = Vec::new();
+    for row in rows {
+        if row.path == path { continue; }
+        let links = serde_json::from_str::<Vec<String>>(&row.links).unwrap_or_default();
+        if links.iter().any(|l| keys.contains(l)) {
+            out.push(SearchHit { permalink: permalink_for_guid(state, &row.guid), guid: row.guid, path: row.path, title: row.title, snippet: String::new() });
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+pub async fn candidate_backlinks(state: &AppState, vault_id: &str, old_path: &str) -> AppResult<Vec<note_search::Model>> {
+    let term = stem(old_path);
+    if term.chars().count() >= 3 {
+        let rows = state
+            .db
+            .query_all(Statement::from_sql_and_values(
+                state.db.get_database_backend(),
+                "SELECT guid FROM note_fts WHERE vault_id = ? AND note_fts MATCH ? LIMIT 500",
+                [Value::from(vault_id), Value::from(fts_phrase(term))],
+            ))
+            .await?;
+        let mut out = Vec::new();
+        for row in rows {
+            let guid: String = row.try_get("", "guid")?;
+            if let Some(model) = note_search::Entity::find()
+                .filter(note_search::Column::VaultId.eq(vault_id))
+                .filter(note_search::Column::Guid.eq(guid))
+                .one(&state.db)
+                .await?
+            {
+                out.push(model);
+            }
+        }
+        Ok(out)
+    } else {
+        Ok(note_search::Entity::find().filter(note_search::Column::VaultId.eq(vault_id)).all(&state.db).await?)
+    }
+}
+
+pub async fn reindex_inner(state: &AppState, principal: &ApiPrincipal, vault_id: &str) -> AppResult<ReindexResponse> {
+    principal.require_vault(vault_id)?;
+    require_member(state, &principal.user.id, vault_id).await?;
+    Ok(ReindexResponse { count: reindex_vault(state, vault_id).await? })
+}
+
+pub async fn search_notes(State(state): State<AppState>, principal: ApiPrincipal, Path(vault_id): Path<String>, Query(q): Query<SearchQuery>) -> AppResult<Json<Vec<SearchHit>>> {
+    Ok(Json(search_notes_inner(&state, &principal, &vault_id, &q.q, q.limit).await?))
+}
+
+pub async fn list_tags(State(state): State<AppState>, principal: ApiPrincipal, Path(vault_id): Path<String>) -> AppResult<Json<Vec<TagCount>>> {
+    Ok(Json(list_tags_inner(&state, &principal, &vault_id).await?))
+}
+
+pub async fn list_backlinks(State(state): State<AppState>, principal: ApiPrincipal, Path((vault_id, path)): Path<(String, String)>) -> AppResult<Json<Vec<SearchHit>>> {
+    Ok(Json(list_backlinks_inner(&state, &principal, &vault_id, &path).await?))
+}
+
+pub async fn reindex(State(state): State<AppState>, principal: ApiPrincipal, Path(vault_id): Path<String>) -> AppResult<Json<ReindexResponse>> {
+    Ok(Json(reindex_inner(&state, &principal, &vault_id).await?))
+}
+
+struct VaultState { dirty: bool, deadline: Instant, running: bool }
+struct Inner { config: Arc<Config>, vaults: Mutex<HashMap<String, VaultState>> }
+
+#[derive(Clone)]
+pub struct SearchService(Arc<Inner>);
+
+impl SearchService {
+    pub fn new(config: Arc<Config>) -> Self {
+        Self(Arc::new(Inner { config, vaults: Mutex::new(HashMap::new()) }))
+    }
+    pub async fn mark_write(&self, state: AppState, vault_id: &str, _who: &Principal) {
+        let mut vaults = self.0.vaults.lock().await;
+        let entry = vaults.entry(vault_id.to_string()).or_insert_with(|| VaultState { dirty: false, deadline: Instant::now(), running: false });
+        entry.dirty = true;
+        entry.deadline = Instant::now() + Duration::from_millis(self.0.config.git_debounce_ms);
+        if !entry.running {
+            entry.running = true;
+            let svc = self.clone();
+            let vault_id = vault_id.to_string();
+            tokio::spawn(async move { svc.run_vault(state, vault_id).await });
+        }
+    }
+    async fn run_vault(self, state: AppState, vault_id: String) {
+        loop {
+            loop {
+                let remaining = { self.0.vaults.lock().await.get(&vault_id).and_then(|s| s.deadline.checked_duration_since(Instant::now())) };
+                match remaining { Some(d) => tokio::time::sleep(d).await, None => break }
+            }
+            { let mut vaults = self.0.vaults.lock().await; if let Some(s) = vaults.get_mut(&vault_id) { if !s.dirty { s.running = false; return; } s.dirty = false; } else { return; } }
+            if let Err(e) = reindex_vault(&state, &vault_id).await { tracing::error!("search reindex for vault {vault_id} failed: {e}"); }
+            { let mut vaults = self.0.vaults.lock().await; if let Some(s) = vaults.get_mut(&vault_id) { if !s.dirty { s.running = false; return; } } else { return; } }
+        }
+    }
+}
+
+pub fn spawn_startup_backfill(state: AppState) {
+    tokio::spawn(async move {
+        match vaults::Entity::find().all(&state.db).await {
+            Ok(vaults) => for v in vaults { let state = state.clone(); tokio::spawn(async move { if let Err(e) = reindex_vault(&state, &v.id).await { tracing::warn!("startup search reindex {} failed: {e}", v.id); } }); },
+            Err(e) => tracing::warn!("startup search vault scan failed: {e}"),
+        }
+    });
+}
+
+fn frontmatter_value(content: &str) -> Option<serde_json::Value> {
+    let rest = content.strip_prefix("---\n")?;
+    let end = rest.find("\n---")?;
+    serde_yaml::from_str(&rest[..end]).ok()
+}
+
+fn collect_yaml_tags(v: &serde_json::Value, tags: &mut Vec<String>) {
+    match v {
+        serde_json::Value::String(s) => for tag in s.split_whitespace() { tags.push(tag.trim_start_matches('#').to_ascii_lowercase()); },
+        serde_json::Value::Array(items) => for item in items { if let Some(s) = item.as_str() { tags.push(s.trim_start_matches('#').to_ascii_lowercase()); } },
+        _ => {}
+    }
+}
+
+fn push_link_keys(out: &mut Vec<String>, target: &str) {
+    out.extend(target_keys(target));
+}
+
+pub fn target_keys(path: &str) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    keys.insert(normalize_key(path));
+    keys.insert(normalize_key(stem(path)));
+    keys
+}
+
+fn normalize_key(value: &str) -> String {
+    value.trim().trim_end_matches(".md").to_ascii_lowercase()
+}
+
+fn stem(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path).trim_end_matches(".md")
+}
+
+/// Wrap a user query as a single FTS5 string token so its contents are matched
+/// literally instead of being parsed as an FTS5 query expression (which would
+/// error on bare `"`, `*`, `:`, `-`, `OR`, etc.). With the trigram tokenizer
+/// this yields substring matching.
+fn fts_phrase(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+/// Escape LIKE wildcards so a query's `%`/`_`/`\` are matched literally
+/// (paired with `ESCAPE '\'` in the query).
+fn like_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn permalink_for_guid(state: &AppState, guid: &str) -> String {
+    format!("{}/n/{guid}", state.config.public_base_url.trim_end_matches('/'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_title_tags_and_links() {
+        let content = "---\ntitle: Custom\ntags: [Project, '#rust']\n---\n#body #inline\n[[Note]] [[dir/Other.md|Alias]] ![[Embed#h]] [txt](deep/Target.md#x)";
+        let parsed = parse_note(content, "Fallback.md");
+        assert_eq!(parsed.title, "Custom");
+        assert!(parsed.tags.contains(&"project".into()));
+        assert!(parsed.tags.contains(&"rust".into()));
+        assert!(parsed.tags.contains(&"inline".into()));
+        assert!(parsed.links.contains(&"note".into()));
+        assert!(parsed.links.contains(&"dir/other".into()));
+        assert!(parsed.links.contains(&"other".into()));
+        assert!(parsed.links.contains(&"embed".into()));
+        assert!(parsed.links.contains(&"deep/target".into()));
+    }
+
+    #[test]
+    fn rewrites_all_link_forms() {
+        let content = "[[Old]] [[Old#h|Alias]] ![[dir/Old.md]] [txt](dir/Old.md#h) [[Other]]";
+        let (out, changed) = rewrite_links(content, "dir/Old.md", "new/New.md");
+        assert!(changed);
+        assert_eq!(out, "[[New]] [[New#h|Alias]] ![[New]] [txt](new/New.md#h) [[Other]]");
+    }
+}

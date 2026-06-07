@@ -1162,7 +1162,7 @@ async fn create_list_vault() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(vault["role"], "admin");
     assert_eq!(vault["owner"], true);
-    assert_eq!(vault["createdBy"].as_str().is_some(), true);
+    assert!(vault["createdBy"].as_str().is_some());
 
     let (status, list) = send(&app, "GET", "/api/vaults", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
@@ -2128,5 +2128,150 @@ async fn doc_token_scopes_and_mints() {
             .contains("public.example:9999"),
         "host should be rewritten to public url, got {}",
         token["url"]
+    );
+}
+
+#[tokio::test]
+async fn search_tags_backlinks_reindex_and_rename_rewrite() {
+    let ys = fake_ysweet_store().await;
+    let app = test_app(&ys, &ys).await;
+    let token = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&token),
+        Some(json!({"name": "Notes"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap();
+    let notes_url = format!("/api/vaults/{vault_id}/notes");
+
+    // alpha links to beta and carries frontmatter + inline tags.
+    let (status, _) = send(
+        &app,
+        "POST",
+        &notes_url,
+        Some(&token),
+        Some(json!({
+            "path": "alpha.md",
+            "content": "---\ntitle: Alpha Note\ntags:\n  - project\n  - rust\n---\nSee [[beta]] for details. #journal"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &notes_url,
+        Some(&token),
+        Some(json!({"path": "beta.md", "content": "# Beta\nunique xyzzy content"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // FTS path (>= 3 chars): body-only term finds beta.
+    let (status, hits) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/search?q=xyzzy"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let hits = hits.as_array().unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["path"], "beta.md");
+
+    // LIKE fallback path (< 3 chars): matches alpha's path substring.
+    let (status, hits) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/search?q=al"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let paths: Vec<&str> = hits
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&"alpha.md"), "fallback hits: {paths:?}");
+
+    // Tags aggregation.
+    let (status, tags) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/tags"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let tag_names: Vec<&str> = tags
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["tag"].as_str().unwrap())
+        .collect();
+    assert!(tag_names.contains(&"project"));
+    assert!(tag_names.contains(&"rust"));
+    assert!(tag_names.contains(&"journal"));
+
+    // Backlinks: alpha links to beta.
+    let (status, backlinks) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/backlinks/beta.md"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let backlinks = backlinks.as_array().unwrap();
+    assert_eq!(backlinks.len(), 1);
+    assert_eq!(backlinks[0]["path"], "alpha.md");
+
+    // Reindex rebuilds from the authoritative CRDT (2 notes).
+    let (status, reindexed) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/reindex"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reindexed["count"], 2);
+
+    // Rename beta -> gamma and assert alpha's backlink was rewritten.
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/note-moves/beta.md"),
+        Some(&token),
+        Some(json!({"toPath": "gamma.md"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, alpha) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/notes/alpha.md"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        alpha["content"].as_str().unwrap().contains("[[gamma]]"),
+        "expected rewritten link, got {}",
+        alpha["content"]
     );
 }

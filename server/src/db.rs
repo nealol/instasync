@@ -2,8 +2,8 @@ use sea_orm::sea_query::{Index, IndexCreateStatement};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, Schema};
 
 use crate::entities::{
-    invites, memberships, oauth_clients, oauth_codes, oauth_tokens, permissions, remote_cursors,
-    sessions, upload_jtis, users, vault_files, vaults,
+    invites, memberships, note_search, oauth_clients, oauth_codes, oauth_tokens, permissions,
+    remote_cursors, sessions, upload_jtis, users, vault_files, vaults,
 };
 
 /// Create all tables (and the composite-unique indexes) if they do not exist.
@@ -27,6 +27,7 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
     create!(memberships::Entity);
     create!(invites::Entity);
     create!(vault_files::Entity);
+    create!(note_search::Entity);
     create!(permissions::Entity);
     create!(remote_cursors::Entity);
     create!(oauth_clients::Entity);
@@ -34,7 +35,7 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
     create!(oauth_tokens::Entity);
     create!(upload_jtis::Entity);
 
-    let indexes: [IndexCreateStatement; 7] = [
+    let indexes: [IndexCreateStatement; 9] = [
         Index::create()
             .if_not_exists()
             .name("idx_users_issuer_subject")
@@ -58,6 +59,20 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
             .col(vault_files::Column::VaultId)
             .col(vault_files::Column::Guid)
             .unique()
+            .to_owned(),
+        Index::create()
+            .if_not_exists()
+            .name("idx_note_search_vault_guid")
+            .table(note_search::Entity)
+            .col(note_search::Column::VaultId)
+            .col(note_search::Column::Guid)
+            .unique()
+            .to_owned(),
+        Index::create()
+            .if_not_exists()
+            .name("idx_note_search_vault")
+            .table(note_search::Entity)
+            .col(note_search::Column::VaultId)
             .to_owned(),
         Index::create()
             .if_not_exists()
@@ -89,6 +104,13 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
     for idx in indexes {
         db.execute(backend.build(&idx)).await?;
     }
+
+    db.execute_unprepared(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS note_fts USING fts5(\
+         vault_id UNINDEXED, guid UNINDEXED, path, title, tags, body, \
+         tokenize = 'trigram')",
+    )
+    .await?;
 
     Ok(())
 }

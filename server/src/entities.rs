@@ -127,6 +127,29 @@ pub mod vault_files {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+pub mod note_search {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "note_search")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub vault_id: String,
+        pub guid: String,
+        pub path: String,
+        pub title: String,
+        pub tags: String,
+        pub links: String,
+        pub updated_at: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod permissions {
     use sea_orm::entity::prelude::*;
 

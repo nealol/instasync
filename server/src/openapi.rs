@@ -39,6 +39,10 @@ use utoipa::{Modify, OpenApi};
         upsert_file,
         list_notes,
         create_note,
+        search_notes,
+        list_tags,
+        list_backlinks,
+        reindex,
         read_note,
         replace_note,
         patch_note,
@@ -66,6 +70,7 @@ use utoipa::{Modify, OpenApi};
         (name = "oauth", description = "OAuth 2.1 authorization server"),
         (name = "vaults", description = "Vault, invite, member, cursor, and file registry APIs"),
         (name = "notes", description = "Vault-scoped note APIs"),
+        (name = "search", description = "Vault-scoped note search APIs"),
         (name = "attachments", description = "Vault-scoped attachment APIs and signed uploads"),
         (name = "permalinks", description = "Public note redirect endpoints")
     )
@@ -172,6 +177,18 @@ async fn list_notes() {}
 
 #[utoipa::path(post, path = "/api/vaults/{id}/notes", tag = "notes", security(("bearerAuth" = [])), params(("id" = String, Path)), request_body = Object, responses((status = 200, description = "Created note"), (status = 409, description = "Note already exists")))]
 async fn create_note() {}
+
+#[utoipa::path(get, path = "/api/vaults/{id}/search", tag = "search", security(("bearerAuth" = [])), params(("id" = String, Path), ("q" = String, Query), ("limit" = Option<u32>, Query)), responses((status = 200, description = "Search hits")))]
+async fn search_notes() {}
+
+#[utoipa::path(get, path = "/api/vaults/{id}/tags", tag = "search", security(("bearerAuth" = [])), params(("id" = String, Path)), responses((status = 200, description = "Tag counts")))]
+async fn list_tags() {}
+
+#[utoipa::path(get, path = "/api/vaults/{id}/backlinks/{path}", tag = "search", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Backlinking notes")))]
+async fn list_backlinks() {}
+
+#[utoipa::path(post, path = "/api/vaults/{id}/reindex", tag = "search", security(("bearerAuth" = [])), params(("id" = String, Path)), responses((status = 200, description = "Reindexed vault")))]
+async fn reindex() {}
 
 #[utoipa::path(get, path = "/api/vaults/{id}/notes/{path}", tag = "notes", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path, description = "Wildcard note path")), responses((status = 200, description = "Note content"), (status = 404, description = "Not found")))]
 async fn read_note() {}

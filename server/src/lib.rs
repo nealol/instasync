@@ -13,6 +13,7 @@ pub mod openapi;
 pub mod permalink;
 pub mod proxy;
 pub mod routes;
+pub mod search;
 pub mod session;
 pub mod state;
 pub mod words;
@@ -69,8 +70,9 @@ pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
         db.clone(),
         authenticator.clone(),
     );
+    let search = search::SearchService::new(config.clone());
 
-    Ok(AppState {
+    let state = AppState {
         db,
         config,
         authenticator,
@@ -78,8 +80,11 @@ pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
         oidc: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         git,
+        search,
         principals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-    })
+    };
+    search::spawn_startup_backfill(state.clone());
+    Ok(state)
 }
 
 /// Assemble the axum router for the given state.
@@ -161,6 +166,13 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/api/vaults/{id}/notes",
             get(notes::list_notes).post(notes::create_note),
+        )
+        .route("/api/vaults/{id}/search", get(search::search_notes))
+        .route("/api/vaults/{id}/tags", get(search::list_tags))
+        .route("/api/vaults/{id}/reindex", post(search::reindex))
+        .route(
+            "/api/vaults/{id}/backlinks/{*path}",
+            get(search::list_backlinks),
         )
         .route(
             "/api/vaults/{id}/notes/{*path}",

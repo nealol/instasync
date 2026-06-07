@@ -1249,6 +1249,7 @@ dependencies = [
  "nanoid",
  "openidconnect",
  "rand 0.8.6",
+ "regex",
  "reqwest",
  "rmcp",
  "schemars 1.2.1",
