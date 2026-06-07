@@ -647,7 +647,7 @@ function ConfigSyncSection({ plugin }: { plugin: InstaSyncPlugin }) {
 
     return <>
         <SettingRow name="Sync `.obsidian` files"
-                    desc="Opt in per device. Matched files under your Obsidian config folder sync as binary attachments; InstaSync's own plugin folder is always skipped. Note: snippets and themes hot-reload, but most JSON config (app.json, appearance.json, hotkeys.json, etc.) is cached by Obsidian — synced changes may need an app restart and can be overwritten by Obsidian's own saves. Last writer wins; there is no conflict prompt."
+                    desc="Opt in per device. Matched files under your Obsidian config folder sync as binary attachments. Expect slight issues. Must be configured per-device. "
                     control={<Toggle value={enabled}
                                      onChange={(value) => void runNotice(undefined, async () => {
                                          setEnabled(value)
@@ -656,7 +656,7 @@ function ConfigSyncSection({ plugin }: { plugin: InstaSyncPlugin }) {
                                          await plugin.reloadSync()
                                      })}/>}/>
         {enabled ? <SettingRow name="Config include globs"
-                    desc="Matched relative to your config folder, e.g. snippets/*.css or hotkeys.json."
+                    desc="Matched relative to your config folder, e.g. snippets/*.css or hotkeys.json. Uses picomatch. The Instasync plugin folder and all node_modules folders are hard excluded."
                     control={<div className="instasync-choice-list">
                         {rows.map((row) => <div className="instasync-actions" key={row.id}>
                             <input className="instasync-modal-input" type="text" value={row.value}

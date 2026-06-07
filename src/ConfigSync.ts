@@ -59,6 +59,10 @@ export class ConfigSync {
 	start(globs: string[]): void {
 		if (this.destroyed) return;
 		this.globs = globs.map((glob) => glob.trim()).filter(Boolean);
+		if (this.started) {
+			void this.reconcileAll();
+			return;
+		}
 		this.started = true;
 		window.addEventListener("focus", this.focusHandler);
 		void this.reconcileAll();
@@ -245,7 +249,7 @@ export class ConfigSync {
 
 	private isHardExcluded(path: string): boolean {
 		const dir = this.hardExcludeDir;
-		return path === dir || path.startsWith(`${dir}/`);
+		return path === dir || path.startsWith(`${dir}/`) || path.split("/").includes("node_modules");
 	}
 
 	destroy(): void {

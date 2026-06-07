@@ -29,6 +29,12 @@ describe("glob", () => {
 	it("returns false when no globs are given", () => {
 		expect(matchesAnyGlob("anything", [])).toBe(false);
 	});
+
+	it("honors negative globs in order", () => {
+		expect(matchesAnyGlob("snippets/a.css", ["**/*", "!snippets/**"])).toBe(false);
+		expect(matchesAnyGlob("hotkeys.json", ["**/*", "!snippets/**"])).toBe(true);
+		expect(matchesAnyGlob("snippets/a.css", ["!snippets/**", "snippets/*.css"])).toBe(true);
+	});
 });
 
 describe("matchesConfigGlobs", () => {
@@ -55,5 +61,10 @@ describe("matchesConfigGlobs", () => {
 
 	it("returns false when no globs are given", () => {
 		expect(matchesConfigGlobs(".obsidian/hotkeys.json", ".obsidian", [])).toBe(false);
+	});
+
+	it("supports negative include globs", () => {
+		expect(matchesConfigGlobs(".obsidian/hotkeys.json", ".obsidian", ["**/*", "!workspace.json"])).toBe(true);
+		expect(matchesConfigGlobs(".obsidian/workspace.json", ".obsidian", ["**/*", "!workspace.json"])).toBe(false);
 	});
 });

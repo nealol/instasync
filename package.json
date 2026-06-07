@@ -53,6 +53,7 @@
     "@pierre/diffs": "^1.2.7",
     "@y-sweet/client": "^0.9.1",
     "lib0": "^0.2.93",
+    "picomatch": "^4.0.3",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "yaml": "^2.8.2",
