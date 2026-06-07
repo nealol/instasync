@@ -426,6 +426,10 @@ function sanitizeSettings(raw: unknown): InstaSyncSettings {
 	settings.enabled = typeof data.enabled === "boolean" ? data.enabled : defaults.enabled;
 	settings.syncBinaries = typeof data.syncBinaries === "boolean" ? data.syncBinaries : defaults.syncBinaries;
 	settings.binaryExcludeGlobs = typeof data.binaryExcludeGlobs === "string" ? data.binaryExcludeGlobs : "";
+	settings.syncConfigEnabled = typeof data.syncConfigEnabled === "boolean" ? data.syncConfigEnabled : false;
+	settings.configIncludeGlobs = Array.isArray(data.configIncludeGlobs)
+		? data.configIncludeGlobs.filter((glob): glob is string => typeof glob === "string").map((glob) => glob.trim()).filter(Boolean)
+		: [];
 	settings.diagnosticLogging = typeof data.diagnosticLogging === "boolean" ? data.diagnosticLogging : false;
 
 	return settings;

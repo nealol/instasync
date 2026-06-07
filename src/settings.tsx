@@ -33,6 +33,10 @@ export interface InstaSyncSettings {
      * files to exclude from sync, e.g. `*.tmp, .obsidian/**`. Empty syncs all.
      */
     binaryExcludeGlobs: string;
+    /** Whether this device syncs whitelisted files under `.obsidian`. */
+    syncConfigEnabled: boolean;
+    /** Globs matched relative to `.obsidian`, e.g. `snippets/*.css`. */
+    configIncludeGlobs: string[];
     /** Hidden advanced setting for verbose diagnostic logging. */
     diagnosticLogging: boolean;
 }
@@ -51,6 +55,8 @@ export function defaultSettings(): InstaSyncSettings {
         enabled: true,
         syncBinaries: true,
         binaryExcludeGlobs: '',
+        syncConfigEnabled: false,
+        configIncludeGlobs: [],
         diagnosticLogging: false,
     }
 }
@@ -583,9 +589,68 @@ function RemoteCursorNameView({ plugin, vault, cursor, refresh, close }: {
     </>
 }
 
+/** A glob row with a stable id so React keys survive add/remove reordering. */
+interface GlobRow {
+    id: number;
+    value: string;
+}
+
+let nextGlobRowId = 1
+
+/**
+ * Self-contained `.obsidian` sync controls. Uses local state for the enabled
+ * flag and the glob rows so toggling never re-renders (and scroll-resets) the
+ * whole settings page. Rows use plain React buttons — not imperatively-mounted
+ * Obsidian components — so React fully owns the dynamic list and reconciliation
+ * can't hit a stale `removeChild`.
+ */
+function ConfigSyncSection({ plugin }: { plugin: InstaSyncPlugin }) {
+    const [enabled, setEnabled] = useState(plugin.settings.syncConfigEnabled)
+    const [rows, setRows] = useState<GlobRow[]>(() =>
+        plugin.settings.configIncludeGlobs.map((value) => ({ id: nextGlobRowId++, value })))
+
+    const persist = async (next: GlobRow[]) => {
+        plugin.settings.configIncludeGlobs = next.map((row) => row.value.trim()).filter(Boolean)
+        await plugin.saveSettings()
+        await plugin.reloadSync()
+    }
+
+    return <>
+        <SettingRow name="Sync `.obsidian` files"
+                    desc="Opt in per device. Matched files under your Obsidian config folder sync as binary attachments; InstaSync's own plugin folder is always skipped. Note: snippets and themes hot-reload, but most JSON config (app.json, appearance.json, hotkeys.json, etc.) is cached by Obsidian — synced changes may need an app restart and can be overwritten by Obsidian's own saves. Last writer wins; there is no conflict prompt."
+                    control={<Toggle value={enabled}
+                                     onChange={(value) => void runNotice(undefined, async () => {
+                                         setEnabled(value)
+                                         plugin.settings.syncConfigEnabled = value
+                                         await plugin.saveSettings()
+                                         await plugin.reloadSync()
+                                     })}/>}/>
+        {enabled ? <SettingRow name="Config include globs"
+                    desc="Matched relative to your config folder, e.g. snippets/*.css or hotkeys.json."
+                    control={<div className="instasync-choice-list">
+                        {rows.map((row) => <div className="instasync-actions" key={row.id}>
+                            <input className="instasync-modal-input" type="text" value={row.value}
+                                   placeholder="snippets/*.css"
+                                   onChange={(event) => {
+                                       const value = event.currentTarget.value
+                                       setRows((current) => current.map((r) => r.id === row.id ? { ...r, value } : r))
+                                   }}
+                                   onBlur={() => void persist(rows)}/>
+                            <button className="mod-warning" onClick={() => {
+                                const next = rows.filter((r) => r.id !== row.id)
+                                setRows(next)
+                                void persist(next)
+                            }}>Remove</button>
+                        </div>)}
+                        <button onClick={() => setRows((current) => [...current, { id: nextGlobRowId++, value: '' }])}>Add glob</button>
+                    </div>}/> : null}
+    </>
+}
+
 function AdvancedSettings({ app, plugin, refresh }: { app: App; plugin: InstaSyncPlugin; refresh: () => void }) {
     return <details className="instasync-advanced">
         <summary>Advanced settings</summary>
+        <ConfigSyncSection plugin={plugin}/>
         <SettingRow name="Diagnostic logging"
                     desc="Write verbose InstaSync diagnostics to the developer console. Keep this off unless troubleshooting."
                     control={<Toggle value={plugin.settings.diagnosticLogging}

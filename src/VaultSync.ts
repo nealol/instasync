@@ -13,6 +13,7 @@ import type InstaSyncPlugin from "./main";
 import { getClientToken } from "./ysweet";
 import { Document } from "./Document";
 import { BinarySync } from "./BinarySync";
+import { ConfigSync } from "./ConfigSync";
 import { matchesAnyGlob, parseGlobs } from "./glob";
 
 /** Matches the sibling backups written on conflict; these must never sync. */
@@ -53,6 +54,8 @@ export class VaultSync {
 	private files: Y.Map<string>;
 	/** Sibling sync path for binary (non-Markdown) files; shares the index doc. */
 	private binarySync: BinarySync;
+	/** Per-device opt-in sync for whitelisted files under `.obsidian`. */
+	private configSync: ConfigSync;
 
 	private documents = new Map<string, Document>();
 	private destroyed = false;
@@ -72,6 +75,7 @@ export class VaultSync {
 		this.indexDoc = new Y.Doc();
 		this.files = this.indexDoc.getMap("files");
 		this.binarySync = new BinarySync(plugin, this, this.indexDoc);
+		this.configSync = new ConfigSync(plugin, this.indexDoc);
 
 		const vaultId = plugin.settings.activeVaultId;
 
@@ -120,6 +124,7 @@ export class VaultSync {
 		if (this.destroyed) return;
 		// Capture the persisted (pre-merge) binary baseline before connecting.
 		this.binarySync.seedBaseline();
+		this.configSync.seedBaseline();
 		void this.indexProvider.connect();
 	}
 
@@ -179,6 +184,9 @@ export class VaultSync {
 		// Reconcile binary files against the blob store (after the text pass so
 		// note sync wins the bandwidth while binaries settle in the background).
 		void this.binarySync.reconcileAll(this.localBinaryPaths());
+		if (this.plugin.settings.syncConfigEnabled) {
+			this.configSync.start(this.plugin.settings.configIncludeGlobs);
+		}
 	}
 
 	/** Vault-relative paths of all local files classified as binary. */
@@ -384,6 +392,7 @@ export class VaultSync {
 		for (const ref of this.vaultEvents) vault.offref(ref);
 		this.vaultEvents = [];
 		this.binarySync.destroy();
+		this.configSync.destroy();
 		this.files.unobserve(this.filesObserver);
 		this.indexProvider.off(EVENT_CONNECTION_STATUS, this.statusListener);
 		for (const doc of this.documents.values()) doc.destroy();

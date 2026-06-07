@@ -1,7 +1,7 @@
 {
   "id": "instasync",
   "name": "InstaSync",
-  "version": "0.1.2-beta.2",
+  "version": "0.1.2-beta.4",
   "minAppVersion": "1.11.4",
   "description": "Google-docs-like collaborative editing. Sync your whole vault in real time with live cursors via a y-sweet server.",
   "author": "InstaSync",
