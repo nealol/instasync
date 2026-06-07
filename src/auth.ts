@@ -9,6 +9,11 @@ export interface MeResponse {
 	displayName: string;
 }
 
+/** Server identity returned by the public `GET /api/server-info`. */
+export interface ServerInfoResponse {
+	serverId: string;
+}
+
 export interface VaultInfo {
 	id: string;
 	name: string;
@@ -76,16 +81,68 @@ export class AuthClient {
 		return normalizeServerUrl(this.plugin.settings.authServerUrl);
 	}
 
+	/**
+	 * SecretStorage key for the current server's session token. Obsidian's
+	 * SecretStorage is shared across local vaults, so the key is namespaced by
+	 * server host + the server's stable id (`/api/server-info`) to let one client
+	 * hold tokens for multiple servers at once. Falls back to the legacy global
+	 * key when the server id isn't known yet (pre-migration installs).
+	 */
+	private tokenKey(): string {
+		const serverId = this.plugin.settings.authServerId;
+		if (!serverId) return LEGACY_TOKEN_KEY;
+		return sessionTokenKey(this.plugin.settings.authServerUrl, serverId);
+	}
+
 	private getToken(): string {
-		return this.plugin.app.secretStorage.getSecret('instasync-session-token') ?? '';
+		return this.plugin.app.secretStorage.getSecret(this.tokenKey()) ?? '';
 	}
 
 	private setToken(value: string): void {
-		this.plugin.app.secretStorage.setSecret('instasync-session-token', value);
+		this.plugin.app.secretStorage.setSecret(this.tokenKey(), value);
+	}
+
+	private deleteToken(): void {
+		// SecretStorage has no delete; clear by storing an empty value. Also clear
+		// the legacy global key so a stale token can't linger and keep the client
+		// looking signed in after logout.
+		this.plugin.app.secretStorage.setSecret(this.tokenKey(), "");
+		this.plugin.app.secretStorage.setSecret(LEGACY_TOKEN_KEY, "");
 	}
 
 	get isLoggedIn(): boolean {
 		return !!this.getToken();
+	}
+
+	// --- server identity -------------------------------------------------------
+
+	/** Fetch a server's stable id (public endpoint; no session required). */
+	serverInfo(baseUrl: string): Promise<ServerInfoResponse> {
+		return this.apiAt<ServerInfoResponse>(normalizeServerUrl(baseUrl), "/api/server-info");
+	}
+
+	/**
+	 * Ensure `authServerId` is known for the current server, fetching it from
+	 * `/api/server-info` if needed and migrating any token stored under the legacy
+	 * global key into the per-server key. Best-effort: callers may ignore failures
+	 * (e.g. offline), in which case the legacy key keeps working.
+	 */
+	async ensureServerId(): Promise<string> {
+		if (this.plugin.settings.authServerId) return this.plugin.settings.authServerId;
+		const { serverId } = await this.serverInfo(this.baseUrl);
+		this.plugin.settings.authServerId = serverId;
+		this.migrateLegacyToken();
+		await this.plugin.saveSettings();
+		return serverId;
+	}
+
+	/** Move a token from the legacy global key to this server's namespaced key. */
+	private migrateLegacyToken(): void {
+		const legacy = this.plugin.app.secretStorage.getSecret(LEGACY_TOKEN_KEY);
+		if (!legacy) return;
+		this.plugin.app.secretStorage.setSecret(this.tokenKey(), legacy);
+		// SecretStorage has no delete; clear the legacy key by storing empty.
+		this.plugin.app.secretStorage.setSecret(LEGACY_TOKEN_KEY, "");
 	}
 
 	// --- low-level request -----------------------------------------------------
@@ -119,6 +176,8 @@ export class AuthClient {
 
 	/** Store a session token, then fetch identity and seed defaults. */
 	async setSession(token: string): Promise<MeResponse> {
+		// Resolve the server id first so the token lands under the per-server key.
+		await this.resolveServerId(this.baseUrl);
 		this.setToken(token);
 		await this.plugin.saveSettings();
 
@@ -128,8 +187,18 @@ export class AuthClient {
 	}
 
 	async setSessionForServer(baseUrl: string, token: string, me: MeResponse): Promise<void> {
-		this.plugin.settings.authServerUrl = normalizeServerUrl(baseUrl);
+		const normalized = normalizeServerUrl(baseUrl);
+		this.plugin.settings.authServerUrl = normalized;
+		// Bind the token to this server's stable id before it is written to
+		// SecretStorage (which is shared across local vaults).
+		await this.resolveServerId(normalized);
 		await this.applySession(token, me);
+	}
+
+	/** Fetch and store the server's stable id for the given (already-set) server. */
+	private async resolveServerId(baseUrl: string): Promise<void> {
+		const { serverId } = await this.serverInfo(baseUrl);
+		this.plugin.settings.authServerId = serverId;
 	}
 
 	private async applySession(token: string, me: MeResponse): Promise<void> {
@@ -144,7 +213,7 @@ export class AuthClient {
 	}
 
 	private async clearSession(): Promise<void> {
-		this.setToken("");
+		this.deleteToken();
 		this.plugin.settings.userDisplayName = "";
 		this.plugin.settings.userEmail = "";
 		await this.plugin.saveSettings();
@@ -487,6 +556,32 @@ function blobErrorMessage(res: { status: number; text?: string }): string {
 		}
 	}
 	return `HTTP ${res.status}`;
+}
+
+/** Legacy, un-namespaced SecretStorage key (single global session token). */
+const LEGACY_TOKEN_KEY = "instasync-session-token";
+
+/**
+ * SecretStorage key for a server's session token, namespaced by host + the
+ * server's stable id. The host keeps keys human-recognizable; the id guarantees
+ * uniqueness even if two servers share a host (e.g. behind different paths) or a
+ * host is reused. SecretStorage is shared across local Obsidian vaults, so this
+ * lets one client hold independent tokens for multiple servers.
+ *
+ * Obsidian requires secret ids to be lowercase alphanumeric with optional
+ * dashes, so the host is sanitized (e.g. `127.0.0.1:8081` -> `127-0-0-1-8081`)
+ * and dashes are used as separators. The server id alone guarantees uniqueness.
+ */
+function sessionTokenKey(serverUrl: string, serverId: string): string {
+	let host: string;
+	try {
+		host = new URL(serverUrl).host;
+	} catch {
+		host = serverUrl;
+	}
+	const safeHost = host.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+	const safeId = serverId.toLowerCase().replace(/[^a-z0-9-]+/g, "-");
+	return `${LEGACY_TOKEN_KEY}-${safeHost}-${safeId}`;
 }
 
 export function normalizeServerUrl(url: string): string {

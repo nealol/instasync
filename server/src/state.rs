@@ -90,6 +90,8 @@ impl OAuthFlow {
 pub struct AppState {
     pub db: DatabaseConnection,
     pub config: Arc<Config>,
+    /// Stable, persisted id for this server, advertised via `/api/server-info`.
+    pub server_id: String,
     pub authenticator: Arc<Authenticator>,
     pub http: reqwest::Client,
     pub oidc: Arc<Mutex<HashMap<String, OidcFlow>>>,

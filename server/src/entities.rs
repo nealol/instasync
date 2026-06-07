@@ -1,6 +1,25 @@
 //! SeaORM entities. Ids are stored as TEXT (uuid v4 strings) and timestamps as
 //! epoch-millis i64, which keeps the sqlite mapping trivial.
 
+pub mod server_meta {
+    use sea_orm::entity::prelude::*;
+
+    /// Singleton-ish key/value table for server-wide metadata. Currently holds
+    /// the stable `server_id` advertised by `GET /api/server-info`.
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "server_meta")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub key: String,
+        pub value: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod users {
     use sea_orm::entity::prelude::*;
 

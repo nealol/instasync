@@ -683,6 +683,22 @@ async fn login_creates_session_and_me_works() {
 }
 
 #[tokio::test]
+async fn server_info_returns_stable_id_without_auth() {
+    let ys = fake_ysweet().await;
+    let app = test_app(&ys, &ys).await;
+
+    // Public: no bearer required.
+    let (status, info) = send(&app, "GET", "/api/server-info", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let id = info["serverId"].as_str().expect("serverId string");
+    assert!(!id.is_empty());
+
+    // Stable across calls on the same server.
+    let (_, again) = send(&app, "GET", "/api/server-info", None, None).await;
+    assert_eq!(again["serverId"].as_str(), Some(id));
+}
+
+#[tokio::test]
 async fn logout_revokes_session() {
     let ys = fake_ysweet().await;
     let app = test_app(&ys, &ys).await;

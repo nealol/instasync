@@ -50,6 +50,7 @@ pub fn gen_auth_key() -> String {
 pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
     let db = Database::connect(&config.database_url).await?;
     db::init_schema(&db).await?;
+    let server_id = db::ensure_server_id(&db).await?;
 
     let authenticator = Arc::new(
         Authenticator::new(&config.ysweet_auth_key)
@@ -75,6 +76,7 @@ pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
     let state = AppState {
         db,
         config,
+        server_id,
         authenticator,
         http,
         oidc: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -134,6 +136,7 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/n/{guid}", get(permalink::note_by_guid))
         .route("/p", get(permalink::note_by_path))
+        .route("/api/server-info", get(routes::server_info))
         .route("/api/me", get(routes::me))
         .route("/api/logout", post(routes::logout))
         .route(

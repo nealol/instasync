@@ -121,6 +121,10 @@ export default class InstaSyncPlugin extends Plugin {
 			this.setStatus("signin");
 			return;
 		}
+		// Resolve this server's stable id and migrate any legacy token into the
+		// per-server SecretStorage key. Best-effort: tolerate offline startups,
+		// where the legacy key keeps working until we can reach the server.
+		await this.auth.ensureServerId().catch(() => {});
 		// Validate the session; a 401 clears it. Other (network) errors are
 		// tolerated so we can still start and let the providers retry.
 		try {
@@ -416,6 +420,7 @@ function sanitizeSettings(raw: unknown): InstaSyncSettings {
 	const settings: InstaSyncSettings = { ...defaults };
 
 	settings.authServerUrl = sanitizeUrl(data.authServerUrl, defaults.authServerUrl);
+	settings.authServerId = typeof data.authServerId === "string" ? data.authServerId.trim() : "";
 	settings.pendingSetupServerUrl = data.pendingSetupServerUrl
 		? sanitizeUrl(data.pendingSetupServerUrl, "")
 		: "";

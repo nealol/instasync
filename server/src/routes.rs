@@ -32,6 +32,12 @@ pub struct MeResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ServerInfoResponse {
+    pub server_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VaultResponse {
     pub id: String,
     pub name: String,
@@ -77,6 +83,14 @@ async fn require_admin(
 }
 
 // ---------- auth / session ----------
+
+/// Public: advertise this server's stable id so clients can scope cached
+/// session tokens per server. No authentication required.
+pub async fn server_info(State(state): State<AppState>) -> Json<ServerInfoResponse> {
+    Json(ServerInfoResponse {
+        server_id: state.server_id.clone(),
+    })
+}
 
 pub async fn me(AuthUser(user): AuthUser) -> Json<MeResponse> {
     Json(MeResponse {

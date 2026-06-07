@@ -10,6 +10,13 @@ export interface InstaSyncSettings {
     /** Base URL of the InstaSync auth server, e.g. http://127.0.0.1:8081 */
     authServerUrl: string;
     /**
+     * Stable id of the server at {@link authServerUrl}, from `/api/server-info`.
+     * Combined with the server host, it namespaces this account's session token
+     * in Obsidian's SecretStorage (which is shared across local vaults), so one
+     * Obsidian client can hold tokens for multiple servers without collisions.
+     */
+    authServerId: string;
+    /**
      * Server URL of an in-progress SSO setup login. Used for nothing else:
      * changing it cancels any pending SSO login (see AuthClient.beginSetupFor).
      */
@@ -49,6 +56,7 @@ export function defaultSettings(): InstaSyncSettings {
     const identity = generateClientIdentity()
     return {
         authServerUrl: 'http://127.0.0.1:8081',
+        authServerId: '',
         pendingSetupServerUrl: '',
         userDisplayName: '',
         userEmail: '',
