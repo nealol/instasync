@@ -25,6 +25,12 @@ export class CanvasDocument extends StructuredDocument {
 		this.binding.tryBind();
 	}
 
+	// Canvas owns the live view via CanvasBinding while it's open, so the base
+	// class must not also write through to disk (that would thrash the view).
+	protected shouldDeferToLiveBinding(): boolean {
+		return true;
+	}
+
 	protected parse(text: string): JsonValue {
 		return parseCanvas(text);
 	}

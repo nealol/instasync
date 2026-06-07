@@ -37,6 +37,25 @@ export abstract class StructuredDocument extends SyncedDoc {
 	protected abstract parse(text: string): JsonValue;
 	protected abstract serialize(value: JsonValue): string;
 
+	/**
+	 * When the file is open in the workspace, should we defer to a live editor
+	 * binding instead of writing through to disk? Canvas overrides this to `true`
+	 * because {@link CanvasBinding} owns the live view while it's open; writing to
+	 * an open file would surface as an external change and thrash the view.
+	 *
+	 * Document types without a live binding (e.g. Bases) must return `false` so the
+	 * disk write-through path stays active — otherwise they never sync while open,
+	 * which is exactly when they're being edited.
+	 */
+	protected shouldDeferToLiveBinding(): boolean {
+		return false;
+	}
+
+	/** True only when an open file should suppress disk write-through. */
+	private suppressedWhileOpen(): boolean {
+		return this.isOpen() && this.shouldDeferToLiveBinding();
+	}
+
 	protected async afterPersistenceSynced(): Promise<void> {
 		this.baselineAtStartup = this.serialize(this.value);
 		const disk = await this.readParsedFromDisk();
@@ -51,7 +70,7 @@ export abstract class StructuredDocument extends SyncedDoc {
 			if (this.localChangedAtStartup && this.diskAtStartup !== null) {
 				this.applyValue(this.diskAtStartup, DISK_ORIGIN);
 			}
-			if (!this.isOpen()) await this.writeToDisk(this.serialize(this.value));
+			if (!this.suppressedWhileOpen()) await this.writeToDisk(this.serialize(this.value));
 		} catch (e) {
 			console.error(`[Realtime] structured startup reconcile failed for ${this.path}`, e);
 		} finally {
@@ -60,7 +79,7 @@ export abstract class StructuredDocument extends SyncedDoc {
 	}
 
 	async onDiskChanged(): Promise<void> {
-		if (this.destroyed || this.writingToDisk || this.isOpen()) return;
+		if (this.destroyed || this.writingToDisk || this.suppressedWhileOpen()) return;
 		const disk = await this.readParsedFromDisk();
 		if (disk === null) return;
 		if (this.serialize(disk) === this.serialize(this.value)) return;
@@ -75,7 +94,7 @@ export abstract class StructuredDocument extends SyncedDoc {
 	protected onRootChanged(_origin?: unknown): void {
 		if (this.destroyed) return;
 		this.plugin.vaultSync?.noteTextActivity();
-		if (this.isOpen()) return;
+		if (this.suppressedWhileOpen()) return;
 		this.scheduleWriteToDisk();
 	}
 
@@ -83,7 +102,7 @@ export abstract class StructuredDocument extends SyncedDoc {
 		if (this.writeTimer !== null) window.clearTimeout(this.writeTimer);
 		this.writeTimer = window.setTimeout(() => {
 			this.writeTimer = null;
-			if (this.destroyed || this.isOpen()) return;
+			if (this.destroyed || this.suppressedWhileOpen()) return;
 			void this.writeToDisk(this.serialize(this.value));
 		}, 100);
 	}
@@ -114,7 +133,7 @@ export abstract class StructuredDocument extends SyncedDoc {
 		try {
 			const file = this.getFile();
 			if (file) {
-				if (this.isOpen()) return;
+				if (this.suppressedWhileOpen()) return;
 				if ((await this.plugin.app.vault.read(file)) === text) return;
 				await this.plugin.app.vault.modify(file, text);
 			} else {

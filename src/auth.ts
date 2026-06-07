@@ -562,26 +562,28 @@ function blobErrorMessage(res: { status: number; text?: string }): string {
 const LEGACY_TOKEN_KEY = "realtime-session-token";
 
 /**
- * SecretStorage key for a server's session token, namespaced by host + the
- * server's stable id. The host keeps keys human-recognizable; the id guarantees
- * uniqueness even if two servers share a host (e.g. behind different paths) or a
- * host is reused. SecretStorage is shared across local Obsidian vaults, so this
- * lets one client hold independent tokens for multiple servers.
+ * SecretStorage key for a server's session token, namespaced by the server's
+ * stable id plus a short hash of the full URL/id pair. SecretStorage is shared
+ * across local Obsidian vaults, so this lets one client hold independent tokens
+ * for multiple servers.
  *
  * Obsidian requires secret ids to be lowercase alphanumeric with optional
- * dashes, so the host is sanitized (e.g. `127.0.0.1:8081` -> `127-0-0-1-8081`)
- * and dashes are used as separators. The server id alone guarantees uniqueness.
+ * dashes and 64 characters max. Keep a readable server-id slug, then append a
+ * hash so long/truncated ids and different URLs remain distinct.
  */
 function sessionTokenKey(serverUrl: string, serverId: string): string {
-	let host: string;
-	try {
-		host = new URL(serverUrl).host;
-	} catch {
-		host = serverUrl;
+	const hash = shortHash(`${normalizeServerUrl(serverUrl)}\n${serverId}`);
+	const slug = serverId.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32);
+	return `${LEGACY_TOKEN_KEY}-${slug || "server"}-${hash}`;
+}
+
+function shortHash(value: string): string {
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < value.length; i++) {
+		hash ^= value.charCodeAt(i);
+		hash = Math.imul(hash, 0x01000193);
 	}
-	const safeHost = host.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-	const safeId = serverId.toLowerCase().replace(/[^a-z0-9-]+/g, "-");
-	return `${LEGACY_TOKEN_KEY}-${safeHost}-${safeId}`;
+	return (hash >>> 0).toString(36).padStart(7, "0");
 }
 
 export function normalizeServerUrl(url: string): string {
