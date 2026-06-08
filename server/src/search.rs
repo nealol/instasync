@@ -548,18 +548,42 @@ pub fn spawn_startup_backfill(state: AppState) {
     tokio::spawn(async move {
         match vaults::Entity::find().all(&state.db).await {
             Ok(vaults) => {
+                let mut failed = 0usize;
                 for v in vaults {
-                    let state = state.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = reindex_vault(&state, &v.id).await {
-                            tracing::warn!("startup search reindex {} failed: {e}", v.id);
-                        }
-                    });
+                    if let Err(e) = reindex_vault_with_startup_retries(&state, &v.id).await {
+                        failed += 1;
+                        tracing::debug!("startup search reindex {} skipped: {e}", v.id);
+                    }
+                }
+                if failed > 0 {
+                    tracing::warn!(
+                        "startup search reindex skipped {failed} vault(s); they will reindex on the next change or manual reindex"
+                    );
                 }
             }
             Err(e) => tracing::warn!("startup search vault scan failed: {e}"),
         }
     });
+}
+
+async fn reindex_vault_with_startup_retries(state: &AppState, vault_id: &str) -> AppResult<usize> {
+    let mut last_err = None;
+    for delay in [
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    ] {
+        match reindex_vault(state, vault_id).await {
+            Ok(count) => return Ok(count),
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+    reindex_vault(state, vault_id)
+        .await
+        .or_else(|e| Err(last_err.unwrap_or(e)))
 }
 
 fn frontmatter_value(content: &str) -> Option<serde_json::Value> {

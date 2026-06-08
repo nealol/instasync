@@ -330,20 +330,28 @@ struct IdPathArgs {
     id: String,
 }
 #[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct BaseViewArgs {
     path: String,
     name: String,
     #[serde(rename = "type")]
     view_type: String,
-    #[serde(flatten)]
-    fields: serde_json::Map<String, serde_json::Value>,
+    filters: Option<serde_json::Value>,
+    order: Option<Vec<serde_json::Value>>,
+    sort: Option<serde_json::Value>,
+    group_by: Option<serde_json::Value>,
+    columns: Option<Vec<serde_json::Value>>,
 }
 #[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct BaseViewPatchArgs {
     path: String,
     name: String,
-    #[serde(flatten)]
-    patch: serde_json::Map<String, serde_json::Value>,
+    filters: Option<serde_json::Value>,
+    order: Option<Vec<serde_json::Value>>,
+    sort: Option<serde_json::Value>,
+    group_by: Option<serde_json::Value>,
+    columns: Option<Vec<serde_json::Value>>,
 }
 #[derive(Deserialize, JsonSchema)]
 struct NamePathArgs {
@@ -355,6 +363,32 @@ struct SetValueArgs {
     path: String,
     name: Option<String>,
     value: serde_json::Value,
+}
+
+fn base_view_fields(
+    filters: Option<serde_json::Value>,
+    order: Option<Vec<serde_json::Value>>,
+    sort: Option<serde_json::Value>,
+    group_by: Option<serde_json::Value>,
+    columns: Option<Vec<serde_json::Value>>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    if let Some(value) = filters {
+        fields.insert("filters".into(), value);
+    }
+    if let Some(value) = order {
+        fields.insert("order".into(), serde_json::Value::Array(value));
+    }
+    if let Some(value) = sort {
+        fields.insert("sort".into(), value);
+    }
+    if let Some(value) = group_by {
+        fields.insert("groupBy".into(), value);
+    }
+    if let Some(value) = columns {
+        fields.insert("columns".into(), serde_json::Value::Array(value));
+    }
+    fields
 }
 
 #[tool_router]
@@ -647,7 +681,13 @@ impl InstaMcp {
                 BaseViewBody {
                     name: args.name,
                     view_type: args.view_type,
-                    fields: args.fields,
+                    fields: base_view_fields(
+                        args.filters,
+                        args.order,
+                        args.sort,
+                        args.group_by,
+                        args.columns,
+                    ),
                 },
             )
             .await,
@@ -684,7 +724,13 @@ impl InstaMcp {
                 &args.path,
                 BaseViewPatchBody {
                     name: args.name,
-                    patch: args.patch,
+                    patch: base_view_fields(
+                        args.filters,
+                        args.order,
+                        args.sort,
+                        args.group_by,
+                        args.columns,
+                    ),
                 },
             )
             .await,
