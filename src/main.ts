@@ -37,8 +37,14 @@ export default class RealtimePlugin extends Plugin {
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
+		const pluginDir = this.manifest.dir;
+		const adapter = this.app.vault.adapter as { getFullPath?: (path: string) => string };
+		const wasmPath = adapter.getFullPath
+			? adapter.getFullPath(`${pluginDir}/crsqlite.wasm`)
+			: `${pluginDir}/crsqlite.wasm`;
 		configureCrsqliteWasmFallback(
 			`https://github.com/nealol/realtime/releases/download/${this.manifest.version}/crsqlite.wasm`,
+			wasmPath,
 		);
 		this.auth = new AuthClient(this);
 

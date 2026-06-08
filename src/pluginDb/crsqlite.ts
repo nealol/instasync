@@ -1,4 +1,5 @@
 import initWasm from "@vlcn.io/crsqlite-wasm";
+import { requestUrl } from "obsidian";
 import type { SqlDatabaseAdapter } from "./types";
 
 declare const __dirname: string | undefined;
@@ -6,18 +7,19 @@ declare const require: ((id: string) => unknown) | undefined;
 
 let sqlitePromise: ReturnType<typeof initWasm> | null = null;
 let fallbackWasmUrl = "";
+let localWasmPath = "";
 
-export function configureCrsqliteWasmFallback(url: string): void {
+export function configureCrsqliteWasmFallback(url: string, localPath?: string): void {
 	fallbackWasmUrl = url;
+	localWasmPath = localPath?.replace(/\\/g, "/") ?? "";
 }
 
 function wasmUrl(file: string): string {
 	if (file !== "crsqlite.wasm") return file;
+	if (localWasmPath) return localWasmPath;
 	if (typeof __dirname === "string") {
 		const localPath = `${__dirname.replace(/\\/g, "/")}/crsqlite.wasm`;
-		if (localFileExists(localPath) || !fallbackWasmUrl) return localPath;
-		console.warn(`[Realtime] crsqlite.wasm not found at ${localPath}; loading from release asset.`);
-		return fallbackWasmUrl;
+		return localPath;
 	}
 	if (fallbackWasmUrl) return fallbackWasmUrl;
 	return "crsqlite.wasm";
@@ -33,8 +35,25 @@ function localFileExists(path: string): boolean {
 	}
 }
 
+async function ensureLocalWasm(): Promise<void> {
+	const localPath = localWasmPath || (typeof __dirname === "string" ? `${__dirname.replace(/\\/g, "/")}/crsqlite.wasm` : "");
+	if (!localPath || !fallbackWasmUrl) return;
+	if (localFileExists(localPath)) return;
+	console.warn(`[Realtime] crsqlite.wasm not found at ${localPath}; downloading release asset.`);
+	const res = await requestUrl({ url: fallbackWasmUrl, throw: false });
+	if (res.status < 200 || res.status >= 300) throw new Error(`failed to download crsqlite.wasm: HTTP ${res.status}`);
+	try {
+		if (typeof require !== "function") throw new Error("filesystem unavailable");
+		const fs = require("fs") as { writeFileSync?: (path: string, data: Uint8Array) => void };
+		if (!fs.writeFileSync) throw new Error("filesystem unavailable");
+		fs.writeFileSync(localPath, new Uint8Array(res.arrayBuffer));
+	} catch (e) {
+		throw new Error(`failed to cache crsqlite.wasm locally: ${e instanceof Error ? e.message : String(e)}`);
+	}
+}
+
 export async function openCrsqliteDatabase(name: string): Promise<SqlDatabaseAdapter> {
-	if (!sqlitePromise) sqlitePromise = initWasm(wasmUrl);
+	if (!sqlitePromise) sqlitePromise = ensureLocalWasm().then(() => initWasm(wasmUrl));
 	const sqlite = await sqlitePromise;
 	const db = await sqlite.open(name);
 	return {
