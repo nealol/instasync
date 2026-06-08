@@ -88,8 +88,9 @@ export class RealtimeSettingTab extends PluginSettingTab {
     }
 
     display(): void {
-        this.containerEl.empty()
         this.root?.unmount()
+        this.root = null
+        this.containerEl.empty()
         this.root = createRoot(this.containerEl)
         this.root.render(<SettingsView app={this.app} plugin={this.plugin} refresh={() => this.display()}/>)
     }

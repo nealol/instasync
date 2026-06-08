@@ -672,26 +672,19 @@ const LEGACY_TOKEN_KEY = "realtime-session-token";
 const KNOWN_SESSIONS_KEY = "realtime-known-sessions";
 
 /**
- * SecretStorage key for a server's session token, namespaced by the server's
- * stable id plus a short hash of the full URL/id pair. SecretStorage is shared
- * across local Obsidian vaults, so this lets one client hold independent tokens
- * for multiple servers.
- *
- * Obsidian requires secret ids to be lowercase alphanumeric with optional
- * dashes and 64 characters max. Keep a readable server-id slug, then append a
- * hash so long/truncated ids and different URLs remain distinct.
+ * SecretStorage ids must be lowercase alphanumeric/dashes and 64 chars max.
+ * Use only hashes in the variable portion so arbitrary UUID/user id formats
+ * cannot push the id over the limit or leave invalid punctuation behind.
  */
 function serverSessionTokenKey(serverUrl: string, serverId: string): string {
 	const hash = shortHash(`${normalizeServerUrl(serverUrl)}\n${serverId}`);
-	const slug = serverId.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32);
-	return `${LEGACY_TOKEN_KEY}-${slug || "server"}-${hash}`;
+	return `${LEGACY_TOKEN_KEY}-server-${hash}`;
 }
 
 function sessionTokenKey(serverUrl: string, serverId: string, userId: string): string {
-	const hash = shortHash(`${normalizeServerUrl(serverUrl)}\n${serverId}\n${userId}`);
-	const serverSlug = serverId.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 20);
-	const userSlug = userId.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 16);
-	return `${LEGACY_TOKEN_KEY}-${serverSlug || "server"}-${userSlug || "user"}-${hash}`;
+	const serverHash = shortHash(`${normalizeServerUrl(serverUrl)}\n${serverId}`);
+	const userHash = shortHash(`${normalizeServerUrl(serverUrl)}\n${serverId}\n${userId}`);
+	return `${LEGACY_TOKEN_KEY}-${serverHash}-${userHash}`;
 }
 
 function shortHash(value: string): string {
