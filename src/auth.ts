@@ -1,5 +1,5 @@
 import { requestUrl } from "obsidian";
-import type InstaSyncPlugin from "./main";
+import type RealtimePlugin from "./main";
 import type { ClientToken } from "./ysweet";
 
 /** Identity returned by `GET /api/me`. */
@@ -7,6 +7,17 @@ export interface MeResponse {
 	userId: string;
 	email: string;
 	displayName: string;
+}
+
+export interface KnownSession extends MeResponse {
+	serverUrl: string;
+	serverId: string;
+	tokenKey: string;
+}
+
+/** Server identity returned by the public `GET /api/server-info`. */
+export interface ServerInfoResponse {
+	serverId: string;
 }
 
 export interface VaultInfo {
@@ -25,23 +36,50 @@ export interface MemberInfo {
 	owner?: boolean;
 }
 
+export interface RemoteCursorInfo {
+	id: string;
+	appId: string;
+	name: string;
+	mcpUrl: string;
+	createdAt: number;
+}
+
+export interface SearchHit {
+	path: string;
+	guid: string;
+	title: string;
+	permalink: string;
+	snippet: string;
+}
+
+export interface TagCount {
+	tag: string;
+	count: number;
+}
+
+/** Stable permalink for a note, returned by the note-permalinks endpoint. */
+export interface PermalinkResponse {
+	kind: string;
+	url: string;
+}
+
 /** Thrown when the server rejects the session; callers should prompt re-login. */
 export class AuthError extends Error {}
 
 /**
- * Talks to the InstaSync auth server: SSO login (via an `obsidian://` deep link,
+ * Talks to the Realtime auth server: SSO login (via an `obsidian://` deep link,
  * with a paste-code fallback), session management, and the vault/sharing/token
  * endpoints. Uses Obsidian's `requestUrl` so it works around desktop CORS.
  */
 export class AuthClient {
-	private plugin: InstaSyncPlugin;
+	private plugin: RealtimePlugin;
 	/** Resolver for an in-flight login call awaiting the deep link / paste code. */
 	private pendingLogin: ((token: string) => Promise<MeResponse>) | null = null;
 	/** Rejecter paired with {@link pendingLogin}, so the wait can be cancelled. */
 	private pendingReject: ((err: Error) => void) | null = null;
 	private pendingTimer: number | null = null;
 
-	constructor(plugin: InstaSyncPlugin) {
+	constructor(plugin: RealtimePlugin) {
 		this.plugin = plugin;
 	}
 
@@ -49,15 +87,84 @@ export class AuthClient {
 		return normalizeServerUrl(this.plugin.settings.authServerUrl);
 	}
 
+	/**
+	 * SecretStorage key for the current server's session token. Obsidian's
+	 * SecretStorage is shared across local vaults, so the key is namespaced by
+	 * server host + the server's stable id (`/api/server-info`) to let one client
+	 * hold tokens for multiple servers at once. Falls back to the legacy global
+	 * key when the server id isn't known yet (pre-migration installs).
+	 */
+	private tokenKey(userId = this.plugin.settings.userId): string {
+		const serverId = this.plugin.settings.authServerId;
+		if (!serverId) return LEGACY_TOKEN_KEY;
+		if (!userId) return serverSessionTokenKey(this.plugin.settings.authServerUrl, serverId);
+		return sessionTokenKey(this.plugin.settings.authServerUrl, serverId, userId);
+	}
+
+	private getToken(): string {
+		return this.plugin.app.secretStorage.getSecret(this.tokenKey())
+			?? this.plugin.app.secretStorage.getSecret(this.tokenKey(""))
+			?? '';
+	}
+
+	private setToken(value: string, userId = this.plugin.settings.userId): void {
+		this.plugin.app.secretStorage.setSecret(this.tokenKey(userId), value);
+	}
+
+	private deleteToken(): void {
+		// SecretStorage has no delete; clear by storing an empty value. Also clear
+		// the legacy global key so a stale token can't linger and keep the client
+		// looking signed in after logout.
+		this.plugin.app.secretStorage.setSecret(this.tokenKey(), "");
+		this.plugin.app.secretStorage.setSecret(LEGACY_TOKEN_KEY, "");
+	}
+
 	get isLoggedIn(): boolean {
-		return !!this.plugin.settings.sessionToken;
+		return !!this.getToken();
+	}
+
+	// --- server identity -------------------------------------------------------
+
+	/** Fetch a server's stable id (public endpoint; no session required). */
+	serverInfo(baseUrl: string): Promise<ServerInfoResponse> {
+		return this.apiAt<ServerInfoResponse>(normalizeServerUrl(baseUrl), "/api/server-info");
+	}
+
+	/**
+	 * Ensure `authServerId` is known for the current server, fetching it from
+	 * `/api/server-info` if needed and migrating any token stored under the legacy
+	 * global key into the per-server key. Best-effort: callers may ignore failures
+	 * (e.g. offline), in which case the legacy key keeps working.
+	 */
+	async ensureServerId(): Promise<string> {
+		if (this.plugin.settings.authServerId) return this.plugin.settings.authServerId;
+		const { serverId } = await this.serverInfo(this.baseUrl);
+		this.plugin.settings.authServerId = serverId;
+		await this.migrateLegacyToken();
+		await this.plugin.saveSettings();
+		return serverId;
+	}
+
+	/** Move a token from the legacy global key to this server's namespaced key. */
+	private async migrateLegacyToken(): Promise<void> {
+		const legacy = this.plugin.app.secretStorage.getSecret(LEGACY_TOKEN_KEY);
+		if (!legacy) return;
+		let me: MeResponse | null = null;
+		try {
+			me = await this.apiAt<MeResponse>(this.baseUrl, "/api/me", legacy);
+		} catch {
+			// Keep the old per-server migration path if the token can't be validated.
+		}
+		this.plugin.app.secretStorage.setSecret(me ? this.tokenKey(me.userId) : this.tokenKey(""), legacy);
+		if (me) this.rememberSession(me, this.tokenKey(me.userId));
+		// SecretStorage has no delete; clear the legacy key by storing empty.
+		this.plugin.app.secretStorage.setSecret(LEGACY_TOKEN_KEY, "");
 	}
 
 	// --- low-level request -----------------------------------------------------
 
 	private async api<T>(path: string, init?: { method?: string; body?: unknown }): Promise<T> {
-		const token = this.plugin.settings.sessionToken;
-		return this.apiAt<T>(this.baseUrl, path, token, init);
+		return this.apiAt<T>(this.baseUrl, path, this.getToken(), init);
 	}
 
 	async apiAt<T>(baseUrl: string, path: string, token?: string, init?: { method?: string; body?: unknown }): Promise<T> {
@@ -85,7 +192,9 @@ export class AuthClient {
 
 	/** Store a session token, then fetch identity and seed defaults. */
 	async setSession(token: string): Promise<MeResponse> {
-		this.plugin.settings.sessionToken = token;
+		// Resolve the server id first so the token lands under the per-server key.
+		await this.resolveServerId(this.baseUrl);
+		this.setToken(token);
 		await this.plugin.saveSettings();
 
 		const me = await this.me();
@@ -94,12 +203,24 @@ export class AuthClient {
 	}
 
 	async setSessionForServer(baseUrl: string, token: string, me: MeResponse): Promise<void> {
-		this.plugin.settings.authServerUrl = normalizeServerUrl(baseUrl);
+		const normalized = normalizeServerUrl(baseUrl);
+		this.plugin.settings.authServerUrl = normalized;
+		// Bind the token to this server's stable id before it is written to
+		// SecretStorage (which is shared across local vaults).
+		await this.resolveServerId(normalized);
 		await this.applySession(token, me);
 	}
 
+	/** Fetch and store the server's stable id for the given (already-set) server. */
+	private async resolveServerId(baseUrl: string): Promise<void> {
+		const { serverId } = await this.serverInfo(baseUrl);
+		this.plugin.settings.authServerId = serverId;
+	}
+
 	private async applySession(token: string, me: MeResponse): Promise<void> {
-		this.plugin.settings.sessionToken = token;
+		this.plugin.settings.userId = me.userId;
+		this.setToken(token, me.userId);
+		this.rememberSession(me, this.tokenKey(me.userId));
 		this.plugin.settings.userDisplayName = me.displayName;
 		this.plugin.settings.userEmail = me.email;
 		// Default the cursor name to the SSO display name on first login.
@@ -110,7 +231,8 @@ export class AuthClient {
 	}
 
 	private async clearSession(): Promise<void> {
-		this.plugin.settings.sessionToken = "";
+		this.deleteToken();
+		this.plugin.settings.userId = "";
 		this.plugin.settings.userDisplayName = "";
 		this.plugin.settings.userEmail = "";
 		await this.plugin.saveSettings();
@@ -127,11 +249,11 @@ export class AuthClient {
 	/** Log out: drop the session and the active vault binding. */
 	async logout(): Promise<void> {
 		try {
-			if (this.plugin.settings.sessionToken) {
+			if (this.getToken()) {
 				await this.api("/api/logout", { method: "POST", body: {} });
 			}
 		} catch (e) {
-			console.warn("[InstaSync] server logout failed", e);
+			console.warn("[Realtime] server logout failed", e);
 		}
 		this.plugin.settings.activeVaultId = "";
 		await this.clearSession();
@@ -145,7 +267,7 @@ export class AuthClient {
 
 	/**
 	 * Open the browser to the SSO login page and resolve once the auth server
-	 * redirects back to `obsidian://instasync-auth?token=…`. The settings tab also
+	 * redirects back to `obsidian://realtime-auth?token=…`. The settings tab also
 	 * offers a paste-code fallback that calls {@link setSession} directly.
 	 */
 	async login(): Promise<MeResponse> {
@@ -161,13 +283,57 @@ export class AuthClient {
 		return me;
 	}
 
+	async validSessionsForServer(baseUrl: string): Promise<KnownSession[]> {
+		const normalized = normalizeServerUrl(baseUrl);
+		const { serverId } = await this.serverInfo(normalized);
+		let sessions = this.knownSessions().filter((session) => {
+			return session.serverUrl === normalized && session.serverId === serverId
+				&& !!this.plugin.app.secretStorage.getSecret(session.tokenKey);
+		});
+		const oldServerKey = serverSessionTokenKey(normalized, serverId);
+		if (this.plugin.app.secretStorage.getSecret(oldServerKey) && !sessions.some((session) => session.tokenKey === oldServerKey)) {
+			sessions = [...sessions, {
+				serverUrl: normalized,
+				serverId,
+				userId: "",
+				email: "",
+				displayName: "",
+				tokenKey: oldServerKey,
+			}];
+		}
+		const valid: KnownSession[] = [];
+		for (const session of sessions) {
+			const token = this.plugin.app.secretStorage.getSecret(session.tokenKey);
+			if (!token) continue;
+			try {
+				const me = await this.apiAt<MeResponse>(normalized, "/api/me", token);
+				const updated = { ...session, ...me, serverUrl: normalized, serverId, tokenKey: session.tokenKey };
+				valid.push(updated);
+				this.rememberSession(updated, session.tokenKey);
+			} catch {
+				this.forgetSession(session.tokenKey);
+			}
+		}
+		return valid;
+	}
+
+	async useKnownSession(session: KnownSession): Promise<MeResponse> {
+		const token = this.plugin.app.secretStorage.getSecret(session.tokenKey);
+		if (!token) throw new AuthError("Saved session not found. Please sign in again.");
+		this.plugin.settings.authServerUrl = session.serverUrl;
+		this.plugin.settings.authServerId = session.serverId;
+		const me = await this.apiAt<MeResponse>(session.serverUrl, "/api/me", token);
+		await this.applySession(token, me);
+		return me;
+	}
+
 	authenticateAt(baseUrl: string): Promise<{ token: string; me: MeResponse }> {
 		const normalized = normalizeServerUrl(baseUrl);
 		// Record which server this SSO attempt targets. Pointing it at a different
 		// server cancels any earlier in-flight login (see beginSetupFor). Must run
 		// before we install the new resolver below so we don't cancel ourselves.
 		this.beginSetupFor(normalized);
-		const redirect = encodeURIComponent("obsidian://instasync-auth");
+		const redirect = encodeURIComponent("obsidian://realtime-auth");
 		window.open(`${normalized}/auth/login?redirect=${redirect}`);
 		return new Promise<{ token: string; me: MeResponse }>((resolve, reject) => {
 			this.pendingReject = reject;
@@ -252,6 +418,52 @@ export class AuthClient {
 		}
 	}
 
+	private rememberSession(me: MeResponse, tokenKey: string): void {
+		const session: KnownSession = {
+			serverUrl: this.baseUrl,
+			serverId: this.plugin.settings.authServerId,
+			userId: me.userId,
+			email: me.email,
+			displayName: me.displayName,
+			tokenKey,
+		};
+		this.saveKnownSessions([
+			session,
+			...this.knownSessions().filter((existing) => existing.tokenKey !== tokenKey),
+		]);
+	}
+
+	private forgetSession(tokenKey: string): void {
+		this.saveKnownSessions(this.knownSessions().filter((session) => session.tokenKey !== tokenKey));
+	}
+
+	private knownSessions(): KnownSession[] {
+		try {
+			const raw = window.localStorage.getItem(KNOWN_SESSIONS_KEY);
+			const parsed = raw ? JSON.parse(raw) : [];
+			if (!Array.isArray(parsed)) return [];
+			return parsed.filter((session): session is KnownSession => {
+				return !!session && typeof session === "object"
+					&& typeof session.serverUrl === "string"
+					&& typeof session.serverId === "string"
+					&& typeof session.userId === "string"
+					&& typeof session.email === "string"
+					&& typeof session.displayName === "string"
+					&& typeof session.tokenKey === "string";
+			});
+		} catch {
+			return [];
+		}
+	}
+
+	private saveKnownSessions(sessions: KnownSession[]): void {
+		try {
+			window.localStorage.setItem(KNOWN_SESSIONS_KEY, JSON.stringify(sessions));
+		} catch {
+			// Token discovery is an enhancement; auth still works without the index.
+		}
+	}
+
 	// --- vaults / sharing ------------------------------------------------------
 
 	listVaults(): Promise<VaultInfo[]> {
@@ -295,6 +507,59 @@ export class AuthClient {
 		await this.api(`/api/vaults/${vaultId}/members/${userId}`, { method: "DELETE" });
 	}
 
+	listCursors(vaultId: string): Promise<RemoteCursorInfo[]> {
+		return this.api<RemoteCursorInfo[]>(`/api/vaults/${vaultId}/cursors`);
+	}
+
+	createCursor(vaultId: string, name: string): Promise<RemoteCursorInfo & { secretToken: string }> {
+		return this.api<RemoteCursorInfo & { secretToken: string }>(`/api/vaults/${vaultId}/cursors`, {
+			method: "POST",
+			body: { name },
+		});
+	}
+
+	renameCursor(vaultId: string, cursorId: string, name: string): Promise<RemoteCursorInfo> {
+		return this.api<RemoteCursorInfo>(`/api/vaults/${vaultId}/cursors/${cursorId}`, {
+			method: "POST",
+			body: { name },
+		});
+	}
+
+	regenerateCursorToken(vaultId: string, cursorId: string): Promise<{ secretToken: string }> {
+		return this.api<{ secretToken: string }>(`/api/vaults/${vaultId}/cursors/${cursorId}/token`, {
+			method: "POST",
+			body: {},
+		});
+	}
+
+	async deleteCursor(vaultId: string, cursorId: string): Promise<void> {
+		await this.api(`/api/vaults/${vaultId}/cursors/${cursorId}`, { method: "DELETE" });
+	}
+
+	/** Resolve a stable, shareable permalink (`…/n/{guid}`) for a note by path. */
+	notePermalink(vaultId: string, path: string): Promise<PermalinkResponse> {
+		const encoded = path.split("/").map(encodeURIComponent).join("/");
+		return this.api<PermalinkResponse>(
+			`/api/vaults/${vaultId}/note-permalinks/${encoded}`,
+			{ method: "POST", body: {} },
+		);
+	}
+
+	search(vaultId: string, q: string, limit?: number): Promise<SearchHit[]> {
+		const params = new URLSearchParams({ q });
+		if (limit !== undefined) params.set("limit", String(limit));
+		return this.api<SearchHit[]>(`/api/vaults/${vaultId}/search?${params.toString()}`);
+	}
+
+	listTags(vaultId: string): Promise<TagCount[]> {
+		return this.api<TagCount[]>(`/api/vaults/${vaultId}/tags`);
+	}
+
+	backlinks(vaultId: string, path: string): Promise<SearchHit[]> {
+		const encoded = path.split("/").map(encodeURIComponent).join("/");
+		return this.api<SearchHit[]>(`/api/vaults/${vaultId}/backlinks/${encoded}`);
+	}
+
 	/** Best-effort registry update so the server can resolve doc → path for ACLs. */
 	async registerFile(vaultId: string, guid: string, path: string): Promise<void> {
 		try {
@@ -303,7 +568,7 @@ export class AuthClient {
 				body: { guid, path },
 			});
 		} catch (e) {
-			console.warn("[InstaSync] file registry update failed", e);
+			console.warn("[Realtime] file registry update failed", e);
 		}
 	}
 
@@ -326,7 +591,7 @@ export class AuthClient {
 	}
 
 	private get authHeaders(): Record<string, string> {
-		const token = this.plugin.settings.sessionToken;
+		const token = this.getToken();
 		return token ? { Authorization: `Bearer ${token}` } : {};
 	}
 
@@ -400,6 +665,35 @@ function blobErrorMessage(res: { status: number; text?: string }): string {
 		}
 	}
 	return `HTTP ${res.status}`;
+}
+
+/** Legacy, un-namespaced SecretStorage key (single global session token). */
+const LEGACY_TOKEN_KEY = "realtime-session-token";
+const KNOWN_SESSIONS_KEY = "realtime-known-sessions";
+
+/**
+ * SecretStorage ids must be lowercase alphanumeric/dashes and 64 chars max.
+ * Use only hashes in the variable portion so arbitrary UUID/user id formats
+ * cannot push the id over the limit or leave invalid punctuation behind.
+ */
+function serverSessionTokenKey(serverUrl: string, serverId: string): string {
+	const hash = shortHash(`${normalizeServerUrl(serverUrl)}\n${serverId}`);
+	return `${LEGACY_TOKEN_KEY}-server-${hash}`;
+}
+
+function sessionTokenKey(serverUrl: string, serverId: string, userId: string): string {
+	const serverHash = shortHash(`${normalizeServerUrl(serverUrl)}\n${serverId}`);
+	const userHash = shortHash(`${normalizeServerUrl(serverUrl)}\n${serverId}\n${userId}`);
+	return `${LEGACY_TOKEN_KEY}-${serverHash}-${userHash}`;
+}
+
+function shortHash(value: string): string {
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < value.length; i++) {
+		hash ^= value.charCodeAt(i);
+		hash = Math.imul(hash, 0x01000193);
+	}
+	return (hash >>> 0).toString(36).padStart(7, "0");
 }
 
 export function normalizeServerUrl(url: string): string {

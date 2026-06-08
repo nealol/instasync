@@ -1,6 +1,9 @@
 use serde_json::{json, Value};
+use std::sync::Arc;
 use url::Url;
+use y_sweet_core::auth::Authenticator;
 
+use crate::config::Config;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
@@ -22,13 +25,15 @@ impl Level {
 
 /// Strip the scheme from a base URL, returning the `host[:port]` authority.
 fn authority(url: &str) -> Option<String> {
-    Url::parse(url).ok().and_then(|u| u.host_str().map(|host| {
-        if let Some(port) = u.port() {
-            format!("{host}:{port}")
-        } else {
-            host.to_string()
-        }
-    }))
+    Url::parse(url).ok().and_then(|u| {
+        u.host_str().map(|host| {
+            if let Some(port) = u.port() {
+                format!("{host}:{port}")
+            } else {
+                host.to_string()
+            }
+        })
+    })
 }
 
 /// Rewrite the internal y-sweet authority in a minted token URL to the public one.
@@ -101,19 +106,84 @@ pub async fn mint_client_token(state: &AppState, doc_id: &str, level: Level) -> 
     Ok(token)
 }
 
+/// Mint a y-sweet ClientToken for server-to-y-sweet calls. Unlike
+/// `mint_client_token`, this deliberately preserves y-sweet's internal base URL.
+pub async fn mint_internal_token(
+    state: &AppState,
+    doc_id: &str,
+    level: Level,
+) -> AppResult<(String, String)> {
+    mint_internal_token_with(
+        &state.config,
+        &state.http,
+        &state.authenticator,
+        doc_id,
+        level,
+    )
+    .await
+}
+
+pub async fn mint_internal_token_with(
+    config: &Arc<Config>,
+    http: &reqwest::Client,
+    authenticator: &Arc<Authenticator>,
+    doc_id: &str,
+    level: Level,
+) -> AppResult<(String, String)> {
+    let url = format!(
+        "{}/doc/{}/auth",
+        config.ysweet_url.trim_end_matches('/'),
+        doc_id
+    );
+    let res = http
+        .post(&url)
+        .bearer_auth(authenticator.server_token())
+        .json(&json!({ "authorization": level.as_str() }))
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("y-sweet auth: {e}")))?;
+
+    if !res.status().is_success() {
+        return Err(AppError::Internal(format!(
+            "y-sweet auth returned {}",
+            res.status()
+        )));
+    }
+
+    let token: Value = res
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("y-sweet auth body: {e}")))?;
+    let base_url = token
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Internal("y-sweet auth missing baseUrl".into()))?
+        .to_string();
+    let token = token
+        .get("token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Internal("y-sweet auth missing token".into()))?
+        .to_string();
+    Ok((base_url, token))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn authority_strips_scheme_and_trailing_slash() {
-        assert_eq!(authority("http://127.0.0.1:8080/").unwrap(), "127.0.0.1:8080");
+        assert_eq!(
+            authority("http://127.0.0.1:8080/").unwrap(),
+            "127.0.0.1:8080"
+        );
         assert_eq!(authority("ws://example.com").unwrap(), "example.com");
     }
 
     #[test]
     fn rewrite_swaps_authority() {
-        let mut v = json!({ "url": "ws://127.0.0.1:8080/d/abc", "baseUrl": "http://127.0.0.1:8080/d/abc" });
+        let mut v =
+            json!({ "url": "ws://127.0.0.1:8080/d/abc", "baseUrl": "http://127.0.0.1:8080/d/abc" });
         rewrite_host(&mut v, "url", "127.0.0.1:8080", "sync.example.com");
         rewrite_host(&mut v, "baseUrl", "127.0.0.1:8080", "sync.example.com");
         assert_eq!(v["url"], "ws://sync.example.com/d/abc");

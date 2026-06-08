@@ -24,14 +24,13 @@ use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as WsMsg};
 use url::Url;
 
-use crate::git::GitService;
 use crate::state::{AppState, Principal};
 
 /// Everything the proxy needs to attribute a write on this connection to a user.
 struct Attribution {
     vault_id: String,
     principal: Principal,
-    git: GitService,
+    state: AppState,
 }
 
 /// Hop-by-hop headers must not be forwarded across the proxy.
@@ -50,7 +49,9 @@ const HOP_BY_HOP: &[&str] = &[
 /// `host[:port]` of the internal y-sweet, derived from the configured URL.
 fn upstream_authority(state: &AppState) -> anyhow::Result<String> {
     let url = Url::parse(&state.config.ysweet_url)?;
-    let host = url.host_str().ok_or_else(|| anyhow::anyhow!("missing y-sweet host"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("missing y-sweet host"))?;
     Ok(if let Some(port) = url.port() {
         format!("{host}:{port}")
     } else {
@@ -109,8 +110,15 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         Err(_) => return (StatusCode::BAD_REQUEST, "request body too large").into_response(),
     };
 
-    match proxy_http(&state, &parts.method, &authority, &path_and_query, &parts.headers, bytes)
-        .await
+    match proxy_http(
+        &state,
+        &parts.method,
+        &authority,
+        &path_and_query,
+        &parts.headers,
+        bytes,
+    )
+    .await
     {
         Ok(res) => res,
         Err(e) => {
@@ -140,7 +148,10 @@ async fn proxy_http(
     req = req.body(body);
 
     let upstream = timeout(Duration::from_secs(30), req.send()).await??;
-    if upstream.content_length().is_some_and(|len| len > MAX_BODY_BYTES as u64) {
+    if upstream
+        .content_length()
+        .is_some_and(|len| len > MAX_BODY_BYTES as u64)
+    {
         return Ok((StatusCode::BAD_GATEWAY, "y-sweet response too large").into_response());
     }
 
@@ -174,7 +185,7 @@ async fn resolve_attribution(state: &AppState, uri: &axum::http::Uri) -> Option<
     Some(Attribution {
         vault_id,
         principal,
-        git: state.git.clone(),
+        state: state.clone(),
     })
 }
 
@@ -222,7 +233,11 @@ async fn relay_ws(
         .map(|a| a.as_str().to_string())
         .ok_or_else(|| anyhow::anyhow!("missing authority in {target}"))?;
     let tcp = timeout(Duration::from_secs(10), TcpStream::connect(&host)).await??;
-    let (upstream, _resp) = timeout(Duration::from_secs(10), tokio_tungstenite::client_async(request, tcp)).await??;
+    let (upstream, _resp) = timeout(
+        Duration::from_secs(10),
+        tokio_tungstenite::client_async(request, tcp),
+    )
+    .await??;
 
     let (mut up_tx, mut up_rx) = upstream.split();
     let (mut cl_tx, mut cl_rx) = client.split();
@@ -233,7 +248,14 @@ async fn relay_ws(
             let msg = msg?;
             if let (Some(attr), AxumMsg::Binary(bytes)) = (&attribution, &msg) {
                 if is_content_write(bytes) {
-                    attr.git.mark_write(&attr.vault_id, &attr.principal).await;
+                    attr.state
+                        .git
+                        .mark_write(&attr.vault_id, &attr.principal)
+                        .await;
+                    attr.state
+                        .search
+                        .mark_write(attr.state.clone(), &attr.vault_id, &attr.principal)
+                        .await;
                 }
             }
             if let Some(out) = axum_to_tungstenite(msg) {

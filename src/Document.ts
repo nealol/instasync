@@ -1,20 +1,17 @@
 import * as Y from "yjs";
-import { YSweetProvider, STATUS_OFFLINE, STATUS_ERROR } from "@y-sweet/client";
-import type { Awareness } from "y-protocols/awareness";
-import { IndexeddbPersistence } from "y-indexeddb";
 import { TFile, Notice, normalizePath } from "obsidian";
-import type InstaSyncPlugin from "./main";
-import { getClientToken } from "./ysweet";
+import type RealtimePlugin from "./main";
 import { applyTextToYText } from "./diff";
 import { dbg, snip } from "./debug";
 import { ensureParentFolder, getFileByPath, isOpenInWorkspace } from "./vaultHelpers";
 import { openTextConflictModal } from "./TextConflictModal";
+import { SyncedDoc } from "./SyncedDoc";
 
 /**
  * Origin tag used on Yjs transactions that originate from this Document writing
  * disk content into the shared text, so our own ytext observer can ignore them.
  */
-const DISK_ORIGIN = Symbol("instasync-disk");
+const DISK_ORIGIN = Symbol("realtime-disk");
 
 /**
  * A single collaboratively-edited Markdown file. Owns its own Y.Doc and
@@ -28,28 +25,13 @@ const DISK_ORIGIN = Symbol("instasync-disk");
  * offline edits become Yjs operations that merge with remote changes instead
  * of being clobbered.
  */
-export class Document {
-	readonly path: string;
-	readonly guid: string;
-	/** Vault-namespaced id used for the y-sweet provider and local persistence. */
-	readonly serverDocId: string;
-	readonly ydoc: Y.Doc;
+export class Document extends SyncedDoc {
 	readonly ytext: Y.Text;
-	readonly provider: YSweetProvider;
-	readonly awareness: Awareness;
 
 	/** Number of CodeMirror editors currently bound to this document. */
 	private boundEditors = 0;
 	/** True while we are writing ytext content to disk (to ignore the echo). */
 	private writingToDisk = false;
-	private destroyed = false;
-
-	/** Resolves once local state is loaded and the editor may safely bind. */
-	private readyPromise: Promise<void>;
-	private resolveReady!: () => void;
-
-	/** Local persistence layer; gives us a baseline that survives restarts. */
-	private persistence: IndexeddbPersistence;
 	/** Disk content captured at startup, before remote sync (for conflict checks). */
 	private diskAtStartup: string | null = null;
 	/** Locally persisted Y.Text content before the first remote sync. */
@@ -59,63 +41,23 @@ export class Document {
 	/** Guards the one-time startup merge so reconnects don't re-run it. */
 	private startupReconciled = false;
 
-	/** Whether this client created the index entry (and may seed an empty doc). */
-	isCreator: boolean;
-
-	private plugin: InstaSyncPlugin;
 	private ytextObserver: () => void;
-	private syncedListener: (synced: boolean) => void;
 	private writeTimer: number | null = null;
 
 	constructor(
-		plugin: InstaSyncPlugin,
+		plugin: RealtimePlugin,
 		path: string,
 		guid: string,
 		serverDocId: string,
 		isCreator: boolean,
 	) {
-		this.plugin = plugin;
-		this.path = path;
-		this.guid = guid;
-		this.serverDocId = serverDocId;
-		this.isCreator = isCreator;
-
-		this.ydoc = new Y.Doc();
+		super(plugin, path, guid, serverDocId, isCreator);
 		this.ytext = this.ydoc.getText("contents");
-
-		this.readyPromise = new Promise((resolve) => {
-			this.resolveReady = resolve;
-		});
-
-		// Connect only after we have loaded the local baseline and folded in any
-		// offline disk edits (see init()). The provider/persistence are keyed by the
-		// vault-namespaced doc id; the CRDT format (the bare guid) is unchanged.
-		this.provider = new YSweetProvider(
-			() => getClientToken(plugin, serverDocId),
-			serverDocId,
-			this.ydoc,
-			{ connect: false, showDebuggerLink: false },
-		);
-		this.awareness = this.provider.awareness;
-		this.persistence = new IndexeddbPersistence(serverDocId, this.ydoc);
 
 		// ytext changes (local edits from other peers, or our own editor) flow to
 		// disk only while no editor is bound — otherwise Obsidian persists the file.
 		this.ytextObserver = this.onYTextChanged.bind(this);
 		this.ytext.observe(this.ytextObserver);
-
-		// The provider re-fires "synced" on every (re)connection; the startup merge
-		// runs only on the first one.
-		this.syncedListener = (synced) => {
-			if (synced) void this.finishStartupReconcile();
-		};
-		this.provider.on("synced", this.syncedListener);
-
-		void this.init();
-	}
-
-	whenReady(): Promise<void> {
-		return this.readyPromise;
 	}
 
 	get content(): string {
@@ -148,37 +90,17 @@ export class Document {
 		return this.boundEditors > 0;
 	}
 
-	/** Nudge a stalled provider to reconnect. Safe to call repeatedly. */
-	ensureConnected(): void {
-		if (this.destroyed) return;
-		const status = this.provider.status;
-		if (status === STATUS_OFFLINE || status === STATUS_ERROR) {
-			void this.provider.connect();
-		}
-	}
-
 	/**
 	 * Startup sequence: load the persisted baseline, read local disk, then connect.
 	 * Local disk edits are deliberately not folded into Y.Text until the first
 	 * remote sync tells us whether the remote also changed from the baseline.
 	 */
-	private async init(): Promise<void> {
-		try {
-			await this.persistence.whenSynced;
-			if (this.destroyed) return;
-
-			const baseline = this.content;
-			this.baselineAtStartup = baseline;
-			const disk = await this.readFromDisk();
-			this.diskAtStartup = disk;
-			this.localChangedAtStartup = disk !== null && disk !== baseline;
-		} catch (e) {
-			console.error(`[InstaSync] init failed for ${this.path}`, e);
-			// If local persistence failed, do not leave editors waiting forever.
-			this.resolveReady();
-		}
-
-		if (!this.destroyed) void this.provider.connect();
+	protected async afterPersistenceSynced(): Promise<void> {
+		const baseline = this.content;
+		this.baselineAtStartup = baseline;
+		const disk = await this.readFromDisk();
+		this.diskAtStartup = disk;
+		this.localChangedAtStartup = disk !== null && disk !== baseline;
 	}
 
 	/**
@@ -191,7 +113,7 @@ export class Document {
 	 *  - both sides changed (conflict) -> prompt for local vs remote, then apply
 	 *                                     the chosen text as canonical.
 	 */
-	private async finishStartupReconcile(): Promise<void> {
+	protected async finishStartupReconcile(): Promise<void> {
 		if (this.startupReconciled || this.destroyed) return;
 		this.startupReconciled = true;
 
@@ -213,9 +135,9 @@ export class Document {
 				if (this.destroyed) return;
 				if (choice === "local") {
 					this.applyText(localDisk);
-					new Notice(`InstaSync: kept your local version of "${this.path}".`);
+					new Notice(`Realtime: kept your local version of "${this.path}".`);
 				} else {
-					new Notice(`InstaSync: kept the remote version of "${this.path}".`);
+					new Notice(`Realtime: kept the remote version of "${this.path}".`);
 				}
 			} else if (this.localChangedAtStartup && localDisk !== null && !remoteChanged) {
 				this.applyText(localDisk);
@@ -227,9 +149,9 @@ export class Document {
 				await this.writeToDisk(this.content);
 			}
 		} catch (e) {
-			console.error(`[InstaSync] startup reconcile failed for ${this.path}`, e);
+			console.error(`[Realtime] startup reconcile failed for ${this.path}`, e);
 		} finally {
-			this.resolveReady();
+			this.resolveWhenReady();
 		}
 	}
 
@@ -317,7 +239,7 @@ export class Document {
 				await this.plugin.app.vault.create(path, text);
 			}
 		} catch (e) {
-			console.error(`[InstaSync] writeToDisk failed for ${this.path}`, e);
+			console.error(`[Realtime] writeToDisk failed for ${this.path}`, e);
 		} finally {
 			// Release on the next tick so the resulting vault 'modify' event,
 			// which is dispatched asynchronously, is still treated as our own.
@@ -327,17 +249,11 @@ export class Document {
 		}
 	}
 
-	destroy(): void {
-		if (this.destroyed) return;
-		this.destroyed = true;
+	protected destroySubclass(): void {
 		if (this.writeTimer !== null) {
 			window.clearTimeout(this.writeTimer);
 			this.writeTimer = null;
 		}
 		this.ytext.unobserve(this.ytextObserver);
-		this.provider.off("synced", this.syncedListener);
-		this.provider.destroy();
-		void this.persistence.destroy();
-		this.ydoc.destroy();
 	}
 }

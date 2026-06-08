@@ -38,7 +38,11 @@ export class FakeVault {
 		return null;
 	}
 	async read(file: TFile): Promise<string> {
-		return this.files.get(file.path) ?? "";
+		const text = this.files.get(file.path);
+		if (text !== undefined) return text;
+		const binary = this.binaries.get(file.path);
+		if (binary) return new TextDecoder().decode(binary);
+		return "";
 	}
 	async readBinary(file: TFile): Promise<ArrayBuffer> {
 		const buf = this.binaries.get(file.path);
@@ -57,10 +61,12 @@ export class FakeVault {
 	}
 	async modify(file: TFile, text: string): Promise<void> {
 		this.files.set(file.path, text);
+		this.binaries.delete(file.path);
 		this.emit("modify", new TFile(file.path));
 	}
 	async create(path: string, text: string): Promise<TFile> {
 		this.files.set(path, text);
+		this.binaries.delete(path);
 		const f = new TFile(path);
 		this.emit("create", f);
 		return f;
@@ -100,17 +106,22 @@ export interface FakePlugin {
 		sessionToken: string;
 		userDisplayName: string;
 		userEmail: string;
+		userId: string;
 		activeVaultId: string;
 		clientName: string;
 		clientColor: string;
 		clientColorLight: string;
 		enabled: boolean;
 		syncBinaries: boolean;
+		syncCanvases: boolean;
+		syncBases: boolean;
 		binaryExcludeGlobs: string;
+		syncConfigEnabled: boolean;
+		configIncludeGlobs: string[];
 		diagnosticLogging: boolean;
 	};
 	auth: AuthClient;
-	app: { vault: FakeVault; workspace: { on: () => unknown } };
+	app: { vault: FakeVault; workspace: { on: () => unknown }; secretStorage: { getSecret: (key: string) => string | null; setSecret: (key: string, value: string) => void; deleteSecret: (key: string) => void } };
 	registerEvent: (ref: unknown) => void;
 	applyAwarenessTo: (doc: unknown) => void;
 	setStatus: (status: string) => void;
@@ -124,24 +135,38 @@ export function makeFakePlugin(
 	opts: { sessionToken: string; activeVaultId: string; clientName?: string },
 ): { plugin: FakePlugin; vault: FakeVault } {
 	const vault = new FakeVault();
+	const secrets = new Map<string, string>([["realtime-session-token", opts.sessionToken]]);
 	const plugin: FakePlugin = {
 		settings: {
 			authServerUrl,
 			sessionToken: opts.sessionToken,
 			userDisplayName: "",
 			userEmail: "",
+			userId: "",
 			activeVaultId: opts.activeVaultId,
 			clientName: opts.clientName ?? "Test Client",
 			clientColor: "#ffffff",
 			clientColorLight: "#ffffff33",
 			enabled: true,
 			syncBinaries: true,
+			syncCanvases: true,
+			syncBases: true,
 			binaryExcludeGlobs: "",
+			syncConfigEnabled: false,
+			configIncludeGlobs: [],
 			diagnosticLogging: false,
 		},
 		// Set just below, once the object exists (AuthClient needs the plugin).
 		auth: undefined as unknown as AuthClient,
-		app: { vault, workspace: { on: () => ({}) } },
+		app: {
+			vault,
+			workspace: { on: () => ({}) },
+			secretStorage: {
+				getSecret: (key) => secrets.get(key) ?? null,
+				setSecret: (key, value) => { secrets.set(key, value); },
+				deleteSecret: (key) => { secrets.delete(key); },
+			},
+		},
 		registerEvent: () => {},
 		applyAwarenessTo: () => {},
 		setStatus: () => {},

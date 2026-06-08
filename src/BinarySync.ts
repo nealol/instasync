@@ -1,6 +1,6 @@
 import * as Y from "yjs";
 import { TFile, Notice } from "obsidian";
-import type InstaSyncPlugin from "./main";
+import type RealtimePlugin from "./main";
 import type { VaultSync } from "./VaultSync";
 import { sha256Hex } from "./hash";
 import { dbg } from "./debug";
@@ -55,7 +55,7 @@ interface UploadJob {
  * server yet.
  */
 export class BinarySync {
-	private plugin: InstaSyncPlugin;
+	private plugin: RealtimePlugin;
 	private vaultSync: VaultSync;
 	private binaries: Y.Map<BinaryMeta>;
 	private indexDoc: Y.Doc;
@@ -66,6 +66,10 @@ export class BinarySync {
 	private chains = new Map<string, Promise<void>>();
 	/** Paths we are currently writing to disk, to ignore the resulting vault event. */
 	private writing = new Set<string>();
+	/** Paths migrated away from binary sync during this session. */
+	private ignoredPaths = new Set<string>();
+	/** Startup pulls should restore missing files from the moved/persisted index. */
+	private pullingMissingRemote = false;
 
 	/** Background upload queue (latest job per path wins). */
 	private uploadQueue: UploadJob[] = [];
@@ -84,7 +88,7 @@ export class BinarySync {
 	private destroyed = false;
 	private observer: (event: Y.YMapEvent<BinaryMeta>) => void;
 
-	constructor(plugin: InstaSyncPlugin, vaultSync: VaultSync, indexDoc: Y.Doc) {
+	constructor(plugin: RealtimePlugin, vaultSync: VaultSync, indexDoc: Y.Doc) {
 		this.plugin = plugin;
 		this.vaultSync = vaultSync;
 		this.indexDoc = indexDoc;
@@ -122,28 +126,52 @@ export class BinarySync {
 		const paths = new Set<string>(this.binaries.keys());
 		for (const p of localBinaryPaths) paths.add(p);
 
-		for (const path of paths) {
-			await this.reconcile(path);
-			if (this.destroyed) return;
+		this.pullingMissingRemote = true;
+		try {
+			for (const path of paths) {
+				await this.reconcile(path);
+				if (this.destroyed) return;
+			}
+		} finally {
+			this.pullingMissingRemote = false;
 		}
+	}
+
+	remotePaths(): string[] {
+		return [...this.binaries.keys()];
+	}
+
+	async reconcilePath(path: string): Promise<void> {
+		await this.reconcile(path);
+	}
+
+	stopTrackingPath(path: string): void {
+		this.ignoredPaths.add(path);
+		this.lastSyncedHash.delete(path);
+		this.indexDoc.transact(() => {
+			this.binaries.delete(path);
+		});
 	}
 
 	// --- live triggers ---------------------------------------------------------
 
 	/** A local binary file was created or modified. */
 	onLocalChanged(path: string): void {
+		if (this.ignoredPaths.has(path)) return;
 		if (this.writing.has(path)) return;
 		void this.reconcile(path);
 	}
 
 	/** A local binary file was deleted. */
 	onLocalDeleted(path: string): void {
+		if (this.ignoredPaths.has(path)) return;
 		if (this.writing.has(path)) return;
 		void this.reconcile(path);
 	}
 
 	/** A local binary file was renamed: treat as a delete of old + change of new. */
 	onLocalRenamed(file: TFile, oldPath: string): void {
+		if (this.ignoredPaths.has(oldPath) || this.ignoredPaths.has(file.path)) return;
 		void this.reconcile(oldPath);
 		void this.reconcile(file.path);
 	}
@@ -151,6 +179,7 @@ export class BinarySync {
 	private onBinariesChanged(event: Y.YMapEvent<BinaryMeta>): void {
 		if (this.destroyed || !this.started) return;
 		event.changes.keys.forEach((_change, path) => {
+			if (this.ignoredPaths.has(path)) return;
 			void this.reconcile(path);
 		});
 	}
@@ -161,7 +190,7 @@ export class BinarySync {
 	private reconcile(path: string): Promise<void> {
 		const prev = this.chains.get(path) ?? Promise.resolve();
 		const next = prev.then(() => this.reconcileNow(path)).catch((e) => {
-			console.error(`[InstaSync] binary reconcile failed for ${path}`, e);
+			console.error(`[Realtime] binary reconcile failed for ${path}`, e);
 		});
 		this.chains.set(path, next);
 		void next.finally(() => {
@@ -172,6 +201,7 @@ export class BinarySync {
 
 	private async reconcileNow(path: string): Promise<void> {
 		if (this.destroyed) return;
+		if (this.ignoredPaths.has(path)) return;
 
 		const localHash = await this.hashDisk(path);
 		if (this.destroyed) return;
@@ -209,7 +239,7 @@ export class BinarySync {
 
 		// Local absent, remote present.
 		if (!localHash && remoteHash) {
-			if (base === remoteHash) {
+			if (base === remoteHash && !this.pullingMissingRemote) {
 				// We deleted it locally → propagate the delete to the index.
 				this.publishDelete(path);
 			} else {
@@ -243,7 +273,7 @@ export class BinarySync {
 			const buf = await this.plugin.app.vault.readBinary(file);
 			return await sha256Hex(buf);
 		} catch (e) {
-			console.error(`[InstaSync] failed to read binary ${path}`, e);
+			console.error(`[Realtime] failed to read binary ${path}`, e);
 			return undefined;
 		}
 	}
@@ -266,7 +296,7 @@ export class BinarySync {
 			bytes = await this.plugin.auth.getBlob(this.vaultId, hash);
 		} catch (e) {
 			if (this.destroyed) return;
-			console.error(`[InstaSync] blob download failed for ${path}`, e);
+			console.error(`[Realtime] blob download failed for ${path}`, e);
 			window.setTimeout(() => void this.reconcile(path), DRAIN_RETRY_MS);
 			return;
 		}
@@ -290,7 +320,7 @@ export class BinarySync {
 				await this.plugin.app.vault.createBinary(path, bytes);
 			}
 		} catch (e) {
-			console.error(`[InstaSync] writeDisk failed for ${path}`, e);
+			console.error(`[Realtime] writeDisk failed for ${path}`, e);
 		} finally {
 			// Release on the next tick so the resulting vault event is still ours.
 			window.setTimeout(() => this.writing.delete(path), 0);
@@ -309,7 +339,7 @@ export class BinarySync {
 			await this.plugin.app.vault.delete(file);
 			this.lastSyncedHash.delete(path);
 		} catch (e) {
-			console.error(`[InstaSync] failed to delete binary ${path}`, e);
+			console.error(`[Realtime] failed to delete binary ${path}`, e);
 		} finally {
 			window.setTimeout(() => this.writing.delete(path), 0);
 		}
@@ -395,8 +425,8 @@ export class BinarySync {
 						this.uploadQueue.push(job);
 						this.scheduleDrain(DRAIN_RETRY_MS);
 					} else {
-						console.error(`[InstaSync] giving up uploading ${job.path}`, e);
-						new Notice(`InstaSync: failed to upload "${job.path}".`);
+						console.error(`[Realtime] giving up uploading ${job.path}`, e);
+						new Notice(`Realtime: failed to upload "${job.path}".`);
 					}
 					break;
 				} finally {
@@ -450,7 +480,7 @@ export class BinarySync {
 			await this.applyConflictChoice(path, choice, nowLocal, nowRemote);
 		});
 		this.conflictChain = run.catch((e) => {
-			console.error(`[InstaSync] conflict resolution failed for ${path}`, e);
+			console.error(`[Realtime] conflict resolution failed for ${path}`, e);
 		});
 		return this.conflictChain;
 	}
@@ -468,7 +498,7 @@ export class BinarySync {
 			} else if (localHash) {
 				await this.queueLocalUpload(path);
 			}
-			new Notice(`InstaSync: kept your local copy of "${path}".`);
+			new Notice(`Realtime: kept your local copy of "${path}".`);
 		} else {
 			if (remoteHash === null) {
 				// Remote deleted, user keeps remote → delete local.
@@ -476,7 +506,7 @@ export class BinarySync {
 			} else {
 				await this.downloadToDisk(path, remoteHash);
 			}
-			new Notice(`InstaSync: replaced "${path}" with the remote copy.`);
+			new Notice(`Realtime: replaced "${path}" with the remote copy.`);
 		}
 	}
 

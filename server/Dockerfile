@@ -1,4 +1,4 @@
-# Multi-stage build for the InstaSync auth server.
+# Multi-stage build for the Realtime auth server.
 # Build context is the `server/` directory.
 #
 # The final image bundles a stock y-sweet binary and runs it internally; the auth
@@ -20,7 +20,7 @@ COPY --from=planner /app/recipe.json recipe.json
 # Compile dependencies first; this layer is cached unless Cargo.toml/lock change.
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
-RUN cargo build --release --bin instasync-server
+RUN cargo build --release --bin realtime-server
 
 # --- y-sweet binary --------------------------------------------------------
 # Download the prebuilt y-sweet release matching the `y-sweet` npm version used
@@ -50,7 +50,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/instasync-server /usr/local/bin/instasync-server
+COPY --from=builder /app/target/release/realtime-server /usr/local/bin/realtime-server
 COPY --from=ysweet /usr/local/bin/y-sweet /usr/local/bin/y-sweet
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
@@ -68,8 +68,8 @@ ENV BIND_ADDR=0.0.0.0:8081 \
     YSWEET_INTERNAL_PORT=8080 \
     YSWEET_STORE=/data/ysweet \
     GIT_DATA_DIR=/data/git \
-    DATABASE_URL=sqlite:///data/instasync.db?mode=rwc \
-    RUST_LOG=instasync_server=info,warn
+    DATABASE_URL=sqlite:///data/realtime.db?mode=rwc \
+    RUST_LOG=realtime_server=info,warn
 
 EXPOSE 8081
 ENTRYPOINT ["docker-entrypoint.sh"]

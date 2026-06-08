@@ -1,29 +1,4 @@
-/**
- * Minimal glob matching for the binary-file exclude setting. Supports `*` (any
- * run of non-separator chars), `**` (any run including separators), and `?` (a
- * single non-separator char). Patterns are matched against the full
- * vault-relative path. Everything else is treated literally.
- */
-
-function globToRegExp(glob: string): RegExp {
-	let re = "";
-	for (let i = 0; i < glob.length; i++) {
-		const c = glob[i];
-		if (c === "*") {
-			if (glob[i + 1] === "*") {
-				re += ".*"; // ** — crosses path separators
-				i++;
-			} else {
-				re += "[^/]*"; // * — within a single path segment
-			}
-		} else if (c === "?") {
-			re += "[^/]";
-		} else {
-			re += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
-		}
-	}
-	return new RegExp(`^${re}$`);
-}
+import picomatch from "picomatch";
 
 /** Parse a comma-separated glob list into trimmed, non-empty patterns. */
 export function parseGlobs(list: string): string[] {
@@ -35,5 +10,23 @@ export function parseGlobs(list: string): string[] {
 
 /** True if `path` matches any of the given glob patterns. */
 export function matchesAnyGlob(path: string, globs: string[]): boolean {
-	return globs.some((g) => globToRegExp(g).test(path));
+	let matched = false;
+	for (const glob of globs) {
+		const negated = glob.startsWith("!");
+		const pattern = negated ? glob.slice(1) : glob;
+		if (!pattern) continue;
+		if (picomatch.isMatch(path, pattern, { dot: true })) matched = !negated;
+	}
+	return matched;
+}
+
+/**
+ * True if a path under the Obsidian config dir matches any per-device config
+ * include glob. Globs are matched relative to `configDir` (e.g. `.obsidian`),
+ * so the leading `${configDir}/` is stripped before matching.
+ */
+export function matchesConfigGlobs(path: string, configDir: string, globs: string[]): boolean {
+	const prefix = `${configDir}/`;
+	if (!path.startsWith(prefix)) return false;
+	return matchesAnyGlob(path.slice(prefix.length), globs);
 }

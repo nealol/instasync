@@ -1,12 +1,13 @@
-import { Notice, Plugin } from "obsidian";
+import { Menu, MenuItem, Notice, Plugin, TFile } from "obsidian";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
-import { InstaSyncSettings, InstaSyncSettingTab, defaultSettings } from "./settings";
+import { RealtimeSettings, RealtimeSettingTab, defaultSettings } from "./settings";
 import { VaultSync, isConflictCopy } from "./VaultSync";
 import type { UploadStatus } from "./BinarySync";
 import { matchesAnyGlob, parseGlobs } from "./glob";
-import type { Document } from "./Document";
+import type { SyncedDoc } from "./SyncedDoc";
 import { AuthClient, AuthError, normalizeServerUrl } from "./auth";
+import { PLUGIN_NAME } from "./brand";
 import { liveEdit } from "./editor/LiveEdit";
 import { yRemoteSelections, yRemoteSelectionsTheme } from "./editor/RemoteSelections";
 import { setDiagnosticLoggingEnabled } from "./debug";
@@ -21,8 +22,8 @@ const STATUS_TEXT: Record<ConnectionStatus, string> = {
 	signin: "Sync: sign in",
 };
 
-export default class InstaSyncPlugin extends Plugin {
-	settings!: InstaSyncSettings;
+export default class RealtimePlugin extends Plugin {
+	settings!: RealtimeSettings;
 	auth!: AuthClient;
 	vaultSync: VaultSync | null = null;
 	private statusBarEl!: HTMLElement;
@@ -35,7 +36,7 @@ export default class InstaSyncPlugin extends Plugin {
 		await this.loadSettings();
 		this.auth = new AuthClient(this);
 
-		this.addSettingTab(new InstaSyncSettingTab(this.app, this));
+		this.addSettingTab(new RealtimeSettingTab(this.app, this));
 
 		this.statusBarEl = this.addStatusBarItem();
 		this.renderStatus();
@@ -43,30 +44,34 @@ export default class InstaSyncPlugin extends Plugin {
 		// Editor extensions: live editing + remote cursors.
 		this.registerEditorExtension([liveEdit, yRemoteSelections, yRemoteSelectionsTheme]);
 
-		// Deep link back from the SSO login page: obsidian://instasync-auth?token=…
-		this.registerObsidianProtocolHandler("instasync-auth", (params) => {
+		// Deep link back from the SSO login page: obsidian://realtime-auth?token=…
+		this.registerObsidianProtocolHandler("realtime-auth", (params) => {
 			void (async () => {
 				try {
 					await this.auth.handleProtocol(params as Record<string, string>);
-					new Notice("InstaSync: signed in.");
+					new Notice(`${PLUGIN_NAME}: signed in.`);
 					await this.onLoggedIn();
 				} catch (e) {
-					console.error("[InstaSync] sign-in callback failed", e);
-					new Notice(`InstaSync: sign-in failed: ${e instanceof Error ? e.message : String(e)}`);
+					console.error(`[${PLUGIN_NAME}] sign-in callback failed`, e);
+					new Notice(`${PLUGIN_NAME}: sign-in failed: ${e instanceof Error ? e.message : String(e)}`);
 				}
 			})();
 		});
 
+		this.registerObsidianProtocolHandler("realtime-open", (params) => {
+			void this.openRealtimeLink(params as Record<string, string>);
+		});
+
 		this.addCommand({
-			id: "instasync-reconnect",
+			id: "realtime-reconnect",
 			name: "Reconnect to server",
 			callback: () => this.reloadSync(),
 		});
 		this.addCommand({
-			id: "instasync-setup-vault",
+			id: "realtime-setup-vault",
 			name: "Set up vault",
 			callback: () => {
-				new Notice("InstaSync: open Settings → InstaSync to set up this vault.");
+				new Notice(`${PLUGIN_NAME}: open Settings → ${PLUGIN_NAME} to set up this vault.`);
 			},
 		});
 
@@ -81,7 +86,18 @@ export default class InstaSyncPlugin extends Plugin {
 			if (document.visibilityState === "visible") this.vaultSync?.reconnectAll();
 		});
 		this.registerEvent(
-			this.app.workspace.on("active-leaf-change", () => this.vaultSync?.reconnectAll()),
+			this.app.workspace.on("active-leaf-change", () => {
+				this.vaultSync?.reconnectAll();
+				this.vaultSync?.bindOpenCanvases();
+				this.vaultSync?.bindOpenBases();
+			}),
+		);
+
+		// Add "as Realtime Permalink" under the file tree's native "Copy path >" submenu.
+		this.registerEvent(
+			this.app.workspace.on("file-menu", (menu, file) => {
+				if (file instanceof TFile) this.addPermalinkMenuItem(menu, file);
+			}),
 		);
 
 		// Wait for the vault to finish loading before scanning files.
@@ -107,6 +123,10 @@ export default class InstaSyncPlugin extends Plugin {
 			this.setStatus("signin");
 			return;
 		}
+		// Resolve this server's stable id and migrate any legacy token into the
+		// per-server SecretStorage key. Best-effort: tolerate offline startups,
+		// where the legacy key keeps working until we can reach the server.
+		await this.auth.ensureServerId().catch(() => {});
 		// Validate the session; a 401 clears it. Other (network) errors are
 		// tolerated so we can still start and let the providers retry.
 		try {
@@ -165,6 +185,83 @@ export default class InstaSyncPlugin extends Plugin {
 		this.setStatus("signin");
 	}
 
+	private async openRealtimeLink(params: Record<string, string>): Promise<void> {
+		try {
+			// `vault` is reserved by Obsidian's URI router; permalinks pass the
+			// vault id as `vaultId`. Fall back to the legacy `vault` param just in
+			// case one reaches us (older links that slipped past Obsidian).
+			const vaultId = (params.vaultId ?? params.vault)?.trim();
+			if (!vaultId || vaultId !== this.settings.activeVaultId) {
+				new Notice(`${PLUGIN_NAME}: this link is for a different vault.`);
+				return;
+			}
+
+			let path = params.path?.trim() || "";
+			const guid = params.guid?.trim();
+			if (!path && guid) {
+				path = this.vaultSync?.pathForGuid(guid) ?? "";
+			}
+			if (!path) {
+				new Notice(`${PLUGIN_NAME}: note link is not available locally yet.`);
+				return;
+			}
+
+			const file = this.app.vault.getAbstractFileByPath(path);
+			if (!(file instanceof TFile)) {
+				new Notice(`${PLUGIN_NAME}: note not found: ${path}`);
+				return;
+			}
+			await this.app.workspace.getLeaf(false).openFile(file);
+		} catch (e) {
+			console.error(`[${PLUGIN_NAME}] failed to open permalink`, e);
+			new Notice(`${PLUGIN_NAME}: failed to open link: ${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+
+	/**
+	 * Inject "as Realtime Permalink" into the file tree context menu. Obsidian's
+	 * core renders a native "Copy path >" submenu; we slot our option in there when
+	 * we can find it, and otherwise fall back to a top-level "Copy Realtime
+	 * permalink" item so the action is always reachable.
+	 */
+	private addPermalinkMenuItem(menu: Menu, file: TFile): void {
+		const build = (item: MenuItem, title: string) => {
+			item
+				.setTitle(title)
+				.setIcon("link")
+				.onClick(() => void this.copyRealtimePermalink(file));
+		};
+		const submenu = findCopyPathSubmenu(menu);
+		if (submenu) {
+			submenu.addItem((item) => build(item, "as Realtime Permalink"));
+		} else {
+			menu.addItem((item) => build(item, "Copy Realtime permalink"));
+		}
+	}
+
+	/** Resolve and copy a stable permalink for the given file to the clipboard. */
+	private async copyRealtimePermalink(file: TFile): Promise<void> {
+		try {
+			const vaultId = this.settings.activeVaultId;
+			if (!vaultId) {
+				new Notice(`${PLUGIN_NAME}: set up a vault before copying a permalink.`);
+				return;
+			}
+			if (!this.auth.isLoggedIn) {
+				new Notice(`${PLUGIN_NAME}: sign in to copy a permalink.`);
+				return;
+			}
+			const { url } = await this.auth.notePermalink(vaultId, file.path);
+			await navigator.clipboard?.writeText(url);
+			new Notice(`${PLUGIN_NAME}: permalink copied.`);
+		} catch (e) {
+			console.error(`[${PLUGIN_NAME}] failed to copy permalink`, e);
+			new Notice(
+				`${PLUGIN_NAME}: failed to copy permalink: ${e instanceof Error ? e.message : String(e)}`,
+			);
+		}
+	}
+
 	/** Create a new server vault from the current local files and start syncing it. */
 	async createAndActivateVault(name: string): Promise<void> {
 		const vault = await this.auth.createVault(name);
@@ -189,31 +286,32 @@ export default class InstaSyncPlugin extends Plugin {
 		this.settings.activeVaultId = vaultId;
 		await this.saveSettings();
 		await this.reloadSync();
-		new Notice(`InstaSync: adopting "${name}"…`);
+		new Notice(`${PLUGIN_NAME}: adopting "${name}"…`);
 	}
 
 	/**
-	 * Erase local files that InstaSync would sync (Markdown, plus binaries when
+	 * Erase local files that Realtime would sync (Markdown, plus binaries when
 	 * enabled) so the adopted vault's contents replace them cleanly — otherwise
 	 * local-only files would be pushed up as new additions.
 	 */
 	private async wipeLocalSyncedFiles(): Promise<void> {
 		const excludes = parseGlobs(this.settings.binaryExcludeGlobs);
-		const targets = this.settings.syncBinaries
-			? this.app.vault.getFiles()
-			: this.app.vault.getMarkdownFiles();
+		const targets = this.app.vault.getFiles();
 		for (const file of targets) {
 			if (isConflictCopy(file.path)) continue;
-			if (
-				file.extension !== "md" &&
-				(!this.settings.syncBinaries || matchesAnyGlob(file.path, excludes))
-			) {
+			if (file.extension === "md") {
+				// Always synced through the text CRDT.
+			} else if (file.extension === "canvas" && this.settings.syncCanvases) {
+				// Synced through the structured CRDT.
+			} else if (file.extension === "base" && this.settings.syncBases) {
+				// Synced through the structured CRDT.
+			} else if (!this.settings.syncBinaries || matchesAnyGlob(file.path, excludes)) {
 				continue;
 			}
 			try {
 				await this.app.vault.delete(file);
 			} catch (e) {
-				console.error(`[InstaSync] failed to erase ${file.path}`, e);
+				console.error(`[${PLUGIN_NAME}] failed to erase ${file.path}`, e);
 			}
 		}
 	}
@@ -221,7 +319,7 @@ export default class InstaSyncPlugin extends Plugin {
 	// --- Awareness / identity --------------------------------------------------
 
 	/** Sets this client's cursor identity on a single document's awareness. */
-	applyAwarenessTo(doc: Document): void {
+	applyAwarenessTo(doc: SyncedDoc): void {
 		doc.awareness.setLocalStateField("user", {
 			name: this.settings.clientName,
 			color: this.settings.clientColor,
@@ -268,7 +366,14 @@ export default class InstaSyncPlugin extends Plugin {
 	// --- Settings persistence --------------------------------------------------
 
 	async loadSettings(): Promise<void> {
-		this.settings = sanitizeSettings(await this.loadData());
+		const raw = await this.loadData();
+		this.settings = sanitizeSettings(raw);
+		// Migrate legacy plaintext token from data.json to SecretStorage.
+		const legacy = raw && typeof raw === "object" ? (raw as Record<string, unknown>).sessionToken : undefined;
+		if (typeof legacy === "string" && legacy) {
+			this.app.secretStorage.setSecret("realtime-session-token", legacy);
+			await this.saveSettings();
+		}
 		this.applyDiagnosticLoggingSetting();
 	}
 
@@ -281,16 +386,47 @@ export default class InstaSyncPlugin extends Plugin {
 	}
 }
 
-function sanitizeSettings(raw: unknown): InstaSyncSettings {
+/**
+ * Obsidian's bundled types don't expose a menu's items or an item's submenu,
+ * but both exist at runtime — the native "Copy path >" entry is a MenuItem with
+ * a populated `submenu`. We read these defensively so a future API change just
+ * trips the top-level fallback instead of throwing.
+ */
+interface InternalMenuItem extends MenuItem {
+	submenu?: Menu | null;
+	titleEl?: HTMLElement;
+	dom?: HTMLElement;
+}
+interface InternalMenu extends Menu {
+	items?: MenuItem[];
+}
+
+/** Locate the native "Copy path" submenu within a file-menu, if present. */
+function findCopyPathSubmenu(menu: Menu): Menu | null {
+	const items = (menu as InternalMenu).items;
+	if (!Array.isArray(items)) return null;
+	for (const raw of items) {
+		const item = raw as InternalMenuItem;
+		if (!item.submenu) continue;
+		const title = (item.titleEl?.textContent ?? item.dom?.textContent ?? "")
+			.trim()
+			.toLowerCase();
+		if (title.includes("copy path")) return item.submenu;
+	}
+	return null;
+}
+
+function sanitizeSettings(raw: unknown): RealtimeSettings {
 	const defaults = defaultSettings();
-	const data = raw && typeof raw === "object" ? raw as Partial<InstaSyncSettings> : {};
-	const settings: InstaSyncSettings = { ...defaults };
+	const data = raw && typeof raw === "object" ? raw as Partial<RealtimeSettings> : {};
+	const settings: RealtimeSettings = { ...defaults };
 
 	settings.authServerUrl = sanitizeUrl(data.authServerUrl, defaults.authServerUrl);
+	settings.authServerId = typeof data.authServerId === "string" ? data.authServerId.trim() : "";
 	settings.pendingSetupServerUrl = data.pendingSetupServerUrl
 		? sanitizeUrl(data.pendingSetupServerUrl, "")
 		: "";
-	settings.sessionToken = typeof data.sessionToken === "string" ? data.sessionToken.trim() : "";
+	settings.userId = typeof data.userId === "string" ? data.userId : "";
 	settings.userDisplayName = typeof data.userDisplayName === "string" ? data.userDisplayName : "";
 	settings.userEmail = typeof data.userEmail === "string" ? data.userEmail : "";
 	settings.activeVaultId = typeof data.activeVaultId === "string" ? data.activeVaultId.trim() : "";
@@ -301,7 +437,13 @@ function sanitizeSettings(raw: unknown): InstaSyncSettings {
 	settings.clientColorLight = sanitizeColor(data.clientColorLight, defaults.clientColorLight);
 	settings.enabled = typeof data.enabled === "boolean" ? data.enabled : defaults.enabled;
 	settings.syncBinaries = typeof data.syncBinaries === "boolean" ? data.syncBinaries : defaults.syncBinaries;
+	settings.syncCanvases = typeof data.syncCanvases === "boolean" ? data.syncCanvases : defaults.syncCanvases;
+	settings.syncBases = typeof data.syncBases === "boolean" ? data.syncBases : defaults.syncBases;
 	settings.binaryExcludeGlobs = typeof data.binaryExcludeGlobs === "string" ? data.binaryExcludeGlobs : "";
+	settings.syncConfigEnabled = typeof data.syncConfigEnabled === "boolean" ? data.syncConfigEnabled : false;
+	settings.configIncludeGlobs = Array.isArray(data.configIncludeGlobs)
+		? data.configIncludeGlobs.filter((glob): glob is string => typeof glob === "string").map((glob) => glob.trim()).filter(Boolean)
+		: [];
 	settings.diagnosticLogging = typeof data.diagnosticLogging === "boolean" ? data.diagnosticLogging : false;
 
 	return settings;

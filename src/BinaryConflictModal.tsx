@@ -1,6 +1,6 @@
 import { App, Modal } from "obsidian";
 import { createRoot, type Root } from "react-dom/client";
-import type InstaSyncPlugin from "./main";
+import type RealtimePlugin from "./main";
 
 export type ConflictChoice = "local" | "remote";
 
@@ -17,7 +17,7 @@ interface ConflictInfo {
  * local copy (the safe, non-destructive option).
  */
 export function openBinaryConflictModal(
-	plugin: InstaSyncPlugin,
+	plugin: RealtimePlugin,
 	info: ConflictInfo,
 ): Promise<ConflictChoice> {
 	return new Promise((resolve) => {
@@ -82,10 +82,10 @@ function BinaryConflictView({
 	return (
 		<>
 			<h3>Binary file conflict</h3>
-			<div className="instasync-warning-box">
+			<div className="realtime-warning-box">
 				<p className="setting-item-description">{remoteDesc}</p>
 			</div>
-			<div className="instasync-actions">
+			<div className="realtime-actions">
 				<button onClick={onLocal}>Keep local</button>
 				<button className="mod-cta" onClick={onRemote}>
 					{info.remoteDeleted ? "Delete it here too" : "Keep remote"}

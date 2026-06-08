@@ -1,18 +1,18 @@
-use instasync_server::{app, build_state, config::Config};
+use realtime_server::{app, build_state, config::Config, SERVER_NAME};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
     let config = Config::from_env();
     let bind_addr = config.bind_addr.clone();
     tracing::info!(
-        "InstaSync auth server: oidc_mode={:?}, ysweet={}",
+        "{} auth server: oidc_mode={:?}, ysweet={}",
+        SERVER_NAME,
         config.oidc_mode,
         config.ysweet_url
     );
@@ -30,7 +30,9 @@ async fn main() -> anyhow::Result<()> {
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c().await.expect("install Ctrl-C handler");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install Ctrl-C handler");
     };
 
     #[cfg(unix)]

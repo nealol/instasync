@@ -3,9 +3,9 @@ use axum::http::request::Parts;
 use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
 use sha2::{Digest, Sha256};
 
-use crate::entities::{sessions, users};
+use crate::entities::{oauth_tokens, remote_cursors, sessions, users};
 use crate::error::AppError;
-use crate::state::AppState;
+use crate::state::{AppState, Principal, PrincipalActor};
 
 /// Milliseconds since the Unix epoch.
 pub fn now_millis() -> i64 {
@@ -27,7 +27,7 @@ fn random_token() -> String {
 
 /// Upsert a user by (issuer, subject); refreshes email / display name on login.
 pub async fn upsert_user(
-	db: &impl ConnectionTrait,
+    db: &impl ConnectionTrait,
     issuer: &str,
     subject: &str,
     email: &str,
@@ -72,18 +72,22 @@ pub async fn create_session(db: &impl ConnectionTrait, user_id: &str) -> Result<
     Ok(token)
 }
 
-fn hash_token(token: &str) -> String {
+pub(crate) fn hash_token(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub async fn revoke_session(db: &impl ConnectionTrait, token: &str) -> Result<(), AppError> {
-    sessions::Entity::delete_by_id(hash_token(token)).exec(db).await?;
+    sessions::Entity::delete_by_id(hash_token(token))
+        .exec(db)
+        .await?;
     Ok(())
 }
 
 pub fn bearer_token(header: &str) -> Option<&str> {
-    header.strip_prefix("Bearer ").or_else(|| header.strip_prefix("bearer "))
+    header
+        .strip_prefix("Bearer ")
+        .or_else(|| header.strip_prefix("bearer "))
 }
 
 /// Authenticated user, extracted from the `Authorization: Bearer <token>` header.
@@ -118,5 +122,126 @@ impl FromRequestParts<AppState> for AuthUser {
             .ok_or(AppError::Unauthorized)?;
 
         Ok(AuthUser(user))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum ApiActor {
+    User,
+    Cursor(remote_cursors::Model),
+}
+
+/// Bearer principal for new API/MCP surfaces. Accepts existing session tokens
+/// and remote cursor secrets. Cursor principals are pinned to one vault.
+#[derive(Clone, Debug)]
+pub struct ApiPrincipal {
+    pub user: users::Model,
+    pub actor: ApiActor,
+}
+
+impl ApiPrincipal {
+    pub fn pinned_vault_id(&self) -> Option<&str> {
+        match &self.actor {
+            ApiActor::User => None,
+            ApiActor::Cursor(cursor) => Some(&cursor.vault_id),
+        }
+    }
+
+    pub fn require_vault(&self, vault_id: &str) -> Result<(), AppError> {
+        if self
+            .pinned_vault_id()
+            .is_some_and(|pinned| pinned != vault_id)
+        {
+            return Err(AppError::Forbidden);
+        }
+        Ok(())
+    }
+
+    pub fn to_git_principal(&self, expires_at_ms: i64) -> Principal {
+        let actor = match &self.actor {
+            ApiActor::User => PrincipalActor::User,
+            ApiActor::Cursor(cursor) => PrincipalActor::Cursor {
+                cursor_id: cursor.id.clone(),
+                app_id: cursor.app_id.clone(),
+                cursor_name: cursor.name.clone(),
+            },
+        };
+        Principal {
+            user_id: self.user.id.clone(),
+            display_name: self.user.display_name.clone(),
+            email: self.user.email.clone(),
+            actor,
+            expires_at_ms,
+        }
+    }
+}
+
+impl FromRequestParts<AppState> for ApiPrincipal {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let header = parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or(AppError::Unauthorized)?;
+        let token = bearer_token(header).ok_or(AppError::Unauthorized)?;
+        let token_hash = hash_token(token);
+
+        if let Some(session) = sessions::Entity::find_by_id(token_hash.clone())
+            .one(&state.db)
+            .await?
+        {
+            if session.expires_at < now_millis() {
+                return Err(AppError::Unauthorized);
+            }
+            let user = users::Entity::find_by_id(session.user_id)
+                .one(&state.db)
+                .await?
+                .ok_or(AppError::Unauthorized)?;
+            return Ok(ApiPrincipal {
+                user,
+                actor: ApiActor::User,
+            });
+        }
+
+        if let Some(cursor) = remote_cursors::Entity::find()
+            .filter(remote_cursors::Column::TokenHash.eq(token_hash.clone()))
+            .one(&state.db)
+            .await?
+        {
+            let user = users::Entity::find_by_id(cursor.created_by.clone())
+                .one(&state.db)
+                .await?
+                .ok_or(AppError::Unauthorized)?;
+            return Ok(ApiPrincipal {
+                user,
+                actor: ApiActor::Cursor(cursor),
+            });
+        }
+
+        let oauth = oauth_tokens::Entity::find_by_id(token_hash)
+            .one(&state.db)
+            .await?
+            .ok_or(AppError::Unauthorized)?;
+        if oauth.access_expires_at < now_millis() {
+            return Err(AppError::Unauthorized);
+        }
+        let cursor = remote_cursors::Entity::find()
+            .filter(remote_cursors::Column::AppId.eq(oauth.app_id))
+            .one(&state.db)
+            .await?
+            .ok_or(AppError::Unauthorized)?;
+        let user = users::Entity::find_by_id(cursor.created_by.clone())
+            .one(&state.db)
+            .await?
+            .ok_or(AppError::Unauthorized)?;
+        Ok(ApiPrincipal {
+            user,
+            actor: ApiActor::Cursor(cursor),
+        })
     }
 }

@@ -10,9 +10,9 @@ const WORDS: &[&str] = &[
     "honey", "iris", "ivory", "jade", "jolly", "juniper", "kelp", "lagoon", "lark", "laurel",
     "lemon", "lilac", "lotus", "lunar", "maple", "marble", "meadow", "mint", "misty", "moss",
     "nectar", "noble", "ocean", "olive", "onyx", "opal", "orchid", "otter", "pearl", "pebble",
-    "pine", "plum", "quartz", "quill", "rapid", "raven", "reed", "river", "robin", "rose",
-    "sage", "sandy", "shell", "silver", "solar", "spruce", "storm", "summit", "sunny", "thistle",
-    "tide", "topaz", "umber", "valley", "velvet", "willow", "winter", "wren", "zephyr", "zinnia",
+    "pine", "plum", "quartz", "quill", "rapid", "raven", "reed", "river", "robin", "rose", "sage",
+    "sandy", "shell", "silver", "solar", "spruce", "storm", "summit", "sunny", "thistle", "tide",
+    "topaz", "umber", "valley", "velvet", "willow", "winter", "wren", "zephyr", "zinnia",
 ];
 
 /// Generate a single-use invite code: four random words joined by dashes.

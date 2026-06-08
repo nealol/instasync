@@ -9,13 +9,14 @@ use serde::Deserialize;
 
 use crate::config::OidcMode;
 use crate::error::{AppError, AppResult};
-use crate::session::{create_session, upsert_user};
 use crate::session::now_millis;
+use crate::session::{create_session, upsert_user};
 use crate::state::{AppState, MockIdentity, OidcFlow};
+use crate::SERVER_NAME;
 
 #[derive(Debug, Deserialize)]
 pub struct LoginParams {
-    /// Where to send the browser after login (e.g. `obsidian://instasync-auth`).
+    /// Where to send the browser after login (e.g. `obsidian://realtime-auth`).
     pub redirect: Option<String>,
     // Mock-mode only: lets tests choose distinct identities.
     pub mock_sub: Option<String>,
@@ -36,6 +37,25 @@ pub async fn login(
     Query(params): Query<LoginParams>,
 ) -> AppResult<Response> {
     let redirect = validate_login_redirect(&state, params.redirect.as_deref())?;
+    begin_login(
+        state,
+        redirect,
+        params.mock_sub,
+        params.mock_email,
+        params.mock_name,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn begin_login(
+    state: AppState,
+    redirect: String,
+    mock_sub: Option<String>,
+    mock_email: Option<String>,
+    mock_name: Option<String>,
+    oauth_flow_key: Option<String>,
+) -> AppResult<Response> {
     prune_oidc_flows(&state).await;
 
     match state.config.oidc_mode {
@@ -43,11 +63,9 @@ pub async fn login(
             let csrf = CsrfToken::new_random();
             let identity = MockIdentity {
                 issuer: "mock".to_string(),
-                subject: params.mock_sub.unwrap_or_else(|| "mock-user".to_string()),
-                email: params
-                    .mock_email
-                    .unwrap_or_else(|| "mock@example.com".to_string()),
-                name: params.mock_name.unwrap_or_else(|| "Mock User".to_string()),
+                subject: mock_sub.unwrap_or_else(|| "mock-user".to_string()),
+                email: mock_email.unwrap_or_else(|| "mock@example.com".to_string()),
+                name: mock_name.unwrap_or_else(|| "Mock User".to_string()),
             };
             state.oidc.lock().await.insert(
                 csrf.secret().clone(),
@@ -57,6 +75,7 @@ pub async fn login(
                     redirect,
                     created_at: now_millis(),
                     mock: Some(identity),
+                    oauth_flow_key,
                 },
             );
             let url = format!("/auth/callback?state={}", csrf.secret());
@@ -86,6 +105,7 @@ pub async fn login(
                     redirect,
                     created_at: now_millis(),
                     mock: None,
+                    oauth_flow_key,
                 },
             );
             Ok(Redirect::to(auth_url.as_str()).into_response())
@@ -121,12 +141,19 @@ pub async fn callback(
     };
 
     let user = upsert_user(&state.db, &issuer, &subject, &email, &name).await?;
+    if let Some(oauth_flow_key) = flow.oauth_flow_key {
+        return crate::oauth::finish_authorize(state, oauth_flow_key, user).await;
+    }
     let token = create_session(&state.db, &user.id).await?;
 
     if flow.redirect.is_empty() {
         Ok(Html(token_page(&token)).into_response())
     } else {
-        let sep = if flow.redirect.contains('?') { '&' } else { '?' };
+        let sep = if flow.redirect.contains('?') {
+            '&'
+        } else {
+            '?'
+        };
         let dest = format!("{}{}token={}", flow.redirect, sep, token);
         let is_web = dest.starts_with("http://") || dest.starts_with("https://");
         if is_web {
@@ -144,8 +171,10 @@ pub async fn callback(
 }
 
 fn validate_login_redirect(state: &AppState, redirect: Option<&str>) -> AppResult<String> {
-    let Some(redirect) = redirect else { return Ok(String::new()); };
-    if redirect.is_empty() || redirect == "obsidian://instasync-auth" {
+    let Some(redirect) = redirect else {
+        return Ok(String::new());
+    };
+    if redirect.is_empty() || redirect == "obsidian://realtime-auth" {
         return Ok(redirect.to_string());
     }
 
@@ -223,7 +252,12 @@ async fn resolve_oidc_identity(
 /// inferred (openidconnect v4 encodes "endpoint set" in the type).
 async fn discover(
     state: &AppState,
-) -> AppResult<(CoreProviderMetadata, ClientId, Option<ClientSecret>, RedirectUrl)> {
+) -> AppResult<(
+    CoreProviderMetadata,
+    ClientId,
+    Option<ClientSecret>,
+    RedirectUrl,
+)> {
     let cfg = &state.config;
     let issuer = cfg
         .oidc_issuer
@@ -257,9 +291,9 @@ async fn discover(
 fn redirect_page(dest: &str, token: &str) -> String {
     let href = html_escape(dest);
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>InstaSync</title></head>\
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{SERVER_NAME}</title></head>\
 <body style=\"font-family:system-ui;max-width:40rem;margin:3rem auto\">\
-<h2>InstaSync sign-in complete</h2>\
+<h2>{SERVER_NAME} sign-in complete</h2>\
 <p><a id=\"open\" href=\"{href}\" \
 style=\"display:inline-block;padding:.6rem 1rem;background:#7c3aed;color:#fff;\
 border-radius:6px;text-decoration:none\">Open Obsidian</a> to finish signing in.</p>\
@@ -282,9 +316,9 @@ fn html_escape(s: &str) -> String {
 
 fn token_page(token: &str) -> String {
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>InstaSync</title></head>\
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{SERVER_NAME}</title></head>\
 <body style=\"font-family:system-ui;max-width:40rem;margin:3rem auto\">\
-<h2>InstaSync sign-in complete</h2>\
+<h2>{SERVER_NAME} sign-in complete</h2>\
 <p>If Obsidian did not open automatically, copy this code into the plugin's \
 <em>paste code</em> field:</p>\
 <pre style=\"padding:1rem;background:#f4f4f4;border-radius:6px;user-select:all\">{token}</pre>\

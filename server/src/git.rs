@@ -22,17 +22,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use sea_orm::DatabaseConnection;
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
-use y_sweet_core::api_types::Authorization;
-use y_sweet_core::auth::{Authenticator, ExpirationTimeEpochMillis};
-use yrs::types::ToJson;
-use yrs::updates::decoder::Decode;
-use yrs::{Any, Doc, GetString, Transact, Update};
+use y_sweet_core::auth::Authenticator;
 
 use crate::config::Config;
-use crate::state::Principal;
+use crate::state::{Principal, PrincipalActor};
+use crate::structured::canvas_to_file_json;
+use crate::ydoc::{decode_files_map, decode_structured, decode_structured_index, decode_text};
 
 /// A principal seen contributing to a vault during one debounce window.
 type Contributor = Principal;
@@ -50,6 +51,7 @@ struct VaultState {
 
 struct Inner {
     config: Arc<Config>,
+    #[allow(dead_code)]
     http: reqwest::Client,
     #[allow(dead_code)] // reserved for future per-doc lookups / catch-up sweeps
     db: DatabaseConnection,
@@ -87,14 +89,21 @@ impl GitService {
             return;
         }
         let mut vaults = self.0.vaults.lock().await;
-        let entry = vaults.entry(vault_id.to_string()).or_insert_with(|| VaultState {
-            dirty: false,
-            contributors: Vec::new(),
-            deadline: Instant::now(),
-            running: false,
-        });
+        let entry = vaults
+            .entry(vault_id.to_string())
+            .or_insert_with(|| VaultState {
+                dirty: false,
+                contributors: Vec::new(),
+                deadline: Instant::now(),
+                running: false,
+            });
         entry.dirty = true;
-        if !entry.contributors.iter().any(|c| c.user_id == who.user_id) {
+        let actor_key = who.actor_key();
+        if !entry
+            .contributors
+            .iter()
+            .any(|c| c.actor_key() == actor_key)
+        {
             entry.contributors.push(who.clone());
         }
         entry.deadline = Instant::now() + self.debounce();
@@ -128,7 +137,9 @@ impl GitService {
             // Claim the pending work.
             let contributors = {
                 let mut vaults = self.0.vaults.lock().await;
-                let Some(s) = vaults.get_mut(&vault_id) else { return };
+                let Some(s) = vaults.get_mut(&vault_id) else {
+                    return;
+                };
                 if !s.dirty {
                     s.running = false;
                     return;
@@ -144,7 +155,9 @@ impl GitService {
             // More writes during the commit? Loop and wait again; otherwise stop.
             {
                 let mut vaults = self.0.vaults.lock().await;
-                let Some(s) = vaults.get_mut(&vault_id) else { return };
+                let Some(s) = vaults.get_mut(&vault_id) else {
+                    return;
+                };
                 if !s.dirty {
                     s.running = false;
                     return;
@@ -160,9 +173,10 @@ impl GitService {
         // 1. Authoritative file set from the vault index doc's `files` map.
         let index_update = self.fetch_as_update(vault_id).await?;
         let files = decode_files_map(&index_update)?; // Vec<(path, guid)>
+        let structured = decode_structured_index(&index_update)?;
 
-        // 2. Reconstruct each markdown file's text from its own doc.
-        let mut tree: Vec<(PathBuf, String)> = Vec::with_capacity(files.len());
+        // 2. Reconstruct each markdown/structured file from its own doc.
+        let mut tree: Vec<(PathBuf, String)> = Vec::with_capacity(files.len() + structured.len());
         for (path, guid) in &files {
             let rel = match safe_rel_path(path) {
                 Ok(rel) => rel,
@@ -180,13 +194,34 @@ impl GitService {
                 Err(e) => tracing::warn!("git audit: fetch {doc_id} failed: {e}"),
             }
         }
+        for entry in &structured {
+            let rel = match safe_rel_path(&entry.path) {
+                Ok(rel) => rel,
+                Err(e) => {
+                    tracing::warn!("git audit: skipping unsafe path {:?}: {e}", entry.path);
+                    continue;
+                }
+            };
+            let doc_id = format!("{vault_id}__{}", entry.guid);
+            match self.fetch_as_update(&doc_id).await {
+                Ok(update) => match decode_structured(&update)
+                    .and_then(|value| serialize_structured_for_git(&entry.kind, value))
+                {
+                    Ok(content) => tree.push((rel, content)),
+                    Err(e) => tracing::warn!("git audit: decode {} failed: {e}", entry.path),
+                },
+                Err(e) => tracing::warn!("git audit: fetch {doc_id} failed: {e}"),
+            }
+        }
 
         // 3. Write the tree to disk (and prune anything no longer present).
         let repo_for_blocking = repo.clone();
         let tree_for_blocking = tree.clone();
-        tokio::task::spawn_blocking(move || materialize_tree(&repo_for_blocking, &tree_for_blocking))
-            .await
-            .context("materialize task panicked")??;
+        tokio::task::spawn_blocking(move || {
+            materialize_tree(&repo_for_blocking, &tree_for_blocking)
+        })
+        .await
+        .context("materialize task panicked")??;
 
         // 4. Commit the diff, if any.
         self.commit(&repo, vault_id, tree.len(), contributors).await
@@ -202,9 +237,15 @@ impl GitService {
             .await
             .with_context(|| format!("create repo dir {}", repo.display()))?;
         self.git(&repo, &["init", "-q"]).await?;
-        self.git(&repo, &["config", "core.autocrlf", "false"]).await?;
-        self.git(&repo, &["config", "user.name", &self.0.config.git_bot_name]).await?;
-        self.git(&repo, &["config", "user.email", &self.0.config.git_bot_email]).await?;
+        self.git(&repo, &["config", "core.autocrlf", "false"])
+            .await?;
+        self.git(&repo, &["config", "user.name", &self.0.config.git_bot_name])
+            .await?;
+        self.git(
+            &repo,
+            &["config", "user.email", &self.0.config.git_bot_email],
+        )
+        .await?;
         Ok(repo)
     }
 
@@ -223,28 +264,9 @@ impl GitService {
     /// Fetch a document's full state as a Yjs v1 update, authorizing with an
     /// in-process read-only doc token signed by the shared y-sweet key.
     async fn fetch_as_update(&self, doc_id: &str) -> Result<Vec<u8>> {
-        let token = self.0.authenticator.gen_doc_token(
-            doc_id,
-            Authorization::ReadOnly,
-            ExpirationTimeEpochMillis::max(),
-        );
-        let url = format!(
-            "{}/doc/{}/as-update",
-            self.0.config.ysweet_url.trim_end_matches('/'),
-            doc_id
-        );
-        let res = self
-            .0
-            .http
-            .get(&url)
-            .bearer_auth(token)
-            .send()
+        crate::ydoc::read_update_with(&self.0.config, &self.0.http, &self.0.authenticator, doc_id)
             .await
-            .with_context(|| format!("GET {url}"))?;
-        if !res.status().is_success() {
-            bail!("as-update {doc_id} returned {}", res.status());
-        }
-        Ok(res.bytes().await?.to_vec())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
     }
 
     /// Stage everything and commit if the working tree actually changed.
@@ -265,7 +287,7 @@ impl GitService {
 
         let (author, message) =
             build_commit_meta(vault_id, file_count, contributors, &self.0.config);
-        // Pin the committer to the InstaSync bot via command-scoped (`-c`) config so
+        // Pin the committer to the Realtime bot via command-scoped (`-c`) config so
         // it never falls back to the server's *global* git identity — regardless of
         // what (if anything) is in global config or whether ensure_repo's local
         // config write ran. The author is the attributed principal (or the bot).
@@ -339,55 +361,59 @@ fn build_commit_meta(
     config: &Config,
 ) -> (String, String) {
     let (author_name, author_email) = match contributors.first() {
-        Some(p) => (p.display_name.as_str(), p.email.as_str()),
-        None => (config.git_bot_name.as_str(), config.git_bot_email.as_str()),
+        Some(p) => author_identity(p, config),
+        None => (config.git_bot_name.clone(), config.git_bot_email.clone()),
     };
     let author = format!("{author_name} <{author_email}>");
 
     let mut message = format!("Sync {file_count} file(s)\n\n");
     message.push_str(&format!("Vault-Id: {vault_id}\n"));
     if let Some(p) = contributors.first() {
-        message.push_str(&format!("Principal-Id: {}\n", p.user_id));
-        message.push_str("Principal-Type: user\n");
+        append_principal_trailers(&mut message, p);
     }
     for p in contributors.iter().skip(1) {
-        message.push_str(&format!("Co-authored-by: {} <{}>\n", p.display_name, p.email));
+        let (name, email) = author_identity(p, config);
+        message.push_str(&format!("Co-authored-by: {} <{}>\n", name, email));
+        append_principal_trailers(&mut message, p);
     }
     (author, message)
 }
 
-/// Decode a named root `Y.Text` from a full-state update into a String.
-fn decode_text(update: &[u8], name: &str) -> Result<String> {
-    let doc = Doc::new();
-    let update = Update::decode_v1(update).map_err(|e| anyhow!("decode update: {e:?}"))?;
-    {
-        let mut txn = doc.transact_mut();
-        txn.apply_update(update);
+fn author_identity(principal: &Principal, config: &Config) -> (String, String) {
+    match &principal.actor {
+        PrincipalActor::User => (principal.display_name.clone(), principal.email.clone()),
+        PrincipalActor::Cursor {
+            app_id,
+            cursor_name,
+            ..
+        } => (
+            cursor_name.clone(),
+            format!("cursor+{app_id}@{}", config.cursor_email_domain),
+        ),
     }
-    let text = doc.get_or_insert_text(name);
-    let txn = doc.transact();
-    Ok(text.get_string(&txn))
 }
 
-/// Decode the vault index doc's `files` map (path -> guid) from a full-state update.
-fn decode_files_map(update: &[u8]) -> Result<Vec<(String, String)>> {
-    let doc = Doc::new();
-    let update = Update::decode_v1(update).map_err(|e| anyhow!("decode index: {e:?}"))?;
-    {
-        let mut txn = doc.transact_mut();
-        txn.apply_update(update);
-    }
-    let map = doc.get_or_insert_map("files");
-    let txn = doc.transact();
-    let mut out = Vec::new();
-    if let Any::Map(entries) = map.to_json(&txn) {
-        for (path, value) in entries.iter() {
-            if let Any::String(guid) = value {
-                out.push((path.clone(), guid.to_string()));
-            }
+fn append_principal_trailers(message: &mut String, principal: &Principal) {
+    match &principal.actor {
+        PrincipalActor::User => {
+            message.push_str(&format!("Principal-Id: {}\n", principal.user_id));
+            message.push_str("Principal-Type: user\n");
+        }
+        PrincipalActor::Cursor {
+            cursor_id,
+            cursor_name,
+            ..
+        } => {
+            message.push_str("Principal-Type: cursor\n");
+            message.push_str(&format!("Cursor-Id: {cursor_id}\n"));
+            message.push_str(&format!("Cursor-Name: {cursor_name}\n"));
+            message.push_str(&format!(
+                "On-Behalf-Of: {} <{}>\n",
+                principal.display_name, principal.email
+            ));
+            message.push_str(&format!("Authorized-User-Id: {}\n", principal.user_id));
         }
     }
-    Ok(out)
 }
 
 /// Validate a vault-relative path and turn it into a safe relative `PathBuf`.
@@ -404,6 +430,17 @@ fn safe_rel_path(path: &str) -> Result<PathBuf> {
         rel.push(comp);
     }
     Ok(rel)
+}
+
+fn serialize_structured_for_git(kind: &str, value: JsonValue) -> Result<String> {
+    match kind {
+        "canvas" => Ok(format!(
+            "{}\n",
+            serde_json::to_string_pretty(&canvas_to_file_json(value))?
+        )),
+        "base" => Ok(serde_yaml::to_string(&value)?),
+        other => bail!("unknown structured document kind {other}"),
+    }
 }
 
 /// Write every file in `tree` and delete any working-tree file not present in it.
@@ -451,7 +488,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yrs::{Map, ReadTxn, Text, Transact};
+    use yrs::{Doc, Map, ReadTxn, Text, Transact};
 
     fn text_update(name: &str, value: &str) -> Vec<u8> {
         let doc = Doc::new();
@@ -460,7 +497,9 @@ mod tests {
             let mut txn = doc.transact_mut();
             text.insert(&mut txn, 0, value);
         }
-        let update = doc.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        let update = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
         update
     }
 
@@ -473,7 +512,9 @@ mod tests {
                 map.insert(&mut txn, path.to_string(), guid.to_string());
             }
         }
-        let update = doc.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        let update = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
         update
     }
 
@@ -504,15 +545,67 @@ mod tests {
         assert!(safe_rel_path("a/../b").is_err());
         assert!(safe_rel_path("a\\b").is_err());
         assert!(safe_rel_path("").is_err());
-        assert_eq!(safe_rel_path("a/b.md").unwrap(), PathBuf::from("a").join("b.md"));
+        assert_eq!(
+            safe_rel_path("a/b.md").unwrap(),
+            PathBuf::from("a").join("b.md")
+        );
+    }
+
+    #[test]
+    fn serializes_structured_canvas_for_git() {
+        let value = json!({
+            "nodes": {
+                "n2": { "id": "n2", "type": "text", "text": "second" },
+                "n1": { "id": "n1", "type": "text", "text": "first" }
+            },
+            "edges": {
+                "e1": { "id": "e1", "fromNode": "n1", "toNode": "n2" }
+            },
+            "nodeOrder": ["n1", "n2"],
+            "edgeOrder": ["e1"]
+        });
+        let serialized = serialize_structured_for_git("canvas", value).unwrap();
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&serialized).unwrap(),
+            json!({
+                "nodes": [
+                    { "id": "n1", "type": "text", "text": "first" },
+                    { "id": "n2", "type": "text", "text": "second" }
+                ],
+                "edges": [
+                    { "id": "e1", "fromNode": "n1", "toNode": "n2" }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_structured_base_for_git() {
+        let serialized =
+            serialize_structured_for_git("base", json!({ "views": [{ "type": "table" }] }))
+                .unwrap();
+        assert!(serialized.contains("views:"));
+        assert!(serialized.contains("type: table"));
     }
 
     #[test]
     fn commit_meta_uses_primary_author_and_coauthors() {
         let config = test_config();
         let contributors = vec![
-            Principal { user_id: "u1".into(), display_name: "Alice".into(), email: "a@x".into(), expires_at_ms: 0 },
-            Principal { user_id: "u2".into(), display_name: "Bob".into(), email: "b@x".into(), expires_at_ms: 0 },
+            Principal {
+                user_id: "u1".into(),
+                display_name: "Alice".into(),
+                email: "a@x".into(),
+                actor: PrincipalActor::User,
+                expires_at_ms: 0,
+            },
+            Principal {
+                user_id: "u2".into(),
+                display_name: "Bob".into(),
+                email: "b@x".into(),
+                actor: PrincipalActor::User,
+                expires_at_ms: 0,
+            },
         ];
         let (author, message) = build_commit_meta("v1", 2, &contributors, &config);
         assert_eq!(author, "Alice <a@x>");
@@ -525,8 +618,32 @@ mod tests {
     fn commit_meta_falls_back_to_bot() {
         let config = test_config();
         let (author, message) = build_commit_meta("v1", 0, &[], &config);
-        assert_eq!(author, "InstaSync <instasync@localhost>");
+        assert_eq!(author, "Realtime <realtime@localhost>");
         assert!(!message.contains("Principal-Id"));
+    }
+
+    #[test]
+    fn commit_meta_attributes_cursor_author_on_behalf_of_user() {
+        let config = test_config();
+        let contributors = vec![Principal {
+            user_id: "u1".into(),
+            display_name: "Alice".into(),
+            email: "a@x".into(),
+            actor: PrincipalActor::Cursor {
+                cursor_id: "c1".into(),
+                app_id: "app123".into(),
+                cursor_name: "Claude".into(),
+            },
+            expires_at_ms: 0,
+        }];
+
+        let (author, message) = build_commit_meta("v1", 2, &contributors, &config);
+        assert_eq!(author, "Claude <cursor+app123@localhost>");
+        assert!(message.contains("Principal-Type: cursor"));
+        assert!(message.contains("Cursor-Id: c1"));
+        assert!(message.contains("Cursor-Name: Claude"));
+        assert!(message.contains("On-Behalf-Of: Alice <a@x>"));
+        assert!(message.contains("Authorized-User-Id: u1"));
     }
 
     fn test_config() -> Config {
@@ -548,10 +665,31 @@ mod tests {
             git_data_dir: ".".into(),
             git_enabled: true,
             git_debounce_ms: 5000,
-            git_bot_name: "InstaSync".into(),
-            git_bot_email: "instasync@localhost".into(),
+            git_bot_name: "Realtime".into(),
+            git_bot_email: "realtime@localhost".into(),
+            cursor_email_domain: "localhost".into(),
             git_remote_url: None,
             git_push_enabled: false,
+            daily_note_path_template: "Daily Notes/{{YYYY-MM-DD}}.md".into(),
+            weekly_note_path_template: None,
+            monthly_note_path_template: None,
+            quarterly_note_path_template: None,
+            yearly_note_path_template: None,
+            attachment_fetch_host_allowlist: vec![],
+            attachment_allowed_extensions: vec![
+                "png".into(),
+                "jpg".into(),
+                "jpeg".into(),
+                "gif".into(),
+                "webp".into(),
+                "svg".into(),
+                "pdf".into(),
+                "txt".into(),
+            ],
+            attachment_max_bytes: crate::blobs::MAX_BLOB_BYTES,
+            attachments_path_mode: "relative".into(),
+            attachments_subfolder: None,
+            upload_token: "test-upload-token".into(),
         }
     }
 }

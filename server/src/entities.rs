@@ -1,6 +1,25 @@
 //! SeaORM entities. Ids are stored as TEXT (uuid v4 strings) and timestamps as
 //! epoch-millis i64, which keeps the sqlite mapping trivial.
 
+pub mod server_meta {
+    use sea_orm::entity::prelude::*;
+
+    /// Singleton-ish key/value table for server-wide metadata. Currently holds
+    /// the stable `server_id` advertised by `GET /api/server-info`.
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "server_meta")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub key: String,
+        pub value: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod users {
     use sea_orm::entity::prelude::*;
 
@@ -127,6 +146,29 @@ pub mod vault_files {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+pub mod note_search {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "note_search")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub vault_id: String,
+        pub guid: String,
+        pub path: String,
+        pub title: String,
+        pub tags: String,
+        pub links: String,
+        pub updated_at: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod permissions {
     use sea_orm::entity::prelude::*;
 
@@ -141,6 +183,119 @@ pub mod permissions {
         pub path_prefix: String,
         /// "full" | "read-only" | "deny"
         pub level: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod remote_cursors {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "remote_cursors")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub vault_id: String,
+        #[sea_orm(unique)]
+        pub app_id: String,
+        pub name: String,
+        pub token_hash: String,
+        pub created_by: String,
+        pub created_at: i64,
+        pub updated_at: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod oauth_clients {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "oauth_clients")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub client_secret_hash: Option<String>,
+        pub redirect_uris: String,
+        pub app_id: Option<String>,
+        pub created_at: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod oauth_codes {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "oauth_codes")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub code_hash: String,
+        pub client_id: String,
+        pub user_id: String,
+        pub app_id: String,
+        pub vault_id: String,
+        pub code_challenge: String,
+        pub redirect_uri: String,
+        pub scope: String,
+        pub expires_at: i64,
+        pub created_at: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod oauth_tokens {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "oauth_tokens")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub access_hash: String,
+        #[sea_orm(unique)]
+        pub refresh_hash: Option<String>,
+        pub client_id: String,
+        pub user_id: String,
+        pub app_id: String,
+        pub vault_id: String,
+        pub scope: String,
+        pub access_expires_at: i64,
+        pub refresh_expires_at: i64,
+        pub created_at: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod upload_jtis {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "upload_jtis")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub jti: String,
+        pub expires_at: i64,
+        pub created_at: i64,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

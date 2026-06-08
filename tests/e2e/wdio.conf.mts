@@ -6,7 +6,7 @@
 // fully isolated headless Obsidian instances (separate sandboxed vault copies +
 // user-data dirs => isolated IndexedDB), coordinated in one test.
 //
-// We boot a y-sweet server (started with --auth) AND the InstaSync auth server
+// We boot a y-sweet server (started with --auth) AND the Realtime auth server
 // (mock OIDC), sharing one key. They are pinned to the plugin's default ports
 // (y-sweet 8080, auth 8081) so a freshly installed plugin reaches them with no
 // URL injection; the spec signs each device in and binds it to a vault.

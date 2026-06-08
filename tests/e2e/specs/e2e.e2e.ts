@@ -26,6 +26,14 @@ import {
 	listedVaultIds,
 	setSyncPaused,
 	docTokenStatus,
+	enableCorePlugin,
+	openFileInLeaf,
+	bindOpenStructured,
+	detachLeaves,
+	canvasViewData,
+	editCanvasView,
+	baseViewData,
+	editBaseView,
 } from "./helpers.js";
 import { apiCreateVault, apiPromoteMember, apiRedeemInvite, apiRemoveMember, mockLogin } from "../../support/authServer.js";
 
@@ -50,6 +58,13 @@ const SECONDS = 1000;
 const AUTH_PORT = Number(process.env.AUTH_PORT ?? 8081);
 const authUrl = `http://127.0.0.1:${AUTH_PORT}`;
 
+/** A JSON Canvas text node with the required geometry fields. */
+const canvasNode = (id: string, text: string, x = 0) => ({ id, type: "text", text, x, y: 0, width: 200, height: 60 });
+/** Serialize a JSON Canvas document from a list of nodes (no edges). */
+const canvasJson = (nodes: ReturnType<typeof canvasNode>[]) => JSON.stringify({ nodes, edges: [] }, null, 2);
+/** A minimal valid `.base` YAML with a single named table view. */
+const baseYaml = (name: string) => `views:\n  - type: table\n    name: ${name}\n`;
+
 // Device A is the wdio session (vault A). Device B is a second, fully isolated
 // Obsidian instance started programmatically (vault B). Both install this plugin;
 // the conf boots y-sweet (--auth) + the auth server (mock OIDC) on the plugin's
@@ -61,7 +76,7 @@ let vaultId: string;
 let adminToken: string;
 let bobToken: string;
 
-describe("InstaSync — two isolated Obsidian devices", function () {
+describe("Realtime — two isolated Obsidian devices", function () {
 	before(async function () {
 		A = browser;
 		B = await startWdioSession({
@@ -91,10 +106,14 @@ describe("InstaSync — two isolated Obsidian devices", function () {
 		await redeemAndAdopt(B, code);
 
 		// Wait until both devices are connected ("live") before exercising sync.
-		for (const dev of [A, B]) {
-			await dev.waitUntil(async () => /live/i.test(await statusText(dev)), {
+		for (const [label, dev] of [["A", A], ["B", B]] as const) {
+			let last = "";
+			await dev.waitUntil(async () => {
+				last = await statusText(dev);
+				return /live/i.test(last);
+			}, {
 				timeout: 90 * SECONDS,
-				timeoutMsg: "device never reached 'live'",
+				timeoutMsg: `${label} never reached 'live' (last status: ${last})`,
 			});
 		}
 
@@ -289,12 +308,114 @@ describe("InstaSync — two isolated Obsidian devices", function () {
 		});
 	});
 
-	describe("offline divergence -> conflict copy", function () {
-		// The conflicted-copy backup is a startup-path artifact: it fires when a file
-		// changed on disk while the Document was not tracking it AND the shared doc
-		// also advanced. We model "offline & not tracking" by disabling the plugin,
-		// editing the file externally, then re-enabling it (no production changes).
-		it("saves the offline device's pre-merge copy and merges the rest", async function () {
+	describe("canvas live binding", function () {
+		// Canvases sync through a Y.Map CRDT, but while the file is open the disk
+		// write-through is suppressed in favor of CanvasBinding (which patches the
+		// canvas's private `requestSave`/`importData`). These tests drive the real
+		// open canvas view so the binding — not the disk fallback — is under test.
+		before(async function () {
+			const a = await enableCorePlugin(A, "canvas");
+			const b = await enableCorePlugin(B, "canvas");
+			if (!a || !b) this.skip();
+
+			await writeNote(A, "Board.canvas", canvasJson([canvasNode("n1", "hello")]));
+			await B.waitUntil(async () => !!(await readNote(B, "Board.canvas"))?.includes("hello"), {
+				timeout: 60 * SECONDS,
+				timeoutMsg: "B never received the seeded canvas",
+			});
+
+			await openFileInLeaf(A, "Board.canvas");
+			await A.pause(SECONDS); // let the canvas view mount
+			await bindOpenStructured(A); // ensure CanvasBinding is patched on
+		});
+
+		after(async function () {
+			await detachLeaves(A, "canvas");
+			await deleteNote(A, "Board.canvas").catch(() => {});
+		});
+
+		it("propagates a local edit made in A's open canvas to B", async function () {
+			// Edit through the live canvas (patched requestSave -> captureLocal).
+			await editCanvasView(A, "Board.canvas", {
+				nodes: [canvasNode("n1", "edited-on-A"), canvasNode("n2", "added-on-A", 300)],
+				edges: [],
+			});
+			await B.waitUntil(
+				async () => {
+					const disk = await readNote(B, "Board.canvas");
+					return !!disk && disk.includes("edited-on-A") && disk.includes("added-on-A");
+				},
+				{ timeout: 60 * SECONDS, timeoutMsg: "B never received A's live canvas edit" },
+			);
+		});
+
+		it("applies a remote edit into A's open canvas view in place", async function () {
+			// B is not viewing the canvas, so it writes via the disk path; the change
+			// must land in A's *open* view via CanvasBinding.applyRemote (no reload).
+			await writeNote(
+				B,
+				"Board.canvas",
+				canvasJson([canvasNode("n1", "hello"), canvasNode("n3", "from-B-remote", 600)]),
+			);
+			await A.waitUntil(
+				async () => {
+					const data = await canvasViewData(A, "Board.canvas");
+					const nodes = (data?.nodes ?? []) as Array<{ text?: string }>;
+					return nodes.some((n) => n?.text === "from-B-remote");
+				},
+				{ timeout: 60 * SECONDS, timeoutMsg: "A's open canvas view never showed B's remote node" },
+			);
+		});
+	});
+
+	describe("base live binding", function () {
+		// Bases are a TextFileView, so BaseBinding hooks the standard
+		// getViewData/setViewData/requestSave instead of a private API. Skipped on
+		// Obsidian builds that predate the Bases core plugin.
+		before(async function () {
+			const a = await enableCorePlugin(A, "bases");
+			const b = await enableCorePlugin(B, "bases");
+			if (!a || !b) this.skip();
+
+			await writeNote(A, "Tracker.base", baseYaml("Initial"));
+			await B.waitUntil(async () => !!(await readNote(B, "Tracker.base"))?.includes("Initial"), {
+				timeout: 60 * SECONDS,
+				timeoutMsg: "B never received the seeded base",
+			});
+
+			await openFileInLeaf(A, "Tracker.base");
+			await A.pause(SECONDS); // let the base view mount
+			await bindOpenStructured(A); // ensure BaseBinding is patched on
+		});
+
+		after(async function () {
+			await detachLeaves(A, "bases");
+			await deleteNote(A, "Tracker.base").catch(() => {});
+		});
+
+		it("propagates a local edit made in A's open base to B", async function () {
+			// Edit through the live base view (patched requestSave -> captureLocal).
+			await editBaseView(A, "Tracker.base", baseYaml("EditedOnA"));
+			await B.waitUntil(async () => !!(await readNote(B, "Tracker.base"))?.includes("EditedOnA"), {
+				timeout: 60 * SECONDS,
+				timeoutMsg: "B never received A's live base edit",
+			});
+		});
+
+		it("applies a remote edit into A's open base view in place", async function () {
+			await writeNote(B, "Tracker.base", baseYaml("FromBRemote"));
+			await A.waitUntil(
+				async () => !!(await baseViewData(A, "Tracker.base"))?.includes("FromBRemote"),
+				{ timeout: 60 * SECONDS, timeoutMsg: "A's open base view never showed B's remote edit" },
+			);
+		});
+	});
+
+	describe("offline divergence -> conflict resolution", function () {
+		// Model "offline & not tracking" by disabling the plugin, editing the file
+		// externally, then re-enabling it. The current text conflict flow resolves to
+		// one canonical version and must not create/sync legacy conflicted-copy files.
+		it("converges without syncing conflicted-copy files", async function () {
 			await writeNote(A, "Conflict.md", "base");
 			await B.waitUntil(async () => (await readNote(B, "Conflict.md")) === "base", {
 				timeout: 60 * SECONDS,
@@ -319,14 +440,16 @@ describe("InstaSync — two isolated Obsidian devices", function () {
 				{ timeout: 60 * SECONDS, timeoutMsg: "devices did not converge" },
 			);
 
+			const canonical = await readNote(A, "Conflict.md");
+			expect(["base + LOCAL while offline", "base + REMOTE online"]).toContain(canonical);
+
 			// Scope to Conflict.md (the file under test) so unrelated files can't
 			// influence the assertion.
 			const isConflictCopy = (p: string) => /^Conflict \(conflicted copy .+\)\.md$/.test(p);
 			const aCopies = (await listMarkdown(A)).filter(isConflictCopy);
 			const bCopies = (await listMarkdown(B)).filter(isConflictCopy);
-			expect(aCopies.length).toBe(1); // A (the offline device) kept its copy
-			expect(bCopies.length).toBe(0); // B never made one; A's copy did not sync
-			expect(await readNote(A, aCopies[0])).toBe("base + LOCAL while offline");
+			expect(aCopies.length).toBe(0);
+			expect(bCopies.length).toBe(0);
 		});
 	});
 

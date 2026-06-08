@@ -31,7 +31,10 @@ pub const MAX_BLOB_BYTES: u64 = 100 * 1024 * 1024;
 /// A sha256 hex digest is exactly 64 lowercase hex characters. Validating this
 /// before building any path is what keeps `hash` from escaping the blob dir.
 fn valid_hash(hash: &str) -> bool {
-    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Resolve the on-disk path for a blob, after validating both segments.
@@ -40,7 +43,11 @@ fn blob_path(state: &AppState, vault_id: &str, hash: &str) -> AppResult<PathBuf>
         return Err(AppError::BadRequest("invalid blob hash".into()));
     }
     // vault_id is a server-issued UUID, but guard against separators regardless.
-    if vault_id.is_empty() || vault_id.contains('/') || vault_id.contains('\\') || vault_id.contains("..") {
+    if vault_id.is_empty()
+        || vault_id.contains('/')
+        || vault_id.contains('\\')
+        || vault_id.contains("..")
+    {
         return Err(AppError::BadRequest("invalid vault id".into()));
     }
     let mut p = PathBuf::from(&state.config.blob_dir);
@@ -146,7 +153,8 @@ async fn stream_to_file(body: Body, tmp: &FsPath) -> AppResult<String> {
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| AppError::BadRequest(format!("upload stream: {e}")))?;
-        if file.metadata().await.map(|m| m.len()).unwrap_or(0) + chunk.len() as u64 > MAX_BLOB_BYTES {
+        if file.metadata().await.map(|m| m.len()).unwrap_or(0) + chunk.len() as u64 > MAX_BLOB_BYTES
+        {
             return Err(AppError::PayloadTooLarge);
         }
         hasher.update(&chunk);

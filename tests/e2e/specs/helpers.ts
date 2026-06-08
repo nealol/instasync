@@ -5,7 +5,7 @@
 
 import { mockLogin, apiCreateInvite } from "../../support/authServer.js";
 
-// --- InstaSync auth / vault onboarding (Tier-3) ----------------------------
+// --- Realtime auth / vault onboarding (Tier-3) ----------------------------
 
 /**
  * Sign a device in: mint a mock-OIDC session (Node side) for a distinct user,
@@ -16,7 +16,7 @@ export async function signInDevice(b: any, authUrl: string, sub: string): Promis
 	const token = await mockLogin(authUrl, sub);
 	await b.executeObsidian(
 		async ({ app }: any, url: string, tok: string) => {
-			const p = (app as any).plugins.plugins.instasync;
+			const p = (app as any).plugins.plugins.realtime;
 			p.settings.authServerUrl = url;
 			p.settings.enabled = true;
 			await p.auth.setSession(tok);
@@ -30,7 +30,7 @@ export async function signInDevice(b: any, authUrl: string, sub: string): Promis
 /** Create a vault from the device's local files and start syncing it. */
 export async function createVaultFromLocal(b: any, name: string): Promise<string> {
 	return b.executeObsidian(async ({ app }: any, n: string) => {
-		const p = (app as any).plugins.plugins.instasync;
+		const p = (app as any).plugins.plugins.realtime;
 		await p.createAndActivateVault(n);
 		return p.settings.activeVaultId as string;
 	}, name);
@@ -48,7 +48,7 @@ export function generateInvite(authUrl: string, adminToken: string, vaultId: str
  */
 export async function redeemAndAdopt(b: any, code: string): Promise<string> {
 	return b.executeObsidian(async ({ app }: any, c: string) => {
-		const p = (app as any).plugins.plugins.instasync;
+		const p = (app as any).plugins.plugins.realtime;
 		const { vaultId } = await p.auth.redeemInvite(c);
 		for (const f of app.vault.getMarkdownFiles()) {
 			try {
@@ -67,7 +67,7 @@ export async function redeemAndAdopt(b: any, code: string): Promise<string> {
 /** Redeem an invite but leave the local vault bound to its current remote. */
 export async function redeemInviteOnly(b: any, code: string): Promise<{ vaultId: string; activeVaultId: string }> {
 	return b.executeObsidian(async ({ app }: any, c: string) => {
-		const p = (app as any).plugins.plugins.instasync;
+		const p = (app as any).plugins.plugins.realtime;
 		const { vaultId } = await p.auth.redeemInvite(c);
 		return { vaultId, activeVaultId: p.settings.activeVaultId as string };
 	}, code);
@@ -75,19 +75,19 @@ export async function redeemInviteOnly(b: any, code: string): Promise<{ vaultId:
 
 export async function activeVaultId(b: any): Promise<string> {
 	return b.executeObsidian(async ({ app }: any) => {
-		return (app as any).plugins.plugins.instasync.settings.activeVaultId as string;
+		return (app as any).plugins.plugins.realtime.settings.activeVaultId as string;
 	});
 }
 
 export async function listedVaultIds(b: any): Promise<string[]> {
 	return b.executeObsidian(async ({ app }: any) => {
-		return ((await (app as any).plugins.plugins.instasync.auth.listVaults()) as { id: string }[]).map((v) => v.id);
+		return ((await (app as any).plugins.plugins.realtime.auth.listVaults()) as { id: string }[]).map((v) => v.id);
 	});
 }
 
 export async function setSyncPaused(b: any, paused: boolean): Promise<void> {
 	await b.executeObsidian(async ({ app }: any, p: boolean) => {
-		const plugin = (app as any).plugins.plugins.instasync;
+		const plugin = (app as any).plugins.plugins.realtime;
 		plugin.settings.enabled = !p;
 		await plugin.saveSettings();
 		await plugin.reloadSync();
@@ -98,7 +98,7 @@ export async function setSyncPaused(b: any, paused: boolean): Promise<void> {
 export async function docTokenStatus(b: any, vaultId: string): Promise<string> {
 	return b.executeObsidian(async ({ app }: any, vid: string) => {
 		try {
-			await (app as any).plugins.plugins.instasync.auth.docToken(vid, vid);
+			await (app as any).plugins.plugins.realtime.auth.docToken(vid, vid);
 			return "ok";
 		} catch {
 			return "refused";
@@ -172,6 +172,121 @@ export async function closeAllEditors(b: any): Promise<void> {
 	});
 }
 
+// --- Structured files (canvas / base live bindings) ------------------------
+//
+// Canvas and Base files sync through a CRDT, but when the file is *open* the
+// disk write-through is suppressed in favor of a live binding (CanvasBinding /
+// BaseBinding). The plain read/write helpers only exercise the disk path; these
+// drive the actual open views so the bindings are under test.
+
+/**
+ * Enable an Obsidian core plugin (e.g. "canvas", "bases"). Returns true if the
+ * plugin is enabled afterwards — false means this Obsidian build doesn't ship it
+ * (older versions predate Bases), so the caller can skip the dependent tests.
+ */
+export async function enableCorePlugin(b: any, id: string): Promise<boolean> {
+	return b.executeObsidian(async ({ app }: any, pid: string) => {
+		const ip = (app as any).internalPlugins;
+		const plugin = ip.getPluginById ? ip.getPluginById(pid) : ip.plugins?.[pid];
+		if (!plugin) return false;
+		if (!plugin.enabled) {
+			try {
+				if (ip.enablePluginAndSave) await ip.enablePluginAndSave(pid);
+				else if (plugin.enable) await plugin.enable();
+			} catch {
+				return false;
+			}
+		}
+		return !!plugin.enabled;
+	}, id);
+}
+
+/** Open a file in its native view (canvas/base) in a new active leaf. */
+export async function openFileInLeaf(b: any, path: string): Promise<void> {
+	await b.executeObsidian(async ({ app }: any, p: string) => {
+		const f = app.vault.getAbstractFileByPath(p);
+		const leaf = app.workspace.getLeaf(true);
+		await leaf.openFile(f, { active: true });
+		app.workspace.setActiveLeaf(leaf, { focus: true });
+	}, path);
+}
+
+/** Force the plugin to (re)bind live canvas/base views to their documents. */
+export async function bindOpenStructured(b: any): Promise<void> {
+	await b.executeObsidian(async ({ app }: any) => {
+		const vs = (app as any).plugins.plugins.realtime.vaultSync;
+		vs?.bindOpenCanvases?.();
+		vs?.bindOpenBases?.();
+	});
+}
+
+/** Detach all leaves of a given view type (e.g. "canvas", "bases"). */
+export async function detachLeaves(b: any, viewType: string): Promise<void> {
+	await b.executeObsidian(async ({ app }: any, vt: string) => {
+		app.workspace.detachLeavesOfType(vt);
+	}, viewType);
+}
+
+/** Read the live canvas view's data object for an open canvas, or null. */
+export async function canvasViewData(b: any, path: string): Promise<any | null> {
+	return b.executeObsidian(async ({ app }: any, p: string) => {
+		let result: any = null;
+		app.workspace.iterateAllLeaves((leaf: any) => {
+			const v = leaf?.view;
+			if (v?.getViewType?.() === "canvas" && v?.file?.path === p && v.canvas?.getData) {
+				result = v.canvas.getData();
+			}
+		});
+		return result;
+	}, path);
+}
+
+/** Apply data to the live canvas view and save it — simulates a user edit. */
+export async function editCanvasView(b: any, path: string, data: any): Promise<void> {
+	await b.executeObsidian(async ({ app }: any, p: string, d: any) => {
+		let done = false;
+		app.workspace.iterateAllLeaves((leaf: any) => {
+			const v = leaf?.view;
+			if (!done && v?.getViewType?.() === "canvas" && v?.file?.path === p && v.canvas?.importData) {
+				v.canvas.importData(d);
+				v.canvas.requestSave();
+				done = true;
+			}
+		});
+		if (!done) throw new Error("no open canvas view for " + p);
+	}, path, data);
+}
+
+/** Read the live base view's serialized data (YAML) for an open base, or null. */
+export async function baseViewData(b: any, path: string): Promise<string | null> {
+	return b.executeObsidian(async ({ app }: any, p: string) => {
+		let result: string | null = null;
+		app.workspace.iterateAllLeaves((leaf: any) => {
+			const v = leaf?.view;
+			if (v?.getViewType?.() === "bases" && v?.file?.path === p && typeof v.getViewData === "function") {
+				result = v.getViewData();
+			}
+		});
+		return result;
+	}, path);
+}
+
+/** Load YAML into the live base view and save it — simulates a user config edit. */
+export async function editBaseView(b: any, path: string, yaml: string): Promise<void> {
+	await b.executeObsidian(async ({ app }: any, p: string, y: string) => {
+		let done = false;
+		app.workspace.iterateAllLeaves((leaf: any) => {
+			const v = leaf?.view;
+			if (!done && v?.getViewType?.() === "bases" && v?.file?.path === p && typeof v.setViewData === "function") {
+				v.setViewData(y, false);
+				v.requestSave();
+				done = true;
+			}
+		});
+		if (!done) throw new Error("no open base view for " + p);
+	}, path, yaml);
+}
+
 export async function readNote(b: any, path: string): Promise<string | null> {
 	return b.executeObsidian(
 		async ({ app }: any, p: string) => {
@@ -209,8 +324,8 @@ export async function listMarkdown(b: any): Promise<string[]> {
 
 export async function setPluginEnabled(b: any, enabled: boolean): Promise<void> {
 	await b.executeObsidian(async ({ app }: any, on: boolean) => {
-		if (on) await app.plugins.enablePlugin("instasync");
-		else await app.plugins.disablePlugin("instasync");
+		if (on) await app.plugins.enablePlugin("realtime");
+		else await app.plugins.disablePlugin("realtime");
 	}, enabled);
 }
 
@@ -268,11 +383,11 @@ export async function setNetworkOffline(b: any, offline: boolean): Promise<void>
 	}, offline);
 }
 
-/** Reads the InstaSync status-bar text from the renderer. */
+/** Reads the Realtime status-bar text from the renderer. */
 export async function statusText(b: any): Promise<string> {
 	return b.executeObsidian(() => {
 		const el = Array.from(document.querySelectorAll(".status-bar-item")).find((e) =>
-			(e.textContent ?? "").includes("InstaSync"),
+			(e.textContent ?? "").includes("Sync:"),
 		);
 		return el?.textContent ?? "";
 	});
