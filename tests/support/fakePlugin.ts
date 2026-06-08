@@ -106,6 +106,7 @@ export interface FakePlugin {
 		sessionToken: string;
 		userDisplayName: string;
 		userEmail: string;
+		userId: string;
 		activeVaultId: string;
 		clientName: string;
 		clientColor: string;
@@ -141,6 +142,7 @@ export function makeFakePlugin(
 			sessionToken: opts.sessionToken,
 			userDisplayName: "",
 			userEmail: "",
+			userId: "",
 			activeVaultId: opts.activeVaultId,
 			clientName: opts.clientName ?? "Test Client",
 			clientColor: "#ffffff",

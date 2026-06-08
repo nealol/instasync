@@ -523,7 +523,7 @@ pub(crate) async fn note_permalink_inner(
     vault_id: &str,
     path: &str,
 ) -> AppResult<PermalinkResponse> {
-    let file = require_note_access(state, principal, vault_id, path, false).await?;
+    let file = require_file_access(state, principal, vault_id, path, false).await?;
     Ok(PermalinkResponse {
         kind: "id".into(),
         url: permalink_for_guid(state, &file.guid),
@@ -748,6 +748,32 @@ async fn require_note_access(
     Ok(file)
 }
 
+async fn require_file_access(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+    path: &str,
+    write: bool,
+) -> AppResult<vault_files::Model> {
+    principal.require_vault(vault_id)?;
+    require_member(state, &principal.user.id, vault_id).await?;
+    validate_vault_file_path(path)?;
+    let file = file_by_path(state, vault_id, path)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let level = authorize_doc(
+        state,
+        &principal.user,
+        vault_id,
+        &doc_id(vault_id, &file.guid),
+    )
+    .await?;
+    if write && level == Level::ReadOnly {
+        return Err(AppError::Forbidden);
+    }
+    Ok(file)
+}
+
 async fn file_by_path(
     state: &AppState,
     vault_id: &str,
@@ -761,7 +787,15 @@ async fn file_by_path(
 }
 
 fn validate_note_path(path: &str) -> AppResult<()> {
-    if path.is_empty() || path.contains('\\') || !path.ends_with(".md") {
+    validate_vault_file_path(path)?;
+    if !path.ends_with(".md") {
+        return Err(AppError::BadRequest("invalid note path".into()));
+    }
+    Ok(())
+}
+
+fn validate_vault_file_path(path: &str) -> AppResult<()> {
+    if path.is_empty() || path.contains('\\') {
         return Err(AppError::BadRequest("invalid note path".into()));
     }
     for component in path.split('/') {
@@ -881,6 +915,21 @@ mod tests {
             .iter()
             .map(|(id, guid, path)| (id.to_string(), guid.to_string(), path.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn vault_file_paths_allow_non_markdown_files() {
+        assert!(validate_vault_file_path("attachments/image.png").is_ok());
+        assert!(validate_vault_file_path("dir/data.json").is_ok());
+        assert!(validate_note_path("attachments/image.png").is_err());
+    }
+
+    #[test]
+    fn vault_file_paths_reject_unsafe_paths() {
+        assert!(validate_vault_file_path("").is_err());
+        assert!(validate_vault_file_path("../secret.png").is_err());
+        assert!(validate_vault_file_path("dir//file.png").is_err());
+        assert!(validate_vault_file_path("dir\\file.png").is_err());
     }
 
     #[test]

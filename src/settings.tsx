@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type RealtimePlugin from './main'
-import { normalizeServerUrl, type MemberInfo, type RemoteCursorInfo, type VaultInfo } from './auth'
+import { normalizeServerUrl, type KnownSession, type MemberInfo, type RemoteCursorInfo, type VaultInfo } from './auth'
 import { PLUGIN_NAME } from './brand'
 import { generateClientIdentity } from './names'
 
@@ -23,6 +23,7 @@ export interface RealtimeSettings {
      */
     pendingSetupServerUrl: string;
     /** Identity from /api/me, cached for status + awareness defaults. */
+    userId: string;
     userDisplayName: string;
     userEmail: string;
     /** The server vault UUID currently synced into this local vault; "" if none. */
@@ -59,6 +60,7 @@ export function defaultSettings(): RealtimeSettings {
         authServerUrl: 'http://127.0.0.1:8081',
         authServerId: '',
         pendingSetupServerUrl: '',
+        userId: '',
         userDisplayName: '',
         userEmail: '',
         activeVaultId: '',
@@ -112,9 +114,27 @@ function SetupView({ app, plugin, refresh }: { app: App; plugin: RealtimePlugin;
     const [serverUrl, setServerUrl] = useState(plugin.settings.authServerUrl)
     const [busy, setBusy] = useState(false)
     const [error, setError] = useState('')
+    const [sessions, setSessions] = useState<KnownSession[]>([])
     // Reveal the paste-code fallback shortly after SSO starts, in case the deep
     // link back into Obsidian doesn't fire.
     const showPaste = useDelayedFlag(busy, 2000)
+
+    useEffect(() => {
+        let cancelled = false
+        setSessions([])
+        if (step !== 'server' || busy) return
+        const timeout = window.setTimeout(() => {
+            void plugin.auth.validSessionsForServer(serverUrl).then((result) => {
+                if (!cancelled) setSessions(result)
+            }).catch(() => {
+                if (!cancelled) setSessions([])
+            })
+        }, 250)
+        return () => {
+            cancelled = true
+            window.clearTimeout(timeout)
+        }
+    }, [busy, plugin, serverUrl, step])
 
     return (
         <div className="realtime-setup-wrap">
@@ -147,6 +167,20 @@ function SetupView({ app, plugin, refresh }: { app: App; plugin: RealtimePlugin;
                         <SsoPasteFallback plugin={plugin} visible={showPaste}/>
                         <button className="mod-cta realtime-wide-button" type="submit"
                                 disabled={busy}>{busy ? 'Waiting for SSO...' : 'Log in with SSO'}</button>
+                        {sessions.map((session) => <button key={session.tokenKey} className="realtime-wide-button" type="button"
+                                disabled={busy} onClick={() => void (async () => {
+                                    setBusy(true)
+                                    setError('')
+                                    try {
+                                        await plugin.auth.useKnownSession(session)
+                                        await plugin.onLoggedIn()
+                                        setStep('choose')
+                                    } catch (e) {
+                                        setError((e as Error).message)
+                                    } finally {
+                                        setBusy(false)
+                                    }
+                                })()}>Log in as {session.displayName || session.email}</button>)}
                     </form>
                 ) : null}
                 {step === 'choose' ?

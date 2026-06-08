@@ -9,6 +9,12 @@ export interface MeResponse {
 	displayName: string;
 }
 
+export interface KnownSession extends MeResponse {
+	serverUrl: string;
+	serverId: string;
+	tokenKey: string;
+}
+
 /** Server identity returned by the public `GET /api/server-info`. */
 export interface ServerInfoResponse {
 	serverId: string;
@@ -88,18 +94,21 @@ export class AuthClient {
 	 * hold tokens for multiple servers at once. Falls back to the legacy global
 	 * key when the server id isn't known yet (pre-migration installs).
 	 */
-	private tokenKey(): string {
+	private tokenKey(userId = this.plugin.settings.userId): string {
 		const serverId = this.plugin.settings.authServerId;
 		if (!serverId) return LEGACY_TOKEN_KEY;
-		return sessionTokenKey(this.plugin.settings.authServerUrl, serverId);
+		if (!userId) return serverSessionTokenKey(this.plugin.settings.authServerUrl, serverId);
+		return sessionTokenKey(this.plugin.settings.authServerUrl, serverId, userId);
 	}
 
 	private getToken(): string {
-		return this.plugin.app.secretStorage.getSecret(this.tokenKey()) ?? '';
+		return this.plugin.app.secretStorage.getSecret(this.tokenKey())
+			?? this.plugin.app.secretStorage.getSecret(this.tokenKey(""))
+			?? '';
 	}
 
-	private setToken(value: string): void {
-		this.plugin.app.secretStorage.setSecret(this.tokenKey(), value);
+	private setToken(value: string, userId = this.plugin.settings.userId): void {
+		this.plugin.app.secretStorage.setSecret(this.tokenKey(userId), value);
 	}
 
 	private deleteToken(): void {
@@ -131,16 +140,23 @@ export class AuthClient {
 		if (this.plugin.settings.authServerId) return this.plugin.settings.authServerId;
 		const { serverId } = await this.serverInfo(this.baseUrl);
 		this.plugin.settings.authServerId = serverId;
-		this.migrateLegacyToken();
+		await this.migrateLegacyToken();
 		await this.plugin.saveSettings();
 		return serverId;
 	}
 
 	/** Move a token from the legacy global key to this server's namespaced key. */
-	private migrateLegacyToken(): void {
+	private async migrateLegacyToken(): Promise<void> {
 		const legacy = this.plugin.app.secretStorage.getSecret(LEGACY_TOKEN_KEY);
 		if (!legacy) return;
-		this.plugin.app.secretStorage.setSecret(this.tokenKey(), legacy);
+		let me: MeResponse | null = null;
+		try {
+			me = await this.apiAt<MeResponse>(this.baseUrl, "/api/me", legacy);
+		} catch {
+			// Keep the old per-server migration path if the token can't be validated.
+		}
+		this.plugin.app.secretStorage.setSecret(me ? this.tokenKey(me.userId) : this.tokenKey(""), legacy);
+		if (me) this.rememberSession(me, this.tokenKey(me.userId));
 		// SecretStorage has no delete; clear the legacy key by storing empty.
 		this.plugin.app.secretStorage.setSecret(LEGACY_TOKEN_KEY, "");
 	}
@@ -202,7 +218,9 @@ export class AuthClient {
 	}
 
 	private async applySession(token: string, me: MeResponse): Promise<void> {
-		this.setToken(token);
+		this.plugin.settings.userId = me.userId;
+		this.setToken(token, me.userId);
+		this.rememberSession(me, this.tokenKey(me.userId));
 		this.plugin.settings.userDisplayName = me.displayName;
 		this.plugin.settings.userEmail = me.email;
 		// Default the cursor name to the SSO display name on first login.
@@ -214,6 +232,7 @@ export class AuthClient {
 
 	private async clearSession(): Promise<void> {
 		this.deleteToken();
+		this.plugin.settings.userId = "";
 		this.plugin.settings.userDisplayName = "";
 		this.plugin.settings.userEmail = "";
 		await this.plugin.saveSettings();
@@ -261,6 +280,50 @@ export class AuthClient {
 		const normalized = normalizeServerUrl(baseUrl);
 		const { token, me } = await this.authenticateAt(normalized);
 		await this.setSessionForServer(normalized, token, me);
+		return me;
+	}
+
+	async validSessionsForServer(baseUrl: string): Promise<KnownSession[]> {
+		const normalized = normalizeServerUrl(baseUrl);
+		const { serverId } = await this.serverInfo(normalized);
+		let sessions = this.knownSessions().filter((session) => {
+			return session.serverUrl === normalized && session.serverId === serverId
+				&& !!this.plugin.app.secretStorage.getSecret(session.tokenKey);
+		});
+		const oldServerKey = serverSessionTokenKey(normalized, serverId);
+		if (this.plugin.app.secretStorage.getSecret(oldServerKey) && !sessions.some((session) => session.tokenKey === oldServerKey)) {
+			sessions = [...sessions, {
+				serverUrl: normalized,
+				serverId,
+				userId: "",
+				email: "",
+				displayName: "",
+				tokenKey: oldServerKey,
+			}];
+		}
+		const valid: KnownSession[] = [];
+		for (const session of sessions) {
+			const token = this.plugin.app.secretStorage.getSecret(session.tokenKey);
+			if (!token) continue;
+			try {
+				const me = await this.apiAt<MeResponse>(normalized, "/api/me", token);
+				const updated = { ...session, ...me, serverUrl: normalized, serverId, tokenKey: session.tokenKey };
+				valid.push(updated);
+				this.rememberSession(updated, session.tokenKey);
+			} catch {
+				this.forgetSession(session.tokenKey);
+			}
+		}
+		return valid;
+	}
+
+	async useKnownSession(session: KnownSession): Promise<MeResponse> {
+		const token = this.plugin.app.secretStorage.getSecret(session.tokenKey);
+		if (!token) throw new AuthError("Saved session not found. Please sign in again.");
+		this.plugin.settings.authServerUrl = session.serverUrl;
+		this.plugin.settings.authServerId = session.serverId;
+		const me = await this.apiAt<MeResponse>(session.serverUrl, "/api/me", token);
+		await this.applySession(token, me);
 		return me;
 	}
 
@@ -352,6 +415,52 @@ export class AuthClient {
 		} else {
 			// No awaiting promise (e.g. app restarted between open and callback).
 			return this.setSession(token);
+		}
+	}
+
+	private rememberSession(me: MeResponse, tokenKey: string): void {
+		const session: KnownSession = {
+			serverUrl: this.baseUrl,
+			serverId: this.plugin.settings.authServerId,
+			userId: me.userId,
+			email: me.email,
+			displayName: me.displayName,
+			tokenKey,
+		};
+		this.saveKnownSessions([
+			session,
+			...this.knownSessions().filter((existing) => existing.tokenKey !== tokenKey),
+		]);
+	}
+
+	private forgetSession(tokenKey: string): void {
+		this.saveKnownSessions(this.knownSessions().filter((session) => session.tokenKey !== tokenKey));
+	}
+
+	private knownSessions(): KnownSession[] {
+		try {
+			const raw = window.localStorage.getItem(KNOWN_SESSIONS_KEY);
+			const parsed = raw ? JSON.parse(raw) : [];
+			if (!Array.isArray(parsed)) return [];
+			return parsed.filter((session): session is KnownSession => {
+				return !!session && typeof session === "object"
+					&& typeof session.serverUrl === "string"
+					&& typeof session.serverId === "string"
+					&& typeof session.userId === "string"
+					&& typeof session.email === "string"
+					&& typeof session.displayName === "string"
+					&& typeof session.tokenKey === "string";
+			});
+		} catch {
+			return [];
+		}
+	}
+
+	private saveKnownSessions(sessions: KnownSession[]): void {
+		try {
+			window.localStorage.setItem(KNOWN_SESSIONS_KEY, JSON.stringify(sessions));
+		} catch {
+			// Token discovery is an enhancement; auth still works without the index.
 		}
 	}
 
@@ -560,6 +669,7 @@ function blobErrorMessage(res: { status: number; text?: string }): string {
 
 /** Legacy, un-namespaced SecretStorage key (single global session token). */
 const LEGACY_TOKEN_KEY = "realtime-session-token";
+const KNOWN_SESSIONS_KEY = "realtime-known-sessions";
 
 /**
  * SecretStorage key for a server's session token, namespaced by the server's
@@ -571,10 +681,17 @@ const LEGACY_TOKEN_KEY = "realtime-session-token";
  * dashes and 64 characters max. Keep a readable server-id slug, then append a
  * hash so long/truncated ids and different URLs remain distinct.
  */
-function sessionTokenKey(serverUrl: string, serverId: string): string {
+function serverSessionTokenKey(serverUrl: string, serverId: string): string {
 	const hash = shortHash(`${normalizeServerUrl(serverUrl)}\n${serverId}`);
 	const slug = serverId.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32);
 	return `${LEGACY_TOKEN_KEY}-${slug || "server"}-${hash}`;
+}
+
+function sessionTokenKey(serverUrl: string, serverId: string, userId: string): string {
+	const hash = shortHash(`${normalizeServerUrl(serverUrl)}\n${serverId}\n${userId}`);
+	const serverSlug = serverId.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 20);
+	const userSlug = userId.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 16);
+	return `${LEGACY_TOKEN_KEY}-${serverSlug || "server"}-${userSlug || "user"}-${hash}`;
 }
 
 function shortHash(value: string): string {

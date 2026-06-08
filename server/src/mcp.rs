@@ -669,7 +669,16 @@ impl InstaMcp {
         Parameters(args): Parameters<SearchArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let c = ctx(&context)?;
-        tool_result(search::search_notes_inner(&c.state, &c.principal, &c.vault_id, &args.query, args.limit).await)
+        tool_result(
+            search::search_notes_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.query,
+                args.limit,
+            )
+            .await,
+        )
     }
 
     #[tool(description = "List tags")]
@@ -688,7 +697,9 @@ impl InstaMcp {
         Parameters(args): Parameters<BacklinksArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let c = ctx(&context)?;
-        tool_result(search::list_backlinks_inner(&c.state, &c.principal, &c.vault_id, &args.path).await)
+        tool_result(
+            search::list_backlinks_inner(&c.state, &c.principal, &c.vault_id, &args.path).await,
+        )
     }
 
     #[tool(description = "Backfill note ids")]

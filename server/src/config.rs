@@ -96,8 +96,7 @@ impl Config {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(5000),
             git_bot_name: opt("GIT_BOT_NAME").unwrap_or_else(|| SERVER_NAME.to_string()),
-            git_bot_email: opt("GIT_BOT_EMAIL")
-                .unwrap_or_else(|| SERVER_BOT_EMAIL.to_string()),
+            git_bot_email: opt("GIT_BOT_EMAIL").unwrap_or_else(|| SERVER_BOT_EMAIL.to_string()),
             cursor_email_domain: opt("CURSOR_EMAIL_DOMAIN").unwrap_or_else(|| {
                 opt("GIT_BOT_EMAIL")
                     .and_then(|email| email.split_once('@').map(|(_, domain)| domain.to_string()))

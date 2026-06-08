@@ -426,6 +426,7 @@ function sanitizeSettings(raw: unknown): RealtimeSettings {
 	settings.pendingSetupServerUrl = data.pendingSetupServerUrl
 		? sanitizeUrl(data.pendingSetupServerUrl, "")
 		: "";
+	settings.userId = typeof data.userId === "string" ? data.userId : "";
 	settings.userDisplayName = typeof data.userDisplayName === "string" ? data.userDisplayName : "";
 	settings.userEmail = typeof data.userEmail === "string" ? data.userEmail : "";
 	settings.activeVaultId = typeof data.activeVaultId === "string" ? data.activeVaultId.trim() : "";

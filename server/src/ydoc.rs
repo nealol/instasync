@@ -375,8 +375,12 @@ pub fn decode_structured_index(update: &[u8]) -> Result<Vec<StructuredIndexEntry
     if let Any::Map(entries) = map.to_json(&txn) {
         for (path, value) in entries.iter() {
             let Any::Map(meta) = value else { continue };
-            let Some(Any::String(guid)) = meta.get("guid") else { continue };
-            let Some(Any::String(kind)) = meta.get("kind") else { continue };
+            let Some(Any::String(guid)) = meta.get("guid") else {
+                continue;
+            };
+            let Some(Any::String(kind)) = meta.get("kind") else {
+                continue;
+            };
             out.push(StructuredIndexEntry {
                 path: path.clone(),
                 guid: guid.to_string(),
@@ -443,10 +447,16 @@ fn any_to_json(value: &Any) -> JsonValue {
     match value {
         Any::Null | Any::Undefined => JsonValue::Null,
         Any::Bool(v) => JsonValue::Bool(*v),
-        Any::Number(v) => JsonNumber::from_f64(*v).map(JsonValue::Number).unwrap_or(JsonValue::Null),
+        Any::Number(v) => JsonNumber::from_f64(*v)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
         Any::BigInt(v) => JsonValue::Number(JsonNumber::from(*v)),
         Any::String(v) => JsonValue::String(v.to_string()),
-        Any::Buffer(v) => JsonValue::Array(v.iter().map(|b| JsonValue::Number(JsonNumber::from(*b))).collect()),
+        Any::Buffer(v) => JsonValue::Array(
+            v.iter()
+                .map(|b| JsonValue::Number(JsonNumber::from(*b)))
+                .collect(),
+        ),
         Any::Array(values) => JsonValue::Array(values.iter().map(any_to_json).collect()),
         Any::Map(entries) => {
             let mut out = JsonMap::new();

@@ -854,9 +854,7 @@ fn sign_payload<T: Serialize>(state: &AppState, payload: &T) -> AppResult<String
 }
 
 fn verify_payload<T: DeserializeOwned>(state: &AppState, token: &str) -> AppResult<T> {
-    let (payload, sig) = token
-        .split_once('.')
-        .ok_or(AppError::Unauthorized)?;
+    let (payload, sig) = token.split_once('.').ok_or(AppError::Unauthorized)?;
     let expected = sign_bytes(state, payload.as_bytes())?;
     if !constant_time_eq(expected.as_bytes(), sig.as_bytes()) {
         return Err(AppError::Unauthorized);

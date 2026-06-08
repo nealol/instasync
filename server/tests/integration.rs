@@ -242,11 +242,7 @@ async fn fake_attachment_source() -> String {
 /// Build a git-enabled `AppState` plus its repo dir and a synthetic vault id.
 async fn git_state(
     ysweet_url: &str,
-) -> (
-    realtime_server::state::AppState,
-    std::path::PathBuf,
-    String,
-) {
+) -> (realtime_server::state::AppState, std::path::PathBuf, String) {
     let mut db_path = std::env::temp_dir();
     db_path.push(format!("realtime-test-{}.db", uuid::Uuid::new_v4()));
     let mut git_dir = std::env::temp_dir();

@@ -431,7 +431,10 @@ fn safe_rel_path(path: &str) -> Result<PathBuf> {
 
 fn serialize_structured_for_git(kind: &str, value: JsonValue) -> Result<String> {
     match kind {
-        "canvas" => Ok(format!("{}\n", serde_json::to_string_pretty(&canvas_to_file_json(value))?)),
+        "canvas" => Ok(format!(
+            "{}\n",
+            serde_json::to_string_pretty(&canvas_to_file_json(value))?
+        )),
         "base" => Ok(serde_yaml::to_string(&value)?),
         other => bail!("unknown structured document kind {other}"),
     }
@@ -455,7 +458,9 @@ fn ordered_canvas_items(
     items: Option<&serde_json::Map<String, JsonValue>>,
     order: Option<&Vec<JsonValue>>,
 ) -> Vec<JsonValue> {
-    let Some(items) = items else { return Vec::new() };
+    let Some(items) = items else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     if let Some(order) = order {
@@ -612,7 +617,9 @@ mod tests {
 
     #[test]
     fn serializes_structured_base_for_git() {
-        let serialized = serialize_structured_for_git("base", json!({ "views": [{ "type": "table" }] })).unwrap();
+        let serialized =
+            serialize_structured_for_git("base", json!({ "views": [{ "type": "table" }] }))
+                .unwrap();
         assert!(serialized.contains("views:"));
         assert!(serialized.contains("type: table"));
     }
