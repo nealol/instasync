@@ -12,7 +12,7 @@ import { liveEdit } from "./editor/LiveEdit";
 import { yRemoteSelections, yRemoteSelectionsTheme } from "./editor/RemoteSelections";
 import { setDiagnosticLoggingEnabled } from "./debug";
 import { purgePersistedVaultState } from "./pluginDb/purge";
-import type { OpenSyncedDatabaseOptions, SyncedDatabase } from "./pluginDb/types";
+import type { DeleteSyncedDatabaseOptions, OpenSyncedDatabaseOptions, SyncedDatabase } from "./pluginDb/types";
 import { configureCrsqliteWasmFallback } from "./pluginDb/crsqlite";
 
 type ConnectionStatus = "offline" | "connecting" | "connected" | "error" | "signin";
@@ -34,8 +34,13 @@ export default class RealtimePlugin extends Plugin {
 	private status: ConnectionStatus = "offline";
 	/** Attachment upload activity; overrides the "live" label when connected. */
 	private uploadStatus: UploadStatus = "idle";
+	private layoutReadyPromise: Promise<void> | null = null;
+	private syncStartPromise: Promise<void> | null = null;
 
 	async onload(): Promise<void> {
+		this.layoutReadyPromise = new Promise((resolve) => {
+			this.app.workspace.onLayoutReady(resolve);
+		});
 		await this.loadSettings();
 		const pluginDir = this.manifest.dir;
 		const adapter = this.app.vault.adapter as { getFullPath?: (path: string) => string };
@@ -112,8 +117,9 @@ export default class RealtimePlugin extends Plugin {
 			}),
 		);
 
-		// Wait for the vault to finish loading before scanning files.
-		this.app.workspace.onLayoutReady(() => void this.maybeStartSync());
+		// Wait for the vault to finish loading before scanning files. Public APIs
+		// also await this so dependent plugins can call us during their onload().
+		void this.layoutReadyPromise.then(() => this.ensureSyncStarted());
 	}
 
 	onunload(): void {
@@ -127,6 +133,7 @@ export default class RealtimePlugin extends Plugin {
 
 	/** Start syncing only when enabled, signed in, and bound to a vault. */
 	private async maybeStartSync(): Promise<void> {
+		if (!this.settings || !this.auth) return;
 		if (!this.settings.enabled) {
 			this.setStatus("offline");
 			return;
@@ -156,6 +163,16 @@ export default class RealtimePlugin extends Plugin {
 		this.startSync();
 	}
 
+	private ensureSyncStarted(): Promise<void> {
+		if (this.vaultSync) return Promise.resolve();
+		if (!this.syncStartPromise) {
+			this.syncStartPromise = this.maybeStartSync().finally(() => {
+				this.syncStartPromise = null;
+			});
+		}
+		return this.syncStartPromise;
+	}
+
 	private startSync(): void {
 		if (this.vaultSync) return;
 		if (!this.settings.activeVaultId) {
@@ -180,9 +197,22 @@ export default class RealtimePlugin extends Plugin {
 		await this.maybeStartSync();
 	}
 
-	openSyncedDatabase(options: OpenSyncedDatabaseOptions): Promise<SyncedDatabase> {
-		if (!this.vaultSync) throw new Error("Realtime sync is not running");
+	async openSyncedDatabase(options: OpenSyncedDatabaseOptions): Promise<SyncedDatabase> {
+		if (!this.vaultSync) {
+			await (this.layoutReadyPromise ?? Promise.resolve());
+			await this.ensureSyncStarted();
+		}
+		if (!this.vaultSync) throw new Error("Realtime sync is not running. Make sure Realtime is enabled, signed in, and bound to this vault.");
 		return this.vaultSync.openSyncedDatabase(options);
+	}
+
+	async deleteSyncedDatabase(options: DeleteSyncedDatabaseOptions): Promise<void> {
+		if (!this.vaultSync) {
+			await (this.layoutReadyPromise ?? Promise.resolve());
+			await this.ensureSyncStarted();
+		}
+		if (!this.vaultSync) throw new Error("Realtime sync is not running. Make sure Realtime is enabled, signed in, and bound to this vault.");
+		await this.vaultSync.deleteSyncedDatabase(options);
 	}
 
 	// --- Auth / onboarding -----------------------------------------------------

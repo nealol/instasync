@@ -136,7 +136,27 @@ const db = await realtime.openSyncedDatabase({
 await db.exec("INSERT INTO tasks(id, title, done) VALUES (?, ?, ?)", ["t1", "Ship", 0]);
 ```
 
-`pluginId` and `name` may contain only ASCII letters, numbers, dash, and underscore. The API is available only when Realtime sync is enabled, signed in, bound to a vault, and running.
+`pluginId` and `name` may contain only ASCII letters, numbers, dash, and underscore. API calls wait for Realtime startup, then require Realtime sync to be enabled, signed in, bound to a vault, and running.
+
+Close a handle when your plugin unloads:
+
+```ts
+async onunload() {
+	await this.db?.close();
+	this.db = null;
+}
+```
+
+To delete the entire synced database for your plugin, call `deleteSyncedDatabase` with the same `pluginId` and `name`:
+
+```ts
+await realtime.deleteSyncedDatabase({
+	pluginId: "my-plugin",
+	name: "main",
+});
+```
+
+Deletion closes any open local handle, removes the local checkpoint, clears the synced Yjs database state, unregisters the server-side plugin DB pseudo-file, and writes a backend tombstone so other clients do not resurrect old batches. Y-Sweet does not currently expose physical document deletion, so the backend document is cleared/tombstoned rather than removed from storage.
 
 ## Development
 

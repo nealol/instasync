@@ -572,6 +572,14 @@ export class AuthClient {
 		}
 	}
 
+	async deletePluginDatabase(vaultId: string, pluginId: string, name: string): Promise<void> {
+		const safePluginId = encodeURIComponent(pluginId);
+		const safeName = encodeURIComponent(name);
+		await this.api(`/api/vaults/${vaultId}/plugin-dbs/${safePluginId}/${safeName}`, {
+			method: "DELETE",
+		});
+	}
+
 	/** Mint a y-sweet client token for a (namespaced) doc id in the active vault. */
 	docToken(vaultId: string, docId: string): Promise<ClientToken> {
 		return this.api<ClientToken>("/api/doc-token", {

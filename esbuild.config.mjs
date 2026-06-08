@@ -12,6 +12,14 @@ Realtime - collaborative editing for Obsidian.
 const prod = process.argv[2] === "production";
 const watch = process.argv[2] === "watch";
 
+function copyCrsqliteWasm() {
+  const wasmSrc = "node_modules/@vlcn.io/crsqlite-wasm/dist/crsqlite.wasm";
+  if (!existsSync(wasmSrc)) {
+    throw new Error(`Missing cr-sqlite WASM asset: ${wasmSrc}`);
+  }
+  copyFileSync(wasmSrc, "crsqlite.wasm");
+}
+
 const context = await esbuild.context({
   banner: { js: banner },
   entryPoints: ["src/main.ts"],
@@ -42,13 +50,10 @@ const context = await esbuild.context({
 });
 
 if (watch) {
+  copyCrsqliteWasm();
   await context.watch();
 } else {
   await context.rebuild();
-  const wasmSrc = "node_modules/@vlcn.io/crsqlite-wasm/dist/crsqlite.wasm";
-  if (!existsSync(wasmSrc)) {
-    throw new Error(`Missing cr-sqlite WASM asset: ${wasmSrc}`);
-  }
-  copyFileSync(wasmSrc, "crsqlite.wasm");
+  copyCrsqliteWasm();
   process.exit(0);
 }

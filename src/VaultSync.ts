@@ -19,7 +19,7 @@ import { BinarySync } from "./BinarySync";
 import { ConfigSync } from "./ConfigSync";
 import { matchesAnyGlob, parseGlobs } from "./glob";
 import { PluginDbSync } from "./pluginDb/PluginDbSync";
-import type { OpenSyncedDatabaseOptions, SyncedDatabase } from "./pluginDb/types";
+import type { DeleteSyncedDatabaseOptions, OpenSyncedDatabaseOptions, SyncedDatabase } from "./pluginDb/types";
 
 type FileKind = "text" | "structured" | "binary" | "ignore";
 type StructuredKind = "canvas" | "base";
@@ -160,6 +160,10 @@ export class VaultSync {
 
 	openSyncedDatabase(options: OpenSyncedDatabaseOptions): Promise<SyncedDatabase> {
 		return this.pluginDbSync.open(options);
+	}
+
+	deleteSyncedDatabase(options: DeleteSyncedDatabaseOptions): Promise<void> {
+		return this.pluginDbSync.delete(options);
 	}
 
 	pathForGuid(guid: string): string | null {

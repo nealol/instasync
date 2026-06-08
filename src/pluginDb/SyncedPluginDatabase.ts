@@ -4,10 +4,17 @@ import { EVENT_CONNECTION_STATUS, STATUS_CONNECTED, STATUS_ERROR, STATUS_OFFLINE
 import type RealtimePlugin from "../main";
 import { getClientToken } from "../ysweet";
 import { decodeSqlValue, encodeSqlValue, openCrsqliteDatabase } from "./crsqlite";
-import type { CrSqliteChangeRow, OpenSyncedDatabaseOptions, PluginDbChangeBatch, SqlDatabaseAdapter, SyncedDatabase, SyncedDatabaseStatus, SyncedPluginDatabaseDeps } from "./types";
+import type { CrSqliteChangeRow, EncodedSqlValue, OpenSyncedDatabaseOptions, PluginDbChangeBatch, PluginDbCheckpointStore, SqlDatabaseAdapter, SyncedDatabase, SyncedDatabaseStatus, SyncedPluginDatabaseDeps } from "./types";
 
 const RETAIN_BATCHES = 1000;
 const RETAIN_MS = 7 * 24 * 60 * 60 * 1000;
+const CHECKPOINT_FORMAT = 1;
+
+interface PluginDbCheckpoint {
+	format: number;
+	cursors: Record<string, number>;
+	tables: Array<{ name: string; columns: string[]; rows: EncodedSqlValue[][] }>;
+}
 
 export class SyncedPluginDatabase implements SyncedDatabase {
 	readonly ydoc: Y.Doc;
@@ -27,6 +34,8 @@ export class SyncedPluginDatabase implements SyncedDatabase {
 	private observer: () => void;
 	private statusListener: (status: string) => void;
 	private initPromise: Promise<void>;
+	private readonly checkpointStore: PluginDbCheckpointStore | undefined;
+	private checkpointCursors: Record<string, number> = {};
 
 	constructor(
 		private readonly plugin: RealtimePlugin,
@@ -35,6 +44,7 @@ export class SyncedPluginDatabase implements SyncedDatabase {
 		private readonly options: OpenSyncedDatabaseOptions,
 		deps: SyncedPluginDatabaseDeps = {},
 	) {
+		this.checkpointStore = deps.checkpointStore ?? makeAdapterCheckpointStore(plugin);
 		const made = deps.makeDoc?.(serverDocId);
 		this.ydoc = made?.ydoc ?? new Y.Doc();
 		this.persistence = made ? made.persistence : new IndexeddbPersistence(serverDocId, this.ydoc);
@@ -98,17 +108,36 @@ export class SyncedPluginDatabase implements SyncedDatabase {
 		await this.db?.close?.();
 	}
 
+	async deleteDatabase(): Promise<void> {
+		await this.whenReady();
+		if (this.publishTimer !== null) {
+			window.clearTimeout(this.publishTimer);
+			this.publishTimer = null;
+		}
+		this.ydoc.transact(() => {
+			if (this.batches.length) this.batches.delete(0, this.batches.length);
+			for (const key of Array.from(this.cursors.keys())) this.cursors.delete(key);
+			for (const key of Array.from(this.meta.keys())) this.meta.delete(key);
+			this.meta.set("format", 1);
+			this.meta.set("deletedAt", Date.now());
+		});
+		await this.deleteCheckpoint();
+		await this.close();
+	}
+
 	private async init(open: (name: string) => Promise<SqlDatabaseAdapter>): Promise<void> {
 		try {
 			await this.persistence?.whenSynced;
 			if (this.destroyed) return;
 			this.db = await open(this.localName);
 			await this.options.schema?.(this.schemaFacade());
+			await this.restoreCheckpoint();
 			this.localSiteId = await this.readSiteId();
 			this.lastPublishedDbVersion = await this.readPublishedCursor();
 			await this.applyRemoteBatches();
 			this.provider?.connect?.();
 			await this.publishLocalChanges();
+			await this.saveCheckpoint();
 			this.setStatus("synced");
 		} catch (e) {
 			console.error(`[Realtime] plugin DB failed to open: ${this.serverDocId}`, e);
@@ -171,12 +200,13 @@ export class SyncedPluginDatabase implements SyncedDatabase {
 		};
 		this.ydoc.transact(() => {
 			this.batches.push([batch]);
-			this.cursors.set(this.localSiteId, { [this.localSiteId]: toDbVersion });
+			this.cursors.set(this.localSiteId, { ...(this.cursors.get(this.localSiteId) ?? {}), [this.localSiteId]: toDbVersion });
 			this.meta.set("format", 1);
 		});
 		this.appliedBatchIds.add(batch.id);
 		this.lastPublishedDbVersion = toDbVersion;
 		this.compactBatches();
+		await this.saveCheckpoint();
 		this.setStatus("synced");
 	}
 
@@ -203,7 +233,7 @@ export class SyncedPluginDatabase implements SyncedDatabase {
 
 	private async applyRemoteBatches(): Promise<void> {
 		if (this.destroyed || !this.db) return;
-		const pending = this.batches.toArray().filter((b) => b.siteId !== this.localSiteId && !this.appliedBatchIds.has(b.id));
+		const pending = this.batches.toArray().filter((b) => b.siteId !== this.localSiteId && !this.appliedBatchIds.has(b.id) && !this.isCoveredByCheckpoint(b));
 		if (!pending.length) return;
 		this.setStatus("syncing");
 		for (const batch of pending) {
@@ -219,7 +249,101 @@ export class SyncedPluginDatabase implements SyncedDatabase {
 			this.cursors.set(this.localSiteId, { ...(this.cursors.get(this.localSiteId) ?? {}), [batch.siteId]: batch.toDbVersion });
 		}
 		this.compactBatches();
+		await this.saveCheckpoint();
 		this.setStatus("synced");
+	}
+
+	private isCoveredByCheckpoint(batch: PluginDbChangeBatch): boolean {
+		return Number(this.checkpointCursors[batch.siteId] ?? 0) >= batch.toDbVersion;
+	}
+
+	private async restoreCheckpoint(): Promise<void> {
+		const raw = await this.readCheckpointRaw();
+		if (!raw) return;
+		let checkpoint: PluginDbCheckpoint;
+		try {
+			checkpoint = JSON.parse(raw) as PluginDbCheckpoint;
+		} catch (e) {
+			console.warn(`[Realtime] plugin DB checkpoint is invalid: ${this.localName}`, e);
+			return;
+		}
+		if (checkpoint.format !== CHECKPOINT_FORMAT || !Array.isArray(checkpoint.tables)) return;
+		this.checkpointCursors = checkpoint.cursors ?? {};
+		try {
+			await this.db.transaction(async () => {
+				for (const table of checkpoint.tables) {
+					if (!isUserTable(table.name)) continue;
+					const columns = table.columns.map(quoteIdent).join(", ");
+					const placeholders = table.columns.map(() => "?").join(", ");
+					for (const row of table.rows) {
+						await this.db.exec(`INSERT OR REPLACE INTO ${quoteIdent(table.name)} (${columns}) VALUES (${placeholders})`, row.map(decodeSqlValue));
+					}
+				}
+			});
+		} catch (e) {
+			this.checkpointCursors = {};
+			console.warn(`[Realtime] failed to restore plugin DB checkpoint: ${this.localName}`, e);
+		}
+	}
+
+	private async saveCheckpoint(): Promise<void> {
+		if (!this.checkpointStore || !this.db || !this.localSiteId) return;
+		try {
+			const tables = await this.exportUserTables();
+			const checkpoint: PluginDbCheckpoint = {
+				format: CHECKPOINT_FORMAT,
+				cursors: this.cursors.get(this.localSiteId) ?? {},
+				tables,
+			};
+			this.checkpointCursors = checkpoint.cursors;
+			await this.checkpointStore.write(this.checkpointPath(), JSON.stringify(checkpoint));
+		} catch (e) {
+			console.warn(`[Realtime] failed to save plugin DB checkpoint: ${this.localName}`, e);
+		}
+	}
+
+	private async exportUserTables(): Promise<PluginDbCheckpoint["tables"]> {
+		const rows = await this.db.query<{ name: string }>(
+			`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`,
+		);
+		const out: PluginDbCheckpoint["tables"] = [];
+		for (const { name } of rows) {
+			const tableName = String(name);
+			if (!isUserTable(tableName)) continue;
+			const info = await this.db.query<{ name: string }>(`PRAGMA table_info(${quoteIdent(tableName)})`);
+			const columns = info.map((c) => String(c.name));
+			if (!columns.length) continue;
+			const selected = columns.map(quoteIdent).join(", ");
+			const tableRows = await this.db.query<Record<string, unknown>>(`SELECT ${selected} FROM ${quoteIdent(tableName)}`);
+			out.push({
+				name: tableName,
+				columns,
+				rows: tableRows.map((row) => columns.map((column) => encodeSqlValue(row[column]))),
+			});
+		}
+		return out;
+	}
+
+	private async readCheckpointRaw(): Promise<string | null> {
+		try {
+			return await this.checkpointStore?.read(this.checkpointPath()) ?? null;
+		} catch (e) {
+			console.warn(`[Realtime] failed to read plugin DB checkpoint: ${this.localName}`, e);
+			return null;
+		}
+	}
+
+	private async deleteCheckpoint(): Promise<void> {
+		try {
+			await this.checkpointStore?.delete(this.checkpointPath());
+		} catch (e) {
+			console.warn(`[Realtime] failed to delete plugin DB checkpoint: ${this.localName}`, e);
+		}
+	}
+
+	private checkpointPath(): string {
+		const dir = this.plugin.manifest.dir ?? `.obsidian/plugins/${this.plugin.manifest.id}`;
+		return `${dir}/plugin-db-checkpoints/${this.options.pluginId}/${this.options.name}.json`;
 	}
 
 	private compactBatches(): void {
@@ -233,6 +357,44 @@ export class SyncedPluginDatabase implements SyncedDatabase {
 		}
 		if (remove > 0) this.batches.delete(0, remove);
 	}
+}
+
+function makeAdapterCheckpointStore(plugin: RealtimePlugin): PluginDbCheckpointStore | undefined {
+	const adapter = plugin.app?.vault?.adapter as { read?: (path: string) => Promise<string>; write?: (path: string, data: string) => Promise<void>; remove?: (path: string) => Promise<void>; exists?: (path: string) => Promise<boolean>; mkdir?: (path: string) => Promise<void> } | undefined;
+	if (!adapter?.read || !adapter.write) return undefined;
+	return {
+		read: async (path) => adapter.exists && !(await adapter.exists(path)) ? null : adapter.read!(path),
+		write: async (path, data) => {
+			const mkdir = adapter.mkdir;
+			if (mkdir) await ensureParentDir({ exists: adapter.exists, mkdir }, path);
+			await adapter.write!(path, data);
+		},
+		delete: async (path) => {
+			if (adapter.exists && !(await adapter.exists(path))) return;
+			await adapter.remove?.(path);
+		},
+	};
+}
+
+async function ensureParentDir(adapter: { exists?: (path: string) => Promise<boolean>; mkdir: (path: string) => Promise<void> }, path: string): Promise<void> {
+	const parts = path.split("/").slice(0, -1);
+	let current = "";
+	for (const part of parts) {
+		current = current ? `${current}/${part}` : part;
+		try {
+			if (!adapter.exists || !(await adapter.exists(current))) await adapter.mkdir(current);
+		} catch {
+			// Directory may have been created concurrently.
+		}
+	}
+}
+
+function isUserTable(name: string): boolean {
+	return !!name && !name.startsWith("sqlite_") && !name.startsWith("crsql_") && !name.startsWith("_crsql") && !name.includes("__crsql");
+}
+
+function quoteIdent(name: string): string {
+	return `"${name.replace(/"/g, '""')}"`;
 }
 
 function randomId(): string {

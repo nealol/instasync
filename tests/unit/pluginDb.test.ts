@@ -9,9 +9,16 @@ class FakeDb implements SqlDatabaseAdapter {
 	changes: any[] = [];
 	siteId: string;
 	closed = false;
+	columns = ["id", "title", "done"];
 	constructor(siteId: string) { this.siteId = siteId; }
 	async exec(sql: string, params: unknown[] = []): Promise<void> {
 		if (/CREATE TABLE/i.test(sql) || /crsql_as_crr/i.test(sql)) return;
+		if (/INSERT OR REPLACE INTO "tasks"/i.test(sql)) {
+			const row: any = {};
+			this.columns.forEach((column, i) => { row[column] = params[i]; });
+			this.rows.set(String(row.id), row);
+			return;
+		}
 		if (/INSERT INTO tasks/i.test(sql)) {
 			const [id, title, done] = params;
 			this.rows.set(String(id), { id, title, done });
@@ -25,10 +32,12 @@ class FakeDb implements SqlDatabaseAdapter {
 		}
 	}
 	async query<T>(sql: string, params: unknown[] = []): Promise<T[]> {
+		if (/FROM sqlite_master/i.test(sql)) return [{ name: "tasks" }] as T[];
+		if (/PRAGMA table_info\("tasks"\)/i.test(sql)) return this.columns.map((name) => ({ name })) as T[];
 		if (/FROM crsql_changes/i.test(sql)) return this.changes.filter((c) => c.db_version > Number(params[0] ?? 0) && c.site_id === this.siteId) as T[];
 		if (/crsql_site_id/i.test(sql)) return [{ site_id: this.siteId }] as T[];
 		if (/crsql_master/i.test(sql)) return [{ value: 0 }] as T[];
-		if (/FROM tasks/i.test(sql)) {
+		if (/FROM "?tasks"?/i.test(sql)) {
 			for (const c of this.changes) if (c.table === "tasks" && c.cid === "title") this.rows.set(String(c.pk), { id: String(c.pk), title: c.val, done: 0 });
 			return [...this.rows.values()] as T[];
 		}
@@ -63,8 +72,9 @@ describe("PluginDbSync", () => {
 		const dbB = new FakeDb("bb");
 		let opens = 0;
 		const makePlugin = () => ({
+			manifest: { id: "realtime", dir: ".obsidian/plugins/realtime" },
 			settings: { enabled: true, activeVaultId: "vault" },
-			auth: { isLoggedIn: true, registerFile: async () => {} },
+			auth: { isLoggedIn: true, registerFile: async () => {}, deletePluginDatabase: async () => {} },
 		}) as any;
 		const deps = (db: FakeDb) => ({
 			openSqliteDatabase: async () => { opens++; return db; },
@@ -90,5 +100,78 @@ describe("PluginDbSync", () => {
 		await Promise.resolve();
 		expect(dbA.closed).toBe(true);
 		expect(dbB.closed).toBe(true);
+	});
+
+	it("restores a fresh in-memory database from a checkpoint", async () => {
+		const ydoc = new Y.Doc();
+		const files = new Map<string, string>();
+		const checkpointStore = {
+			read: async (path: string) => files.get(path) ?? null,
+			write: async (path: string, data: string) => { files.set(path, data); },
+			delete: async (path: string) => { files.delete(path); },
+		};
+		const makePlugin = () => ({
+			manifest: { id: "realtime", dir: ".obsidian/plugins/realtime" },
+			settings: { enabled: true, activeVaultId: "vault" },
+			auth: { isLoggedIn: true, registerFile: async () => {}, deletePluginDatabase: async () => {} },
+		}) as any;
+		const opts = { pluginId: "my-plugin", name: "main", schema: async (db: any) => db.exec("CREATE TABLE tasks(id TEXT); SELECT crsql_as_crr('tasks')") };
+
+		const firstDb = new FakeDb("aa");
+		const first = new PluginDbSync(makePlugin(), {
+			checkpointStore,
+			openSqliteDatabase: async () => firstDb,
+			makeDoc: () => ({ ydoc, persistence: { whenSynced: Promise.resolve(), destroy: () => {} } }),
+		});
+		const opened = await first.open(opts);
+		await opened.exec("INSERT INTO tasks(id, title, done) VALUES (?, ?, ?)", ["t1", "Task", 0]);
+		first.destroy();
+
+		const restartedDb = new FakeDb("aa");
+		const restarted = new PluginDbSync(makePlugin(), {
+			checkpointStore,
+			openSqliteDatabase: async () => restartedDb,
+			makeDoc: () => ({ ydoc, persistence: { whenSynced: Promise.resolve(), destroy: () => {} } }),
+		});
+		const restored = await restarted.open(opts);
+
+		expect(await restored.query("SELECT * FROM tasks")).toEqual([{ id: "t1", title: "Task", done: 0 }]);
+		expect(files.size).toBeGreaterThan(0);
+		restarted.destroy();
+	});
+
+	it("deletes an open synced database and its checkpoint", async () => {
+		const ydoc = new Y.Doc();
+		const files = new Map<string, string>();
+		const db = new FakeDb("aa");
+		const checkpointStore = {
+			read: async (path: string) => files.get(path) ?? null,
+			write: async (path: string, data: string) => { files.set(path, data); },
+			delete: async (path: string) => { files.delete(path); },
+		};
+		const plugin = {
+			manifest: { id: "realtime", dir: ".obsidian/plugins/realtime" },
+			settings: { enabled: true, activeVaultId: "vault" },
+			auth: { isLoggedIn: true, registerFile: async () => {}, deletePluginDatabase: async () => {} },
+		} as any;
+		const sync = new PluginDbSync(plugin, {
+			checkpointStore,
+			openSqliteDatabase: async () => db,
+			makeDoc: () => ({ ydoc, persistence: { whenSynced: Promise.resolve(), destroy: () => {} } }),
+		});
+		const opts = { pluginId: "my-plugin", name: "main", schema: async (db: any) => db.exec("CREATE TABLE tasks(id TEXT); SELECT crsql_as_crr('tasks')") };
+		const opened = await sync.open(opts);
+		await opened.exec("INSERT INTO tasks(id, title, done) VALUES (?, ?, ?)", ["t1", "Task", 0]);
+
+		expect(files.size).toBeGreaterThan(0);
+		expect(ydoc.getArray("batches").length).toBeGreaterThan(0);
+
+		await sync.delete({ pluginId: "my-plugin", name: "main" });
+
+		expect(db.closed).toBe(true);
+		expect(files.size).toBe(0);
+		expect(ydoc.getArray("batches").length).toBe(0);
+		expect(ydoc.getMap("cursors").size).toBe(0);
+		expect(ydoc.getMap("meta").get("deletedAt")).toEqual(expect.any(Number));
 	});
 });

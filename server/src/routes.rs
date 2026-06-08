@@ -12,6 +12,7 @@ use crate::error::{AppError, AppResult};
 use crate::session::{bearer_token, hash_token, now_millis, revoke_session, AuthUser};
 use crate::state::{AppState, Principal, PrincipalActor};
 use crate::words::generate_invite_code;
+use crate::ydoc::tombstone_plugin_db;
 use crate::ysweet::{ensure_doc, mint_client_token, Level};
 
 const ROLE_ADMIN: &str = "admin";
@@ -639,7 +640,36 @@ pub async fn upsert_file(
         .await?;
     }
 
-    Ok(Json(serde_json::json!({ "ok": true })))
+	Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+pub async fn delete_plugin_db(
+	State(state): State<AppState>,
+	AuthUser(user): AuthUser,
+	Path((vault_id, plugin_id, name)): Path<(String, String, String)>,
+) -> AppResult<Json<Value>> {
+	require_member(&state, &user.id, &vault_id).await?;
+	if !safe_plugin_db_part(&plugin_id) || !safe_plugin_db_part(&name) {
+		return Err(AppError::BadRequest("invalid plugin database id".into()));
+	}
+	let guid = format!("plugindb__{plugin_id}__{name}");
+	let doc_id = format!("{vault_id}__{guid}");
+	let path = format!(".realtime/plugin-dbs/{plugin_id}/{name}");
+	let level = authorize_path(&state, &user, &vault_id, &path).await?;
+	if level != Level::Full {
+		return Err(AppError::Forbidden);
+	}
+
+	vault_files::Entity::delete_many()
+		.filter(vault_files::Column::VaultId.eq(&vault_id))
+		.filter(vault_files::Column::Guid.eq(&guid))
+		.exec(&state.db)
+		.await?;
+
+	ensure_doc(&state, &doc_id).await?;
+	tombstone_plugin_db(&state, &doc_id).await?;
+
+	Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 // ---------- doc-token minting ----------
@@ -754,6 +784,14 @@ fn is_plugin_db_guid(guid: &str) -> bool {
         && parts[2]
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+fn safe_plugin_db_part(value: &str) -> bool {
+	!value.is_empty()
+		&& value.len() <= 80
+		&& value
+			.bytes()
+			.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
 pub(crate) async fn authorize_path(

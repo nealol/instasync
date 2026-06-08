@@ -1495,6 +1495,49 @@ async fn attachment_upload_list_read_delete_roundtrip() {
 }
 
 #[tokio::test]
+async fn plugin_database_delete_tombstones_backend_doc() {
+    let ys = fake_ysweet_store().await;
+    let app = test_app(&ys, &ys).await;
+    let token = login(&app, "alice").await;
+    let (status, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&token),
+        Some(json!({ "name": "Plugin DB Vault" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let vault_id = vault["id"].as_str().unwrap();
+
+    let (status, registered) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/files"),
+        Some(&token),
+        Some(json!({
+            "guid": "plugindb__test_plugin__main",
+            "path": ".realtime/plugin-dbs/test_plugin/main"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(registered["ok"], true);
+
+    let (status, deleted) = send(
+        &app,
+        "DELETE",
+        &format!("/api/vaults/{vault_id}/plugin-dbs/test_plugin/main"),
+        Some(&token),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(deleted["ok"], true);
+}
+
+#[tokio::test]
 async fn signed_upload_link_uploads_once_and_rejects_bad_inputs() {
     let ys = fake_ysweet_store().await;
     let app = test_app_with_attachment_max(&ys, &ys, 16).await;

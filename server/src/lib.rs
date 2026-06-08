@@ -170,8 +170,12 @@ pub fn app(state: AppState) -> Router {
             "/api/vaults/{id}/members/{user_id}",
             delete(routes::remove_member),
         )
-        .route("/api/vaults/{id}/files", post(routes::upsert_file))
-        .route(
+		.route("/api/vaults/{id}/files", post(routes::upsert_file))
+		.route(
+			"/api/vaults/{id}/plugin-dbs/{plugin_id}/{name}",
+			delete(routes::delete_plugin_db),
+		)
+		.route(
             "/api/vaults/{id}/notes",
             get(notes::list_notes).post(notes::create_note),
         )

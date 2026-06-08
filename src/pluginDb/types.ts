@@ -8,6 +8,11 @@ export interface OpenSyncedDatabaseOptions {
 	schema?: (db: SyncedDatabase) => Promise<void>;
 }
 
+export interface DeleteSyncedDatabaseOptions {
+	pluginId: string;
+	name: string;
+}
+
 export interface SyncedDatabase {
 	exec(sql: string, params?: unknown[]): Promise<void>;
 	query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]>;
@@ -55,4 +60,11 @@ export interface SqlDatabaseAdapter {
 export interface SyncedPluginDatabaseDeps {
 	openSqliteDatabase?: (name: string) => Promise<SqlDatabaseAdapter>;
 	makeDoc?: (serverDocId: string) => { ydoc: import("yjs").Doc; provider?: any; persistence?: { whenSynced?: Promise<void>; destroy?: () => unknown } };
+	checkpointStore?: PluginDbCheckpointStore;
+}
+
+export interface PluginDbCheckpointStore {
+	read(path: string): Promise<string | null>;
+	write(path: string, data: string): Promise<void>;
+	delete(path: string): Promise<void>;
 }

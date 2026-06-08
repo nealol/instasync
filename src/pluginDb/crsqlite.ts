@@ -8,14 +8,18 @@ declare const require: ((id: string) => unknown) | undefined;
 let sqlitePromise: ReturnType<typeof initWasm> | null = null;
 let fallbackWasmUrl = "";
 let localWasmPath = "";
+let resolvedWasmUrl = "";
+let indexedDbTransactionShimInstalled = false;
 
 export function configureCrsqliteWasmFallback(url: string, localPath?: string): void {
 	fallbackWasmUrl = url;
 	localWasmPath = localPath?.replace(/\\/g, "/") ?? "";
+	resolvedWasmUrl = "";
 }
 
 function wasmUrl(file: string): string {
 	if (file !== "crsqlite.wasm") return file;
+	if (resolvedWasmUrl) return resolvedWasmUrl;
 	if (localWasmPath) return localWasmPath;
 	if (typeof __dirname === "string") {
 		const localPath = `${__dirname.replace(/\\/g, "/")}/crsqlite.wasm`;
@@ -35,27 +39,70 @@ function localFileExists(path: string): boolean {
 	}
 }
 
+function readLocalFile(path: string): Uint8Array | null {
+	try {
+		if (typeof require !== "function") return null;
+		const fs = require("fs") as { readFileSync?: (path: string) => Uint8Array };
+		return fs.readFileSync?.(path) ?? null;
+	} catch {
+		return null;
+	}
+}
+
+function blobUrl(bytes: Uint8Array): string {
+	const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+	return URL.createObjectURL(new Blob([buffer], { type: "application/wasm" }));
+}
+
 async function ensureLocalWasm(): Promise<void> {
 	const localPath = localWasmPath || (typeof __dirname === "string" ? `${__dirname.replace(/\\/g, "/")}/crsqlite.wasm` : "");
-	if (!localPath || !fallbackWasmUrl) return;
-	if (localFileExists(localPath)) return;
+	if (localPath && localFileExists(localPath)) {
+		const bytes = readLocalFile(localPath);
+		resolvedWasmUrl = bytes ? blobUrl(bytes) : localPath;
+		return;
+	}
+	if (!fallbackWasmUrl) {
+		resolvedWasmUrl = localPath || "crsqlite.wasm";
+		return;
+	}
+	if (!localPath) {
+		resolvedWasmUrl = fallbackWasmUrl;
+		return;
+	}
 	console.warn(`[Realtime] crsqlite.wasm not found at ${localPath}; downloading release asset.`);
 	const res = await requestUrl({ url: fallbackWasmUrl, throw: false });
 	if (res.status < 200 || res.status >= 300) throw new Error(`failed to download crsqlite.wasm: HTTP ${res.status}`);
+	const bytes = new Uint8Array(res.arrayBuffer);
 	try {
 		if (typeof require !== "function") throw new Error("filesystem unavailable");
 		const fs = require("fs") as { writeFileSync?: (path: string, data: Uint8Array) => void };
 		if (!fs.writeFileSync) throw new Error("filesystem unavailable");
-		fs.writeFileSync(localPath, new Uint8Array(res.arrayBuffer));
+		fs.writeFileSync(localPath, bytes);
+		resolvedWasmUrl = blobUrl(bytes);
 	} catch (e) {
-		throw new Error(`failed to cache crsqlite.wasm locally: ${e instanceof Error ? e.message : String(e)}`);
+		console.warn(`[Realtime] failed to cache crsqlite.wasm locally; using downloaded bytes: ${e instanceof Error ? e.message : String(e)}`);
+		resolvedWasmUrl = blobUrl(bytes);
 	}
 }
 
 export async function openCrsqliteDatabase(name: string): Promise<SqlDatabaseAdapter> {
-	if (!sqlitePromise) sqlitePromise = ensureLocalWasm().then(() => initWasm(wasmUrl));
+	if (!sqlitePromise) sqlitePromise = ensureLocalWasm().then(() => {
+		installIndexedDbTransactionOptionsShim();
+		return initWasm(wasmUrl);
+	});
 	const sqlite = await sqlitePromise;
-	const db = await sqlite.open(name);
+	const filename = sqliteFilename(name);
+	let db: Awaited<ReturnType<typeof sqlite.open>>;
+	try {
+		db = await sqlite.open(filename);
+	} catch (e) {
+		if (name !== ":memory:") {
+			console.warn(`[Realtime] persistent crsqlite database failed to open; falling back to memory: ${openErrorMessage(filename, e)}`);
+			db = await sqlite.open();
+		} else {
+			throw new Error(openErrorMessage(filename, e));
+		}
+	}
 	return {
 		exec: (sql, params) => db.exec(sql, params as any),
 		query: (sql, params) => db.execO(sql, params as any) as Promise<any[]>,
@@ -65,6 +112,35 @@ export async function openCrsqliteDatabase(name: string): Promise<SqlDatabaseAda
 			return out;
 		},
 		close: () => db.close(),
+	};
+}
+
+function openErrorMessage(filename: string, e: unknown): string {
+	const cause = e instanceof Error ? e.message : String(e);
+	const errorName = e instanceof Error ? e.name : typeof e;
+	const hasIndexedDb = typeof indexedDB !== "undefined";
+	const hasWebLocks = typeof navigator !== "undefined" && "locks" in navigator;
+	return `failed to open crsqlite database ${filename}: ${errorName}: ${cause} (indexedDB=${hasIndexedDb}, webLocks=${hasWebLocks})`;
+}
+
+function sqliteFilename(name: string): string {
+	if (name === ":memory:" || name.startsWith("file:")) return name;
+	return `file:/realtime/plugin-dbs/${encodeURIComponent(name)}`;
+}
+
+function installIndexedDbTransactionOptionsShim(): void {
+	if (indexedDbTransactionShimInstalled) return;
+	indexedDbTransactionShimInstalled = true;
+	const proto = (globalThis as any).IDBDatabase?.prototype as { transaction?: (...args: any[]) => IDBTransaction } | undefined;
+	if (!proto?.transaction) return;
+	const transaction = proto.transaction;
+	proto.transaction = function(this: IDBDatabase, storeNames: string | string[], mode?: IDBTransactionMode, options?: IDBTransactionOptions) {
+		try {
+			return transaction.call(this, storeNames, mode, options);
+		} catch (e) {
+			if (options === undefined) throw e;
+			return transaction.call(this, storeNames, mode);
+		}
 	};
 }
 

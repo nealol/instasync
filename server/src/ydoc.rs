@@ -80,12 +80,21 @@ pub async fn set_text(state: &AppState, doc_id: &str, new_content: &str) -> AppR
 }
 
 pub async fn set_structured(state: &AppState, doc_id: &str, value: &JsonValue) -> AppResult<()> {
-    let current = read_update(state, doc_id).await?;
-    let update = build_structured_update(&current, value)?;
-    if update.is_empty() {
-        return Ok(());
-    }
-    write_update(state, doc_id, update).await
+	let current = read_update(state, doc_id).await?;
+	let update = build_structured_update(&current, value)?;
+	if update.is_empty() {
+		return Ok(());
+	}
+	write_update(state, doc_id, update).await
+}
+
+pub async fn tombstone_plugin_db(state: &AppState, doc_id: &str) -> AppResult<()> {
+	let current = read_update(state, doc_id).await?;
+	let update = build_plugin_db_tombstone_update(&current)?;
+	if !update.is_empty() {
+		write_update(state, doc_id, update).await?;
+	}
+	Ok(())
 }
 
 pub async fn index_set_file(
@@ -526,6 +535,31 @@ fn build_map_remove_update(current_update: &[u8], map_name: &str, key: &str) -> 
     }
     let update = doc.transact().encode_state_as_update_v1(&before);
     Ok(update)
+}
+
+fn build_plugin_db_tombstone_update(current_update: &[u8]) -> AppResult<Vec<u8>> {
+	let doc = doc_from_update(current_update)?;
+	let before = doc.transact().state_vector();
+	let batches = doc.get_or_insert_array("batches");
+	let cursors = doc.get_or_insert_map("cursors");
+	let meta = doc.get_or_insert_map("meta");
+	{
+		let mut txn = doc.transact_mut();
+		let len = batches.len(&txn);
+		if len > 0 {
+			batches.remove_range(&mut txn, 0, len);
+		}
+		for key in cursors.keys(&txn).map(ToString::to_string).collect::<Vec<_>>() {
+			cursors.remove(&mut txn, &key);
+		}
+		for key in meta.keys(&txn).map(ToString::to_string).collect::<Vec<_>>() {
+			meta.remove(&mut txn, &key);
+		}
+		meta.insert(&mut txn, "format".to_string(), 1.0);
+		meta.insert(&mut txn, "deletedAt".to_string(), now_millis() as f64);
+	}
+	let update = doc.transact().encode_state_as_update_v1(&before);
+	Ok(update)
 }
 
 fn build_map_rename_update<V>(

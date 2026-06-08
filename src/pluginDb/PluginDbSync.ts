@@ -1,5 +1,5 @@
 import type RealtimePlugin from "../main";
-import type { OpenSyncedDatabaseOptions, SyncedDatabase, SyncedPluginDatabaseDeps } from "./types";
+import type { DeleteSyncedDatabaseOptions, OpenSyncedDatabaseOptions, SyncedDatabase, SyncedPluginDatabaseDeps } from "./types";
 import { SyncedPluginDatabase } from "./SyncedPluginDatabase";
 
 export const MAX_SAFE_ID_LENGTH = 80;
@@ -35,8 +35,12 @@ export class PluginDbSync {
 		const guid = pluginDbGuid(safePluginId, safeName);
 		const serverDocId = `${vaultId}__${guid}`;
 		const key = `${safePluginId}/${safeName}`;
+		await this.plugin.auth.deletePluginDatabase(vaultId, safePluginId, safeName);
 		const existing = this.opened.get(key);
-		if (existing) return existing;
+		if (existing) {
+			await existing.whenReady();
+			return existing;
+		}
 		await this.plugin.auth.registerFile(vaultId, guid, `.realtime/plugin-dbs/${safePluginId}/${safeName}`);
 		const db = new SyncedPluginDatabase(this.plugin, serverDocId, `${vaultId}__plugindb__${safePluginId}__${safeName}`, { ...options, pluginId: safePluginId, name: safeName }, this.deps);
 		this.opened.set(key, db);
@@ -48,6 +52,31 @@ export class PluginDbSync {
 			throw e;
 		}
 		return db;
+	}
+
+	async delete(options: DeleteSyncedDatabaseOptions): Promise<void> {
+		if (this.destroyed) throw new Error("plugin DB sync is stopped");
+		const vaultId = this.plugin.settings.activeVaultId;
+		if (!this.plugin.settings.enabled || !this.plugin.auth.isLoggedIn || !vaultId) throw new Error("Realtime sync must be enabled and signed in before deleting a synced database");
+		const safePluginId = sanitizePluginDbId(options.pluginId, "pluginId");
+		const safeName = sanitizePluginDbId(options.name, "name");
+		const guid = pluginDbGuid(safePluginId, safeName);
+		const serverDocId = `${vaultId}__${guid}`;
+		const key = `${safePluginId}/${safeName}`;
+		const existing = this.opened.get(key);
+		if (existing) {
+			this.opened.delete(key);
+			await existing.deleteDatabase();
+			return;
+		}
+		const db = new SyncedPluginDatabase(this.plugin, serverDocId, `${vaultId}__plugindb__${safePluginId}__${safeName}`, { pluginId: safePluginId, name: safeName }, this.deps);
+		try {
+			await db.whenReady();
+			await db.deleteDatabase();
+		} catch (e) {
+			await db.close().catch(() => {});
+			throw e;
+		}
 	}
 
 	reconnectAll(): void {
