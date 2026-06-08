@@ -24,12 +24,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use sea_orm::DatabaseConnection;
-use serde_json::{json, Value as JsonValue};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 use y_sweet_core::auth::Authenticator;
 
 use crate::config::Config;
 use crate::state::{Principal, PrincipalActor};
+use crate::structured::canvas_to_file_json;
 use crate::ydoc::{decode_files_map, decode_structured, decode_structured_index, decode_text};
 
 /// A principal seen contributing to a vault during one debounce window.
@@ -438,45 +441,6 @@ fn serialize_structured_for_git(kind: &str, value: JsonValue) -> Result<String> 
         "base" => Ok(serde_yaml::to_string(&value)?),
         other => bail!("unknown structured document kind {other}"),
     }
-}
-
-fn canvas_to_file_json(value: JsonValue) -> JsonValue {
-    let Some(root) = value.as_object() else {
-        return json!({ "nodes": [], "edges": [] });
-    };
-    let nodes = root.get("nodes").and_then(JsonValue::as_object);
-    let edges = root.get("edges").and_then(JsonValue::as_object);
-    let node_order = root.get("nodeOrder").and_then(JsonValue::as_array);
-    let edge_order = root.get("edgeOrder").and_then(JsonValue::as_array);
-    json!({
-        "nodes": ordered_canvas_items(nodes, node_order),
-        "edges": ordered_canvas_items(edges, edge_order),
-    })
-}
-
-fn ordered_canvas_items(
-    items: Option<&serde_json::Map<String, JsonValue>>,
-    order: Option<&Vec<JsonValue>>,
-) -> Vec<JsonValue> {
-    let Some(items) = items else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    if let Some(order) = order {
-        for id in order.iter().filter_map(JsonValue::as_str) {
-            if let Some(item) = items.get(id) {
-                out.push(item.clone());
-                seen.insert(id.to_string());
-            }
-        }
-    }
-    for (id, item) in items {
-        if !seen.contains(id) {
-            out.push(item.clone());
-        }
-    }
-    out
 }
 
 /// Write every file in `tree` and delete any working-tree file not present in it.

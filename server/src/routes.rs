@@ -710,7 +710,7 @@ fn safe_doc_id(doc_id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
-/// Resolve the docId to a path and evaluate the (currently allow-all) ACL.
+/// Resolve the docId to a path and evaluate the ACL.
 pub(crate) async fn authorize_doc(
     state: &AppState,
     user: &users::Model,
@@ -733,6 +733,15 @@ pub(crate) async fn authorize_doc(
             .unwrap_or_default()
     };
 
+    authorize_path(state, user, vault_id, &path).await
+}
+
+pub(crate) async fn authorize_path(
+    state: &AppState,
+    user: &users::Model,
+    vault_id: &str,
+    path: &str,
+) -> AppResult<Level> {
     let rows = permissions::Entity::find()
         .filter(permissions::Column::VaultId.eq(vault_id))
         .all(&state.db)

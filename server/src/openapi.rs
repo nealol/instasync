@@ -64,7 +64,26 @@ use utoipa::{Modify, OpenApi};
         move_attachment,
         public_upload,
         note_by_guid,
-        note_by_path
+        note_by_path,
+        list_canvases,
+        read_canvas,
+        create_canvas,
+        replace_canvas,
+        delete_canvas,
+        canvas_nodes,
+        canvas_edges,
+        move_canvas,
+        list_bases,
+        read_base,
+        create_base,
+        replace_base,
+        delete_base,
+        base_views,
+        base_filters,
+        base_view_filters,
+        base_formulas,
+        base_properties,
+        move_base
     ),
     tags(
         (name = "auth", description = "Browser login and session management"),
@@ -72,6 +91,8 @@ use utoipa::{Modify, OpenApi};
         (name = "vaults", description = "Vault, invite, member, cursor, and file registry APIs"),
         (name = "notes", description = "Vault-scoped note APIs"),
         (name = "search", description = "Vault-scoped note search APIs"),
+        (name = "canvas", description = "Vault-scoped Obsidian Canvas APIs"),
+        (name = "bases", description = "Vault-scoped Obsidian Base APIs"),
         (name = "attachments", description = "Vault-scoped attachment APIs and signed uploads"),
         (name = "permalinks", description = "Public note redirect endpoints")
     )
@@ -118,6 +139,63 @@ async fn oauth_protected_resource_app() {}
 
 #[utoipa::path(get, path = "/.well-known/oauth-authorization-server", tag = "oauth", responses((status = 200, description = "RFC 8414 authorization server metadata")))]
 async fn oauth_authorization_server() {}
+
+#[utoipa::path(get, path = "/api/vaults/{id}/canvases", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path)), responses((status = 200, description = "Canvas list")))]
+async fn list_canvases() {}
+
+#[utoipa::path(get, put, delete, path = "/api/vaults/{id}/canvas/{path}", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Canvas document")))]
+async fn read_canvas() {}
+
+#[utoipa::path(post, path = "/api/vaults/{id}/canvases", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path)), responses((status = 200, description = "Created Canvas")))]
+async fn create_canvas() {}
+
+#[utoipa::path(put, path = "/api/vaults/{id}/canvas/{path}", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Replaced Canvas")))]
+async fn replace_canvas() {}
+
+#[utoipa::path(delete, path = "/api/vaults/{id}/canvas/{path}", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Deleted Canvas")))]
+async fn delete_canvas() {}
+
+#[utoipa::path(post, patch, delete, path = "/api/vaults/{id}/canvas-nodes/{path}", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Canvas node mutation")))]
+async fn canvas_nodes() {}
+
+#[utoipa::path(post, patch, delete, path = "/api/vaults/{id}/canvas-edges/{path}", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Canvas edge mutation")))]
+async fn canvas_edges() {}
+
+#[utoipa::path(post, path = "/api/vaults/{id}/canvas-moves/{path}", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Moved Canvas")))]
+async fn move_canvas() {}
+
+#[utoipa::path(get, path = "/api/vaults/{id}/bases", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path)), responses((status = 200, description = "Base list")))]
+async fn list_bases() {}
+
+#[utoipa::path(get, put, delete, path = "/api/vaults/{id}/base/{path}", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Base document")))]
+async fn read_base() {}
+
+#[utoipa::path(post, path = "/api/vaults/{id}/bases", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path)), responses((status = 200, description = "Created Base")))]
+async fn create_base() {}
+
+#[utoipa::path(put, path = "/api/vaults/{id}/base/{path}", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Replaced Base")))]
+async fn replace_base() {}
+
+#[utoipa::path(delete, path = "/api/vaults/{id}/base/{path}", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Deleted Base")))]
+async fn delete_base() {}
+
+#[utoipa::path(get, post, patch, delete, path = "/api/vaults/{id}/base-views/{path}", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Base views")))]
+async fn base_views() {}
+
+#[utoipa::path(put, path = "/api/vaults/{id}/base-filters/{path}", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Base filters")))]
+async fn base_filters() {}
+
+#[utoipa::path(put, path = "/api/vaults/{id}/base-view-filters/{path}", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Base view filters")))]
+async fn base_view_filters() {}
+
+#[utoipa::path(put, delete, path = "/api/vaults/{id}/base-formulas/{path}", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Base formulas")))]
+async fn base_formulas() {}
+
+#[utoipa::path(put, delete, path = "/api/vaults/{id}/base-properties/{path}", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Base properties")))]
+async fn base_properties() {}
+
+#[utoipa::path(post, path = "/api/vaults/{id}/base-moves/{path}", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Moved Base")))]
+async fn move_base() {}
 
 #[utoipa::path(post, path = "/oauth/register", tag = "oauth", request_body = Object, responses((status = 200, description = "Dynamic client registration response"), (status = 400, description = "Invalid registration")))]
 async fn oauth_register() {}

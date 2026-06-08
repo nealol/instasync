@@ -27,6 +27,10 @@ use crate::notes::{
 use crate::search;
 use crate::session::{bearer_token, hash_token, now_millis, ApiActor, ApiPrincipal};
 use crate::state::AppState;
+use crate::structured::{
+    self, BaseViewBody, BaseViewPatchBody, CanvasEdgeBody, CanvasEdgePatchBody, CanvasNodeBody,
+    CanvasNodePatchBody, CreateStructuredBody, MoveStructuredBody,
+};
 use crate::{SERVER_NAME, SERVER_SLUG};
 
 #[derive(Clone)]
@@ -283,8 +287,611 @@ struct BacklinksArgs {
     path: String,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct JsonPathArgs {
+    path: String,
+    value: serde_json::Value,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CanvasNodeArgs {
+    path: String,
+    id: Option<String>,
+    #[serde(flatten)]
+    fields: serde_json::Map<String, serde_json::Value>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct CanvasNodePatchArgs {
+    path: String,
+    id: String,
+    #[serde(flatten)]
+    patch: serde_json::Map<String, serde_json::Value>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct CanvasEdgeArgs {
+    path: String,
+    id: Option<String>,
+    from_node: String,
+    to_node: String,
+    #[serde(flatten)]
+    fields: serde_json::Map<String, serde_json::Value>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct CanvasEdgePatchArgs {
+    path: String,
+    id: String,
+    #[serde(flatten)]
+    patch: serde_json::Map<String, serde_json::Value>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct IdPathArgs {
+    path: String,
+    id: String,
+}
+#[derive(Deserialize, JsonSchema)]
+struct BaseViewArgs {
+    path: String,
+    name: String,
+    #[serde(rename = "type")]
+    view_type: String,
+    #[serde(flatten)]
+    fields: serde_json::Map<String, serde_json::Value>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct BaseViewPatchArgs {
+    path: String,
+    name: String,
+    #[serde(flatten)]
+    patch: serde_json::Map<String, serde_json::Value>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct NamePathArgs {
+    path: String,
+    name: String,
+}
+#[derive(Deserialize, JsonSchema)]
+struct SetValueArgs {
+    path: String,
+    name: Option<String>,
+    value: serde_json::Value,
+}
+
 #[tool_router]
 impl InstaMcp {
+    #[tool(description = "List Obsidian Canvas files in the cursor vault")]
+    async fn list_canvases(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::list_structured_inner(&c.state, &c.principal, &c.vault_id, Some("canvas"))
+                .await,
+        )
+    }
+
+    #[tool(description = "Read an Obsidian Canvas as file-form arrays")]
+    async fn read_canvas(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<PathArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::read_canvas_inner(&c.state, &c.principal, &c.vault_id, &args.path).await,
+        )
+    }
+
+    #[tool(
+        description = "Create an Obsidian Canvas; writes are CRDT-merged and appear live in open Canvas views"
+    )]
+    async fn create_canvas(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<JsonPathArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::create_canvas_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                CreateStructuredBody {
+                    path: args.path,
+                    value: args.value,
+                },
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Add a Canvas node; writes are CRDT-merged and appear live in open Canvas views"
+    )]
+    async fn add_canvas_node(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<CanvasNodeArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::add_canvas_node_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.path,
+                CanvasNodeBody {
+                    id: args.id,
+                    fields: args.fields,
+                },
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Update a Canvas node; writes are CRDT-merged and appear live in open Canvas views"
+    )]
+    async fn update_canvas_node(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<CanvasNodePatchArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::update_canvas_node_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.path,
+                CanvasNodePatchBody {
+                    id: args.id,
+                    patch: args.patch,
+                },
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Delete a Canvas node and connected edges; writes are CRDT-merged and appear live in open Canvas views"
+    )]
+    async fn delete_canvas_node(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<IdPathArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::delete_canvas_node_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.path,
+                &args.id,
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Add a Canvas edge; writes are CRDT-merged and appear live in open Canvas views"
+    )]
+    async fn add_canvas_edge(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<CanvasEdgeArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::add_canvas_edge_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.path,
+                CanvasEdgeBody {
+                    id: args.id,
+                    from_node: args.from_node,
+                    to_node: args.to_node,
+                    fields: args.fields,
+                },
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Update a Canvas edge; writes are CRDT-merged and appear live in open Canvas views"
+    )]
+    async fn update_canvas_edge(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<CanvasEdgePatchArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::update_canvas_edge_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.path,
+                CanvasEdgePatchBody {
+                    id: args.id,
+                    patch: args.patch,
+                },
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Delete a Canvas edge; writes are CRDT-merged and appear live in open Canvas views"
+    )]
+    async fn delete_canvas_edge(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<IdPathArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::delete_canvas_edge_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.path,
+                &args.id,
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Move or rename a Canvas; writes are CRDT-merged and appear live in open Canvas views"
+    )]
+    async fn move_canvas(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<MoveArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::move_structured_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.path,
+                MoveStructuredBody {
+                    to_path: args.to_path,
+                },
+                "canvas",
+            )
+            .await,
+        )
+    }
+
+    #[tool(description = "Delete a Canvas")]
+    async fn delete_canvas(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<PathArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_unit(
+            structured::delete_canvas_inner(&c.state, &c.principal, &c.vault_id, &args.path).await,
+        )
+    }
+
+    #[tool(description = "List Obsidian Bases in the cursor vault")]
+    async fn list_bases(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::list_structured_inner(&c.state, &c.principal, &c.vault_id, Some("base"))
+                .await,
+        )
+    }
+
+    #[tool(description = "Read an Obsidian Base")]
+    async fn read_base(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<PathArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::read_base_inner(&c.state, &c.principal, &c.vault_id, &args.path).await,
+        )
+    }
+
+    #[tool(
+        description = "Create an Obsidian Base; writes are CRDT-merged and appear live in open Base views"
+    )]
+    async fn create_base(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<JsonPathArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::create_base_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                CreateStructuredBody {
+                    path: args.path,
+                    value: args.value,
+                },
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Add or replace a Base view by name; writes are CRDT-merged and appear live in open Base views"
+    )]
+    async fn add_base_view(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<BaseViewArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::add_base_view_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.path,
+                BaseViewBody {
+                    name: args.name,
+                    view_type: args.view_type,
+                    fields: args.fields,
+                },
+            )
+            .await,
+        )
+    }
+
+    #[tool(description = "List views in an Obsidian Base")]
+    async fn list_base_views(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<PathArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::list_base_views_inner(&c.state, &c.principal, &c.vault_id, &args.path)
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Update a Base view by name; writes are CRDT-merged and appear live in open Base views"
+    )]
+    async fn update_base_view(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<BaseViewPatchArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::update_base_view_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.path,
+                BaseViewPatchBody {
+                    name: args.name,
+                    patch: args.patch,
+                },
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Delete a Base view by name; writes are CRDT-merged and appear live in open Base views"
+    )]
+    async fn delete_base_view(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<NamePathArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::delete_base_view_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.path,
+                &args.name,
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Set global Base filters; writes are CRDT-merged and appear live in open Base views"
+    )]
+    async fn set_base_filters(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<SetValueArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::set_base_filters_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.path,
+                args.value,
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Set Base view filters by view name; writes are CRDT-merged and appear live in open Base views"
+    )]
+    async fn set_base_view_filters(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<SetValueArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        let Some(name) = args.name else {
+            return Ok(CallToolResult::structured_error(
+                json!({ "ok": false, "reason": "name is required" }),
+            ));
+        };
+        tool_result(
+            structured::set_base_view_filters_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.path,
+                &name,
+                args.value,
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Set a Base formula by name; writes are CRDT-merged and appear live in open Base views"
+    )]
+    async fn set_base_formula(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<SetValueArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        let Some(name) = args.name else {
+            return Ok(CallToolResult::structured_error(
+                json!({ "ok": false, "reason": "name is required" }),
+            ));
+        };
+        tool_result(
+            structured::set_base_formula_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.path,
+                &name,
+                args.value,
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Delete a Base formula by name; writes are CRDT-merged and appear live in open Base views"
+    )]
+    async fn delete_base_formula(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<NamePathArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::delete_base_formula_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.path,
+                &args.name,
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Set a Base property by name; writes are CRDT-merged and appear live in open Base views"
+    )]
+    async fn set_base_property(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<SetValueArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        let Some(name) = args.name else {
+            return Ok(CallToolResult::structured_error(
+                json!({ "ok": false, "reason": "name is required" }),
+            ));
+        };
+        tool_result(
+            structured::set_base_property_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.path,
+                &name,
+                args.value,
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Delete a Base property by name; writes are CRDT-merged and appear live in open Base views"
+    )]
+    async fn delete_base_property(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<NamePathArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::delete_base_property_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.path,
+                &args.name,
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Move or rename a Base; writes are CRDT-merged and appear live in open Base views"
+    )]
+    async fn move_base(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<MoveArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(
+            structured::move_structured_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.path,
+                MoveStructuredBody {
+                    to_path: args.to_path,
+                },
+                "base",
+            )
+            .await,
+        )
+    }
+
+    #[tool(description = "Delete a Base")]
+    async fn delete_base(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<PathArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_unit(
+            structured::delete_base_inner(&c.state, &c.principal, &c.vault_id, &args.path).await,
+        )
+    }
+
     #[tool(description = "List notes in the cursor vault")]
     async fn list_notes(
         &self,

@@ -16,6 +16,7 @@ pub mod routes;
 pub mod search;
 pub mod session;
 pub mod state;
+pub mod structured;
 pub mod words;
 pub mod ydoc;
 pub mod ysweet;
@@ -29,7 +30,7 @@ use std::sync::Arc;
 use axum::{
     extract::DefaultBodyLimit,
     http::HeaderValue,
-    routing::{any, delete, get, post},
+    routing::{any, delete, get, post, put},
     Router,
 };
 use sea_orm::Database;
@@ -175,6 +176,14 @@ pub fn app(state: AppState) -> Router {
             get(notes::list_notes).post(notes::create_note),
         )
         .route("/api/vaults/{id}/search", get(search::search_notes))
+        .route(
+            "/api/vaults/{id}/canvases",
+            get(structured::list_canvases).post(structured::create_canvas),
+        )
+        .route(
+            "/api/vaults/{id}/bases",
+            get(structured::list_bases).post(structured::create_base),
+        )
         .route("/api/vaults/{id}/tags", get(search::list_tags))
         .route("/api/vaults/{id}/reindex", post(search::reindex))
         .route(
@@ -199,6 +208,61 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/api/vaults/{id}/note-frontmatter/{*path}",
             get(notes::parse_frontmatter).patch(notes::patch_frontmatter),
+        )
+        .route(
+            "/api/vaults/{id}/canvas/{*path}",
+            get(structured::read_canvas)
+                .put(structured::replace_canvas)
+                .delete(structured::delete_canvas),
+        )
+        .route(
+            "/api/vaults/{id}/canvas-nodes/{*path}",
+            post(structured::add_canvas_node)
+                .patch(structured::update_canvas_node)
+                .delete(structured::delete_canvas_node),
+        )
+        .route(
+            "/api/vaults/{id}/canvas-edges/{*path}",
+            post(structured::add_canvas_edge)
+                .patch(structured::update_canvas_edge)
+                .delete(structured::delete_canvas_edge),
+        )
+        .route(
+            "/api/vaults/{id}/canvas-moves/{*path}",
+            post(structured::move_canvas),
+        )
+        .route(
+            "/api/vaults/{id}/base/{*path}",
+            get(structured::read_base)
+                .put(structured::replace_base)
+                .delete(structured::delete_base),
+        )
+        .route(
+            "/api/vaults/{id}/base-views/{*path}",
+            get(structured::list_base_views)
+                .post(structured::add_base_view)
+                .patch(structured::update_base_view)
+                .delete(structured::delete_base_view),
+        )
+        .route(
+            "/api/vaults/{id}/base-filters/{*path}",
+            put(structured::set_base_filters),
+        )
+        .route(
+            "/api/vaults/{id}/base-view-filters/{*path}",
+            put(structured::set_base_view_filters),
+        )
+        .route(
+            "/api/vaults/{id}/base-formulas/{*path}",
+            put(structured::set_base_formula).delete(structured::delete_base_formula),
+        )
+        .route(
+            "/api/vaults/{id}/base-properties/{*path}",
+            put(structured::set_base_property).delete(structured::delete_base_property),
+        )
+        .route(
+            "/api/vaults/{id}/base-moves/{*path}",
+            post(structured::move_base),
         )
         .route(
             "/api/vaults/{id}/periodic/{period}",

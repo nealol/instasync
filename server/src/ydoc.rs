@@ -6,7 +6,10 @@ use std::sync::Arc;
 use y_sweet_core::auth::Authenticator;
 use yrs::types::ToJson;
 use yrs::updates::decoder::Decode;
-use yrs::{Any, Doc, GetString, Map, ReadTxn, Text, Transact, Update};
+use yrs::{
+    Any, Array, ArrayPrelim, Doc, GetString, Map, MapPrelim, Out, ReadTxn, Text, TextPrelim,
+    Transact, Update,
+};
 
 use crate::config::Config;
 use crate::entities::vault_files;
@@ -70,6 +73,15 @@ pub async fn write_update(state: &AppState, doc_id: &str, update: Vec<u8>) -> Ap
 pub async fn set_text(state: &AppState, doc_id: &str, new_content: &str) -> AppResult<()> {
     let current = read_update(state, doc_id).await?;
     let update = build_set_text_update(&current, "contents", new_content)?;
+    if update.is_empty() {
+        return Ok(());
+    }
+    write_update(state, doc_id, update).await
+}
+
+pub async fn set_structured(state: &AppState, doc_id: &str, value: &JsonValue) -> AppResult<()> {
+    let current = read_update(state, doc_id).await?;
+    let update = build_structured_update(&current, value)?;
     if update.is_empty() {
         return Ok(());
     }
@@ -172,6 +184,274 @@ pub async fn index_rename_binary(
         write_update(state, vault_id, update).await?;
     }
     Ok(())
+}
+
+pub async fn index_set_structured(
+    state: &AppState,
+    vault_id: &str,
+    path: &str,
+    guid: &str,
+    kind: &str,
+) -> AppResult<()> {
+    let current = read_update(state, vault_id).await?;
+    let metadata = HashMap::from([
+        ("guid".to_string(), Any::String(guid.into())),
+        ("kind".to_string(), Any::String(kind.into())),
+    ]);
+    let update = build_map_set_update(&current, "structured", path, metadata)?;
+    if !update.is_empty() {
+        write_update(state, vault_id, update).await?;
+    }
+    Ok(())
+}
+
+pub async fn index_remove_structured(
+    state: &AppState,
+    vault_id: &str,
+    path: &str,
+) -> AppResult<()> {
+    let current = read_update(state, vault_id).await?;
+    let update = build_map_remove_update(&current, "structured", path)?;
+    if !update.is_empty() {
+        write_update(state, vault_id, update).await?;
+    }
+    Ok(())
+}
+
+pub async fn index_rename_structured(
+    state: &AppState,
+    vault_id: &str,
+    from: &str,
+    to: &str,
+) -> AppResult<()> {
+    let current = read_update(state, vault_id).await?;
+    let entry = decode_structured_index(&current)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .into_iter()
+        .find(|entry| entry.path == from)
+        .ok_or(AppError::NotFound)?;
+    let metadata = HashMap::from([
+        ("guid".to_string(), Any::String(entry.guid.into())),
+        ("kind".to_string(), Any::String(entry.kind.into())),
+    ]);
+    let update = build_map_rename_update(&current, "structured", from, to, metadata)?;
+    if !update.is_empty() {
+        write_update(state, vault_id, update).await?;
+    }
+    Ok(())
+}
+
+pub fn build_structured_update(current_update: &[u8], value: &JsonValue) -> AppResult<Vec<u8>> {
+    if decode_structured(current_update).map_err(|e| AppError::Internal(e.to_string()))? == *value {
+        return Ok(Vec::new());
+    }
+    let doc = doc_from_update(current_update)?;
+    let before = doc.transact().state_vector();
+    let root = doc.get_or_insert_map("root");
+    {
+        let mut txn = doc.transact_mut();
+        reconcile_map(&mut txn, &root, value.as_object());
+    }
+    let update = doc.transact().encode_state_as_update_v1(&before);
+    Ok(update)
+}
+
+fn reconcile_map(
+    txn: &mut yrs::TransactionMut,
+    map: &yrs::MapRef,
+    value: Option<&JsonMap<String, JsonValue>>,
+) {
+    let empty = JsonMap::new();
+    let value = value.unwrap_or(&empty);
+    let keys: Vec<String> = map.keys(txn).map(ToString::to_string).collect();
+    for key in keys {
+        if !value.contains_key(&key) {
+            map.remove(txn, &key);
+        }
+    }
+    for (key, next) in value {
+        reconcile_map_value(txn, map, key, next);
+    }
+}
+
+fn reconcile_array(txn: &mut yrs::TransactionMut, array: &yrs::ArrayRef, value: &[JsonValue]) {
+    let mut i = 0;
+    while i < value.len() {
+        reconcile_array_value(txn, array, i as u32, &value[i]);
+        i += 1;
+    }
+    let len = array.len(txn);
+    if len > value.len() as u32 {
+        array.remove_range(txn, value.len() as u32, len - value.len() as u32);
+    }
+}
+
+fn reconcile_map_value(
+    txn: &mut yrs::TransactionMut,
+    map: &yrs::MapRef,
+    key: &str,
+    next: &JsonValue,
+) {
+    if let Some(values) = next.as_array() {
+        match map.get(txn, key) {
+            Some(Out::YArray(array)) => reconcile_array(txn, &array, values),
+            _ => {
+                map.insert(txn, key.to_string(), ArrayPrelim::default());
+                if let Some(Out::YArray(array)) = map.get(txn, key) {
+                    reconcile_array(txn, &array, values);
+                }
+            }
+        }
+    } else if let Some(object) = next.as_object() {
+        match map.get(txn, key) {
+            Some(Out::YMap(child)) => reconcile_map(txn, &child, Some(object)),
+            _ => {
+                map.insert(txn, key.to_string(), MapPrelim::default());
+                if let Some(Out::YMap(child)) = map.get(txn, key) {
+                    reconcile_map(txn, &child, Some(object));
+                }
+            }
+        }
+    } else if should_use_text(Some(key), next) {
+        let text = next.as_str().unwrap_or_default();
+        match map.get(txn, key) {
+            Some(Out::YText(ytext)) => apply_string_to_ytext(txn, &ytext, text),
+            _ => {
+                map.insert(txn, key.to_string(), TextPrelim::new(""));
+                if let Some(Out::YText(ytext)) = map.get(txn, key) {
+                    apply_string_to_ytext(txn, &ytext, text);
+                }
+            }
+        }
+    } else {
+        let next_any = json_to_any(next);
+        if map.get(txn, key).is_some_and(|current| match current {
+            Out::Any(current) => any_to_json(&current) == any_to_json(&next_any),
+            _ => false,
+        }) {
+            return;
+        }
+        map.insert(txn, key.to_string(), next_any);
+    }
+}
+
+fn reconcile_array_value(
+    txn: &mut yrs::TransactionMut,
+    array: &yrs::ArrayRef,
+    index: u32,
+    next: &JsonValue,
+) {
+    if let Some(values) = next.as_array() {
+        match array.get(txn, index) {
+            Some(Out::YArray(child)) => reconcile_array(txn, &child, values),
+            _ => {
+                if index < array.len(txn) {
+                    array.remove_range(txn, index, 1);
+                }
+                array.insert(txn, index, ArrayPrelim::default());
+            }
+        }
+        if let Some(Out::YArray(child)) = array.get(txn, index) {
+            reconcile_array(txn, &child, values);
+        }
+    } else if let Some(object) = next.as_object() {
+        match array.get(txn, index) {
+            Some(Out::YMap(child)) => reconcile_map(txn, &child, Some(object)),
+            _ => {
+                if index < array.len(txn) {
+                    array.remove_range(txn, index, 1);
+                }
+                array.insert(txn, index, MapPrelim::default());
+            }
+        }
+        if let Some(Out::YMap(child)) = array.get(txn, index) {
+            reconcile_map(txn, &child, Some(object));
+        }
+    } else if should_use_text(None, next) {
+        let text = next.as_str().unwrap_or_default();
+        match array.get(txn, index) {
+            Some(Out::YText(ytext)) => apply_string_to_ytext(txn, &ytext, text),
+            _ => {
+                if index < array.len(txn) {
+                    array.remove_range(txn, index, 1);
+                }
+                array.insert(txn, index, TextPrelim::new(""));
+            }
+        }
+        if let Some(Out::YText(ytext)) = array.get(txn, index) {
+            apply_string_to_ytext(txn, &ytext, text);
+        }
+    } else {
+        let next_any = json_to_any(next);
+        if array.get(txn, index).is_some_and(|current| match current {
+            Out::Any(current) => any_to_json(&current) == any_to_json(&next_any),
+            _ => false,
+        }) {
+            return;
+        }
+        if index < array.len(txn) {
+            array.remove_range(txn, index, 1);
+        }
+        array.insert(txn, index, next_any);
+    }
+}
+
+fn should_use_text(key: Option<&str>, value: &JsonValue) -> bool {
+    let Some(value) = value.as_str() else {
+        return false;
+    };
+    key.is_some_and(|key| {
+        matches!(
+            key,
+            "text" | "label" | "filter" | "formula" | "query" | "name" | "description"
+        )
+    }) || value.len() > 256
+}
+
+fn apply_string_to_ytext(txn: &mut yrs::TransactionMut, ytext: &yrs::TextRef, next: &str) {
+    let old = ytext.get_string(txn);
+    if old == next {
+        return;
+    }
+    let ascii_splice = old.is_ascii() && next.is_ascii();
+    let (prefix, old_suffix, new_suffix) = if ascii_splice {
+        common_affixes(&old, next)
+    } else {
+        (0, old.len(), next.len())
+    };
+    let prefix_units = old[..prefix].chars().count() as u32;
+    let delete_len = if ascii_splice {
+        old[prefix..old_suffix].chars().count() as u32
+    } else {
+        old[prefix..old_suffix].len() as u32
+    };
+    if delete_len > 0 {
+        ytext.remove_range(txn, prefix_units, delete_len);
+    }
+    let insert = &next[prefix..new_suffix];
+    if !insert.is_empty() {
+        ytext.insert(txn, prefix_units, insert);
+    }
+}
+
+fn json_to_any(value: &JsonValue) -> Any {
+    match value {
+        JsonValue::Null => Any::Null,
+        JsonValue::Bool(v) => Any::Bool(*v),
+        JsonValue::Number(v) => v
+            .as_i64()
+            .map(Any::BigInt)
+            .unwrap_or_else(|| Any::Number(v.as_f64().unwrap_or(0.0))),
+        JsonValue::String(v) => Any::String(v.as_str().into()),
+        JsonValue::Array(values) => Any::Array(values.iter().map(json_to_any).collect()),
+        JsonValue::Object(values) => Any::Map(
+            values
+                .iter()
+                .map(|(k, v)| (k.clone(), json_to_any(v)))
+                .collect::<HashMap<_, _>>()
+                .into(),
+        ),
+    }
 }
 
 fn build_set_text_update(
@@ -618,5 +898,52 @@ mod tests {
             decode_files_map(&merged).unwrap(),
             vec![("b.md".into(), "guid-a".into())]
         );
+    }
+
+    #[test]
+    fn build_structured_update_roundtrips_and_noops() {
+        let base = text_update("unused", "");
+        let value = serde_json::json!({ "nodes": { "a": { "id": "a", "text": "hello" } }, "nodeOrder": ["a"] });
+        let diff = build_structured_update(&base, &value).unwrap();
+        let merged = apply_update(&base, &diff);
+        assert_eq!(decode_structured(&merged).unwrap(), value);
+        assert!(build_structured_update(&merged, &value).unwrap().is_empty());
+    }
+
+    #[test]
+    fn build_structured_update_promotes_text_keys_and_long_strings() {
+        let base = text_update("unused", "");
+        let long = "x".repeat(257);
+        let value = serde_json::json!({ "label": "short", "plain": "short", "long": long });
+        let merged = apply_update(&base, &build_structured_update(&base, &value).unwrap());
+        let doc = doc_from_update(&merged).unwrap();
+        let root = doc.get_or_insert_map("root");
+        let txn = doc.transact();
+        assert!(matches!(root.get(&txn, "label"), Some(Out::YText(_))));
+        assert!(matches!(
+            root.get(&txn, "plain"),
+            Some(Out::Any(Any::String(_)))
+        ));
+        assert!(matches!(root.get(&txn, "long"), Some(Out::YText(_))));
+    }
+
+    #[test]
+    fn build_structured_update_arrays_grow_shrink_and_delete_keys() {
+        let base = text_update("unused", "");
+        let first = serde_json::json!({ "items": [1, 2, 3], "gone": true });
+        let second = serde_json::json!({ "items": [1, 4] });
+        let merged = apply_update(&base, &build_structured_update(&base, &first).unwrap());
+        let merged = apply_update(&merged, &build_structured_update(&merged, &second).unwrap());
+        assert_eq!(decode_structured(&merged).unwrap(), second);
+    }
+
+    #[test]
+    fn build_structured_update_handles_unicode_text_boundaries() {
+        let base = text_update("unused", "");
+        let first = serde_json::json!({ "text": "hi 🦀 world" });
+        let second = serde_json::json!({ "text": "hi 🦀 vault" });
+        let merged = apply_update(&base, &build_structured_update(&base, &first).unwrap());
+        let merged = apply_update(&merged, &build_structured_update(&merged, &second).unwrap());
+        assert_eq!(decode_structured(&merged).unwrap(), second);
     }
 }

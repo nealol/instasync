@@ -178,9 +178,11 @@ export class VaultSync {
 
 		// Connect documents for entries that already exist in the shared index.
 		for (const [path, guid] of this.files.entries()) {
+			this.registerFile(path, guid);
 			this.ensureDocument(path, guid, false);
 		}
 		for (const [path, meta] of this.structured.entries()) {
+			this.registerFile(path, meta.guid);
 			this.ensureStructuredDocument(path, meta.guid, meta.kind, false);
 		}
 
@@ -200,9 +202,11 @@ export class VaultSync {
 					this.indexDoc.transact(() => {
 						this.structured.set(file.path, { guid, kind: structuredKind });
 					});
+					this.registerFile(file.path, guid);
 					this.ensureStructuredDocument(file.path, guid, structuredKind, true);
 				} else {
 					const meta = this.structured.get(file.path)!;
+					this.registerFile(file.path, meta.guid);
 					this.ensureStructuredDocument(file.path, meta.guid, meta.kind, false);
 				}
 				continue;
@@ -215,6 +219,7 @@ export class VaultSync {
 				this.registerFile(file.path, guid);
 				this.ensureDocument(file.path, guid, true);
 			} else {
+				this.registerFile(file.path, this.files.get(file.path)!);
 				this.ensureDocument(file.path, this.files.get(file.path)!, false);
 			}
 		}
@@ -249,6 +254,7 @@ export class VaultSync {
 			this.indexDoc.transact(() => {
 				this.structured.set(path, { guid, kind: structuredKind });
 			});
+			this.registerFile(path, guid);
 			this.ensureStructuredDocument(path, guid, structuredKind, true);
 			this.binarySync.stopTrackingPath(path);
 		}
@@ -267,7 +273,10 @@ export class VaultSync {
 		event.changes.keys.forEach((change, path) => {
 			if (change.action === "add" || change.action === "update") {
 				const guid = this.files.get(path);
-				if (guid) this.ensureDocument(path, guid, false);
+				if (guid) {
+					this.registerFile(path, guid);
+					this.ensureDocument(path, guid, false);
+				}
 			} else if (change.action === "delete") {
 				this.handleRemoteDelete(path);
 			}
@@ -279,7 +288,10 @@ export class VaultSync {
 		event.changes.keys.forEach((change, path) => {
 			if (change.action === "add" || change.action === "update") {
 				const meta = this.structured.get(path);
-				if (meta) this.ensureStructuredDocument(path, meta.guid, meta.kind, false);
+				if (meta) {
+					this.registerFile(path, meta.guid);
+					this.ensureStructuredDocument(path, meta.guid, meta.kind, false);
+				}
 			} else if (change.action === "delete") {
 				this.handleRemoteDelete(path);
 			}
@@ -447,6 +459,7 @@ export class VaultSync {
 			if (!structuredKind) return;
 			if (this.structured.has(file.path)) {
 				const meta = this.structured.get(file.path)!;
+				this.registerFile(file.path, meta.guid);
 				this.ensureStructuredDocument(file.path, meta.guid, meta.kind, false);
 				return;
 			}
@@ -454,12 +467,14 @@ export class VaultSync {
 			this.indexDoc.transact(() => {
 				this.structured.set(file.path, { guid, kind: structuredKind });
 			});
+			this.registerFile(file.path, guid);
 			this.ensureStructuredDocument(file.path, guid, structuredKind, true);
 			return;
 		}
 		if (kind !== "text") return;
 		if (this.files.has(file.path)) {
 			// Created locally because a remote entry arrived; Document handles it.
+			this.registerFile(file.path, this.files.get(file.path)!);
 			this.ensureDocument(file.path, this.files.get(file.path)!, false);
 			return;
 		}
@@ -529,6 +544,7 @@ export class VaultSync {
 			this.indexDoc.transact(() => {
 				this.structured.set(newPath, { guid: finalGuid, kind: structuredKind });
 			});
+			this.registerFile(newPath, finalGuid);
 			this.ensureStructuredDocument(newPath, finalGuid, structuredKind, !wasStructuredTracked);
 		} else if (kind === "binary") {
 			// Reconcile both old (now gone) and new paths on the binary side.

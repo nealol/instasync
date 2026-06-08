@@ -159,7 +159,9 @@ pub(crate) async fn reconcile_vault_files(
     let (delete_ids, upserts) = plan_reconcile(&index, &row_tuples);
 
     for id in delete_ids {
-        vault_files::Entity::delete_by_id(id).exec(&state.db).await?;
+        vault_files::Entity::delete_by_id(id)
+            .exec(&state.db)
+            .await?;
     }
     for (path, guid) in upserts {
         ydoc::upsert_vault_file(state, vault_id, &path, &guid).await?;
@@ -179,8 +181,10 @@ fn plan_reconcile(
     use std::collections::{HashMap, HashSet};
 
     let live_guids: HashSet<&str> = index.iter().map(|(_, guid)| guid.as_str()).collect();
-    let row_path_by_guid: HashMap<&str, &str> =
-        rows.iter().map(|(_, guid, path)| (guid.as_str(), path.as_str())).collect();
+    let row_path_by_guid: HashMap<&str, &str> = rows
+        .iter()
+        .map(|(_, guid, path)| (guid.as_str(), path.as_str()))
+        .collect();
 
     let delete_ids = rows
         .iter()
@@ -438,10 +442,7 @@ pub(crate) async fn delete_note_inner(
 
 async fn mark_note_write(state: &AppState, vault_id: &str, principal: &ApiPrincipal) {
     let git_principal = principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000);
-    state
-        .git
-        .mark_write(vault_id, &git_principal)
-        .await;
+    state.git.mark_write(vault_id, &git_principal).await;
     state
         .search
         .mark_write(state.clone(), vault_id, &git_principal)
@@ -489,7 +490,8 @@ async fn rewrite_backlinks_after_move(
                         continue;
                     }
                 };
-                let (new_content, changed) = crate::search::rewrite_links(&content, old_path, new_path);
+                let (new_content, changed) =
+                    crate::search::rewrite_links(&content, old_path, new_path);
                 if changed {
                     if let Err(e) = ydoc::set_text(state, &doc_id, &new_content).await {
                         tracing::warn!("rewrite backlink {} failed: {e}", cand.path);
@@ -632,7 +634,13 @@ pub(crate) async fn periodic_note_get_or_create_inner(
     let note_path = periodic_path(state, period, body.date.as_deref())?;
     if let Some(file) = file_by_path(state, vault_id, &note_path).await? {
         // Honor per-path ACLs on the existing periodic note (deny -> Forbidden).
-        authorize_doc(state, &principal.user, vault_id, &doc_id(vault_id, &file.guid)).await?;
+        authorize_doc(
+            state,
+            &principal.user,
+            vault_id,
+            &doc_id(vault_id, &file.guid),
+        )
+        .await?;
         let update = ydoc::read_update(state, &doc_id(vault_id, &file.guid)).await?;
         let content = ydoc::decode_text(&update, "contents")
             .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -688,7 +696,13 @@ pub(crate) async fn periodic_note_append_inner(
         .await?
         .ok_or(AppError::NotFound)?;
     // Appending is a write; reject when the per-path ACL is read-only or deny.
-    let level = authorize_doc(state, &principal.user, vault_id, &doc_id(vault_id, &file.guid)).await?;
+    let level = authorize_doc(
+        state,
+        &principal.user,
+        vault_id,
+        &doc_id(vault_id, &file.guid),
+    )
+    .await?;
     if level == Level::ReadOnly {
         return Err(AppError::Forbidden);
     }
