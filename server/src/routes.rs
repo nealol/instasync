@@ -717,23 +717,43 @@ pub(crate) async fn authorize_doc(
     vault_id: &str,
     doc_id: &str,
 ) -> AppResult<Level> {
-    // Index doc (== vaultId) and unknown guids are treated as vault-level ("").
+    // Index doc (== vaultId) and unknown regular file guids are treated as
+    // vault-level (""). Plugin DB docs use an explicit namespace; when clients
+    // register their pseudo-path we authorize through that path, otherwise MVP
+    // permits vault-level access for vault members.
     let path = if doc_id == vault_id {
         String::new()
     } else {
         let guid = doc_id
             .strip_prefix(&format!("{vault_id}__"))
             .unwrap_or_default();
-        vault_files::Entity::find()
+        let registered = vault_files::Entity::find()
             .filter(vault_files::Column::VaultId.eq(vault_id))
             .filter(vault_files::Column::Guid.eq(guid))
             .one(&state.db)
-            .await?
-            .map(|f| f.path)
-            .unwrap_or_default()
+            .await?;
+        if let Some(file) = registered {
+            file.path
+        } else if is_plugin_db_guid(guid) {
+            String::new()
+        } else {
+            String::new()
+        }
     };
 
     authorize_path(state, user, vault_id, &path).await
+}
+
+fn is_plugin_db_guid(guid: &str) -> bool {
+    let parts: Vec<&str> = guid.split("__").collect();
+    parts.len() == 3
+        && parts[0] == "plugindb"
+        && parts[1]
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        && parts[2]
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
 pub(crate) async fn authorize_path(

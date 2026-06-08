@@ -11,6 +11,8 @@ import { PLUGIN_NAME } from "./brand";
 import { liveEdit } from "./editor/LiveEdit";
 import { yRemoteSelections, yRemoteSelectionsTheme } from "./editor/RemoteSelections";
 import { setDiagnosticLoggingEnabled } from "./debug";
+import { purgePersistedVaultState } from "./pluginDb/purge";
+import type { OpenSyncedDatabaseOptions, SyncedDatabase } from "./pluginDb/types";
 
 type ConnectionStatus = "offline" | "connecting" | "connected" | "error" | "signin";
 
@@ -168,6 +170,11 @@ export default class RealtimePlugin extends Plugin {
 		await this.maybeStartSync();
 	}
 
+	openSyncedDatabase(options: OpenSyncedDatabaseOptions): Promise<SyncedDatabase> {
+		if (!this.vaultSync) throw new Error("Realtime sync is not running");
+		return this.vaultSync.openSyncedDatabase(options);
+	}
+
 	// --- Auth / onboarding -----------------------------------------------------
 
 	/** Called after a successful login; prompts onboarding when no vault is set. */
@@ -283,6 +290,7 @@ export default class RealtimePlugin extends Plugin {
 
 		this.stopSync();
 		await this.wipeLocalSyncedFiles();
+		await purgePersistedVaultState(vaultId);
 		this.settings.activeVaultId = vaultId;
 		await this.saveSettings();
 		await this.reloadSync();

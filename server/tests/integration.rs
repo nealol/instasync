@@ -2123,6 +2123,17 @@ async fn doc_token_scopes_and_mints() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
+    // Invalid doc ids are rejected before y-sweet token minting.
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/doc-token",
+        Some(&alice),
+        Some(json!({"vaultId": vault_id, "docId": format!("{vault_id}__bad/slash")})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
     // Member gets a token (default allow-all), with the host rewritten to public.
     let (status, token) = send(
         &app,
@@ -2141,6 +2152,17 @@ async fn doc_token_scopes_and_mints() {
         "host should be rewritten to public url, got {}",
         token["url"]
     );
+
+    // Plugin DB docs are explicitly recognized under the vault namespace.
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/doc-token",
+        Some(&alice),
+        Some(json!({"vaultId": vault_id, "docId": format!("{vault_id}__plugindb__my-plugin__main")})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]

@@ -111,6 +111,33 @@ and `/api/doc-token`.
 
 The status bar shows `Realtime: connecting… / live / error`.
 
+## Synced Plugin Databases
+
+Third-party Obsidian plugins can open low-level cr-sqlite databases through the Realtime plugin API. Tables that should sync must be converted to cr-sqlite CRRs by the caller; Realtime transports `crsql_changes` rows through a Y-Sweet document instead of syncing `.sqlite` files as binary attachments.
+
+```ts
+const realtime = app.plugins.plugins.realtime;
+
+const db = await realtime.openSyncedDatabase({
+	pluginId: "my-plugin",
+	name: "main",
+	schema: async (db) => {
+		await db.exec(`
+			CREATE TABLE IF NOT EXISTS tasks (
+				id TEXT PRIMARY KEY NOT NULL,
+				title TEXT,
+				done INTEGER
+			);
+			SELECT crsql_as_crr('tasks');
+		`);
+	},
+});
+
+await db.exec("INSERT INTO tasks(id, title, done) VALUES (?, ?, ?)", ["t1", "Ship", 0]);
+```
+
+`pluginId` and `name` may contain only ASCII letters, numbers, dash, and underscore. The API is available only when Realtime sync is enabled, signed in, bound to a vault, and running.
+
 ## Development
 
 ```bash

@@ -200,6 +200,17 @@ describe("Realtime — two isolated Obsidian devices", function () {
 				{ timeout: 60 * SECONDS, timeoutMsg: "A did not catch up after unpausing" },
 			);
 		});
+
+		it("exposes plugin DB API and authorizes plugin DB sync docs", async function () {
+			const hasApi = await A.execute(() => typeof (window as any).app.plugins.plugins.realtime.openSyncedDatabase === "function");
+			expect(hasApi).toBe(true);
+			const res = await fetch(`${authUrl}/api/doc-token`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json", Authorization: `Bearer ${adminToken}` },
+				body: JSON.stringify({ vaultId, docId: `${vaultId}__plugindb__e2e_plugin__main` }),
+			});
+			expect(res.status).toBe(200);
+		});
 	});
 
 	describe("live editing of an open note", function () {

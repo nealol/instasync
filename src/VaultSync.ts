@@ -18,6 +18,8 @@ import type { StructuredDocument } from "./StructuredDocument";
 import { BinarySync } from "./BinarySync";
 import { ConfigSync } from "./ConfigSync";
 import { matchesAnyGlob, parseGlobs } from "./glob";
+import { PluginDbSync } from "./pluginDb/PluginDbSync";
+import type { OpenSyncedDatabaseOptions, SyncedDatabase } from "./pluginDb/types";
 
 type FileKind = "text" | "structured" | "binary" | "ignore";
 type StructuredKind = "canvas" | "base";
@@ -65,6 +67,7 @@ export class VaultSync {
 	private binarySync: BinarySync;
 	/** Per-device opt-in sync for whitelisted files under `.obsidian`. */
 	private configSync: ConfigSync;
+	private pluginDbSync: PluginDbSync;
 
 	private documents = new Map<string, Document>();
 	private structuredDocuments = new Map<string, StructuredDocument>();
@@ -88,6 +91,7 @@ export class VaultSync {
 		this.structured = this.indexDoc.getMap("structured");
 		this.binarySync = new BinarySync(plugin, this, this.indexDoc);
 		this.configSync = new ConfigSync(plugin, this.indexDoc);
+		this.pluginDbSync = new PluginDbSync(plugin);
 
 		const vaultId = plugin.settings.activeVaultId;
 
@@ -151,6 +155,11 @@ export class VaultSync {
 		}
 		for (const doc of this.documents.values()) doc.ensureConnected();
 		for (const doc of this.structuredDocuments.values()) doc.ensureConnected();
+		this.pluginDbSync.reconnectAll();
+	}
+
+	openSyncedDatabase(options: OpenSyncedDatabaseOptions): Promise<SyncedDatabase> {
+		return this.pluginDbSync.open(options);
 	}
 
 	pathForGuid(guid: string): string | null {
@@ -582,6 +591,7 @@ export class VaultSync {
 		this.vaultEvents = [];
 		this.binarySync.destroy();
 		this.configSync.destroy();
+		this.pluginDbSync.destroy();
 		this.files.unobserve(this.filesObserver);
 		this.structured.unobserve(this.structuredObserver);
 		this.indexProvider.off(EVENT_CONNECTION_STATUS, this.statusListener);
