@@ -13,6 +13,7 @@ import { yRemoteSelections, yRemoteSelectionsTheme } from "./editor/RemoteSelect
 import { setDiagnosticLoggingEnabled } from "./debug";
 import { purgePersistedVaultState } from "./pluginDb/purge";
 import type { OpenSyncedDatabaseOptions, SyncedDatabase } from "./pluginDb/types";
+import { configureCrsqliteWasmFallback } from "./pluginDb/crsqlite";
 
 type ConnectionStatus = "offline" | "connecting" | "connected" | "error" | "signin";
 
@@ -36,6 +37,9 @@ export default class RealtimePlugin extends Plugin {
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
+		configureCrsqliteWasmFallback(
+			`https://github.com/nealol/realtime/releases/download/${this.manifest.version}/crsqlite.wasm`,
+		);
 		this.auth = new AuthClient(this);
 
 		this.addSettingTab(new RealtimeSettingTab(this.app, this));

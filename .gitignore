@@ -2,6 +2,7 @@
 /references
 /.idea
 /main.js
+/crsqlite.wasm
 /data.json
 /.ysweet-server.log
 /node_modules/

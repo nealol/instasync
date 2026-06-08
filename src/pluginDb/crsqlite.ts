@@ -1,14 +1,35 @@
 import initWasm from "@vlcn.io/crsqlite-wasm";
 import type { SqlDatabaseAdapter } from "./types";
 
+declare const __dirname: string | undefined;
+declare const require: ((id: string) => unknown) | undefined;
+
 let sqlitePromise: ReturnType<typeof initWasm> | null = null;
+let fallbackWasmUrl = "";
+
+export function configureCrsqliteWasmFallback(url: string): void {
+	fallbackWasmUrl = url;
+}
 
 function wasmUrl(file: string): string {
+	if (file !== "crsqlite.wasm") return file;
+	if (typeof __dirname === "string") {
+		const localPath = `${__dirname.replace(/\\/g, "/")}/crsqlite.wasm`;
+		if (localFileExists(localPath) || !fallbackWasmUrl) return localPath;
+		console.warn(`[Realtime] crsqlite.wasm not found at ${localPath}; loading from release asset.`);
+		return fallbackWasmUrl;
+	}
+	if (fallbackWasmUrl) return fallbackWasmUrl;
+	return "crsqlite.wasm";
+}
+
+function localFileExists(path: string): boolean {
 	try {
-		if (file === "crsqlite.wasm") return new URL("@vlcn.io/crsqlite-wasm/crsqlite.wasm", import.meta.url).toString();
-		return file;
+		if (typeof require !== "function") return false;
+		const fs = require("fs") as { existsSync?: (path: string) => boolean };
+		return fs.existsSync?.(path) === true;
 	} catch {
-		return file;
+		return false;
 	}
 }
 

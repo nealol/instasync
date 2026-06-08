@@ -9,7 +9,7 @@
 //   3. Runs the production build to produce main.js.
 //   4. Creates a GitHub release tagged "<version>" (no "v" prefix, to match
 //      the Obsidian convention) and uploads manifest.json, main.js and
-//      styles.css as assets — which is all BRAT needs.
+//      styles.css, and crsqlite.wasm as assets.
 //
 // Requires the `gh` CLI to be installed and authenticated.
 
@@ -67,9 +67,13 @@ if (!existsSync("main.js")) {
   console.error("Build did not produce main.js — aborting.");
   process.exit(1);
 }
+if (!existsSync("crsqlite.wasm")) {
+  console.error("Build did not produce crsqlite.wasm — aborting.");
+  process.exit(1);
+}
 
 // 4. GitHub release
-const assets = ["manifest.json", "main.js", "styles.css"].filter((f) => existsSync(f));
+const assets = ["manifest.json", "main.js", "styles.css", "crsqlite.wasm"].filter((f) => existsSync(f));
 const ghArgs = [
   "release",
   "create",
