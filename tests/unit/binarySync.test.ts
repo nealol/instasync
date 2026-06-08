@@ -111,6 +111,37 @@ describe("BinarySync", () => {
 		}
 	});
 
+	it("restores a missing local binary from a persisted remote baseline", async () => {
+		const A = makeDevice("A");
+		const B = makeDevice("B");
+		try {
+			await synced(A.provider);
+			await synced(B.provider);
+
+			A.vault.binaries.set("image.png", bytes([7, 6, 5, 4]));
+			A.bs.seedBaseline();
+			await A.bs.reconcileAll(["image.png"]);
+
+			await waitFor(() => B.binaries.has("image.png"), { label: "B index has image" });
+
+			// Simulate a migrated IndexedDB baseline with no local vault file yet. This
+			// must pull the blob, not interpret absence as a local delete.
+			B.bs.seedBaseline();
+			await B.bs.reconcileAll([]);
+
+			await waitFor(() => B.vault.binaries.has("image.png"), { label: "B restored image" });
+			expect(asArray(B.vault.binaries.get("image.png"))).toEqual([7, 6, 5, 4]);
+			expect(B.binaries.has("image.png")).toBe(true);
+		} finally {
+			A.bs.destroy();
+			A.provider.destroy();
+			A.indexDoc.destroy();
+			B.bs.destroy();
+			B.provider.destroy();
+			B.indexDoc.destroy();
+		}
+	});
+
 	it("reports a large deferred file as pending while text sync is busy", async () => {
 		const A = makeDevice("A");
 		try {

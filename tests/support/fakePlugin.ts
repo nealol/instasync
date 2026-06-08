@@ -38,7 +38,11 @@ export class FakeVault {
 		return null;
 	}
 	async read(file: TFile): Promise<string> {
-		return this.files.get(file.path) ?? "";
+		const text = this.files.get(file.path);
+		if (text !== undefined) return text;
+		const binary = this.binaries.get(file.path);
+		if (binary) return new TextDecoder().decode(binary);
+		return "";
 	}
 	async readBinary(file: TFile): Promise<ArrayBuffer> {
 		const buf = this.binaries.get(file.path);
@@ -57,10 +61,12 @@ export class FakeVault {
 	}
 	async modify(file: TFile, text: string): Promise<void> {
 		this.files.set(file.path, text);
+		this.binaries.delete(file.path);
 		this.emit("modify", new TFile(file.path));
 	}
 	async create(path: string, text: string): Promise<TFile> {
 		this.files.set(path, text);
+		this.binaries.delete(path);
 		const f = new TFile(path);
 		this.emit("create", f);
 		return f;

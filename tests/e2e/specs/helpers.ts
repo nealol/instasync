@@ -172,6 +172,121 @@ export async function closeAllEditors(b: any): Promise<void> {
 	});
 }
 
+// --- Structured files (canvas / base live bindings) ------------------------
+//
+// Canvas and Base files sync through a CRDT, but when the file is *open* the
+// disk write-through is suppressed in favor of a live binding (CanvasBinding /
+// BaseBinding). The plain read/write helpers only exercise the disk path; these
+// drive the actual open views so the bindings are under test.
+
+/**
+ * Enable an Obsidian core plugin (e.g. "canvas", "bases"). Returns true if the
+ * plugin is enabled afterwards — false means this Obsidian build doesn't ship it
+ * (older versions predate Bases), so the caller can skip the dependent tests.
+ */
+export async function enableCorePlugin(b: any, id: string): Promise<boolean> {
+	return b.executeObsidian(async ({ app }: any, pid: string) => {
+		const ip = (app as any).internalPlugins;
+		const plugin = ip.getPluginById ? ip.getPluginById(pid) : ip.plugins?.[pid];
+		if (!plugin) return false;
+		if (!plugin.enabled) {
+			try {
+				if (ip.enablePluginAndSave) await ip.enablePluginAndSave(pid);
+				else if (plugin.enable) await plugin.enable();
+			} catch {
+				return false;
+			}
+		}
+		return !!plugin.enabled;
+	}, id);
+}
+
+/** Open a file in its native view (canvas/base) in a new active leaf. */
+export async function openFileInLeaf(b: any, path: string): Promise<void> {
+	await b.executeObsidian(async ({ app }: any, p: string) => {
+		const f = app.vault.getAbstractFileByPath(p);
+		const leaf = app.workspace.getLeaf(true);
+		await leaf.openFile(f, { active: true });
+		app.workspace.setActiveLeaf(leaf, { focus: true });
+	}, path);
+}
+
+/** Force the plugin to (re)bind live canvas/base views to their documents. */
+export async function bindOpenStructured(b: any): Promise<void> {
+	await b.executeObsidian(async ({ app }: any) => {
+		const vs = (app as any).plugins.plugins.realtime.vaultSync;
+		vs?.bindOpenCanvases?.();
+		vs?.bindOpenBases?.();
+	});
+}
+
+/** Detach all leaves of a given view type (e.g. "canvas", "bases"). */
+export async function detachLeaves(b: any, viewType: string): Promise<void> {
+	await b.executeObsidian(async ({ app }: any, vt: string) => {
+		app.workspace.detachLeavesOfType(vt);
+	}, viewType);
+}
+
+/** Read the live canvas view's data object for an open canvas, or null. */
+export async function canvasViewData(b: any, path: string): Promise<any | null> {
+	return b.executeObsidian(async ({ app }: any, p: string) => {
+		let result: any = null;
+		app.workspace.iterateAllLeaves((leaf: any) => {
+			const v = leaf?.view;
+			if (v?.getViewType?.() === "canvas" && v?.file?.path === p && v.canvas?.getData) {
+				result = v.canvas.getData();
+			}
+		});
+		return result;
+	}, path);
+}
+
+/** Apply data to the live canvas view and save it — simulates a user edit. */
+export async function editCanvasView(b: any, path: string, data: any): Promise<void> {
+	await b.executeObsidian(async ({ app }: any, p: string, d: any) => {
+		let done = false;
+		app.workspace.iterateAllLeaves((leaf: any) => {
+			const v = leaf?.view;
+			if (!done && v?.getViewType?.() === "canvas" && v?.file?.path === p && v.canvas?.importData) {
+				v.canvas.importData(d);
+				v.canvas.requestSave();
+				done = true;
+			}
+		});
+		if (!done) throw new Error("no open canvas view for " + p);
+	}, path, data);
+}
+
+/** Read the live base view's serialized data (YAML) for an open base, or null. */
+export async function baseViewData(b: any, path: string): Promise<string | null> {
+	return b.executeObsidian(async ({ app }: any, p: string) => {
+		let result: string | null = null;
+		app.workspace.iterateAllLeaves((leaf: any) => {
+			const v = leaf?.view;
+			if (v?.getViewType?.() === "bases" && v?.file?.path === p && typeof v.getViewData === "function") {
+				result = v.getViewData();
+			}
+		});
+		return result;
+	}, path);
+}
+
+/** Load YAML into the live base view and save it — simulates a user config edit. */
+export async function editBaseView(b: any, path: string, yaml: string): Promise<void> {
+	await b.executeObsidian(async ({ app }: any, p: string, y: string) => {
+		let done = false;
+		app.workspace.iterateAllLeaves((leaf: any) => {
+			const v = leaf?.view;
+			if (!done && v?.getViewType?.() === "bases" && v?.file?.path === p && typeof v.setViewData === "function") {
+				v.setViewData(y, false);
+				v.requestSave();
+				done = true;
+			}
+		});
+		if (!done) throw new Error("no open base view for " + p);
+	}, path, yaml);
+}
+
 export async function readNote(b: any, path: string): Promise<string | null> {
 	return b.executeObsidian(
 		async ({ app }: any, p: string) => {
@@ -272,7 +387,7 @@ export async function setNetworkOffline(b: any, offline: boolean): Promise<void>
 export async function statusText(b: any): Promise<string> {
 	return b.executeObsidian(() => {
 		const el = Array.from(document.querySelectorAll(".status-bar-item")).find((e) =>
-			(e.textContent ?? "").includes("Realtime"),
+			(e.textContent ?? "").includes("Sync:"),
 		);
 		return el?.textContent ?? "";
 	});

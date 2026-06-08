@@ -223,9 +223,34 @@ export class VaultSync {
 
 		// Reconcile binary files against the blob store (after the text pass so
 		// note sync wins the bandwidth while binaries settle in the background).
-		void this.binarySync.reconcileAll(this.localBinaryPaths());
+		void this.reconcileBinariesAndMigrateStructured();
 		if (this.plugin.settings.syncConfigEnabled) {
 			this.configSync.start(this.plugin.settings.configIncludeGlobs);
+		}
+	}
+
+	private async reconcileBinariesAndMigrateStructured(): Promise<void> {
+		await this.binarySync.reconcileAll(this.localBinaryPaths());
+		if (this.destroyed) return;
+
+		for (const path of this.binarySync.remotePaths()) {
+			const structuredKind = this.structuredKindForPath(path);
+			if (!structuredKind || this.structured.has(path)) continue;
+
+			// Legacy sync stored canvases/bases as binary blobs. Pull the blob first,
+			// then promote the path into the structured CRDT index for live sync.
+			await this.binarySync.reconcilePath(path);
+			if (this.destroyed) return;
+
+			const localFile = this.plugin.app.vault.getAbstractFileByPath(path);
+			if (!(localFile instanceof TFile)) continue;
+
+			const guid = newGuid();
+			this.indexDoc.transact(() => {
+				this.structured.set(path, { guid, kind: structuredKind });
+			});
+			this.ensureStructuredDocument(path, guid, structuredKind, true);
+			this.binarySync.stopTrackingPath(path);
 		}
 	}
 
@@ -356,6 +381,12 @@ export class VaultSync {
 		}
 	}
 
+	bindOpenBases(): void {
+		for (const doc of this.structuredDocuments.values()) {
+			if (doc instanceof BaseDocument) doc.tryBindLiveBase();
+		}
+	}
+
 	// --- Local vault events ----------------------------------------------------
 
 	private registerVaultEvents(): void {
@@ -392,6 +423,16 @@ export class VaultSync {
 		if (extension === "canvas") return "canvas";
 		if (extension === "base") return "base";
 		return null;
+	}
+
+	private structuredKindForPath(path: string): StructuredKind | null {
+		const dot = path.lastIndexOf(".");
+		if (dot < 0 || dot < path.lastIndexOf("/")) return null;
+		const extension = path.slice(dot + 1);
+		const kind = this.structuredKindForExtension(extension);
+		if (kind === "canvas" && !this.plugin.settings.syncCanvases) return null;
+		if (kind === "base" && !this.plugin.settings.syncBases) return null;
+		return kind;
 	}
 
 	private onLocalCreate(file: TAbstractFile): void {

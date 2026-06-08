@@ -89,6 +89,7 @@ export default class RealtimePlugin extends Plugin {
 			this.app.workspace.on("active-leaf-change", () => {
 				this.vaultSync?.reconnectAll();
 				this.vaultSync?.bindOpenCanvases();
+				this.vaultSync?.bindOpenBases();
 			}),
 		);
 

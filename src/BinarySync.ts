@@ -66,6 +66,10 @@ export class BinarySync {
 	private chains = new Map<string, Promise<void>>();
 	/** Paths we are currently writing to disk, to ignore the resulting vault event. */
 	private writing = new Set<string>();
+	/** Paths migrated away from binary sync during this session. */
+	private ignoredPaths = new Set<string>();
+	/** Startup pulls should restore missing files from the moved/persisted index. */
+	private pullingMissingRemote = false;
 
 	/** Background upload queue (latest job per path wins). */
 	private uploadQueue: UploadJob[] = [];
@@ -122,28 +126,52 @@ export class BinarySync {
 		const paths = new Set<string>(this.binaries.keys());
 		for (const p of localBinaryPaths) paths.add(p);
 
-		for (const path of paths) {
-			await this.reconcile(path);
-			if (this.destroyed) return;
+		this.pullingMissingRemote = true;
+		try {
+			for (const path of paths) {
+				await this.reconcile(path);
+				if (this.destroyed) return;
+			}
+		} finally {
+			this.pullingMissingRemote = false;
 		}
+	}
+
+	remotePaths(): string[] {
+		return [...this.binaries.keys()];
+	}
+
+	async reconcilePath(path: string): Promise<void> {
+		await this.reconcile(path);
+	}
+
+	stopTrackingPath(path: string): void {
+		this.ignoredPaths.add(path);
+		this.lastSyncedHash.delete(path);
+		this.indexDoc.transact(() => {
+			this.binaries.delete(path);
+		});
 	}
 
 	// --- live triggers ---------------------------------------------------------
 
 	/** A local binary file was created or modified. */
 	onLocalChanged(path: string): void {
+		if (this.ignoredPaths.has(path)) return;
 		if (this.writing.has(path)) return;
 		void this.reconcile(path);
 	}
 
 	/** A local binary file was deleted. */
 	onLocalDeleted(path: string): void {
+		if (this.ignoredPaths.has(path)) return;
 		if (this.writing.has(path)) return;
 		void this.reconcile(path);
 	}
 
 	/** A local binary file was renamed: treat as a delete of old + change of new. */
 	onLocalRenamed(file: TFile, oldPath: string): void {
+		if (this.ignoredPaths.has(oldPath) || this.ignoredPaths.has(file.path)) return;
 		void this.reconcile(oldPath);
 		void this.reconcile(file.path);
 	}
@@ -151,6 +179,7 @@ export class BinarySync {
 	private onBinariesChanged(event: Y.YMapEvent<BinaryMeta>): void {
 		if (this.destroyed || !this.started) return;
 		event.changes.keys.forEach((_change, path) => {
+			if (this.ignoredPaths.has(path)) return;
 			void this.reconcile(path);
 		});
 	}
@@ -172,6 +201,7 @@ export class BinarySync {
 
 	private async reconcileNow(path: string): Promise<void> {
 		if (this.destroyed) return;
+		if (this.ignoredPaths.has(path)) return;
 
 		const localHash = await this.hashDisk(path);
 		if (this.destroyed) return;
@@ -209,7 +239,7 @@ export class BinarySync {
 
 		// Local absent, remote present.
 		if (!localHash && remoteHash) {
-			if (base === remoteHash) {
+			if (base === remoteHash && !this.pullingMissingRemote) {
 				// We deleted it locally → propagate the delete to the index.
 				this.publishDelete(path);
 			} else {
