@@ -129,6 +129,69 @@ async fn fake_ysweet_as_update() -> String {
     format!("http://{addr}")
 }
 
+/// Like [`fake_ysweet_as_update`], but the index doc also carries a `binaries`
+/// map with the given attachment entries (path, sha256 hex, size).
+async fn fake_ysweet_with_binaries(binaries: Vec<(String, String, i64)>) -> String {
+    use axum::extract::{Path, State};
+    use axum::http::HeaderMap;
+    use axum::routing::{get, post};
+    use axum::Json;
+    use yrs::{Any, Map, ReadTxn, Transact};
+
+    async fn auth_doc(headers: HeaderMap, Path(doc_id): Path<String>) -> Json<Value> {
+        let host = headers
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("127.0.0.1")
+            .to_string();
+        Json(json!({
+            "url": format!("ws://{host}/d/{doc_id}"),
+            "baseUrl": format!("http://{host}/d/{doc_id}"),
+            "docId": doc_id,
+            "token": "fake-token",
+            "authorization": "read-only",
+        }))
+    }
+
+    async fn as_update(
+        State(binaries): State<Arc<Vec<(String, String, i64)>>>,
+        Path(doc_id): Path<String>,
+    ) -> Vec<u8> {
+        if let Some((_, guid)) = doc_id.split_once("__") {
+            return text_update("contents", &format!("# Note {guid}\n"));
+        }
+        let doc = yrs::Doc::new();
+        let files_map = doc.get_or_insert_map("files");
+        let bin_map = doc.get_or_insert_map("binaries");
+        {
+            let mut txn = doc.transact_mut();
+            files_map.insert(&mut txn, "note.md".to_string(), "g1".to_string());
+            for (path, hash, size) in binaries.iter() {
+                let meta = HashMap::from([
+                    ("hash".to_string(), Any::String(hash.as_str().into())),
+                    ("size".to_string(), Any::BigInt(*size)),
+                ]);
+                bin_map.insert(&mut txn, path.to_string(), Any::from(meta));
+            }
+        }
+        let update = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        update
+    }
+
+    let router = Router::new()
+        .route("/doc/{doc_id}/auth", post(auth_doc))
+        .route("/d/{doc_id}/as-update", get(as_update))
+        .with_state(Arc::new(binaries));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
 /// Shared doc store for [`fake_ysweet_store_with_docs`].
 type FakeDocs = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
@@ -286,6 +349,7 @@ async fn git_state_ext(
         git_debounce_ms: 50,
         git_bot_name: "Realtime".into(),
         git_bot_email: "realtime@localhost".into(),
+        git_inline_attachment_max_bytes: 5 * 1024 * 1024,
         cursor_email_domain: "localhost".into(),
         daily_note_path_template: "Daily Notes/{{YYYY-MM-DD}}.md".into(),
         weekly_note_path_template: None,
@@ -397,6 +461,7 @@ async fn test_app_with_attachment_max(
         git_debounce_ms: 50,
         git_bot_name: "Realtime".into(),
         git_bot_email: "realtime@localhost".into(),
+        git_inline_attachment_max_bytes: 5 * 1024 * 1024,
         cursor_email_domain: "localhost".into(),
         daily_note_path_template: "Daily Notes/{{YYYY-MM-DD}}.md".into(),
         weekly_note_path_template: None,
@@ -2062,10 +2127,7 @@ async fn git_audit_commits_attributed_to_principal() {
         .await;
 
     let log = wait_for_commit(&repo).await;
-    assert_eq!(
-        log, "Alice|alice@example.com|Add note.md",
-        "author/subject"
-    );
+    assert_eq!(log, "Alice|alice@example.com|Add note.md", "author/subject");
 
     // Committer is pinned to the Realtime bot (not the server's git identity),
     // even though the author is the attributed user.
@@ -2100,15 +2162,73 @@ async fn git_audit_commits_attributed_to_principal() {
     assert_eq!(count, "1", "no-op write must not create a second commit");
 }
 
+#[tokio::test]
+async fn git_audit_commits_attachments_inline_or_as_shim() {
+    let small_bytes = b"small fake png".to_vec();
+    let small_hash = sha256_hex(&small_bytes);
+    let large_hash = "c".repeat(64);
+    let large_size: i64 = 50 * 1024 * 1024; // over the 5 MB inline threshold
+
+    let ys = fake_ysweet_with_binaries(vec![
+        (
+            "img/small.png".to_string(),
+            small_hash.clone(),
+            small_bytes.len() as i64,
+        ),
+        ("img/large.pdf".to_string(), large_hash.clone(), large_size),
+    ])
+    .await;
+    let (state, git_dir, vault_id) = git_state(&ys).await;
+    let repo = git_dir.join(&vault_id);
+
+    // Seed the small attachment's bytes in the blob store; the large one's
+    // bytes are irrelevant (only its shim is committed).
+    let blob_vault_dir = std::path::PathBuf::from(&state.config.blob_dir).join(&vault_id);
+    std::fs::create_dir_all(&blob_vault_dir).unwrap();
+    std::fs::write(blob_vault_dir.join(&small_hash), &small_bytes).unwrap();
+
+    state
+        .git
+        .mark_write(
+            &vault_id,
+            &principal("u-alice", "Alice", "alice@example.com"),
+        )
+        .await;
+    let log = wait_for_commit(&repo).await;
+    assert!(log.contains("Alice|alice@example.com|Add"), "log: {log}");
+
+    // Small attachment: committed verbatim.
+    assert_eq!(
+        std::fs::read(repo.join("img/small.png")).unwrap(),
+        small_bytes
+    );
+
+    // Large attachment: committed as a text shim pointing at the blob API.
+    let shim = std::fs::read_to_string(repo.join("img/large.pdf")).unwrap();
+    let lines: Vec<&str> = shim.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "version https://realtime.md/attachment-shim/v1".to_string(),
+            format!("oid sha256:{large_hash}"),
+            format!("size {large_size}"),
+            format!("vault {vault_id}"),
+            format!("url http://auth.test/api/vaults/{vault_id}/blobs/{large_hash}"),
+        ]
+    );
+
+    // The attachments show up in the commit alongside the note.
+    let (_, names) = git_out(&repo, &["show", "--name-only", "--format=", "HEAD"]);
+    assert!(names.contains("img/small.png"), "files: {names}");
+    assert!(names.contains("img/large.pdf"), "files: {names}");
+    assert!(names.contains("note.md"), "files: {names}");
+}
+
 // ---------- git backup ----------
 
 /// Insert a backup config row directly (tests drive the push path itself with
 /// a credential-less `file://` remote; the route layer is covered separately).
-async fn insert_backup_row(
-    db: &sea_orm::DatabaseConnection,
-    vault_id: &str,
-    remote_url: &str,
-) {
+async fn insert_backup_row(db: &sea_orm::DatabaseConnection, vault_id: &str, remote_url: &str) {
     use realtime_server::entities::git_backups;
     use sea_orm::{ActiveModelTrait, Set};
     git_backups::ActiveModel {
@@ -2263,7 +2383,9 @@ async fn git_backup_routes_admin_only_and_secrets_never_leak() {
         "PUT",
         &uri,
         Some(&alice),
-        Some(json!({"remoteUrl": "https://example.com/r.git", "authMethod": "ssh", "enabled": true})),
+        Some(
+            json!({"remoteUrl": "https://example.com/r.git", "authMethod": "ssh", "enabled": true}),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -2274,7 +2396,9 @@ async fn git_backup_routes_admin_only_and_secrets_never_leak() {
         "PUT",
         &uri,
         Some(&alice),
-        Some(json!({"remoteUrl": "git@example.com:me/r.git", "authMethod": "ssh", "enabled": true})),
+        Some(
+            json!({"remoteUrl": "git@example.com:me/r.git", "authMethod": "ssh", "enabled": true}),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -2562,7 +2686,8 @@ fn open_crsqlite(path: &std::path::Path, ext: &str) -> rusqlite::Connection {
     // SAFETY: loading the operator-supplied test extension.
     unsafe {
         conn.load_extension_enable().unwrap();
-        conn.load_extension(ext, Some("sqlite3_crsqlite_init")).unwrap();
+        conn.load_extension(ext, Some("sqlite3_crsqlite_init"))
+            .unwrap();
         conn.load_extension_disable().unwrap();
     }
     conn
@@ -2573,12 +2698,24 @@ fn b64(bytes: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(T[(n >> 18) as usize & 63] as char);
         out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -2620,28 +2757,30 @@ fn read_source_changes(conn: &rusqlite::Connection) -> (String, i64, Vec<Value>)
         .unwrap();
     let changes = rows
         .into_iter()
-        .map(|(pk, table, cid, val, col_version, db_version, site, cl, seq)| {
-            site_hex = hex(&site);
-            max_v = max_v.max(db_version);
-            let val_json = match val {
-                rusqlite::types::Value::Null => Value::Null,
-                rusqlite::types::Value::Integer(i) => json!(i),
-                rusqlite::types::Value::Real(f) => json!(f),
-                rusqlite::types::Value::Text(t) => json!(t),
-                rusqlite::types::Value::Blob(b) => json!({ "$blob": b64(&b) }),
-            };
-            json!({
-                "table": table,
-                "pk": b64(&pk),
-                "cid": cid,
-                "val": val_json,
-                "col_version": col_version,
-                "db_version": db_version,
-                "site_id": b64(&site),
-                "cl": cl,
-                "seq": seq,
-            })
-        })
+        .map(
+            |(pk, table, cid, val, col_version, db_version, site, cl, seq)| {
+                site_hex = hex(&site);
+                max_v = max_v.max(db_version);
+                let val_json = match val {
+                    rusqlite::types::Value::Null => Value::Null,
+                    rusqlite::types::Value::Integer(i) => json!(i),
+                    rusqlite::types::Value::Real(f) => json!(f),
+                    rusqlite::types::Value::Text(t) => json!(t),
+                    rusqlite::types::Value::Blob(b) => json!({ "$blob": b64(&b) }),
+                };
+                json!({
+                    "table": table,
+                    "pk": b64(&pk),
+                    "cid": cid,
+                    "val": val_json,
+                    "col_version": col_version,
+                    "db_version": db_version,
+                    "site_id": b64(&site),
+                    "cl": cl,
+                    "seq": seq,
+                })
+            },
+        )
         .collect();
     (site_hex, max_v, changes)
 }
@@ -2744,7 +2883,12 @@ fn make_source_batch(ext: &str) -> (Vec<String>, Value, String, i64) {
     (schema, json!([batch]), site_hex, max_v)
 }
 
-fn replica_file(git_dir: &std::path::Path, vault: &str, plugin: &str, name: &str) -> std::path::PathBuf {
+fn replica_file(
+    git_dir: &std::path::Path,
+    vault: &str,
+    plugin: &str,
+    name: &str,
+) -> std::path::PathBuf {
     // replica_root derives from git_data_dir's parent (see plugindb.rs).
     git_dir
         .parent()
@@ -2757,9 +2901,7 @@ fn replica_file(git_dir: &std::path::Path, vault: &str, plugin: &str, name: &str
 
 fn replica_titles(path: &std::path::Path, ext: &str) -> Vec<String> {
     let conn = open_crsqlite(path, ext);
-    let mut stmt = conn
-        .prepare("SELECT title FROM tasks ORDER BY id")
-        .unwrap();
+    let mut stmt = conn.prepare("SELECT title FROM tasks ORDER BY id").unwrap();
     let titles = stmt
         .query_map([], |row| row.get::<_, String>(0))
         .unwrap()
@@ -2783,12 +2925,16 @@ async fn plugin_db_replication_dump_compaction_and_bootstrap() {
     // Seed the per-DB doc with one published batch (two task rows).
     let (schema, batches, site_hex, max_v) = make_source_batch(&ext);
     let doc_id = format!("{vault_id}__plugindb__my-plugin__tasks");
-    docs.lock()
-        .await
-        .insert(doc_id.clone(), plugin_db_doc_update(&schema, &batches, None));
+    docs.lock().await.insert(
+        doc_id.clone(),
+        plugin_db_doc_update(&schema, &batches, None),
+    );
 
     // Replay batches -> replica matches the source.
-    state.plugindb.mark_write(&vault_id, "my-plugin", "tasks").await;
+    state
+        .plugindb
+        .mark_write(&vault_id, "my-plugin", "tasks")
+        .await;
     let replica = replica_file(&git_dir, &vault_id, "my-plugin", "tasks");
     for _ in 0..100 {
         if replica.exists() {
@@ -2844,22 +2990,26 @@ async fn plugin_db_replication_dump_compaction_and_bootstrap() {
     assert_eq!(d1, d2, "dumps must be deterministic");
     assert_eq!(d1.len(), 1);
     let (rel, sql) = &d1[0];
-    assert_eq!(
-        rel.to_string_lossy(),
-        ".sql/my-plugin/tasks.sql"
+    assert_eq!(rel.to_string_lossy(), ".sql/my-plugin/tasks.sql");
+    assert!(
+        sql.contains("-- crr: tasks"),
+        "dump records CRR tables: {sql}"
     );
-    assert!(sql.contains("-- crr: tasks"), "dump records CRR tables: {sql}");
 
     state
         .git
-        .mark_write(&vault_id, &principal("u-alice", "Alice", "alice@example.com"))
+        .mark_write(
+            &vault_id,
+            &principal("u-alice", "Alice", "alice@example.com"),
+        )
         .await;
     wait_for_commit(&repo).await;
     let committed = repo.join(".sql/my-plugin/tasks.sql");
     assert!(committed.exists(), "git tree must contain the dump");
 
     // Restore-from-dump round trip: fresh DB + dump + re-run crsql_as_crr.
-    let restored = std::env::temp_dir().join(format!("crsql-restore-{}.sqlite", uuid::Uuid::new_v4()));
+    let restored =
+        std::env::temp_dir().join(format!("crsql-restore-{}.sqlite", uuid::Uuid::new_v4()));
     let conn = open_crsqlite(&restored, &ext);
     let crr_tables: Vec<String> = sql
         .lines()
@@ -2870,7 +3020,8 @@ async fn plugin_db_replication_dump_compaction_and_bootstrap() {
         .collect();
     conn.execute_batch(sql).unwrap();
     for t in &crr_tables {
-        conn.execute_batch(&format!("SELECT crsql_as_crr('{t}')")).unwrap();
+        conn.execute_batch(&format!("SELECT crsql_as_crr('{t}')"))
+            .unwrap();
     }
     let mut stmt = conn.prepare("SELECT title FROM tasks ORDER BY id").unwrap();
     let titles: Vec<String> = stmt
@@ -2893,12 +3044,16 @@ async fn plugin_db_soft_delete_keeps_replica_and_purge_removes_everything() {
 
     let (schema, batches, _site_hex, _max_v) = make_source_batch(&ext);
     let doc_id = format!("{vault_id}__plugindb__my-plugin__tasks");
-    docs.lock()
-        .await
-        .insert(doc_id.clone(), plugin_db_doc_update(&schema, &batches, None));
+    docs.lock().await.insert(
+        doc_id.clone(),
+        plugin_db_doc_update(&schema, &batches, None),
+    );
 
     // Replicate, then commit the dump.
-    state.plugindb.mark_write(&vault_id, "my-plugin", "tasks").await;
+    state
+        .plugindb
+        .mark_write(&vault_id, "my-plugin", "tasks")
+        .await;
     let replica = replica_file(&git_dir, &vault_id, "my-plugin", "tasks");
     for _ in 0..100 {
         if replica.exists() {
@@ -2909,7 +3064,10 @@ async fn plugin_db_soft_delete_keeps_replica_and_purge_removes_everything() {
     assert!(replica.exists());
     state
         .git
-        .mark_write(&vault_id, &principal("u-alice", "Alice", "alice@example.com"))
+        .mark_write(
+            &vault_id,
+            &principal("u-alice", "Alice", "alice@example.com"),
+        )
         .await;
     wait_for_commit(&repo).await;
     let committed_dump = repo.join(".sql/my-plugin/tasks.sql");
@@ -2917,7 +3075,10 @@ async fn plugin_db_soft_delete_keeps_replica_and_purge_removes_everything() {
 
     // Soft delete: tombstone the doc. Replication stops but the replica stays.
     set_doc_deleted_at(&docs, &doc_id, 12345).await;
-    state.plugindb.mark_write(&vault_id, "my-plugin", "tasks").await;
+    state
+        .plugindb
+        .mark_write(&vault_id, "my-plugin", "tasks")
+        .await;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert!(
         replica.exists(),
@@ -2942,7 +3103,10 @@ async fn plugin_db_soft_delete_keeps_replica_and_purge_removes_everything() {
 
     state
         .git
-        .mark_write(&vault_id, &principal("u-alice", "Alice", "alice@example.com"))
+        .mark_write(
+            &vault_id,
+            &principal("u-alice", "Alice", "alice@example.com"),
+        )
         .await;
     for _ in 0..100 {
         let (_, count) = git_out(&repo, &["rev-list", "--count", "HEAD"]);
@@ -3093,7 +3257,11 @@ async fn plugin_db_decodes_and_replicates_a_real_client_published_doc() {
     );
 
     let dumps = state.plugindb.dumps_for_vault(&vault_id).await;
-    assert_eq!(dumps.len(), 1, "dump must exist for the replicated client db");
+    assert_eq!(
+        dumps.len(),
+        1,
+        "dump must exist for the replicated client db"
+    );
     assert!(dumps[0].1.contains("from-A") && dumps[0].1.contains("from-B"));
 }
 

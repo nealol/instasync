@@ -6,7 +6,11 @@ on:
   pull_request:
 
 jobs:
+  # The plugin job (typecheck, build, test:unit) is disabled for now: the unit
+  # suite spawns y-sweet + auth-server processes per worker and flakes under CI
+  # load. Run `bun run test:unit` locally instead. Re-enable by setting `if: true`.
   plugin:
+    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

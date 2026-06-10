@@ -759,6 +759,37 @@ pub fn decode_structured(update: &[u8]) -> Result<JsonValue> {
     Ok(any_to_json(&root.to_json(&txn)))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryEntry {
+    pub path: String,
+    /// Lowercase hex sha256 of the attachment bytes (blob store key).
+    pub hash: String,
+    pub size: u64,
+}
+
+/// Decode the vault index doc's `binaries` map into typed entries, skipping
+/// any entry whose metadata is malformed (missing/mistyped hash or size).
+pub fn decode_binaries_entries(update: &[u8]) -> Result<Vec<BinaryEntry>> {
+    let mut out = Vec::new();
+    for (path, value) in decode_binaries_map(update)? {
+        let Any::Map(meta) = value else { continue };
+        let Some(Any::String(hash)) = meta.get("hash") else {
+            continue;
+        };
+        let size = match meta.get("size") {
+            Some(Any::Number(value)) if *value >= 0.0 => *value as u64,
+            Some(Any::BigInt(value)) if *value >= 0 => *value as u64,
+            _ => continue,
+        };
+        out.push(BinaryEntry {
+            path,
+            hash: hash.to_string(),
+            size,
+        });
+    }
+    Ok(out)
+}
+
 /// Decode the vault index doc's `binaries` map (path -> JSON metadata) from a full-state update.
 pub fn decode_binaries_map(update: &[u8]) -> Result<Vec<(String, Any)>> {
     let doc = Doc::new();

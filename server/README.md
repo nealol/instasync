@@ -111,6 +111,7 @@ in the Obsidian plugin's **Auth server URL** and you're done.
 | `GIT_AUDIT_ENABLED` | enabled | Set `0` to disable git audit commits |
 | `GIT_DEBOUNCE_MS` | `5000` | Idle debounce before writing a git audit commit |
 | `GIT_BOT_NAME` / `GIT_BOT_EMAIL` | `Realtime` / `realtime@localhost` | Git committer identity and fallback author |
+| `GIT_INLINE_ATTACHMENT_MAX_BYTES` | `5242880` (5 MB) | Attachments up to this size are committed verbatim into the git repo; larger ones become a text shim (`version https://realtime.md/attachment-shim/v1`) carrying the sha256 and an authenticated `/api/vaults/{id}/blobs/{hash}` download URL |
 | `CURSOR_EMAIL_DOMAIN` | domain from `GIT_BOT_EMAIL`, else `localhost` | Synthetic email domain for cursor-attributed git authors |
 | `DAILY_NOTE_PATH_TEMPLATE` | `Daily Notes/{{YYYY-MM-DD}}.md` | Daily periodic note template |
 | `WEEKLY_NOTE_PATH_TEMPLATE` / `MONTHLY_NOTE_PATH_TEMPLATE` / `QUARTERLY_NOTE_PATH_TEMPLATE` / `YEARLY_NOTE_PATH_TEMPLATE` | — | Optional periodic note templates |

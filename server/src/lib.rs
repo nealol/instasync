@@ -179,10 +179,7 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/api/vaults/{id}/backup/test", post(routes::test_backup))
         .route("/api/vaults/{id}/storage", get(storage::get_storage))
-        .route(
-            "/api/vaults/{id}/storage/gc-blobs",
-            post(storage::gc_blobs),
-        )
+        .route("/api/vaults/{id}/storage/gc-blobs", post(storage::gc_blobs))
         .route("/api/vaults/{id}/members", get(routes::list_members))
         .route(
             "/api/vaults/{id}/members/{user_id}/promote",

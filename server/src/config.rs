@@ -38,6 +38,9 @@ pub struct Config {
     /// Identity used as the committer (and as the author when none is known).
     pub git_bot_name: String,
     pub git_bot_email: String,
+    /// Attachments up to this size are committed verbatim into git backups;
+    /// larger ones are committed as a text shim pointing at the blob store.
+    pub git_inline_attachment_max_bytes: u64,
     /// Domain used for synthetic cursor authors in git audit commits.
     pub cursor_email_domain: String,
     pub daily_note_path_template: String,
@@ -104,6 +107,9 @@ impl Config {
                 .unwrap_or(5000),
             git_bot_name: opt("GIT_BOT_NAME").unwrap_or_else(|| SERVER_NAME.to_string()),
             git_bot_email: opt("GIT_BOT_EMAIL").unwrap_or_else(|| SERVER_BOT_EMAIL.to_string()),
+            git_inline_attachment_max_bytes: opt("GIT_INLINE_ATTACHMENT_MAX_BYTES")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5 * 1024 * 1024),
             cursor_email_domain: opt("CURSOR_EMAIL_DOMAIN").unwrap_or_else(|| {
                 opt("GIT_BOT_EMAIL")
                     .and_then(|email| email.split_once('@').map(|(_, domain)| domain.to_string()))
@@ -188,6 +194,7 @@ impl Config {
             git_debounce_ms: 5000,
             git_bot_name: "Realtime".into(),
             git_bot_email: "realtime@localhost".into(),
+            git_inline_attachment_max_bytes: 5 * 1024 * 1024,
             cursor_email_domain: "localhost".into(),
             daily_note_path_template: "Daily Notes/{{YYYY-MM-DD}}.md".into(),
             weekly_note_path_template: None,

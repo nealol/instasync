@@ -670,7 +670,11 @@ fn validate_backup_url(auth_method: &str, url: &str) -> AppResult<()> {
     let ok = match auth_method {
         BACKUP_AUTH_SSH => url.starts_with("ssh://") || (url.contains('@') && url.contains(':')),
         BACKUP_AUTH_HTTPS => url.starts_with("https://"),
-        _ => return Err(AppError::BadRequest("authMethod must be 'ssh' or 'https'".into())),
+        _ => {
+            return Err(AppError::BadRequest(
+                "authMethod must be 'ssh' or 'https'".into(),
+            ))
+        }
     };
     if !ok {
         return Err(AppError::BadRequest(format!(
@@ -691,7 +695,9 @@ pub async fn get_backup(
     Path(vault_id): Path<String>,
 ) -> AppResult<Json<GitBackupResponse>> {
     require_admin(&state, &user.id, &vault_id).await?;
-    let cfg = git_backups::Entity::find_by_id(vault_id).one(&state.db).await?;
+    let cfg = git_backups::Entity::find_by_id(vault_id)
+        .one(&state.db)
+        .await?;
     Ok(Json(match cfg {
         Some(cfg) => git_backup_response(cfg),
         None => unconfigured_backup_response(),
@@ -729,9 +735,9 @@ pub async fn put_backup(
     // Carry forward / generate the per-method secret.
     let (ssh_private_key, ssh_public_key, https_token) = match body.auth_method.as_str() {
         BACKUP_AUTH_SSH => {
-            let existing_pair = existing.as_ref().and_then(|e| {
-                Some((e.ssh_private_key.clone()?, e.ssh_public_key.clone()?))
-            });
+            let existing_pair = existing
+                .as_ref()
+                .and_then(|e| Some((e.ssh_private_key.clone()?, e.ssh_public_key.clone()?)));
             let (private, public) = match (existing_pair, body.regenerate_key) {
                 (Some(pair), false) => pair,
                 _ => crate::git::generate_ssh_keypair()
@@ -805,7 +811,9 @@ pub async fn test_backup(
         .ok_or(AppError::NotFound)?;
     match state.git.test_remote(&vault_id, &cfg).await {
         Ok(()) => Ok(Json(serde_json::json!({ "ok": true }))),
-        Err(e) => Ok(Json(serde_json::json!({ "ok": false, "error": format!("{e:#}") }))),
+        Err(e) => Ok(Json(
+            serde_json::json!({ "ok": false, "error": format!("{e:#}") }),
+        )),
     }
 }
 

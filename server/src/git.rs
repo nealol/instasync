@@ -16,6 +16,11 @@
 //! The commit is a full-tree materialization from the *authoritative* CRDT state
 //! (the vault index doc's `files` map + each file doc's `contents` text), so
 //! creates / edits / deletes / renames all fall out of a single `git add -A`.
+//!
+//! Binary attachments (the index doc's `binaries` map) are included too: ones up
+//! to `config.git_inline_attachment_max_bytes` are copied verbatim from the blob
+//! store, larger ones become a text shim (see [`attachment_shim`]) carrying the
+//! sha256 and an authenticated blob-download URL.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -36,10 +41,43 @@ use crate::plugindb::PluginDbService;
 use crate::session::now_millis;
 use crate::state::{Principal, PrincipalActor};
 use crate::structured::canvas_to_file_json;
-use crate::ydoc::{decode_files_map, decode_structured, decode_structured_index, decode_text};
+use crate::ydoc::{
+    decode_binaries_entries, decode_files_map, decode_structured, decode_structured_index,
+    decode_text,
+};
 
 /// A principal seen contributing to a vault during one debounce window.
 type Contributor = Principal;
+
+/// First line of the text shim committed in place of an oversized attachment.
+pub(crate) const ATTACHMENT_SHIM_VERSION: &str = "https://realtime.md/attachment-shim/v1";
+
+/// One entry of the working tree to materialize.
+enum TreeContent {
+    Text(String),
+    /// Inline attachment: copy bytes from the blob store at `src`. `shim` is
+    /// the fallback written when the blob file is missing on disk, so the
+    /// commit still records the attachment instead of failing or pruning it.
+    BlobCopy {
+        src: PathBuf,
+        hash: String,
+        shim: String,
+    },
+}
+
+/// Git-LFS-style pointer for attachments too large to inline in the repo.
+/// The `url` line is the authenticated Realtime API download endpoint; it is
+/// omitted when no public base URL is configured.
+fn attachment_shim(public_base_url: &str, vault_id: &str, hash: &str, size: u64) -> String {
+    let mut shim = format!(
+        "version {ATTACHMENT_SHIM_VERSION}\noid sha256:{hash}\nsize {size}\nvault {vault_id}\n"
+    );
+    let base = public_base_url.trim_end_matches('/');
+    if !base.is_empty() {
+        shim.push_str(&format!("url {base}/api/vaults/{vault_id}/blobs/{hash}\n"));
+    }
+    shim
+}
 
 struct VaultState {
     /// A content write has landed since the last commit.
@@ -181,7 +219,8 @@ impl GitService {
         let structured = decode_structured_index(&index_update)?;
 
         // 2. Reconstruct each markdown/structured file from its own doc.
-        let mut tree: Vec<(PathBuf, String)> = Vec::with_capacity(files.len() + structured.len());
+        let mut tree: Vec<(PathBuf, TreeContent)> =
+            Vec::with_capacity(files.len() + structured.len());
         for (path, guid) in &files {
             let rel = match safe_rel_path(path) {
                 Ok(rel) => rel,
@@ -193,7 +232,7 @@ impl GitService {
             let doc_id = format!("{vault_id}__{guid}");
             match self.fetch_as_update(&doc_id).await {
                 Ok(update) => match decode_text(&update, "contents") {
-                    Ok(content) => tree.push((rel, content)),
+                    Ok(content) => tree.push((rel, TreeContent::Text(content))),
                     Err(e) => tracing::warn!("git audit: decode {path} failed: {e}"),
                 },
                 Err(e) => tracing::warn!("git audit: fetch {doc_id} failed: {e}"),
@@ -212,10 +251,49 @@ impl GitService {
                 Ok(update) => match decode_structured(&update)
                     .and_then(|value| serialize_structured_for_git(&entry.kind, value))
                 {
-                    Ok(content) => tree.push((rel, content)),
+                    Ok(content) => tree.push((rel, TreeContent::Text(content))),
                     Err(e) => tracing::warn!("git audit: decode {} failed: {e}", entry.path),
                 },
                 Err(e) => tracing::warn!("git audit: fetch {doc_id} failed: {e}"),
+            }
+        }
+
+        // 2a. Binary attachments from the `binaries` map. Small ones are
+        // committed verbatim from the blob store; larger ones as a text shim
+        // pointing at the authenticated blob download endpoint.
+        for entry in decode_binaries_entries(&index_update)? {
+            let rel = match safe_rel_path(&entry.path) {
+                Ok(rel) => rel,
+                Err(e) => {
+                    tracing::warn!("git audit: skipping unsafe path {:?}: {e}", entry.path);
+                    continue;
+                }
+            };
+            let src =
+                match crate::blobs::blob_fs_path(&self.0.config.blob_dir, vault_id, &entry.hash) {
+                    Ok(src) => src,
+                    Err(e) => {
+                        tracing::warn!("git audit: skipping attachment {:?}: {e}", entry.path);
+                        continue;
+                    }
+                };
+            let shim = attachment_shim(
+                &self.0.config.public_base_url,
+                vault_id,
+                &entry.hash,
+                entry.size,
+            );
+            if entry.size <= self.0.config.git_inline_attachment_max_bytes {
+                tree.push((
+                    rel,
+                    TreeContent::BlobCopy {
+                        src,
+                        hash: entry.hash,
+                        shim,
+                    },
+                ));
+            } else {
+                tree.push((rel, TreeContent::Text(shim)));
             }
         }
 
@@ -223,17 +301,14 @@ impl GitService {
         // cr-sqlite extension is configured). Purged DBs are excluded, so the
         // prune step in materialize_tree removes their dumps → "deleted" commits.
         for (rel, sql) in self.0.plugindb.dumps_for_vault(vault_id).await {
-            tree.push((rel, sql));
+            tree.push((rel, TreeContent::Text(sql)));
         }
 
         // 3. Write the tree to disk (and prune anything no longer present).
         let repo_for_blocking = repo.clone();
-        let tree_for_blocking = tree.clone();
-        tokio::task::spawn_blocking(move || {
-            materialize_tree(&repo_for_blocking, &tree_for_blocking)
-        })
-        .await
-        .context("materialize task panicked")??;
+        tokio::task::spawn_blocking(move || materialize_tree(&repo_for_blocking, &tree))
+            .await
+            .context("materialize task panicked")??;
 
         // 4. Commit the diff, if any.
         self.commit(&repo, vault_id, contributors).await
@@ -282,7 +357,12 @@ impl GitService {
     }
 
     /// Stage everything and commit if the working tree actually changed.
-    async fn commit(&self, repo: &Path, vault_id: &str, contributors: &[Contributor]) -> Result<()> {
+    async fn commit(
+        &self,
+        repo: &Path,
+        vault_id: &str,
+        contributors: &[Contributor],
+    ) -> Result<()> {
         self.git(repo, &["add", "-A"]).await?;
 
         // The staged diff drives both the no-op check and the commit subject.
@@ -841,7 +921,7 @@ fn serialize_structured_for_git(kind: &str, value: JsonValue) -> Result<String> 
 
 /// Write every file in `tree` and delete any working-tree file not present in it.
 /// Runs on a blocking thread (synchronous fs walk).
-fn materialize_tree(repo: &Path, tree: &[(PathBuf, String)]) -> Result<()> {
+fn materialize_tree(repo: &Path, tree: &[(PathBuf, TreeContent)]) -> Result<()> {
     let mut desired: HashSet<PathBuf> = HashSet::with_capacity(tree.len());
     for (rel, content) in tree {
         let full = repo.join(rel);
@@ -849,7 +929,33 @@ fn materialize_tree(repo: &Path, tree: &[(PathBuf, String)]) -> Result<()> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("mkdir {}", parent.display()))?;
         }
-        std::fs::write(&full, content).with_context(|| format!("write {}", full.display()))?;
+        match content {
+            TreeContent::Text(content) => {
+                std::fs::write(&full, content)
+                    .with_context(|| format!("write {}", full.display()))?;
+            }
+            TreeContent::BlobCopy { src, hash, shim } => {
+                // Skip unchanged attachments so large files aren't rewritten on
+                // every commit. The hash compare (not just size) also catches a
+                // shim left behind by an earlier missing-blob fallback or a
+                // threshold change: shim text never hashes to the blob's hash.
+                if file_sha256(&full).as_deref() == Some(hash.as_str()) {
+                    desired.insert(rel.clone());
+                    continue;
+                }
+                if let Err(e) = std::fs::copy(src, &full) {
+                    // Missing blob must not fail the whole commit; a shim keeps
+                    // the path alive (pruning it would record a bogus delete).
+                    tracing::warn!(
+                        "git audit: blob {} for {} unavailable ({e}); writing shim",
+                        src.display(),
+                        rel.display()
+                    );
+                    std::fs::write(&full, shim)
+                        .with_context(|| format!("write {}", full.display()))?;
+                }
+            }
+        }
         desired.insert(rel.clone());
     }
 
@@ -861,6 +967,22 @@ fn materialize_tree(repo: &Path, tree: &[(PathBuf, String)]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Lowercase hex sha256 of a file's bytes, or `None` if it can't be read
+/// (typically: it doesn't exist yet).
+fn file_sha256(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
 }
 
 /// Collect all file paths (relative to `root`) under `dir`, skipping the top-level `.git`.
@@ -918,6 +1040,157 @@ mod tests {
     fn decode_text_roundtrips() {
         let update = text_update("contents", "# Hello\nworld");
         assert_eq!(decode_text(&update, "contents").unwrap(), "# Hello\nworld");
+    }
+
+    fn binaries_update(entries: &[(&str, yrs::Any)]) -> Vec<u8> {
+        let doc = Doc::new();
+        let map = doc.get_or_insert_map("binaries");
+        {
+            let mut txn = doc.transact_mut();
+            for (path, meta) in entries {
+                map.insert(&mut txn, path.to_string(), meta.clone());
+            }
+        }
+        let update = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        update
+    }
+
+    fn binary_meta_any(hash: &str, size: i64) -> yrs::Any {
+        yrs::Any::from(std::collections::HashMap::from([
+            ("hash".to_string(), yrs::Any::String(hash.into())),
+            ("size".to_string(), yrs::Any::BigInt(size)),
+        ]))
+    }
+
+    #[test]
+    fn decode_binaries_entries_roundtrips_and_skips_malformed() {
+        use crate::ydoc::BinaryEntry;
+        let hash = "a".repeat(64);
+        let update = binaries_update(&[
+            ("img/a.png", binary_meta_any(&hash, 123)),
+            ("not-a-map.png", yrs::Any::String("nope".into())),
+            (
+                "no-size.png",
+                yrs::Any::from(std::collections::HashMap::from([(
+                    "hash".to_string(),
+                    yrs::Any::String(hash.as_str().into()),
+                )])),
+            ),
+        ]);
+        let got = decode_binaries_entries(&update).unwrap();
+        assert_eq!(
+            got,
+            vec![BinaryEntry {
+                path: "img/a.png".into(),
+                hash: hash.clone(),
+                size: 123,
+            }]
+        );
+    }
+
+    #[test]
+    fn attachment_shim_format() {
+        let hash = "ab".repeat(32);
+        // Trailing slash on the base URL must not produce a double slash.
+        let shim = attachment_shim("http://x.test/", "v1", &hash, 42);
+        assert_eq!(
+            shim,
+            format!(
+                "version https://realtime.md/attachment-shim/v1\n\
+                 oid sha256:{hash}\nsize 42\nvault v1\n\
+                 url http://x.test/api/vaults/v1/blobs/{hash}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn attachment_shim_omits_url_without_base() {
+        let hash = "ab".repeat(32);
+        let shim = attachment_shim("", "v1", &hash, 42);
+        assert!(!shim.contains("url "));
+        assert!(shim.ends_with("vault v1\n"));
+    }
+
+    fn tmpdir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "realtime-git-test-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn materialize_tree_inlines_blob_and_prunes() {
+        let repo = tmpdir("repo");
+        let blobs = tmpdir("blobs");
+        let bytes: &[u8] = b"\x89PNG fake image bytes";
+        let src = blobs.join("blob");
+        std::fs::write(&src, bytes).unwrap();
+        let hash = file_sha256(&src).unwrap();
+        std::fs::write(repo.join("stale.md"), "gone").unwrap();
+
+        let tree = vec![
+            (PathBuf::from("a.md"), TreeContent::Text("hello".into())),
+            (
+                PathBuf::from("img/a.png"),
+                TreeContent::BlobCopy {
+                    src: src.clone(),
+                    hash: hash.clone(),
+                    shim: "SHIM".into(),
+                },
+            ),
+        ];
+        materialize_tree(&repo, &tree).unwrap();
+        assert_eq!(std::fs::read(repo.join("img/a.png")).unwrap(), bytes);
+        assert_eq!(std::fs::read_to_string(repo.join("a.md")).unwrap(), "hello");
+        assert!(!repo.join("stale.md").exists());
+
+        // Unchanged attachment: skipped, not re-copied — even if the source
+        // blob has since vanished.
+        std::fs::remove_file(&src).unwrap();
+        materialize_tree(&repo, &tree).unwrap();
+        assert_eq!(std::fs::read(repo.join("img/a.png")).unwrap(), bytes);
+
+        // Attachment removed from the index: pruned like any other file.
+        materialize_tree(&repo, &tree[..1]).unwrap();
+        assert!(!repo.join("img/a.png").exists());
+    }
+
+    #[test]
+    fn materialize_tree_writes_shim_when_blob_missing() {
+        let repo = tmpdir("repo");
+        let tree = vec![(
+            PathBuf::from("big.pdf"),
+            TreeContent::BlobCopy {
+                src: PathBuf::from("/nonexistent/blob"),
+                hash: "a".repeat(64),
+                shim: "SHIM\n".into(),
+            },
+        )];
+        materialize_tree(&repo, &tree).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.join("big.pdf")).unwrap(),
+            "SHIM\n"
+        );
+
+        // Blob shows up later (re-upload): the shim is replaced by real bytes.
+        let blobs = tmpdir("blobs");
+        let bytes: &[u8] = b"real pdf bytes";
+        let src = blobs.join("blob");
+        std::fs::write(&src, bytes).unwrap();
+        let tree = vec![(
+            PathBuf::from("big.pdf"),
+            TreeContent::BlobCopy {
+                src,
+                hash: file_sha256(&blobs.join("blob")).unwrap(),
+                shim: "SHIM\n".into(),
+            },
+        )];
+        materialize_tree(&repo, &tree).unwrap();
+        assert_eq!(std::fs::read(repo.join("big.pdf")).unwrap(), bytes);
     }
 
     #[test]
@@ -1028,7 +1301,10 @@ mod tests {
 
     #[test]
     fn commit_subject_folds_link_only_updates_into_rename() {
-        let staged = vec![rename("Old.md", "New.md"), changes(&[('M', "ref.md")]).remove(0)];
+        let staged = vec![
+            rename("Old.md", "New.md"),
+            changes(&[('M', "ref.md")]).remove(0),
+        ];
         let link_only: HashSet<String> = ["ref.md".to_string()].into();
         assert_eq!(
             commit_subject(&staged, &link_only),
@@ -1089,7 +1365,10 @@ diff --git a/ref.md b/ref.md
             "Update my-plugin plugin database (tasks)"
         );
         assert_eq!(
-            subject(&changes(&[('M', "a.md"), ('M', ".sql/my-plugin/tasks.sql")])),
+            subject(&changes(&[
+                ('M', "a.md"),
+                ('M', ".sql/my-plugin/tasks.sql")
+            ])),
             "Update a.md, my-plugin plugin database (tasks)"
         );
         // All-dump commits beyond the listing limit count databases, not files.
@@ -1215,7 +1494,13 @@ diff --git a/ref.md b/ref.md
                 expires_at_ms: 0,
             },
         ];
-        let (author, message) = build_commit_meta("v1", &changes(&[('M', "a.md")]), &HashSet::new(), &contributors, &config);
+        let (author, message) = build_commit_meta(
+            "v1",
+            &changes(&[('M', "a.md")]),
+            &HashSet::new(),
+            &contributors,
+            &config,
+        );
         assert_eq!(author, "Alice <a@x>");
         assert!(message.contains("Principal-Id: u1"));
         assert!(message.contains("Co-authored-by: Bob <b@x>"));
@@ -1225,7 +1510,13 @@ diff --git a/ref.md b/ref.md
     #[test]
     fn commit_meta_falls_back_to_bot() {
         let config = test_config();
-        let (author, message) = build_commit_meta("v1", &changes(&[('M', "a.md")]), &HashSet::new(), &[], &config);
+        let (author, message) = build_commit_meta(
+            "v1",
+            &changes(&[('M', "a.md")]),
+            &HashSet::new(),
+            &[],
+            &config,
+        );
         assert_eq!(author, "Realtime <realtime@localhost>");
         assert!(!message.contains("Principal-Id"));
     }
@@ -1245,8 +1536,13 @@ diff --git a/ref.md b/ref.md
             expires_at_ms: 0,
         }];
 
-        let (author, message) =
-            build_commit_meta("v1", &changes(&[('M', "a.md")]), &HashSet::new(), &contributors, &config);
+        let (author, message) = build_commit_meta(
+            "v1",
+            &changes(&[('M', "a.md")]),
+            &HashSet::new(),
+            &contributors,
+            &config,
+        );
         assert_eq!(author, "Claude <cursor+app123@localhost>");
         assert!(message.contains("Principal-Type: cursor"));
         assert!(message.contains("Cursor-Id: c1"));
@@ -1277,6 +1573,7 @@ diff --git a/ref.md b/ref.md
             git_debounce_ms: 5000,
             git_bot_name: "Realtime".into(),
             git_bot_email: "realtime@localhost".into(),
+            git_inline_attachment_max_bytes: 5 * 1024 * 1024,
             cursor_email_domain: "localhost".into(),
             daily_note_path_template: "Daily Notes/{{YYYY-MM-DD}}.md".into(),
             weekly_note_path_template: None,

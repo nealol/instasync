@@ -25,9 +25,7 @@ use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::Connection;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set,
-};
+use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
@@ -306,11 +304,14 @@ impl PluginDbService {
         if self.ext_available() {
             let cursor = self.load_cursor(vault, plugin, name).await?;
             let config = self.0.config.clone();
-            let (vault_s, plugin_s, name_s) = (vault.to_string(), plugin.to_string(), name.to_string());
+            let (vault_s, plugin_s, name_s) =
+                (vault.to_string(), plugin.to_string(), name.to_string());
             let schema = view.schema.clone();
             let batches = view.batches.clone();
             let new_cursor = tokio::task::spawn_blocking(move || {
-                apply_to_replica(&config, &vault_s, &plugin_s, &name_s, &schema, &batches, cursor)
+                apply_to_replica(
+                    &config, &vault_s, &plugin_s, &name_s, &schema, &batches, cursor,
+                )
             })
             .await
             .context("replica task panicked")??;
@@ -462,7 +463,10 @@ impl PluginDbService {
         // Safe high-water mark per origin site: the minimum applied db_version
         // across all non-stale device cursors, intersected with the server's own
         // replica cursor.
-        let server_cursor = self.load_cursor(vault, plugin, name).await.unwrap_or_default();
+        let server_cursor = self
+            .load_cursor(vault, plugin, name)
+            .await
+            .unwrap_or_default();
         let mut safe: Cursor = HashMap::new();
 
         // Collect origin sites from batches.
@@ -741,7 +745,11 @@ fn build_compaction_update(current: &[u8], drop_count: usize, safe: &Cursor) -> 
             .iter()
             .map(|(k, v)| (k.clone(), Any::BigInt(*v)))
             .collect();
-        meta.insert(&mut txn, "compactedThrough".to_string(), Any::Map(map.into()));
+        meta.insert(
+            &mut txn,
+            "compactedThrough".to_string(),
+            Any::Map(map.into()),
+        );
     }
     let update = doc.transact().encode_state_as_update_v1(&before);
     Ok(update)
@@ -766,7 +774,13 @@ fn replica_path(config: &Config, vault: &str, plugin: &str, name: &str) -> PathB
 /// Defang a path component (ids are validated upstream, but be defensive).
 fn safe_component(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -781,7 +795,8 @@ fn probe_extension(ext: &str) -> Result<String> {
         conn.load_extension_disable()?;
         r?;
     }
-    let site: String = conn.query_row("SELECT lower(hex(crsql_site_id()))", [], |row| row.get(0))?;
+    let site: String =
+        conn.query_row("SELECT lower(hex(crsql_site_id()))", [], |row| row.get(0))?;
     let _ = conn.query_row("SELECT crsql_finalize()", [], |_| Ok(()));
     Ok(site)
 }
@@ -969,7 +984,10 @@ fn dump_replica(config: &Config, vault: &str, plugin: &str, name: &str) -> Resul
 fn dump_table_rows(conn: &Connection, table: &str, out: &mut String) -> Result<()> {
     // Column names, in declared order.
     let cols: Vec<String> = {
-        let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{}\")", table.replace('"', "")))?;
+        let mut stmt = conn.prepare(&format!(
+            "PRAGMA table_info(\"{}\")",
+            table.replace('"', "")
+        ))?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
         let mut v = Vec::new();
         for r in rows {
@@ -1258,7 +1276,10 @@ mod tests {
         let blob = serde_json::json!({ "$blob": "AQID" });
         assert!(matches!(json_to_sql(&blob), SqlValue::Blob(b) if b == vec![1, 2, 3]));
         let int = serde_json::json!({ "$int": "9007199254740993" });
-        assert!(matches!(json_to_sql(&int), SqlValue::Integer(9007199254740993)));
+        assert!(matches!(
+            json_to_sql(&int),
+            SqlValue::Integer(9007199254740993)
+        ));
     }
 
     fn ext_config() -> Option<Config> {

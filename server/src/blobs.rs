@@ -23,14 +23,14 @@ use tokio_util::io::ReaderStream;
 
 use crate::error::{AppError, AppResult};
 use crate::routes::require_member;
-use crate::session::AuthUser;
-use crate::state::AppState;
+use crate::session::{now_millis, AuthUser};
+use crate::state::{AppState, Principal, PrincipalActor};
 
 pub const MAX_BLOB_BYTES: u64 = 100 * 1024 * 1024;
 
 /// A sha256 hex digest is exactly 64 lowercase hex characters. Validating this
 /// before building any path is what keeps `hash` from escaping the blob dir.
-fn valid_hash(hash: &str) -> bool {
+pub(crate) fn valid_hash(hash: &str) -> bool {
     hash.len() == 64
         && hash
             .bytes()
@@ -38,9 +38,9 @@ fn valid_hash(hash: &str) -> bool {
 }
 
 /// Resolve the on-disk path for a blob, after validating both segments.
-fn blob_path(state: &AppState, vault_id: &str, hash: &str) -> AppResult<PathBuf> {
+pub(crate) fn blob_fs_path(blob_dir: &str, vault_id: &str, hash: &str) -> Result<PathBuf, String> {
     if !valid_hash(hash) {
-        return Err(AppError::BadRequest("invalid blob hash".into()));
+        return Err("invalid blob hash".into());
     }
     // vault_id is a server-issued UUID, but guard against separators regardless.
     if vault_id.is_empty()
@@ -48,12 +48,16 @@ fn blob_path(state: &AppState, vault_id: &str, hash: &str) -> AppResult<PathBuf>
         || vault_id.contains('\\')
         || vault_id.contains("..")
     {
-        return Err(AppError::BadRequest("invalid vault id".into()));
+        return Err("invalid vault id".into());
     }
-    let mut p = PathBuf::from(&state.config.blob_dir);
+    let mut p = PathBuf::from(blob_dir);
     p.push(vault_id);
     p.push(hash);
     Ok(p)
+}
+
+fn blob_path(state: &AppState, vault_id: &str, hash: &str) -> AppResult<PathBuf> {
+    blob_fs_path(&state.config.blob_dir, vault_id, hash).map_err(AppError::BadRequest)
 }
 
 /// `HEAD /api/vaults/{id}/blobs/{hash}` — 200 if present, 404 otherwise. Lets the
@@ -139,6 +143,17 @@ pub async fn put_blob(
     tokio::fs::rename(&tmp, &path)
         .await
         .map_err(|e| AppError::Internal(format!("blob publish: {e}")))?;
+
+    // A new blob may resolve a shim that git backup committed as a fallback
+    // while the bytes were missing, so nudge a re-commit.
+    let principal = Principal {
+        user_id: user.id.clone(),
+        display_name: user.display_name.clone(),
+        email: user.email.clone(),
+        actor: PrincipalActor::User,
+        expires_at_ms: now_millis() + 24 * 60 * 60 * 1000,
+    };
+    state.git.mark_write(&vault_id, &principal).await;
 
     Ok(StatusCode::OK)
 }
