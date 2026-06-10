@@ -14,72 +14,26 @@
  */
 
 import { requestUrl } from "obsidian";
+import type {
+	AcquireCursorOptions,
+	CursorNote,
+	CursorNoteSummary,
+	CursorNotesApi,
+	RealtimeCursors,
+	RemoteCursorHandle,
+} from "@realtime-md/plugin-api-types";
 import type RealtimePlugin from "../main";
 import { normalizeServerUrl } from "../auth";
 import { isValidId } from "../pluginDb/types";
 
-export interface AcquireCursorOptions {
-	/** The acquiring plugin's manifest id (same trust model as `sql.open`). */
-	pluginId: string;
-	/** Display name for the cursor; defaults to the plugin id on first acquire. */
-	name?: string;
-}
-
-export interface CursorNoteSummary {
-	path: string;
-	guid: string;
-	permalink: string;
-}
-
-export interface CursorNote {
-	path: string;
-	guid: string;
-	content: string;
-	permalink: string;
-}
-
-/**
- * Note operations executed *as the cursor*. Each mutation is recorded in the
- * cursor's audit log and attributed to the cursor robot in Git. Token expiry
- * and renewal are handled internally (one transparent re-acquire on 401).
- */
-export interface CursorNotesApi {
-	list(): Promise<CursorNoteSummary[]>;
-	read(path: string): Promise<CursorNote>;
-	create(path: string, content?: string): Promise<CursorNote>;
-	replace(path: string, content: string): Promise<CursorNote>;
-	patch(path: string, edit: { old: string; new: string; replaceAll?: boolean }): Promise<CursorNote>;
-	/**
-	 * Convenience read-then-replace appending `text` on a fresh line. Not
-	 * atomic: a concurrent edit between the read and the write can be lost —
-	 * prefer `patch` with a unique anchor when contention is possible.
-	 */
-	append(path: string, text: string): Promise<CursorNote>;
-	move(path: string, toPath: string): Promise<CursorNote>;
-	delete(path: string): Promise<void>;
-}
-
-export interface RemoteCursorHandle {
-	cursorId: string;
-	appId: string;
-	vaultId: string;
-	name: string;
-	/** Bearer token for REST/MCP/streaming calls. Expires; re-acquire on 401. */
-	token: string;
-	/** Server base URL, e.g. `https://host` (REST routes live under /api). */
-	baseUrl: string;
-	mcpUrl: string;
-	/** WebSocket endpoint for streaming tokens into a note. */
-	streamUrl: string;
-	expiresAt: number;
-	/** Audited, robot-attributed note edits — no token handling needed. */
-	notes: CursorNotesApi;
-}
+// Public interfaces live in the published types package; re-export for
+// internal callers and docs links.
+export type { AcquireCursorOptions, CursorNote, CursorNoteSummary, CursorNotesApi, RemoteCursorHandle };
 
 /** Re-acquire when the cached token has less than a day left. */
 const EXPIRY_MARGIN_MS = 24 * 60 * 60 * 1000;
 
-export class RealtimeCursorsAPI {
+export class RealtimeCursorsAPI implements RealtimeCursors {
 	private plugin: RealtimePlugin;
 	private cache = new Map<string, RemoteCursorHandle>();
 

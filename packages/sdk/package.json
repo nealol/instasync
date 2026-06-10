@@ -1,0 +1,46 @@
+{
+  "name": "@realtime-md/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for the Realtime.md server: user and remote-cursor auth (OAuth 2.1 PKCE), vaults, notes, attachments, canvases, bases, search, and the note-streaming WebSocket API.",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js",
+      "require": "./dist/node.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "realtime",
+    "obsidian",
+    "sdk",
+    "markdown"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc -noEmit",
+    "test": "vitest run --project sdk-unit --config ../../vitest.config.ts",
+    "test:e2e": "vitest run --project sdk-e2e --config ../../vitest.config.ts",
+    "prepublishOnly": "bun run build",
+    "release": "npm publish --access public"
+  },
+  "devDependencies": {
+    "tsup": "^8.5.0",
+    "typescript": "^5.4.5"
+  }
+}

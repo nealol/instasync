@@ -14,6 +14,7 @@ import { setDiagnosticLoggingEnabled } from "./debug";
 import { openTrashModal } from "./TrashModal";
 import { RealtimeSqlAPI } from "./pluginDb/api";
 import { RealtimeCursorsAPI } from "./cursors/api";
+import type { RealtimeCursors, RealtimePluginApi, RealtimeSql } from "@realtime-md/plugin-api-types";
 
 type ConnectionStatus = "offline" | "connecting" | "connected" | "error" | "signin";
 
@@ -25,20 +26,20 @@ const STATUS_TEXT: Record<ConnectionStatus, string> = {
 	signin: "Sync: sign in",
 };
 
-export default class RealtimePlugin extends Plugin {
+export default class RealtimePlugin extends Plugin implements RealtimePluginApi {
 	settings!: RealtimeSettings;
 	auth!: AuthClient;
 	vaultSync: VaultSync | null = null;
 	/** Synced-SQLite API for third-party plugins (see src/pluginDb, docs/plugin-sql). */
 	sqlApi!: RealtimeSqlAPI;
-	/** Public handle: `app.plugins.plugins["realtime"].sql`. */
-	get sql(): RealtimeSqlAPI {
+	/** Public handle: `app.plugins.plugins["realtime"].sql` — typed by @realtime-md/plugin-api-types. */
+	get sql(): RealtimeSql {
 		return this.sqlApi;
 	}
 	/** Plugin-managed remote cursor API for third-party plugins (see src/cursors/api.ts). */
 	cursorsApi!: RealtimeCursorsAPI;
-	/** Public handle: `app.plugins.plugins["realtime"].cursors`. */
-	get cursors(): RealtimeCursorsAPI {
+	/** Public handle: `app.plugins.plugins["realtime"].cursors` — typed by @realtime-md/plugin-api-types. */
+	get cursors(): RealtimeCursors {
 		return this.cursorsApi;
 	}
 	private statusBarEl!: HTMLElement;

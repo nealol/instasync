@@ -125,6 +125,8 @@ export async function startAuthServer(opts: {
 	gitDebounceMs?: number;
 	/** Path to the cr-sqlite loadable extension (enables plugin-db replicas + git dumps). */
 	crsqliteExtPath?: string;
+	/** Extra origins allowed as `/auth/login?redirect=` targets (e.g. SDK loopback). */
+	allowedLoginRedirects?: string[];
 }): Promise<AuthServer> {
 	buildServerOnce();
 
@@ -155,7 +157,7 @@ export async function startAuthServer(opts: {
 			...(opts.crsqliteExtPath ? { CRSQLITE_EXT_PATH: opts.crsqliteExtPath } : {}),
 			OIDC_MODE: "mock",
 			ALLOW_MOCK_OIDC: "1",
-			ALLOWED_LOGIN_REDIRECTS: "http://app",
+			ALLOWED_LOGIN_REDIRECTS: ["http://app", ...(opts.allowedLoginRedirects ?? [])].join(","),
 			// The readiness probe waits for the "listening on" info log.
 			RUST_LOG: "realtime_server=info,warn",
 		},
@@ -219,10 +221,14 @@ export interface AuthHarness {
 	redeemInvite: (token: string, code: string) => Promise<{ vaultId: string; name: string }>;
 }
 
-export async function startAuthHarness(): Promise<AuthHarness> {
+export async function startAuthHarness(opts: { allowedLoginRedirects?: string[] } = {}): Promise<AuthHarness> {
 	const authKey = await genAuthKey();
 	const ysweet = await startYSweetServer(undefined, authKey);
-	const server = await startAuthServer({ ysweetUrl: ysweet.url, authKey });
+	const server = await startAuthServer({
+		ysweetUrl: ysweet.url,
+		authKey,
+		allowedLoginRedirects: opts.allowedLoginRedirects,
+	});
 	const authUrl = server.url;
 
 	return {

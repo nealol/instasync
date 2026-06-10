@@ -29,6 +29,23 @@ jobs:
       - run: bun run build
       - run: bun run test:unit
 
+  # SDK unit tests are hermetic (mocked fetch + local WebSocket; no spawned
+  # servers), so they can run in CI even while the plugin job is disabled.
+  # The SDK e2e suite (`bun run test:sdk:e2e`) spawns the Rust server +
+  # y-sweet like the plugin suite and stays local-only for the same reason.
+  sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.8
+      - run: bun install --frozen-lockfile
+      - run: bun run --filter @realtime-md/plugin-api-types build
+      - run: bun run typecheck
+      - run: cd packages/sdk && bun run typecheck && bun run build
+      - run: bun run test:sdk
+
   server:
     runs-on: ubuntu-latest
     steps:

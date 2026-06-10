@@ -1,0 +1,348 @@
+/**
+ * Wire types for the Realtime server's REST API. Field names mirror the
+ * server's serde serializations (camelCase) exactly; see server/src in the
+ * Realtime repository (routes.rs, notes.rs, structured.rs, attachments.rs,
+ * search.rs, storage.rs) and the served /openapi.json.
+ */
+
+// ---------- auth & identity ----------
+
+/** Identity returned by `GET /api/me`. */
+export interface MeResponse {
+	userId: string;
+	email: string;
+	displayName: string;
+}
+
+/** Server identity returned by the public `GET /api/server-info`. */
+export interface ServerInfoResponse {
+	serverId: string;
+}
+
+// ---------- vaults, invites, members ----------
+
+export interface VaultInfo {
+	id: string;
+	name: string;
+	role: "admin" | "member";
+	createdBy?: string;
+	owner?: boolean;
+}
+
+export interface CreateVaultBody {
+	name: string;
+}
+
+export interface CreateInviteBody {
+	role?: "admin" | "member";
+}
+
+export interface InviteResponse {
+	code: string;
+}
+
+export interface RedeemResponse {
+	vaultId: string;
+	name: string;
+}
+
+export interface MemberInfo {
+	userId: string;
+	email: string;
+	displayName: string;
+	role: "admin" | "member";
+	owner?: boolean;
+}
+
+// ---------- remote cursors ----------
+
+export interface RemoteCursorInfo {
+	id: string;
+	appId: string;
+	name: string;
+	mcpUrl: string;
+	createdAt: number;
+	/** Manifest id of the managing plugin; absent for admin-created cursors. */
+	pluginId?: string | null;
+}
+
+/** `POST /api/vaults/{id}/cursors` — includes the copy-once secret. */
+export interface CreatedRemoteCursor {
+	id: string;
+	appId: string;
+	name: string;
+	mcpUrl: string;
+	createdAt: number;
+	secretToken: string;
+}
+
+export interface SecretTokenResponse {
+	secretToken: string;
+}
+
+/** `POST /api/vaults/{id}/cursors/plugin` — a plugin-managed cursor grant. */
+export interface PluginCursorGrant {
+	id: string;
+	appId: string;
+	name: string;
+	vaultId: string;
+	pluginId: string;
+	mcpUrl: string;
+	streamUrl: string;
+	secretToken: string;
+	expiresAt: number;
+}
+
+export interface CursorAuditEntry {
+	id: string;
+	createdAt: number;
+	operation: string;
+	path: string;
+	toPath?: string | null;
+	beforeContent?: string | null;
+	afterContent?: string | null;
+	details?: Record<string, unknown> | null;
+	undoneAt?: number | null;
+}
+
+export interface CursorAuditPage {
+	entries: CursorAuditEntry[];
+	hasMore: boolean;
+}
+
+// ---------- notes ----------
+
+export interface NoteSummary {
+	path: string;
+	guid: string;
+	permalink: string;
+}
+
+export interface Note {
+	path: string;
+	guid: string;
+	content: string;
+	permalink: string;
+}
+
+export interface PatchNoteBody {
+	old: string;
+	new: string;
+	replaceAll?: boolean;
+}
+
+/** Stable permalink for a note, returned by the note-permalinks endpoint. */
+export interface PermalinkResponse {
+	kind: string;
+	url: string;
+}
+
+export interface FrontmatterResponse {
+	path: string;
+	frontmatter: unknown;
+}
+
+export interface PatchFrontmatterBody {
+	set?: Record<string, unknown>;
+	unset?: string[];
+}
+
+/** Periodic note granularity (`/api/vaults/{id}/periodic/{period}`). */
+export type PeriodicPeriod = "daily" | "weekly" | "monthly" | "quarterly" | "yearly";
+
+// ---------- search ----------
+
+export interface SearchHit {
+	path: string;
+	guid: string;
+	title: string;
+	permalink: string;
+	snippet: string;
+}
+
+export interface TagCount {
+	tag: string;
+	count: number;
+}
+
+export interface ReindexResponse {
+	count: number;
+}
+
+// ---------- canvases & bases (structured docs) ----------
+
+export interface StructuredSummary {
+	path: string;
+	guid: string;
+	kind: string;
+	permalink: string;
+}
+
+export interface StructuredResponse {
+	path: string;
+	guid: string;
+	kind: string;
+	value: unknown;
+	permalink: string;
+}
+
+/** Free-form node fields (Obsidian Canvas spec) plus an optional stable id. */
+export interface CanvasNodeBody {
+	id?: string;
+	[field: string]: unknown;
+}
+
+export interface CanvasEdgeBody {
+	id?: string;
+	fromNode: string;
+	toNode: string;
+	[field: string]: unknown;
+}
+
+export interface BaseViewBody {
+	name: string;
+	type: string;
+	[field: string]: unknown;
+}
+
+// ---------- attachments & blobs ----------
+
+export interface AttachmentSummary {
+	path: string;
+	hash: string;
+	size: number;
+}
+
+export interface UploadAttachmentResponse {
+	path: string;
+	hash: string;
+	size: number;
+}
+
+export interface CreateUploadLinkResponse {
+	uploadUrl: string;
+	expiresAt: number;
+	landingDir: string;
+	token: string;
+}
+
+// ---------- storage & backup ----------
+
+/** Per-vault storage breakdown, from `GET /api/vaults/{id}/storage`. */
+export interface StorageUsage {
+	blobsCurrentBytes: number;
+	blobsPreviousBytes: number;
+	currentBlobCount: number;
+	previousBlobCount: number;
+	/** null when the y-sweet store path is not configured / readable server-side. */
+	plainVaultBytes: number | null;
+}
+
+export interface GcBlobsResult {
+	removed: number;
+	freedBytes: number;
+}
+
+export interface DeleteBlobResult {
+	deleted: boolean;
+}
+
+export interface GitBackupConfig {
+	configured: boolean;
+	remoteUrl?: string;
+	authMethod?: "ssh" | "https";
+	branch?: string;
+	sshPublicKey?: string;
+	hasHttpsToken: boolean;
+	enabled: boolean;
+	lastPushAt?: number;
+	lastPushError?: string;
+}
+
+export interface PutGitBackupBody {
+	remoteUrl: string;
+	authMethod: "ssh" | "https";
+	branch?: string;
+	httpsToken?: string;
+	regenerateKey?: boolean;
+	enabled: boolean;
+}
+
+// ---------- plugin databases (cr-sqlite replication) ----------
+
+/** Tagged, JSON-safe encoding of a single `crsql_changes.val`. */
+export type PluginDbEncodedVal =
+	| null
+	| number
+	| string
+	| boolean
+	| { $blob: string }
+	| { $int: string };
+
+export interface PluginDbChangeRow {
+	table: string;
+	pk: string;
+	cid: string;
+	val: PluginDbEncodedVal;
+	col_version: number;
+	db_version: number;
+	site_id: string;
+	cl: number;
+	seq: number;
+}
+
+/** Per-device applied cursor: max db_version seen per origin site id (hex). */
+export type PluginDbCursor = Record<string, number>;
+
+// ---------- doc tokens ----------
+
+/** y-sweet client token minted by `POST /api/doc-token`. */
+export interface DocTokenResponse {
+	url?: string;
+	baseUrl?: string;
+	docId?: string;
+	token?: string;
+	[key: string]: unknown;
+}
+
+// ---------- OAuth 2.1 ----------
+
+export interface OAuthServerMetadata {
+	issuer: string;
+	authorization_endpoint: string;
+	token_endpoint: string;
+	registration_endpoint: string;
+	code_challenge_methods_supported: string[];
+	grant_types_supported: string[];
+	response_types_supported: string[];
+}
+
+export interface OAuthRegisteredClient {
+	client_id: string;
+	client_secret?: string | null;
+	redirect_uris: string[];
+}
+
+/** Tokens from `POST /oauth/token`, with camelCase mapping applied. */
+export interface OAuthTokens {
+	accessToken: string;
+	tokenType: string;
+	/** Lifetime in seconds (access tokens live 1 hour). */
+	expiresIn: number;
+	refreshToken: string;
+	scope: string;
+}
+
+// ---------- streaming ----------
+
+export type StreamAnchor =
+	| { mode: "append" }
+	| { mode: "after"; text: string }
+	| { mode: "offset"; offset: number };
+
+export interface StreamResult {
+	/** Audit-log entry covering the whole streamed insert; null if nothing was inserted. */
+	auditId: string | null;
+	/** Total UTF-8 bytes inserted into the note. */
+	inserted: number;
+}

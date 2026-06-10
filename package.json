@@ -3,12 +3,19 @@
   "version": "0.3.0-alpha.3",
   "description": "Google-docs-like collaborative editing for Obsidian, powered by Yjs and y-sweet.",
   "main": "main.js",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
+    "postinstall": "bun run --filter @realtime-md/plugin-api-types build",
     "dev": "node esbuild.config.mjs watch",
     "build": "bun run typecheck && node esbuild.config.mjs production",
     "typecheck": "tsc -noEmit",
-    "test": "vitest run",
-    "test:unit": "vitest run",
+    "test": "vitest run --project plugin --project sdk-unit",
+    "test:unit": "vitest run --project plugin --project sdk-unit",
+    "test:sdk": "vitest run --project sdk-unit",
+    "test:sdk:e2e": "vitest run --project sdk-e2e",
     "test:server": "cargo test --manifest-path server/Cargo.toml",
     "test:all": "bun run typecheck && bun run test:unit && bun run test:server",
     "test:watch": "vitest",
@@ -51,6 +58,7 @@
   },
   "dependencies": {
     "@pierre/diffs": "^1.2.7",
+    "@realtime-md/plugin-api-types": "workspace:*",
     "@vlcn.io/crsqlite-wasm": "0.16.0",
     "@y-sweet/client": "^0.9.1",
     "lib0": "^0.2.93",

@@ -335,8 +335,10 @@ async fn flush(
     Ok(())
 }
 
-/// Open a WebSocket to the internal y-sweet for `doc_id`, the same way clients
-/// do (`{url}/{docId}?token=…`, see proxy.rs / @y-sweet/client `generateUrl`).
+/// Open a WebSocket to the internal y-sweet for `doc_id`, the same way
+/// @y-sweet/client's `generateUrl` does: the minted token's `baseUrl` is
+/// doc-scoped (`{ysweet}/d/{docId}`) and the WS route hangs off its `/ws`
+/// child with the doc id repeated (`{ysweet}/d/{docId}/ws/{docId}?token=…`).
 async fn connect_ysweet(state: &AppState, doc_id: &str) -> anyhow::Result<Upstream> {
     let (base_url, token) = ysweet::mint_internal_token(state, doc_id, Level::Full)
         .await
@@ -349,6 +351,8 @@ async fn connect_ysweet(state: &AppState, doc_id: &str) -> anyhow::Result<Upstre
     let mut url = Url::parse(&ws_base)?;
     url.path_segments_mut()
         .map_err(|_| anyhow::anyhow!("invalid y-sweet url"))?
+        .pop_if_empty()
+        .push("ws")
         .push(doc_id);
     url.query_pairs_mut().append_pair("token", &token);
 

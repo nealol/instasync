@@ -33,7 +33,7 @@ async fn fake_ysweet() -> String {
             .unwrap_or("127.0.0.1")
             .to_string();
         Json(json!({
-            "url": format!("ws://{host}/d/{doc_id}"),
+            "url": format!("ws://{host}/d/{doc_id}/ws"),
             "baseUrl": format!("http://{host}/d/{doc_id}"),
             "docId": doc_id,
             "token": "fake-token",
@@ -103,7 +103,7 @@ async fn fake_ysweet_as_update() -> String {
             .unwrap_or("127.0.0.1")
             .to_string();
         Json(json!({
-            "url": format!("ws://{host}/d/{doc_id}"),
+            "url": format!("ws://{host}/d/{doc_id}/ws"),
             "baseUrl": format!("http://{host}/d/{doc_id}"),
             "docId": doc_id,
             "token": "fake-token",
@@ -145,7 +145,7 @@ async fn fake_ysweet_with_binaries(binaries: Vec<(String, String, i64)>) -> Stri
             .unwrap_or("127.0.0.1")
             .to_string();
         Json(json!({
-            "url": format!("ws://{host}/d/{doc_id}"),
+            "url": format!("ws://{host}/d/{doc_id}/ws"),
             "baseUrl": format!("http://{host}/d/{doc_id}"),
             "docId": doc_id,
             "token": "fake-token",
@@ -240,7 +240,7 @@ async fn fake_ysweet_store_with_docs() -> (String, FakeDocs) {
             .unwrap_or("127.0.0.1")
             .to_string();
         Json(json!({
-            "url": format!("ws://{host}/d/{doc_id}"),
+            "url": format!("ws://{host}/d/{doc_id}/ws"),
             "baseUrl": format!("http://{host}/d/{doc_id}"),
             "docId": doc_id,
             "token": "fake-token",
@@ -300,7 +300,7 @@ async fn fake_ysweet_store_with_docs() -> (String, FakeDocs) {
 type AwarenessLog = Arc<Mutex<Vec<(u32, String)>>>;
 
 /// Like [`fake_ysweet_store_with_docs`], but additionally serves the y-sweet
-/// doc *WebSocket* (`/d/{docId}/{docId}?token=…`, the same path the real
+/// doc *WebSocket* (`/d/{docId}/ws/{docId}?token=…`, the same path the real
 /// client and `stream.rs` use), speaking enough of the y-protocols handshake
 /// to act as the document peer: it greets with SyncStep1, answers SyncStep1
 /// with SyncStep2, applies incoming updates into the shared doc store, and
@@ -353,7 +353,7 @@ async fn fake_ysweet_live() -> (String, FakeDocs, AwarenessLog) {
             .unwrap_or("127.0.0.1")
             .to_string();
         Json(json!({
-            "url": format!("ws://{host}/d/{doc_id}"),
+            "url": format!("ws://{host}/d/{doc_id}/ws"),
             "baseUrl": format!("http://{host}/d/{doc_id}"),
             "docId": doc_id,
             "token": "fake-token",
@@ -497,7 +497,7 @@ async fn fake_ysweet_live() -> (String, FakeDocs, AwarenessLog) {
         .route("/doc/{doc_id}/auth", post(auth_doc))
         .route("/d/{doc_id}/as-update", get(as_update))
         .route("/d/{doc_id}/update", post(update))
-        .route("/d/{doc_id}/{doc_id2}", any(ws_doc))
+        .route("/d/{doc_id}/ws/{doc_id2}", any(ws_doc))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

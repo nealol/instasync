@@ -7,41 +7,23 @@
  * handle.
  */
 
+import type {
+	DatabaseHandle,
+	DeleteOrRestoreOptions,
+	OpenOptions,
+	RealtimeSql,
+} from "@realtime-md/plugin-api-types";
 import type RealtimePlugin from "../main";
 import { SyncedPluginDatabase, makeMemoryDocHandle, type MigrateFn, type SqlTx } from "./SyncedPluginDatabase";
 import { PluginDbSync } from "./PluginDbSync";
 import { buildEngineDeps } from "./obsidianDeps";
-import type { DbState, RemoteChange, SqlValue } from "./types";
 import { isValidId } from "./types";
 
-export interface OpenOptions {
-	name: string;
-	pluginId: string;
-	schemaVersion: number;
-	migrate: MigrateFn;
-	/** Optional repair hook run after each remote apply (dedupe etc.). */
-	onMergeReview?: (tables: string[]) => void | Promise<void>;
-}
+// Public interfaces live in the published types package; re-export for
+// internal callers and docs links.
+export type { OpenOptions, DeleteOrRestoreOptions, DatabaseHandle };
 
-export interface DeleteOrRestoreOptions {
-	pluginId: string;
-	name: string;
-}
-
-/** The database handle returned by {@link RealtimeSqlAPI.open}. */
-export interface DatabaseHandle {
-	exec(sql: string, bind?: SqlValue[]): Promise<void>;
-	query<T = Record<string, SqlValue>>(sql: string, bind?: SqlValue[]): Promise<T[]>;
-	transaction<T>(cb: (tx: SqlTx) => Promise<T>): Promise<T>;
-	onRemoteChange(cb: (c: RemoteChange) => void): () => void;
-	onStateChange(cb: (s: DbState) => void): () => void;
-	readonly state: DbState;
-	whenLive(): Promise<void>;
-	rebaseFromServer(): Promise<void>;
-	close(): Promise<void>;
-}
-
-export class RealtimeSqlAPI {
+export class RealtimeSqlAPI implements RealtimeSql {
 	private plugin: RealtimePlugin;
 	private engines = new Map<string, SyncedPluginDatabase>();
 

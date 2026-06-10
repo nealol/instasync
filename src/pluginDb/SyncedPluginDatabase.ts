@@ -28,13 +28,9 @@ import {
 import type { Batch, ChangeRow, Cursor, DbState, DbErrorReason, RemoteChange, SqlValue } from "./types";
 import { MAX_BATCH_ROWS, SYNC_FORMAT, isValidId } from "./types";
 
-/** A transaction handle passed to `migrate` and `transaction`. */
-export interface SqlTx {
-	exec(sql: string, bind?: SqlValue[]): Promise<void>;
-	query<T = Record<string, SqlValue>>(sql: string, bind?: SqlValue[]): Promise<T[]>;
-}
-
-export type MigrateFn = (tx: SqlTx, fromVersion: number) => Promise<void>;
+// `SqlTx` / `MigrateFn` are part of the published plugin API surface.
+import type { MigrateFn, SqlTx } from "@realtime-md/plugin-api-types";
+export type { MigrateFn, SqlTx };
 
 export interface SyncedPluginDatabaseOptions {
 	vaultId: string;
