@@ -61,24 +61,49 @@ export async function startYSweetServer(
 	/** When provided y-sweet is started with `--storage <dir>` (filesystem store). */
 	storageDir?: string,
 ): Promise<YSweetServer> {
-	const [port, bin] = await Promise.all([
-		fixedPort ? Promise.resolve(fixedPort) : freePort(),
-		resolveBinary(),
-	]);
+	const bin = await resolveBinary();
 
-	const args = storageDir ? ["serve", storageDir, "--port", String(port)] : ["serve", "--port", String(port)];
-	if (authKey) args.push("--auth", authKey);
-	const child: ChildProcess = spawn(bin, args, {
-		stdio: ["ignore", "pipe", "pipe"],
-	});
+	// freePort() releases the port before y-sweet binds it, so a parallel test
+	// process can steal it in the gap; retry on a fresh port when that happens.
+	const maxAttempts = fixedPort ? 1 : 3;
+	let port = 0;
+	let child: ChildProcess | undefined;
+	let lastError: Error | undefined;
 
-	await new Promise<void>((resolve, reject) => {
+	for (let attempt = 0; attempt < maxAttempts; attempt++) {
+		port = fixedPort ?? (await freePort());
+		const args = storageDir
+			? ["serve", storageDir, "--port", String(port)]
+			: ["serve", "--port", String(port)];
+		if (authKey) args.push("--auth", authKey);
+		child = spawn(bin, args, {
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+
+		try {
+			await waitForReady(child);
+			lastError = undefined;
+			break;
+		} catch (err) {
+			lastError = err as Error;
+			child.kill("SIGKILL");
+		}
+	}
+	if (lastError || !child) throw lastError ?? new Error("y-sweet failed to start");
+
+	return makeHandle(child, port, storageDir);
+}
+
+function waitForReady(child: ChildProcess): Promise<void> {
+	return new Promise<void>((resolve, reject) => {
+		let output = "";
 		const timer = setTimeout(
-			() => reject(new Error("y-sweet server did not become ready in 60s")),
+			() => reject(new Error(`y-sweet server did not become ready in 60s\n${output}`)),
 			60_000,
 		);
 		const onChunk = (buf: Buffer) => {
-			if (buf.toString().includes("Listening on")) {
+			output += buf.toString();
+			if (output.includes("Listening on")) {
 				clearTimeout(timer);
 				detach();
 				resolve();
@@ -87,7 +112,7 @@ export async function startYSweetServer(
 		const onExit = (code: number | null) => {
 			clearTimeout(timer);
 			detach();
-			reject(new Error(`y-sweet exited before becoming ready (code ${code})`));
+			reject(new Error(`y-sweet exited before becoming ready (code ${code})\n${output}`));
 		};
 		const detach = () => {
 			child.stdout?.off("data", onChunk);
@@ -98,7 +123,9 @@ export async function startYSweetServer(
 		child.stderr?.on("data", onChunk);
 		child.on("exit", onExit);
 	});
+}
 
+function makeHandle(child: ChildProcess, port: number, storageDir?: string): YSweetServer {
 	return {
 		url: `http://127.0.0.1:${port}`,
 		storageDir,
