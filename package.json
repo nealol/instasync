@@ -5,14 +5,14 @@
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs watch",
-    "build": "npm run typecheck && node esbuild.config.mjs production",
+    "build": "bun run typecheck && node esbuild.config.mjs production",
     "typecheck": "tsc -noEmit",
     "test": "vitest run",
     "test:unit": "vitest run",
     "test:server": "cargo test --manifest-path server/Cargo.toml",
-    "test:all": "npm run typecheck && npm run test:unit && npm run test:server",
+    "test:all": "bun run typecheck && bun run test:unit && bun run test:server",
     "test:watch": "vitest",
-    "pretest:e2e": "npm run build",
+    "pretest:e2e": "bun run build",
     "test:e2e": "wdio run tests/e2e/wdio.conf.mts",
     "release": "node release.mjs"
   },
