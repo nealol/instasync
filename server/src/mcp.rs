@@ -55,6 +55,39 @@ pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
         .route_service("/mcp/i/{app_id}", svc)
         .route_layer(middleware::from_fn_with_state(state, front_auth))
+        .route_layer(middleware::from_fn(log_failures))
+}
+
+/// Transport-level rejections (405/406/400) are produced inside rmcp and
+/// otherwise leave no trace, which makes client issues undiagnosable.
+async fn log_failures(req: Request<Body>, next: Next) -> Response {
+    fn header(req: &Request<Body>, name: &str) -> String {
+        req.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned()
+    }
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let accept = header(&req, "accept");
+    let session_id = header(&req, "mcp-session-id");
+    let protocol_version = header(&req, "mcp-protocol-version");
+    let has_auth = req.headers().contains_key(header::AUTHORIZATION);
+    let response = next.run(req).await;
+    if response.status().is_client_error() || response.status().is_server_error() {
+        tracing::warn!(
+            %method,
+            %uri,
+            status = %response.status(),
+            accept,
+            session_id,
+            protocol_version,
+            has_auth,
+            "mcp request rejected"
+        );
+    }
+    response
 }
 
 async fn front_auth(
