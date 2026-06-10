@@ -64,6 +64,13 @@ export async function redeemAndAdopt(b: any, code: string): Promise<string> {
 	}, code);
 }
 
+/** Reconnect a device's sync (e.g. after its membership was re-granted). */
+export async function reloadSync(b: any): Promise<void> {
+	await b.executeObsidian(async ({ app }: any) => {
+		await (app as any).plugins.plugins.realtime.reloadSync();
+	});
+}
+
 /** Redeem an invite but leave the local vault bound to its current remote. */
 export async function redeemInviteOnly(b: any, code: string): Promise<{ vaultId: string; activeVaultId: string }> {
 	return b.executeObsidian(async ({ app }: any, c: string) => {
@@ -391,4 +398,40 @@ export async function statusText(b: any): Promise<string> {
 		);
 		return el?.textContent ?? "";
 	});
+}
+
+// --- Trash helpers ---------------------------------------------------------
+
+/**
+ * List trash entries on a device (newest deletion first).
+ * Each entry is a plain object with { id, path, kind, deletedAt, guid?, hash?, size? }.
+ */
+export async function listTrash(b: any): Promise<any[]> {
+	return b.executeObsidian(async ({ app }: any) => {
+		const vs = (app as any).plugins.plugins.realtime?.vaultSync;
+		return vs?.listTrash() ?? [];
+	});
+}
+
+/** Restore a trash entry by id, optionally placing it at a different path. */
+export async function restoreTrashEntry(b: any, id: string, targetPath?: string): Promise<void> {
+	await b.executeObsidian(
+		async ({ app }: any, entryId: string, tp: string | undefined) => {
+			const vs = (app as any).plugins.plugins.realtime?.vaultSync;
+			await vs?.restoreTrashEntry(entryId, tp);
+		},
+		id,
+		targetPath,
+	);
+}
+
+/** Permanently delete a trash entry by id (for binaries, also reclaims the blob). */
+export async function permanentlyDeleteTrashEntry(b: any, id: string): Promise<void> {
+	await b.executeObsidian(
+		async ({ app }: any, entryId: string) => {
+			const vs = (app as any).plugins.plugins.realtime?.vaultSync;
+			await vs?.permanentlyDeleteTrashEntry(entryId);
+		},
+		id,
+	);
 }

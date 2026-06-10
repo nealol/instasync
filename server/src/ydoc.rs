@@ -109,7 +109,14 @@ pub async fn index_remove_file(state: &AppState, vault_id: &str, path: &str) -> 
         .into_iter()
         .find(|(p, _)| p == path)
         .map(|(_, guid)| guid);
-    let update = build_map_remove_update(&current, "files", path)?;
+    let update = match &guid {
+        Some(guid) => {
+            let mut entry = trash_entry_common(path, "text");
+            entry.insert("guid".to_string(), Any::String(guid.as_str().into()));
+            build_trash_and_remove_update(&current, "files", path, entry)?
+        }
+        None => build_map_remove_update(&current, "files", path)?,
+    };
     if !update.is_empty() {
         write_update(state, vault_id, update).await?;
     }
@@ -159,7 +166,20 @@ pub async fn index_set_binary(
 
 pub async fn index_remove_binary(state: &AppState, vault_id: &str, path: &str) -> AppResult<()> {
     let current = read_update(state, vault_id).await?;
-    let update = build_map_remove_update(&current, "binaries", path)?;
+    let meta = decode_binaries_map(&current)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .into_iter()
+        .find(|(p, _)| p == path)
+        .map(|(_, meta)| meta);
+    let update = match meta.as_ref().and_then(binary_hash_size) {
+        Some((hash, size)) => {
+            let mut entry = trash_entry_common(path, "binary");
+            entry.insert("hash".to_string(), Any::String(hash.into()));
+            entry.insert("size".to_string(), Any::BigInt(size));
+            build_trash_and_remove_update(&current, "binaries", path, entry)?
+        }
+        None => build_map_remove_update(&current, "binaries", path)?,
+    };
     if !update.is_empty() {
         write_update(state, vault_id, update).await?;
     }
@@ -211,7 +231,18 @@ pub async fn index_remove_structured(
     path: &str,
 ) -> AppResult<()> {
     let current = read_update(state, vault_id).await?;
-    let update = build_map_remove_update(&current, "structured", path)?;
+    let entry_meta = decode_structured_index(&current)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .into_iter()
+        .find(|entry| entry.path == path);
+    let update = match entry_meta {
+        Some(meta) => {
+            let mut entry = trash_entry_common(path, &meta.kind);
+            entry.insert("guid".to_string(), Any::String(meta.guid.as_str().into()));
+            build_trash_and_remove_update(&current, "structured", path, entry)?
+        }
+        None => build_map_remove_update(&current, "structured", path)?,
+    };
     if !update.is_empty() {
         write_update(state, vault_id, update).await?;
     }
@@ -511,6 +542,52 @@ where
     {
         let mut txn = doc.transact_mut();
         map.insert(&mut txn, key.to_string(), value);
+    }
+    let update = doc.transact().encode_state_as_update_v1(&before);
+    Ok(update)
+}
+
+/// Base fields shared by every trash entry written into the index doc's `trash`
+/// map: the original path, the document kind, and the deletion time.
+fn trash_entry_common(path: &str, kind: &str) -> HashMap<String, Any> {
+    HashMap::from([
+        ("path".to_string(), Any::String(path.into())),
+        ("kind".to_string(), Any::String(kind.into())),
+        ("deletedAt".to_string(), Any::BigInt(now_millis())),
+    ])
+}
+
+/// Extract `(hash, size)` from a `binaries` map value (`{ hash, size }`).
+fn binary_hash_size(value: &Any) -> Option<(String, i64)> {
+    let Any::Map(meta) = value else { return None };
+    let Some(Any::String(hash)) = meta.get("hash") else {
+        return None;
+    };
+    let size = match meta.get("size") {
+        Some(Any::BigInt(v)) => *v,
+        Some(Any::Number(v)) => *v as i64,
+        _ => 0,
+    };
+    Some((hash.to_string(), size))
+}
+
+/// In a single update, record a `trash` entry (keyed by a fresh uuid) and remove
+/// the live entry from `live_map`. Keeping deletes recoverable: a later restore
+/// just re-adds the live entry from the retained guid/hash.
+fn build_trash_and_remove_update(
+    current_update: &[u8],
+    live_map: &str,
+    key: &str,
+    entry: HashMap<String, Any>,
+) -> AppResult<Vec<u8>> {
+    let doc = doc_from_update(current_update)?;
+    let before = doc.transact().state_vector();
+    let trash = doc.get_or_insert_map("trash");
+    let live = doc.get_or_insert_map(live_map);
+    {
+        let mut txn = doc.transact_mut();
+        trash.insert(&mut txn, uuid::Uuid::new_v4().to_string(), entry);
+        live.remove(&mut txn, key);
     }
     let update = doc.transact().encode_state_as_update_v1(&before);
     Ok(update)
@@ -845,6 +922,48 @@ mod tests {
                 ("dir/b.md".to_string(), "guid-b".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn trash_and_remove_drops_live_entry_and_records_trash() {
+        let base = files_update(&[("a.md", "guid-a"), ("b.md", "guid-b")]);
+        let mut entry = trash_entry_common("a.md", "text");
+        entry.insert("guid".to_string(), Any::String("guid-a".into()));
+        let update = build_trash_and_remove_update(&base, "files", "a.md", entry).unwrap();
+        let merged = apply_update(&base, &update);
+
+        // The live files map no longer contains the removed entry.
+        let files = decode_files_map(&merged).unwrap();
+        assert_eq!(files, vec![("b.md".to_string(), "guid-b".to_string())]);
+
+        // Exactly one trash entry was recorded, referencing the removed file.
+        let doc = doc_from_update(&merged).unwrap();
+        let trash = doc.get_or_insert_map("trash");
+        let txn = doc.transact();
+        let Any::Map(entries) = trash.to_json(&txn) else {
+            panic!("trash map missing");
+        };
+        assert_eq!(entries.len(), 1);
+        let Some((_, Any::Map(value))) = entries.iter().next() else {
+            panic!("trash entry not a map");
+        };
+        assert_eq!(value.get("path"), Some(&Any::String("a.md".into())));
+        assert_eq!(value.get("kind"), Some(&Any::String("text".into())));
+        assert_eq!(value.get("guid"), Some(&Any::String("guid-a".into())));
+        assert!(matches!(value.get("deletedAt"), Some(Any::BigInt(_))));
+    }
+
+    #[test]
+    fn binary_hash_size_extracts_fields() {
+        let meta = Any::Map(
+            HashMap::from([
+                ("hash".to_string(), Any::String("abc".into())),
+                ("size".to_string(), Any::BigInt(42)),
+            ])
+            .into(),
+        );
+        assert_eq!(binary_hash_size(&meta), Some(("abc".to_string(), 42)));
+        assert_eq!(binary_hash_size(&Any::String("x".into())), None);
     }
 
     #[test]

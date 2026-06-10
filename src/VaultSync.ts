@@ -23,6 +23,28 @@ type FileKind = "text" | "structured" | "binary" | "ignore";
 type StructuredKind = "canvas" | "base";
 interface StructuredMeta { guid: string; kind: StructuredKind }
 
+/** Document kind recorded for a trashed (deleted but recoverable) file. */
+export type TrashKind = "text" | "canvas" | "base" | "binary";
+
+/** Stored value of a `trash` map entry (the map key is the entry id). */
+export interface TrashEntryValue {
+	/** Vault-relative path the file had when it was deleted. */
+	path: string;
+	kind: TrashKind;
+	/** Document guid for text/structured kinds; lets restore re-pull content. */
+	guid?: string;
+	/** Blob hash + byte size for binary kinds; lets restore re-download bytes. */
+	hash?: string;
+	size?: number;
+	/** Deletion time (ms epoch), for newest-first ordering. */
+	deletedAt: number;
+}
+
+/** A trash entry with its map-key id attached, as surfaced to the UI. */
+export interface TrashEntry extends TrashEntryValue {
+	id: string;
+}
+
 /** Matches the sibling backups written on conflict; these must never sync. */
 const CONFLICT_COPY_RE = / \(conflicted copy .+\)$/;
 
@@ -61,6 +83,8 @@ export class VaultSync {
 	private files: Y.Map<string>;
 	/** Shared map of vault-relative structured path -> document metadata. */
 	private structured: Y.Map<StructuredMeta>;
+	/** Shared map of trash entry id -> deleted-file metadata (recoverable). */
+	private trash: Y.Map<TrashEntryValue>;
 	/** Sibling sync path for binary (non-Markdown) files; shares the index doc. */
 	private binarySync: BinarySync;
 	/** Per-device opt-in sync for whitelisted files under `.obsidian`. */
@@ -86,6 +110,7 @@ export class VaultSync {
 		this.indexDoc = new Y.Doc();
 		this.files = this.indexDoc.getMap("files");
 		this.structured = this.indexDoc.getMap("structured");
+		this.trash = this.indexDoc.getMap("trash");
 		this.binarySync = new BinarySync(plugin, this, this.indexDoc);
 		this.configSync = new ConfigSync(plugin, this.indexDoc);
 
@@ -492,7 +517,9 @@ export class VaultSync {
 		if (this.documents.has(path) || this.files.has(path)) {
 			this.removeDocument(path);
 			if (this.files.has(path)) {
+				const guid = this.files.get(path)!;
 				this.indexDoc.transact(() => {
+					this.recordTrashIn({ path, kind: "text", guid });
 					this.files.delete(path);
 				});
 			}
@@ -501,7 +528,9 @@ export class VaultSync {
 		if (this.structuredDocuments.has(path) || this.structured.has(path)) {
 			this.removeStructuredDocument(path);
 			if (this.structured.has(path)) {
+				const meta = this.structured.get(path)!;
 				this.indexDoc.transact(() => {
+					this.recordTrashIn({ path, kind: meta.kind, guid: meta.guid });
 					this.structured.delete(path);
 				});
 			}
@@ -570,6 +599,99 @@ export class VaultSync {
 		if (kind !== "text") return;
 		const doc = this.documents.get(file.path);
 		if (doc) void doc.onDiskChanged();
+	}
+
+	// --- Trash -----------------------------------------------------------------
+
+	/** Write a trash entry inside an already-open index transaction. */
+	private recordTrashIn(entry: { path: string; kind: TrashKind; guid?: string; hash?: string; size?: number }): void {
+		const value: TrashEntryValue = { path: entry.path, kind: entry.kind, deletedAt: Date.now() };
+		if (entry.guid !== undefined) value.guid = entry.guid;
+		if (entry.hash !== undefined) value.hash = entry.hash;
+		if (entry.size !== undefined) value.size = entry.size;
+		this.trash.set(newGuid(), value);
+	}
+
+	/** Record a deleted file in the shared trash (its own transaction). */
+	recordTrash(entry: { path: string; kind: TrashKind; guid?: string; hash?: string; size?: number }): void {
+		if (this.destroyed) return;
+		this.indexDoc.transact(() => this.recordTrashIn(entry));
+	}
+
+	/** Current trash entries, newest deletion first. */
+	listTrash(): TrashEntry[] {
+		const out: TrashEntry[] = [];
+		for (const [id, value] of this.trash.entries()) {
+			if (value) out.push({ id, ...value });
+		}
+		out.sort((a, b) => b.deletedAt - a.deletedAt);
+		return out;
+	}
+
+	/** Subscribe to trash changes; returns an unsubscribe function. */
+	observeTrash(cb: () => void): () => void {
+		const observer = () => cb();
+		this.trash.observe(observer);
+		return () => this.trash.unobserve(observer);
+	}
+
+	/** True when a path is occupied by a tracked doc, blob, or local file. */
+	private pathInUse(path: string): boolean {
+		if (this.files.has(path) || this.structured.has(path)) return true;
+		if (this.binarySync.hasPath(path)) return true;
+		return !!this.plugin.app.vault.getAbstractFileByPath(path);
+	}
+
+	/**
+	 * Restore a trashed file. Re-adds the index entry (content re-materializes
+	 * from the retained y-sweet doc / blob) at the original path, or `targetPath`
+	 * when supplied. Throws if the destination is already occupied.
+	 */
+	async restoreTrashEntry(id: string, targetPath?: string): Promise<void> {
+		if (this.destroyed) return;
+		const value = this.trash.get(id);
+		if (!value) throw new Error("This trash entry no longer exists.");
+		const path = (targetPath ?? "").trim() || value.path;
+		if (this.pathInUse(path)) throw new Error(`"${path}" already exists — restore under a different name.`);
+
+		if (value.kind === "binary") {
+			if (!value.hash) throw new Error("Trash entry is missing its attachment data.");
+			this.binarySync.restoreEntry(path, value.hash, value.size ?? 0);
+		} else if (value.kind === "text") {
+			if (!value.guid) throw new Error("Trash entry is missing its document id.");
+			const guid = value.guid;
+			this.indexDoc.transact(() => this.files.set(path, guid));
+			this.registerFile(path, guid);
+			this.ensureDocument(path, guid, false);
+		} else {
+			if (!value.guid) throw new Error("Trash entry is missing its document id.");
+			const guid = value.guid;
+			const kind = value.kind;
+			this.indexDoc.transact(() => this.structured.set(path, { guid, kind }));
+			this.registerFile(path, guid);
+			this.ensureStructuredDocument(path, guid, kind, false);
+		}
+
+		this.indexDoc.transact(() => this.trash.delete(id));
+	}
+
+	/**
+	 * Permanently drop a trash entry. For binaries this also reclaims the orphaned
+	 * blob (skipped server-side if still referenced). Text/structured docs are
+	 * orphaned: their y-sweet content lingers but is no longer reachable.
+	 */
+	async permanentlyDeleteTrashEntry(id: string): Promise<void> {
+		if (this.destroyed) return;
+		const value = this.trash.get(id);
+		if (!value) return;
+		if (value.kind === "binary" && value.hash && !this.binarySync.hasHash(value.hash)) {
+			try {
+				await this.plugin.auth.deleteBlob(this.plugin.settings.activeVaultId, value.hash);
+			} catch (e) {
+				console.error(`[Realtime] failed to delete blob for trashed ${value.path}`, e);
+			}
+		}
+		this.indexDoc.transact(() => this.trash.delete(id));
 	}
 
 	// --- Lifecycle -------------------------------------------------------------

@@ -195,3 +195,120 @@
 .is-mobile .realtime-conflict-actions button {
 	flex: 1;
 }
+
+/* --- Storage management --- */
+.realtime-storage-bar {
+	display: flex;
+	width: 100%;
+	height: 14px;
+	border-radius: 7px;
+	overflow: hidden;
+	background: var(--background-modifier-border);
+	margin: 8px 0 12px;
+}
+
+.realtime-storage-seg {
+	height: 100%;
+	min-width: 2px;
+}
+
+.realtime-storage-current {
+	background: var(--interactive-accent);
+}
+
+.realtime-storage-previous {
+	background: var(--text-warning, #e0a458);
+}
+
+.realtime-storage-vault {
+	background: var(--text-accent, #7c8cf8);
+}
+
+.realtime-storage-empty {
+	background: var(--background-modifier-border);
+}
+
+.realtime-storage-legend {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px 18px;
+	margin-bottom: 12px;
+}
+
+.realtime-storage-legend-item {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+}
+
+.realtime-storage-dot {
+	width: 10px;
+	height: 10px;
+	border-radius: 3px;
+	display: inline-block;
+}
+
+.realtime-storage-bytes {
+	color: var(--text-normal);
+	font-variant-numeric: tabular-nums;
+}
+
+.realtime-storage-total {
+	font-weight: var(--font-semibold);
+}
+
+.realtime-storage-threshold {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin-right: auto;
+	font-size: var(--font-ui-smaller);
+}
+
+.realtime-storage-threshold .realtime-modal-input {
+	width: 64px;
+	margin-bottom: 0;
+}
+
+/* --- Trash modal --- */
+.realtime-trash-list {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	max-height: 50vh;
+	overflow-y: auto;
+}
+
+.realtime-trash-row {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 12px;
+	padding: 8px 0;
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.realtime-trash-info {
+	min-width: 0;
+	flex: 1;
+}
+
+.realtime-trash-path {
+	word-break: break-all;
+}
+
+.realtime-trash-actions {
+	display: flex;
+	gap: 6px;
+	flex-shrink: 0;
+}
+
+.realtime-trash-rename {
+	margin-top: 8px;
+}
+
+.realtime-trash-rename .realtime-modal-input {
+	margin-bottom: 0;
+}

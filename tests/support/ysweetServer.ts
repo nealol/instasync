@@ -1,5 +1,6 @@
-// Spawns a throwaway y-sweet dev server (in-memory store, random free port) for
-// integration tests, and resolves once it is accepting connections.
+// Spawns a throwaway y-sweet dev server (optionally with a filesystem store,
+// otherwise in-memory) for integration tests, and resolves once it is accepting
+// connections.
 //
 // We resolve the binary through y-sweet's own downloader (`y-sweet/src/get-binary`)
 // rather than `npx`, because the npm launcher writes the Windows binary to a file
@@ -15,6 +16,8 @@ const require = createRequire(import.meta.url);
 
 export interface YSweetServer {
 	url: string;
+	/** Filesystem path passed as `--storage`, or undefined if using the in-memory store. */
+	storageDir?: string;
 	stop: () => Promise<void>;
 }
 
@@ -55,13 +58,15 @@ export async function genAuthKey(): Promise<string> {
 export async function startYSweetServer(
 	fixedPort?: number,
 	authKey?: string,
+	/** When provided y-sweet is started with `--storage <dir>` (filesystem store). */
+	storageDir?: string,
 ): Promise<YSweetServer> {
 	const [port, bin] = await Promise.all([
 		fixedPort ? Promise.resolve(fixedPort) : freePort(),
 		resolveBinary(),
 	]);
 
-	const args = ["serve", "--port", String(port)];
+	const args = storageDir ? ["serve", storageDir, "--port", String(port)] : ["serve", "--port", String(port)];
 	if (authKey) args.push("--auth", authKey);
 	const child: ChildProcess = spawn(bin, args, {
 		stdio: ["ignore", "pipe", "pipe"],
@@ -96,6 +101,7 @@ export async function startYSweetServer(
 
 	return {
 		url: `http://127.0.0.1:${port}`,
+		storageDir,
 		stop: () =>
 			new Promise<void>((resolve) => {
 				if (child.exitCode !== null) return resolve();

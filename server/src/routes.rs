@@ -70,7 +70,7 @@ pub(crate) async fn require_member(
         .ok_or(AppError::Forbidden)
 }
 
-async fn require_admin(
+pub(crate) async fn require_admin(
     state: &AppState,
     user_id: &str,
     vault_id: &str,

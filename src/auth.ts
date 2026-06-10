@@ -63,6 +63,22 @@ export interface PermalinkResponse {
 	url: string;
 }
 
+/** Per-vault storage breakdown, from `GET /api/vaults/{id}/storage`. */
+export interface StorageUsage {
+	blobsCurrentBytes: number;
+	blobsPreviousBytes: number;
+	currentBlobCount: number;
+	previousBlobCount: number;
+	/** null when the y-sweet store path is not configured / readable server-side. */
+	plainVaultBytes: number | null;
+}
+
+/** Result of an orphaned-blob cleanup. */
+export interface GcBlobsResult {
+	removed: number;
+	freedBytes: number;
+}
+
 /** Thrown when the server rejects the session; callers should prompt re-login. */
 export class AuthError extends Error {}
 
@@ -645,6 +661,26 @@ export class AuthClient {
 		if (res.status < 200 || res.status >= 300) {
 			throw new Error(`blob upload failed: ${blobErrorMessage(res)}`);
 		}
+	}
+
+	// --- storage management ----------------------------------------------------
+
+	/** Per-vault storage breakdown (admin only). */
+	getStorageUsage(vaultId: string): Promise<StorageUsage> {
+		return this.api<StorageUsage>(`/api/vaults/${vaultId}/storage`);
+	}
+
+	/** Delete orphaned ("previous") blobs, optionally only those ≥ `minBytes`. */
+	gcBlobs(vaultId: string, minBytes?: number): Promise<GcBlobsResult> {
+		return this.api<GcBlobsResult>(`/api/vaults/${vaultId}/storage/gc-blobs`, {
+			method: "POST",
+			body: minBytes !== undefined ? { minBytes } : {},
+		});
+	}
+
+	/** Reclaim a single orphaned blob (no-op server-side if still referenced). */
+	async deleteBlob(vaultId: string, hash: string): Promise<void> {
+		await this.api(`/api/vaults/${vaultId}/blobs/${hash}`, { method: "DELETE" });
 	}
 }
 

@@ -11,6 +11,7 @@ import { PLUGIN_NAME } from "./brand";
 import { liveEdit } from "./editor/LiveEdit";
 import { yRemoteSelections, yRemoteSelectionsTheme } from "./editor/RemoteSelections";
 import { setDiagnosticLoggingEnabled } from "./debug";
+import { openTrashModal } from "./TrashModal";
 
 type ConnectionStatus = "offline" | "connecting" | "connected" | "error" | "signin";
 
@@ -66,6 +67,17 @@ export default class RealtimePlugin extends Plugin {
 			id: "realtime-reconnect",
 			name: "Reconnect to server",
 			callback: () => this.reloadSync(),
+		});
+		this.addCommand({
+			id: "realtime-open-trash",
+			name: "Open trash",
+			callback: () => {
+				if (!this.vaultSync) {
+					new Notice(`${PLUGIN_NAME}: connect to your vault to view trash.`);
+					return;
+				}
+				openTrashModal(this);
+			},
 		});
 		this.addCommand({
 			id: "realtime-setup-vault",

@@ -117,6 +117,8 @@ export async function startAuthServer(opts: {
 	port?: number;
 	ysweetUrl: string;
 	authKey: string;
+	/** When provided, sets `YSWEET_STORE` so the server can report y-sweet store usage. */
+	ysweetStoreDir?: string;
 }): Promise<AuthServer> {
 	buildServerOnce();
 
@@ -136,6 +138,7 @@ export async function startAuthServer(opts: {
 			YSWEET_URL: opts.ysweetUrl,
 			YSWEET_PUBLIC_URL: opts.ysweetUrl,
 			YSWEET_AUTH_KEY: opts.authKey,
+			...(opts.ysweetStoreDir ? { YSWEET_STORE: opts.ysweetStoreDir } : {}),
 			OIDC_MODE: "mock",
 			ALLOW_MOCK_OIDC: "1",
 			ALLOWED_LOGIN_REDIRECTS: "http://app",

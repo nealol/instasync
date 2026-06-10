@@ -232,7 +232,7 @@ export class BinarySync {
 				await this.deleteLocal(path);
 			} else {
 				// Deleted remotely but we also have unsynced local edits → conflict.
-				await this.resolveConflict(path, localHash, null);
+				await this.resolveConflict(path);
 			}
 			return;
 		}
@@ -259,7 +259,7 @@ export class BinarySync {
 				await this.downloadToDisk(path, remoteHash);
 			} else {
 				// Both diverged from the baseline (or no baseline) → conflict.
-				await this.resolveConflict(path, localHash, remoteHash);
+				await this.resolveConflict(path);
 			}
 		}
 	}
@@ -355,10 +355,40 @@ export class BinarySync {
 	}
 
 	private publishDelete(path: string): void {
+		// Record the deletion in the shared trash before dropping the index entry,
+		// so the attachment stays recoverable (its blob is retained until GC).
+		const meta = this.binaries.get(path);
+		if (meta?.hash) {
+			this.vaultSync.recordTrash({ path, kind: "binary", hash: meta.hash, size: meta.size });
+		}
 		this.indexDoc.transact(() => {
 			this.binaries.delete(path);
 		});
 		this.lastSyncedHash.delete(path);
+	}
+
+	/** True if a path currently has a live binary index entry. */
+	hasPath(path: string): boolean {
+		return this.binaries.has(path);
+	}
+
+	/** True if any live binary entry references this blob hash. */
+	hasHash(hash: string): boolean {
+		for (const meta of this.binaries.values()) {
+			if (meta?.hash === hash) return true;
+		}
+		return false;
+	}
+
+	/** Restore a trashed binary: re-publish its index entry and pull the blob. */
+	restoreEntry(path: string, hash: string, size: number): void {
+		if (this.destroyed) return;
+		this.ignoredPaths.delete(path);
+		this.lastSyncedHash.delete(path);
+		this.indexDoc.transact(() => {
+			this.binaries.set(path, { hash, size });
+		});
+		void this.reconcile(path);
 	}
 
 	// --- upload queue ----------------------------------------------------------
@@ -460,8 +490,6 @@ export class BinarySync {
 	 */
 	private resolveConflict(
 		path: string,
-		localHash: string,
-		remoteHash: string | null,
 	): Promise<void> {
 		const run = this.conflictChain.then(async () => {
 			if (this.destroyed) return;

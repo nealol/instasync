@@ -13,6 +13,10 @@ pub struct Config {
     pub ysweet_url: String,
     /// Filesystem directory for the content-addressed binary blob store.
     pub blob_dir: String,
+    /// Filesystem directory of the internal y-sweet document store (`YSWEET_STORE`).
+    /// Optional: used only to measure per-vault "plain vault" storage. When unset
+    /// or inaccessible, that figure is reported as unavailable.
+    pub ysweet_store_dir: Option<String>,
     /// URL clients should connect to (host rewritten into minted tokens).
     pub ysweet_public_url: String,
     /// Shared private key, identical to what `y-sweet serve --auth` is given.
@@ -79,6 +83,7 @@ impl Config {
                 .unwrap_or_else(|| "http://127.0.0.1:8081".to_string()),
             ysweet_url: opt("YSWEET_URL").unwrap_or_else(|| "http://127.0.0.1:8080".to_string()),
             blob_dir: opt("BLOB_DIR").unwrap_or_else(|| "./blobs".to_string()),
+            ysweet_store_dir: opt("YSWEET_STORE"),
             ysweet_public_url: opt("YSWEET_PUBLIC_URL")
                 .or_else(|| opt("YSWEET_URL"))
                 .unwrap_or_else(|| "http://127.0.0.1:8080".to_string()),

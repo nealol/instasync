@@ -22,6 +22,7 @@ import {
 	generateInvite,
 	redeemAndAdopt,
 	redeemInviteOnly,
+	reloadSync,
 	activeVaultId,
 	listedVaultIds,
 	setSyncPaused,
@@ -34,6 +35,9 @@ import {
 	editCanvasView,
 	baseViewData,
 	editBaseView,
+	listTrash,
+	restoreTrashEntry,
+	permanentlyDeleteTrashEntry,
 } from "./helpers.js";
 import { apiCreateVault, apiPromoteMember, apiRedeemInvite, apiRemoveMember, mockLogin } from "../../support/authServer.js";
 
@@ -498,6 +502,210 @@ describe("Realtime — two isolated Obsidian devices", function () {
 			const bobMe = await fetch(`${authUrl}/api/me`, { headers: { Authorization: `Bearer ${bobToken}` } }).then((res) => res.json() as Promise<{ userId: string }>);
 			expect(await apiRemoveMember(authUrl, adminToken, vaultId, bobMe.userId)).toBe(200);
 			expect(await docTokenStatus(B, vaultId)).toBe("refused");
+		});
+	});
+
+	describe("trash", function () {
+		// Each test is self-contained: it writes, deletes, asserts, and cleans up.
+		// The vault administration suite removed bob (device B), so we re-admit B
+		// here and wait for both devices to be live again before exercising the
+		// trash sync assertions across the two devices.
+		before(async function () {
+			const code = await generateInvite(authUrl, adminToken, vaultId);
+			await redeemInviteOnly(B, code);
+			await reloadSync(B);
+			for (const [label, dev] of [["A", A], ["B", B]] as const) {
+				let last = "";
+				await dev.waitUntil(async () => {
+					last = await statusText(dev);
+					return /live/i.test(last);
+				}, {
+					timeout: 90 * SECONDS,
+					timeoutMsg: `${label} never returned to 'live' before trash tests (last status: ${last})`,
+				});
+			}
+		});
+
+		it("deleting a note records a trash entry that syncs to the remote device", async function () {
+			await writeNote(A, "Trashable.md", "trash me");
+			await B.waitUntil(async () => (await readNote(B, "Trashable.md")) === "trash me", {
+				timeout: 60 * SECONDS,
+				timeoutMsg: "B never received Trashable.md before delete",
+			});
+
+			await deleteNote(A, "Trashable.md");
+
+			// The entry must appear in the shared trash on device B.
+			let trashId: string | undefined;
+			await B.waitUntil(
+				async () => {
+					const entries: any[] = await listTrash(B);
+					const entry = entries.find((e: any) => e.path === "Trashable.md");
+					if (entry) trashId = entry.id;
+					return !!entry;
+				},
+				{ timeout: 60 * SECONDS, timeoutMsg: "B never saw Trashable.md in trash" },
+			);
+
+			// Permanently delete so we don't pollute subsequent tests.
+			await permanentlyDeleteTrashEntry(A, trashId!);
+			await B.waitUntil(
+				async () => !(await listTrash(B)).some((e: any) => e.path === "Trashable.md"),
+				{ timeout: 30 * SECONDS, timeoutMsg: "trash entry did not disappear from B after permanent delete" },
+			);
+		});
+
+		it("restoring a trashed note makes the file reappear on both devices", async function () {
+			await writeNote(A, "Restore.md", "restore me");
+			await B.waitUntil(async () => (await readNote(B, "Restore.md")) === "restore me", {
+				timeout: 60 * SECONDS,
+				timeoutMsg: "B never received Restore.md",
+			});
+
+			await deleteNote(A, "Restore.md");
+			let trashId: string | undefined;
+			await A.waitUntil(
+				async () => {
+					const entries: any[] = await listTrash(A);
+					const entry = entries.find((e: any) => e.path === "Restore.md");
+					if (entry) trashId = entry.id;
+					return !!entry;
+				},
+				{ timeout: 30 * SECONDS, timeoutMsg: "A never saw Restore.md in trash" },
+			);
+
+			await restoreTrashEntry(A, trashId!);
+
+			// File should reappear on A...
+			await A.waitUntil(
+				async () => (await readNote(A, "Restore.md")) !== null,
+				{ timeout: 30 * SECONDS, timeoutMsg: "Restore.md did not reappear on A" },
+			);
+			// ...and propagate to B.
+			await B.waitUntil(
+				async () => (await readNote(B, "Restore.md")) !== null,
+				{ timeout: 60 * SECONDS, timeoutMsg: "Restore.md did not reappear on B" },
+			);
+			// Trash entry must be gone from both devices.
+			expect((await listTrash(A)).some((e: any) => e.path === "Restore.md")).toBe(false);
+			await B.waitUntil(
+				async () => !(await listTrash(B)).some((e: any) => e.path === "Restore.md"),
+				{ timeout: 30 * SECONDS, timeoutMsg: "trash entry lingered on B after restore" },
+			);
+
+			// Cleanup.
+			await deleteNote(A, "Restore.md");
+			const leftovers: any[] = await listTrash(A);
+			const leftover = leftovers.find((e: any) => e.path === "Restore.md");
+			if (leftover) await permanentlyDeleteTrashEntry(A, leftover.id);
+		});
+
+		it("restore under a new path places the file at that path on both devices", async function () {
+			await writeNote(A, "Original.md", "original content");
+			await B.waitUntil(async () => (await readNote(B, "Original.md")) === "original content", {
+				timeout: 60 * SECONDS,
+				timeoutMsg: "B never received Original.md",
+			});
+
+			await deleteNote(A, "Original.md");
+			let trashId: string | undefined;
+			await A.waitUntil(
+				async () => {
+					const entries: any[] = await listTrash(A);
+					const entry = entries.find((e: any) => e.path === "Original.md");
+					if (entry) trashId = entry.id;
+					return !!entry;
+				},
+				{ timeout: 30 * SECONDS, timeoutMsg: "A never saw Original.md in trash" },
+			);
+
+			await restoreTrashEntry(A, trashId!, "RestoredAs.md");
+
+			// Old path must remain absent; new path must appear on both devices.
+			await A.waitUntil(
+				async () => (await readNote(A, "RestoredAs.md")) !== null,
+				{ timeout: 30 * SECONDS, timeoutMsg: "RestoredAs.md did not appear on A" },
+			);
+			expect(await readNote(A, "Original.md")).toBe(null);
+			await B.waitUntil(
+				async () => (await readNote(B, "RestoredAs.md")) !== null,
+				{ timeout: 60 * SECONDS, timeoutMsg: "RestoredAs.md did not propagate to B" },
+			);
+			expect(await readNote(B, "Original.md")).toBe(null);
+
+			// Cleanup.
+			await deleteNote(A, "RestoredAs.md");
+			const leftovers: any[] = await listTrash(A);
+			const leftover = leftovers.find((e: any) => e.path === "RestoredAs.md");
+			if (leftover) await permanentlyDeleteTrashEntry(A, leftover.id);
+		});
+
+		it("permanently deleting a trash entry removes it from the shared trash on both devices", async function () {
+			await writeNote(A, "PermanentDelete.md", "gone for good");
+			await B.waitUntil(async () => (await readNote(B, "PermanentDelete.md")) === "gone for good", {
+				timeout: 60 * SECONDS,
+				timeoutMsg: "B never received PermanentDelete.md",
+			});
+
+			await deleteNote(A, "PermanentDelete.md");
+			let trashId: string | undefined;
+			await A.waitUntil(
+				async () => {
+					const entries: any[] = await listTrash(A);
+					const entry = entries.find((e: any) => e.path === "PermanentDelete.md");
+					if (entry) trashId = entry.id;
+					return !!entry;
+				},
+				{ timeout: 30 * SECONDS, timeoutMsg: "A never saw PermanentDelete.md in trash" },
+			);
+
+			await permanentlyDeleteTrashEntry(A, trashId!);
+
+			// Entry must disappear from A immediately...
+			expect((await listTrash(A)).some((e: any) => e.path === "PermanentDelete.md")).toBe(false);
+			// ...and sync off B.
+			await B.waitUntil(
+				async () => !(await listTrash(B)).some((e: any) => e.path === "PermanentDelete.md"),
+				{ timeout: 60 * SECONDS, timeoutMsg: "permanent-deleted entry did not disappear from B" },
+			);
+		});
+	});
+
+	describe("storage API", function () {
+		// These are pure Node-side REST calls — no Obsidian instance required.
+		// The harness starts y-sweet with --storage so plainVaultBytes is a real
+		// non-negative number rather than null.
+
+		it("returns a valid storage breakdown with the expected shape", async function () {
+			const res = await fetch(`${authUrl}/api/vaults/${vaultId}/storage`, {
+				headers: { Authorization: `Bearer ${adminToken}` },
+			});
+			expect(res.status).toBe(200);
+			const body = (await res.json()) as Record<string, unknown>;
+			expect(typeof body.blobsCurrentBytes).toBe("number");
+			expect(typeof body.blobsPreviousBytes).toBe("number");
+			expect(typeof body.currentBlobCount).toBe("number");
+			expect(typeof body.previousBlobCount).toBe("number");
+			// plainVaultBytes is a number because YSWEET_STORE is wired in the test harness.
+			expect(typeof body.plainVaultBytes).toBe("number");
+			expect((body.plainVaultBytes as number) >= 0).toBe(true);
+		});
+
+		it("gc-blobs returns zero freed bytes when nothing is orphaned", async function () {
+			const res = await fetch(`${authUrl}/api/vaults/${vaultId}/storage/gc-blobs`, {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: `Bearer ${adminToken}`,
+				},
+				body: JSON.stringify({}),
+			});
+			expect(res.status).toBe(200);
+			const body = (await res.json()) as Record<string, unknown>;
+			expect(typeof body.removed).toBe("number");
+			expect(typeof body.freedBytes).toBe("number");
+			expect(body.removed).toBe(0);
+			expect(body.freedBytes).toBe(0);
 		});
 	});
 });

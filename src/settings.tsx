@@ -3,9 +3,10 @@ import { createRoot, type Root } from 'react-dom/client'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type RealtimePlugin from './main'
-import { normalizeServerUrl, type KnownSession, type MemberInfo, type RemoteCursorInfo, type VaultInfo } from './auth'
+import { normalizeServerUrl, type KnownSession, type MemberInfo, type RemoteCursorInfo, type StorageUsage, type VaultInfo } from './auth'
 import { PLUGIN_NAME } from './brand'
 import { generateClientIdentity } from './names'
+import { openTrashModal } from './TrashModal'
 
 export interface RealtimeSettings {
     /** Base URL of the Realtime auth server, e.g. http://127.0.0.1:8081 */
@@ -515,6 +516,7 @@ function VaultDetails({ plugin }: { app: App; plugin: RealtimePlugin }) {
             {activeVault && members?.map((member) => <MemberRow key={member.userId} plugin={plugin} vault={activeVault}
                                                                 member={member} reload={reloadAll}/>)}
             {activeVault?.role === 'admin' ? <InviteGenerator plugin={plugin} vault={activeVault}/> : null}
+            {activeVault?.role === 'admin' ? <StorageSection plugin={plugin} vault={activeVault}/> : null}
             {activeVault?.role === 'admin' ? <RemoteCursors plugin={plugin} vault={activeVault}/> : null}
         </>
     )
@@ -555,6 +557,112 @@ function InviteGenerator({ plugin, vault }: { plugin: RealtimePlugin; vault: Vau
         })}>Generate invite
         </button>
         {code ? <code>{code}</code> : null}</>}/>
+}
+
+const STORAGE_SEGMENTS = [
+    { key: 'current', label: 'Current attachments', className: 'realtime-storage-current' },
+    { key: 'previous', label: 'Previous versions', className: 'realtime-storage-previous' },
+    { key: 'vault', label: 'Plain vault', className: 'realtime-storage-vault' },
+] as const
+
+function StorageSection({ plugin, vault }: { plugin: RealtimePlugin; vault: VaultInfo }) {
+    const { usage, error, reload } = useStorageUsage(plugin, vault.id)
+    const [cleaning, setCleaning] = useState(false)
+    const [busy, setBusy] = useState(false)
+    const [minMb, setMinMb] = useState('1')
+
+    const sizes = usage ? {
+        current: usage.blobsCurrentBytes,
+        previous: usage.blobsPreviousBytes,
+        vault: usage.plainVaultBytes ?? 0,
+    } : { current: 0, previous: 0, vault: 0 }
+    const total = sizes.current + sizes.previous + sizes.vault
+
+    return <>
+        <h3>Storage Management</h3>
+        {error ? <p className="realtime-error">{error}</p> : null}
+        {!usage && !error ? <p className="setting-item-description">Loading storage usage...</p> : null}
+        {usage ? <>
+            <div className="realtime-storage-bar">
+                {STORAGE_SEGMENTS.map((segment) => {
+                    const value = sizes[segment.key]
+                    if (total === 0 || value === 0) return null
+                    return <div key={segment.key} className={`realtime-storage-seg ${segment.className}`}
+                                style={{ width: `${(value / total) * 100}%` }} title={`${segment.label}: ${formatBytes(value)}`}/>
+                })}
+                {total === 0 ? <div className="realtime-storage-seg realtime-storage-empty" style={{ width: '100%' }}/> : null}
+            </div>
+            <div className="realtime-storage-legend">
+                {STORAGE_SEGMENTS.map((segment) => <div key={segment.key} className="realtime-storage-legend-item">
+                    <span className={`realtime-storage-dot ${segment.className}`}/>
+                    <span>{segment.label}</span>
+                    <span className="realtime-storage-bytes">{
+                        segment.key === 'vault' && usage.plainVaultBytes === null ? 'unavailable' : formatBytes(sizes[segment.key])
+                    }</span>
+                </div>)}
+                <div className="realtime-storage-legend-item realtime-storage-total">
+                    <span>Total</span><span className="realtime-storage-bytes">{formatBytes(total)}</span>
+                </div>
+            </div>
+        </> : null}
+        <SettingRow name="Trash" desc="View and restore deleted notes, canvases, bases, and attachments."
+                    control={<button onClick={() => openTrashModal(plugin)}>Open trash</button>}/>
+        <SettingRow name="Clean up previous versions"
+                    desc={`Reclaim ${usage ? formatBytes(usage.blobsPreviousBytes) : 'space used by'} orphaned attachment versions${usage ? ` (${usage.previousBlobCount} blob${usage.previousBlobCount === 1 ? '' : 's'})` : ''}.`}
+                    control={<button className="mod-warning" onClick={() => setCleaning((v) => !v)}>{cleaning ? 'Hide' : 'Clean up...'}</button>}/>
+        {cleaning ? <div className="realtime-warning-box">
+            <strong>This permanently deletes previous and deleted attachment versions.</strong>
+            <p>Only the current versions of your attachments are kept. Older versions and the contents of
+                trashed/deleted attachments are removed and can no longer be restored, including from any
+                point-in-time backup that relied on them. This does not affect notes.</p>
+            <div className="realtime-actions">
+                <label className="realtime-storage-threshold">Only blobs ≥
+                    <input type="number" min="0" step="0.1" className="realtime-modal-input" value={minMb}
+                           onChange={(event) => setMinMb(event.currentTarget.value)}/> MB
+                </label>
+                <button onClick={() => setCleaning(false)}>Cancel</button>
+                <button className="mod-warning" disabled={busy} onClick={() => void runNotice(setBusy, async () => {
+                    const minBytes = Math.max(0, Math.round((parseFloat(minMb) || 0) * 1024 * 1024))
+                    const result = await plugin.auth.gcBlobs(vault.id, minBytes)
+                    new Notice(`${PLUGIN_NAME}: removed ${result.removed} blob${result.removed === 1 ? '' : 's'}, freed ${formatBytes(result.freedBytes)}.`)
+                    setCleaning(false)
+                    reload()
+                })}>Delete previous versions</button>
+            </div>
+        </div> : null}
+    </>
+}
+
+function useStorageUsage(plugin: RealtimePlugin, vaultId: string) {
+    const [reloadKey, setReloadKey] = useState(0)
+    const [usage, setUsage] = useState<StorageUsage | null>(null)
+    const [error, setError] = useState('')
+    useEffect(() => {
+        if (!vaultId) return
+        let cancelled = false
+        setUsage(null)
+        setError('')
+        void (async () => {
+            try {
+                const result = await plugin.auth.getStorageUsage(vaultId)
+                if (!cancelled) setUsage(result)
+            } catch (e) {
+                if (!cancelled) setError(`Could not load storage usage: ${(e as Error).message}`)
+            }
+        })()
+        return () => {
+            cancelled = true
+        }
+    }, [plugin, vaultId, reloadKey])
+    return { usage, error, reload: () => setReloadKey((key) => key + 1) }
+}
+
+function formatBytes(bytes: number): string {
+    if (!bytes) return '0 B'
+    const units = ['B', 'KB', 'MB', 'GB', 'TB']
+    const exp = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)))
+    const value = bytes / Math.pow(1024, exp)
+    return `${value >= 100 || exp === 0 ? Math.round(value) : value.toFixed(1)} ${units[exp]}`
 }
 
 function RemoteCursors({ plugin, vault }: { plugin: RealtimePlugin; vault: VaultInfo }) {

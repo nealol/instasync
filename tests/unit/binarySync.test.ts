@@ -3,7 +3,7 @@ import * as Y from "yjs";
 import { YSweetProvider } from "@y-sweet/client";
 import { BinarySync, type BinaryMeta } from "../../src/BinarySync";
 import { getClientToken } from "../../src/ysweet";
-import { makeFakePlugin, type FakePlugin, type FakeVault } from "../support/fakePlugin";
+import { makeFakePlugin } from "../support/fakePlugin";
 import { notices } from "../support/obsidian-mock";
 import { startAuthHarness, type AuthHarness } from "../support/authServer";
 import { waitFor } from "../support/util";
@@ -47,8 +47,13 @@ function makeDevice(name: string) {
 	// Record the upload-status transitions the plugin would render.
 	const uploadStates: string[] = [];
 	plugin.setUploadStatus = (v: string) => uploadStates.push(v);
-	// BinarySync only needs isTextSyncBusy() from its VaultSync; tests can flip it.
-	const vaultSyncStub = { busy: false, isTextSyncBusy() { return this.busy; } };
+	// BinarySync needs isTextSyncBusy() (tests can flip it) and recordTrash().
+	const trashed: unknown[] = [];
+	const vaultSyncStub = {
+		busy: false,
+		isTextSyncBusy() { return this.busy; },
+		recordTrash(entry: unknown) { trashed.push(entry); },
+	};
 	const bs = new BinarySync(plugin as any, vaultSyncStub as any, indexDoc);
 	const binaries = indexDoc.getMap<BinaryMeta>("binaries");
 	return { plugin, vault, indexDoc, provider, bs, binaries, uploadStates, vaultSyncStub };

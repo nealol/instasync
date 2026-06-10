@@ -7,6 +7,8 @@ set -euo pipefail
 
 : "${YSWEET_INTERNAL_PORT:=8080}"
 : "${YSWEET_STORE:=/data/ysweet}"
+# Export so the auth server can measure per-vault "plain vault" storage usage.
+export YSWEET_STORE
 : "${PUBLIC_BASE_URL:=http://127.0.0.1:8081}"
 # Store binary blobs on the persistent volume next to the y-sweet data by default.
 : "${BLOB_DIR:=/data/blobs}"

@@ -16,6 +16,7 @@ pub mod routes;
 pub mod search;
 pub mod session;
 pub mod state;
+pub mod storage;
 pub mod structured;
 pub mod words;
 pub mod ydoc;
@@ -161,6 +162,11 @@ pub fn app(state: AppState) -> Router {
             "/api/vaults/{id}/cursors/{cursor_id}/token",
             post(routes::regenerate_cursor_token),
         )
+        .route("/api/vaults/{id}/storage", get(storage::get_storage))
+        .route(
+            "/api/vaults/{id}/storage/gc-blobs",
+            post(storage::gc_blobs),
+        )
         .route("/api/vaults/{id}/members", get(routes::list_members))
         .route(
             "/api/vaults/{id}/members/{user_id}/promote",
@@ -303,6 +309,7 @@ pub fn app(state: AppState) -> Router {
             get(blobs::get_blob)
                 .head(blobs::head_blob)
                 .put(blobs::put_blob)
+                .delete(storage::delete_blob)
                 .layer(DefaultBodyLimit::max(blobs::MAX_BLOB_BYTES as usize)),
         )
         .route("/api/invites/redeem", post(routes::redeem_invite))

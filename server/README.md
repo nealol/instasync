@@ -93,6 +93,7 @@ in the Obsidian plugin's **Auth server URL** and you're done.
 | `BIND_ADDR` | `127.0.0.1:8081` | listen address |
 | `PUBLIC_BASE_URL` | `http://127.0.0.1:8081` | this server's public URL; OIDC redirect default **and** the URL baked into minted client tokens (clients connect to `/d/*` here) |
 | `YSWEET_URL` | `http://127.0.0.1:8080` | internal URL used to reach (and proxy to) y-sweet |
+| `YSWEET_STORE` | — (`/data/ysweet` in Docker) | optional path to y-sweet's `FileSystemStore`; when set, the storage-usage endpoint measures the per-vault "plain vault" size by scanning it |
 | `BLOB_DIR` | `./blobs` | filesystem directory for the content-addressed binary blob store (use a path on the persistent volume, e.g. `/data/blobs`) |
 | `YSWEET_PUBLIC_URL` | = `YSWEET_URL` | legacy host-rewrite target; leave unset when y-sweet runs with `--url-prefix` (the Docker default) |
 | `YSWEET_AUTH_KEY` | — | shared private key (same as `y-sweet serve --auth`) |

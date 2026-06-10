@@ -653,6 +653,7 @@ mod tests {
             public_base_url: String::new(),
             ysweet_url: String::new(),
             blob_dir: String::new(),
+            ysweet_store_dir: None,
             ysweet_public_url: String::new(),
             ysweet_auth_key: String::new(),
             oidc_mode: crate::config::OidcMode::Mock,

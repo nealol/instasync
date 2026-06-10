@@ -12,6 +12,8 @@
 // URL injection; the spec signs each device in and binds it to a vault.
 
 import * as path from "path";
+import * as os from "os";
+import * as fs from "fs";
 import { fileURLToPath } from "url";
 import { startYSweetServer, genAuthKey, type YSweetServer } from "../support/ysweetServer.js";
 import { startAuthServer, type AuthServer } from "../support/authServer.js";
@@ -51,11 +53,13 @@ export const config: WebdriverIO.Config = {
 
 	async onPrepare() {
 		const authKey = await genAuthKey();
-		ysweet = await startYSweetServer(YSWEET_PORT, authKey);
+		const ysweetStoreDir = fs.mkdtempSync(path.join(os.tmpdir(), "realtime-ysweet-store-"));
+		ysweet = await startYSweetServer(YSWEET_PORT, authKey, ysweetStoreDir);
 		authServer = await startAuthServer({
 			port: AUTH_PORT,
 			ysweetUrl: ysweet.url,
 			authKey,
+			ysweetStoreDir,
 		});
 	},
 	async onComplete() {
