@@ -141,33 +141,49 @@ function isLinkOnlyUpdate(diff: string, renames: [string, string][]): boolean {
 	});
 }
 
-const GROUPS: [string, string][] = [
-	["R", "rename"],
-	["A", "add"],
-	["M", "update"],
-	["D", "delete"],
-];
-
-function group(status: string): string {
-	return status === "R" || status === "A" || status === "D" ? status : "M";
+/** A rename whose basename is unchanged — the file just moved folders. */
+function isMove(change: Change): boolean {
+	if (!change.renamedTo) return false;
+	return change.path.split("/").pop() === change.renamedTo.split("/").pop();
 }
+
+/** The subject verb a change reads under; VERB_ORDER is the display order. */
+function changeVerb(change: Change): string {
+	if (change.status === "R") return isMove(change) ? "move" : "rename";
+	if (change.status === "A") return "add";
+	if (change.status === "D") return "delete";
+	return "update";
+}
+
+const VERB_ORDER = ["rename", "move", "add", "update", "delete"];
 
 function commitSubject(changes: Change[], linkOnly: Set<string>): string {
 	const renames = changes.filter((c) => c.status === "R");
 	const others = changes.filter((c) => c.status !== "R");
 	if (renames.length > 0 && others.every((c) => linkOnly.has(c.path))) {
-		let subject =
-			renames.length <= SUBJECT_MAX_FILES
-				? `Rename ${renames.map((c) => `${c.path} → ${c.renamedTo}`).join(", ")}`
-				: `Rename ${renames.length} files`;
+		let subject: string;
+		if (renames.length <= SUBJECT_MAX_FILES) {
+			const segments: string[] = [];
+			for (const verb of ["rename", "move"]) {
+				const pairs = renames
+					.filter((c) => changeVerb(c) === verb)
+					.map((c) => `${c.path} → ${c.renamedTo}`);
+				if (pairs.length > 0) segments.push(`${verb} ${pairs.join(", ")}`);
+			}
+			subject = segments.join(", ");
+		} else if (renames.every(isMove)) {
+			subject = `move ${renames.length} files`;
+		} else {
+			subject = `rename ${renames.length} files`;
+		}
 		if (others.length > 0) subject += " and update links";
-		return subject;
+		return subject[0].toUpperCase() + subject.slice(1);
 	}
 
 	if (changes.length <= SUBJECT_MAX_FILES) {
 		const segments: string[] = [];
-		for (const [status, verb] of GROUPS) {
-			const labels = changes.filter((c) => group(c.status) === status).map(changeLabel);
+		for (const verb of VERB_ORDER) {
+			const labels = changes.filter((c) => changeVerb(c) === verb).map(changeLabel);
 			if (labels.length > 0) segments.push(`${verb} ${labels.join(", ")}`);
 		}
 		const subject = segments.join(", ");

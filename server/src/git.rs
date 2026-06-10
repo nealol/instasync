@@ -656,45 +656,72 @@ fn is_link_only_update(diff: &str, renames: &[(String, String)]) -> bool {
     })
 }
 
-/// Summarize staged changes as a commit subject. Rename-led commits — renames
-/// plus, at most, modifications that are pure link updates for those renames —
-/// read as "Rename Old.md to New.md[ and update links]". Otherwise: a verb
-/// matching the change kinds (Add/Update/Delete, "Update" when mixed) plus what
-/// changed, or just a count when more than [`SUBJECT_MAX_FILES`] entries changed.
+/// A rename whose basename is unchanged — the file just moved folders.
+fn is_move(change: &StagedChange) -> bool {
+    let Some(new) = &change.renamed_to else {
+        return false;
+    };
+    let old_base = change.path.rsplit('/').next().unwrap_or(&change.path);
+    let new_base = new.rsplit('/').next().unwrap_or(new);
+    old_base == new_base
+}
+
+/// The subject verb a change reads under: renames split into "rename" (name
+/// changed) and "move" (folder changed); unknown statuses (e.g. T) group with
+/// "update". Returned in display order.
+fn change_verb(change: &StagedChange) -> &'static str {
+    match change.status {
+        'R' if is_move(change) => "move",
+        'R' => "rename",
+        'A' => "add",
+        'D' => "delete",
+        _ => "update",
+    }
+}
+
+const VERB_ORDER: [&str; 5] = ["rename", "move", "add", "update", "delete"];
+
+/// Summarize staged changes as a commit subject. Rename/move-led commits —
+/// renames plus, at most, modifications that are pure link updates for those
+/// renames — read as "Rename Old.md → New.md[ and update links]" (or "Move …"
+/// for folder-only changes). Otherwise each kind is listed under its own verb,
+/// or just counted when more than [`SUBJECT_MAX_FILES`] entries changed.
 fn commit_subject(changes: &[StagedChange], link_only: &HashSet<String>) -> String {
     let (renames, others): (Vec<&StagedChange>, Vec<&StagedChange>) =
         changes.iter().partition(|c| c.status == 'R');
     if !renames.is_empty() && others.iter().all(|c| link_only.contains(&c.path)) {
         let mut subject = if renames.len() <= SUBJECT_MAX_FILES {
-            let pairs: Vec<String> = renames
-                .iter()
-                .map(|c| format!("{} → {}", c.path, c.renamed_to.as_deref().unwrap_or("?")))
-                .collect();
-            format!("Rename {}", pairs.join(", "))
+            let mut segments: Vec<String> = Vec::new();
+            for verb in ["rename", "move"] {
+                let pairs: Vec<String> = renames
+                    .iter()
+                    .filter(|c| change_verb(c) == verb)
+                    .map(|c| format!("{} → {}", c.path, c.renamed_to.as_deref().unwrap_or("?")))
+                    .collect();
+                if !pairs.is_empty() {
+                    segments.push(format!("{verb} {}", pairs.join(", ")));
+                }
+            }
+            segments.join(", ")
+        } else if renames.iter().all(|c| is_move(c)) {
+            format!("move {} files", renames.len())
         } else {
-            format!("Rename {} files", renames.len())
+            format!("rename {} files", renames.len())
         };
         if !others.is_empty() {
             subject.push_str(" and update links");
         }
+        subject[..1].make_ascii_uppercase();
         return subject;
     }
 
     if changes.len() <= SUBJECT_MAX_FILES {
         // List each kind under its own verb: "Rename a.md → b.md, update c.md".
-        // Unknown statuses (e.g. T) group with "update".
-        fn group(status: char) -> char {
-            if matches!(status, 'R' | 'A' | 'D') {
-                status
-            } else {
-                'M'
-            }
-        }
         let mut segments: Vec<String> = Vec::new();
-        for (status, verb) in [('R', "rename"), ('A', "add"), ('M', "update"), ('D', "delete")] {
+        for verb in VERB_ORDER {
             let labels: Vec<String> = changes
                 .iter()
-                .filter(|c| group(c.status) == status)
+                .filter(|c| change_verb(c) == verb)
                 .map(change_label)
                 .collect();
             if !labels.is_empty() {
@@ -957,6 +984,45 @@ mod tests {
                 rename("g.md", "h.md"),
             ]),
             "Rename 4 files"
+        );
+    }
+
+    #[test]
+    fn commit_subject_phrases_moves() {
+        // Same basename, different folder → "move".
+        assert_eq!(
+            subject(&[rename("a/Note.md", "b/Note.md")]),
+            "Move a/Note.md → b/Note.md"
+        );
+        // Renames and moves get their own segments.
+        assert_eq!(
+            subject(&[rename("Old.md", "New.md"), rename("a/Note.md", "b/Note.md")]),
+            "Rename Old.md → New.md, move a/Note.md → b/Note.md"
+        );
+        // A move alongside a real edit lists per-kind verbs.
+        let staged = vec![
+            rename("a/Note.md", "b/Note.md"),
+            changes(&[('M', "ref.md")]).remove(0),
+        ];
+        assert_eq!(
+            commit_subject(&staged, &HashSet::new()),
+            "Move a/Note.md → b/Note.md, update ref.md"
+        );
+        // ... but folds into the move when the edit is link-only.
+        let link_only: HashSet<String> = ["ref.md".to_string()].into();
+        assert_eq!(
+            commit_subject(&staged, &link_only),
+            "Move a/Note.md → b/Note.md and update links"
+        );
+        // All-move count form.
+        assert_eq!(
+            subject(&[
+                rename("a/1.md", "b/1.md"),
+                rename("a/2.md", "b/2.md"),
+                rename("a/3.md", "b/3.md"),
+                rename("a/4.md", "b/4.md"),
+            ]),
+            "Move 4 files"
         );
     }
 
