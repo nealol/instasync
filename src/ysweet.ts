@@ -11,8 +11,21 @@ export type ClientToken = {
 
 const TOKEN_RETRY_DELAY_MS = 30_000;
 
+let tokenRetryDelayMs = TOKEN_RETRY_DELAY_MS;
 let nextTokenAttemptAt = 0;
 let tokenAttemptQueue: Promise<void> = Promise.resolve();
+
+/**
+ * Test-only: clear the module-global token backoff/queue and optionally shrink
+ * the retry delay. The backoff state is shared by every provider in the
+ * process, so without a reset one transient token failure in a test run stalls
+ * every later connection for 30s.
+ */
+export function resetTokenRetryStateForTests(delayMs = TOKEN_RETRY_DELAY_MS): void {
+	tokenRetryDelayMs = delayMs;
+	nextTokenAttemptAt = 0;
+	tokenAttemptQueue = Promise.resolve();
+}
 
 function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -54,7 +67,7 @@ export async function getClientToken(plugin: RealtimePlugin, docId: string): Pro
 		}
 		return token;
 	} catch (e) {
-		nextTokenAttemptAt = Date.now() + TOKEN_RETRY_DELAY_MS;
+		nextTokenAttemptAt = Date.now() + tokenRetryDelayMs;
 		throw e;
 	} finally {
 		release();

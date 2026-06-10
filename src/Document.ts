@@ -189,7 +189,15 @@ export class Document extends SyncedDoc {
 
 	/** Called by VaultSync when the local file changed and no editor is bound. */
 	async onDiskChanged(): Promise<void> {
-		if (this.destroyed || this.writingToDisk || this.hasBoundEditor || this.isOpenInWorkspace()) return;
+		if (this.destroyed || this.hasBoundEditor || this.isOpenInWorkspace()) return;
+		if (this.writingToDisk) {
+			// One of our own writes is in flight, but the change may still be an
+			// external edit that landed in the same window — re-check once the echo
+			// guard clears (next tick) instead of dropping it. A pure echo of our own
+			// write is then absorbed by the `disk === this.content` check below.
+			window.setTimeout(() => void this.onDiskChanged(), 0);
+			return;
+		}
 		const disk = await this.readFromDisk();
 		if (disk === null) return;
 		if (disk === this.content) return;
