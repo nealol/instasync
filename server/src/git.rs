@@ -286,10 +286,11 @@ impl GitService {
         self.git(repo, &["add", "-A"]).await?;
 
         // The staged diff drives both the no-op check and the commit subject.
-        // `--no-renames` keeps statuses to A/M/D so a rename reads as its two
-        // visible effects rather than needing a third phrasing.
         let diff = self
-            .git_raw(repo, &["diff", "--cached", "--name-status", "--no-renames"])
+            .git_raw(
+                repo,
+                &["diff", "--cached", "--name-status", "--find-renames"],
+            )
             .await?;
         if !diff.status.success() {
             bail!(
@@ -302,9 +303,10 @@ impl GitService {
         if changes.is_empty() {
             return Ok(()); // nothing changed — idempotent no-op
         }
+        let link_only = self.link_only_updates(repo, &changes).await;
 
         let (author, message) =
-            build_commit_meta(vault_id, &changes, contributors, &self.0.config);
+            build_commit_meta(vault_id, &changes, &link_only, contributors, &self.0.config);
         // Pin the committer to the Realtime bot via command-scoped (`-c`) config so
         // it never falls back to the server's *global* git identity — regardless of
         // what (if anything) is in global config or whether ensure_repo's local
@@ -333,6 +335,35 @@ impl GitService {
             tracing::warn!("git audit: push for vault {vault_id} failed: {e}");
         }
         Ok(())
+    }
+
+    /// Of the staged modifications, find the ones that are purely link updates
+    /// caused by this commit's renames (every changed line is the old line with
+    /// references to a renamed file swapped for the new name). Only meaningful
+    /// when the commit could read "Rename X to Y and update links" — i.e. when
+    /// every non-rename change is a modification; otherwise returns empty.
+    async fn link_only_updates(&self, repo: &Path, changes: &[StagedChange]) -> HashSet<String> {
+        let renames: Vec<(String, String)> = changes
+            .iter()
+            .filter_map(|c| Some((c.path.clone(), c.renamed_to.clone()?)))
+            .collect();
+        if renames.is_empty() || !changes.iter().all(|c| matches!(c.status, 'R' | 'M')) {
+            return HashSet::new();
+        }
+        let mut link_only = HashSet::new();
+        for change in changes.iter().filter(|c| c.status == 'M') {
+            let out = self
+                .git_raw(repo, &["diff", "--cached", "--", &change.path])
+                .await;
+            if let Ok(out) = out {
+                if out.status.success()
+                    && is_link_only_update(&String::from_utf8_lossy(&out.stdout), &renames)
+                {
+                    link_only.insert(change.path.clone());
+                }
+            }
+        }
+        link_only
     }
 
     /// Push the vault repo to its configured backup remote (if any), recording
@@ -506,22 +537,33 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// One staged change: git name-status letter (A/M/D) plus the path.
+/// One staged change: git name-status letter (A/M/D/R) plus the path
+/// (for renames, the old path, with the destination in `renamed_to`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StagedChange {
     status: char,
     path: String,
+    renamed_to: Option<String>,
 }
 
-/// Parse `git diff --cached --name-status --no-renames` output (`X\tpath` lines).
+/// Parse `git diff --cached --name-status --find-renames` output:
+/// `X\tpath` lines, or `R<score>\told\tnew` for renames.
 fn parse_name_status(output: &str) -> Vec<StagedChange> {
     output
         .lines()
         .filter_map(|line| {
-            let (status, path) = line.split_once('\t')?;
+            let (status, rest) = line.split_once('\t')?;
+            let status = status.chars().next()?;
+            let (path, renamed_to) = if status == 'R' {
+                let (old, new) = rest.split_once('\t')?;
+                (old.to_string(), Some(new.to_string()))
+            } else {
+                (rest.to_string(), None)
+            };
             Some(StagedChange {
-                status: status.chars().next()?,
-                path: path.to_string(),
+                status,
+                path,
+                renamed_to,
             })
         })
         .collect()
@@ -530,10 +572,140 @@ fn parse_name_status(output: &str) -> Vec<StagedChange> {
 /// Most files listed in a commit subject before falling back to a count.
 const SUBJECT_MAX_FILES: usize = 3;
 
-/// Summarize staged changes as a commit subject: a verb matching the change
-/// kinds (Add/Update/Delete, "Update" when mixed) plus the paths themselves,
-/// or just a count when more than [`SUBJECT_MAX_FILES`] files changed.
-fn commit_subject(changes: &[StagedChange]) -> String {
+/// Git-repo directory holding plugin-database SQL dumps
+/// (`.sql/{plugin_id}/{db_name}.sql`).
+pub(crate) const SQL_DUMP_DIR: &str = ".sql";
+
+/// Parse a `.sql/{plugin_id}/{db_name}.sql` dump path into (plugin_id, db_name).
+fn sql_dump_parts(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix(SQL_DUMP_DIR)?.strip_prefix('/')?;
+    let (plugin, file) = rest.split_once('/')?;
+    let name = file.strip_suffix(".sql")?;
+    if plugin.is_empty() || name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some((plugin, name))
+}
+
+/// How one staged change reads in a commit subject: plugin-database dumps are
+/// phrased by plugin, renames as `old → new`, everything else by its vault path.
+fn change_label(change: &StagedChange) -> String {
+    if let Some(new) = &change.renamed_to {
+        return format!("{} → {new}", change.path);
+    }
+    match sql_dump_parts(&change.path) {
+        Some((plugin, name)) => format!("{plugin} plugin database ({name})"),
+        None => change.path.to_string(),
+    }
+}
+
+/// The strings a rename plausibly changes inside other notes' links: the full
+/// path, the path without `.md`, the basename, and the basename stem —
+/// longest-first so broader forms are rewritten before their substrings.
+fn rename_link_variants(old: &str, new: &str) -> Vec<(String, String)> {
+    let mut variants = vec![(old.to_string(), new.to_string())];
+    if let (Some(o), Some(n)) = (old.strip_suffix(".md"), new.strip_suffix(".md")) {
+        variants.push((o.to_string(), n.to_string()));
+    }
+    let (old_base, new_base) = (
+        old.rsplit('/').next().unwrap_or(old),
+        new.rsplit('/').next().unwrap_or(new),
+    );
+    if old_base != old {
+        variants.push((old_base.to_string(), new_base.to_string()));
+    }
+    if let (Some(o), Some(n)) = (old_base.strip_suffix(".md"), new_base.strip_suffix(".md")) {
+        variants.push((o.to_string(), n.to_string()));
+    }
+    variants.sort_by_key(|(o, _)| std::cmp::Reverse(o.len()));
+    variants.dedup();
+    variants
+}
+
+/// True when a staged file diff consists solely of lines whose only difference
+/// is references to renamed files being updated: every removed line, with the
+/// rename variants substituted, equals the matching added line. Conservative —
+/// any insertion, deletion, or unrelated edit makes this false.
+fn is_link_only_update(diff: &str, renames: &[(String, String)]) -> bool {
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+    for line in diff.lines() {
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('-') {
+            removed.push(rest);
+        } else if let Some(rest) = line.strip_prefix('+') {
+            added.push(rest);
+        }
+    }
+    if removed.is_empty() || removed.len() != added.len() {
+        return false;
+    }
+    let mut variants: Vec<(String, String)> = renames
+        .iter()
+        .flat_map(|(old, new)| rename_link_variants(old, new))
+        .collect();
+    variants.sort_by_key(|(o, _)| std::cmp::Reverse(o.len()));
+    removed.iter().zip(&added).all(|(before, after)| {
+        let mut rewritten = before.to_string();
+        for (old, new) in &variants {
+            rewritten = rewritten.replace(old.as_str(), new);
+        }
+        rewritten == **after
+    })
+}
+
+/// Summarize staged changes as a commit subject. Rename-led commits — renames
+/// plus, at most, modifications that are pure link updates for those renames —
+/// read as "Rename Old.md to New.md[ and update links]". Otherwise: a verb
+/// matching the change kinds (Add/Update/Delete, "Update" when mixed) plus what
+/// changed, or just a count when more than [`SUBJECT_MAX_FILES`] entries changed.
+fn commit_subject(changes: &[StagedChange], link_only: &HashSet<String>) -> String {
+    let (renames, others): (Vec<&StagedChange>, Vec<&StagedChange>) =
+        changes.iter().partition(|c| c.status == 'R');
+    if !renames.is_empty() && others.iter().all(|c| link_only.contains(&c.path)) {
+        let mut subject = if renames.len() <= SUBJECT_MAX_FILES {
+            let pairs: Vec<String> = renames
+                .iter()
+                .map(|c| format!("{} → {}", c.path, c.renamed_to.as_deref().unwrap_or("?")))
+                .collect();
+            format!("Rename {}", pairs.join(", "))
+        } else {
+            format!("Rename {} files", renames.len())
+        };
+        if !others.is_empty() {
+            subject.push_str(" and update links");
+        }
+        return subject;
+    }
+
+    if changes.len() <= SUBJECT_MAX_FILES {
+        // List each kind under its own verb: "Rename a.md → b.md, update c.md".
+        // Unknown statuses (e.g. T) group with "update".
+        fn group(status: char) -> char {
+            if matches!(status, 'R' | 'A' | 'D') {
+                status
+            } else {
+                'M'
+            }
+        }
+        let mut segments: Vec<String> = Vec::new();
+        for (status, verb) in [('R', "rename"), ('A', "add"), ('M', "update"), ('D', "delete")] {
+            let labels: Vec<String> = changes
+                .iter()
+                .filter(|c| group(c.status) == status)
+                .map(change_label)
+                .collect();
+            if !labels.is_empty() {
+                segments.push(format!("{verb} {}", labels.join(", ")));
+            }
+        }
+        let mut subject = segments.join(", ");
+        subject[..1].make_ascii_uppercase();
+        return subject;
+    }
+
     let verb = match changes.iter().map(|c| c.status).collect::<HashSet<_>>() {
         s if s.len() == 1 => match changes[0].status {
             'A' => "Add",
@@ -542,9 +714,8 @@ fn commit_subject(changes: &[StagedChange]) -> String {
         },
         _ => "Update",
     };
-    if changes.len() <= SUBJECT_MAX_FILES {
-        let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
-        format!("{verb} {}", paths.join(", "))
+    if changes.iter().all(|c| sql_dump_parts(&c.path).is_some()) {
+        format!("{verb} {} plugin databases", changes.len())
     } else {
         format!("{verb} {} files", changes.len())
     }
@@ -554,6 +725,7 @@ fn commit_subject(changes: &[StagedChange]) -> String {
 fn build_commit_meta(
     vault_id: &str,
     changes: &[StagedChange],
+    link_only: &HashSet<String>,
     contributors: &[Contributor],
     config: &Config,
 ) -> (String, String) {
@@ -563,7 +735,7 @@ fn build_commit_meta(
     };
     let author = format!("{author_name} <{author_email}>");
 
-    let mut message = format!("{}\n\n", commit_subject(changes));
+    let mut message = format!("{}\n\n", commit_subject(changes, link_only));
     message.push_str(&format!("Vault-Id: {vault_id}\n"));
     if let Some(p) = contributors.first() {
         append_principal_trailers(&mut message, p);
@@ -741,39 +913,140 @@ mod tests {
             .map(|(status, path)| StagedChange {
                 status: *status,
                 path: path.to_string(),
+                renamed_to: None,
             })
             .collect()
     }
 
+    fn rename(old: &str, new: &str) -> StagedChange {
+        StagedChange {
+            status: 'R',
+            path: old.to_string(),
+            renamed_to: Some(new.to_string()),
+        }
+    }
+
+    fn subject(changes: &[StagedChange]) -> String {
+        commit_subject(changes, &HashSet::new())
+    }
+
     #[test]
     fn parses_name_status_output() {
-        let parsed = parse_name_status("M\tnote.md\nA\tdir/new.md\nD\told.md\n");
-        assert_eq!(
-            parsed,
-            changes(&[('M', "note.md"), ('A', "dir/new.md"), ('D', "old.md")])
-        );
+        let parsed = parse_name_status("M\tnote.md\nA\tdir/new.md\nD\told.md\nR100\ta.md\tb.md\n");
+        let mut expected = changes(&[('M', "note.md"), ('A', "dir/new.md"), ('D', "old.md")]);
+        expected.push(rename("a.md", "b.md"));
+        assert_eq!(parsed, expected);
         assert!(parse_name_status("").is_empty());
     }
 
     #[test]
-    fn commit_subject_lists_few_files_with_matching_verb() {
-        assert_eq!(commit_subject(&changes(&[('A', "a.md")])), "Add a.md");
-        assert_eq!(commit_subject(&changes(&[('D', "a.md")])), "Delete a.md");
+    fn commit_subject_phrases_renames() {
         assert_eq!(
-            commit_subject(&changes(&[('M', "a.md"), ('M', "dir/b.md")])),
+            subject(&[rename("Old.md", "New.md")]),
+            "Rename Old.md → New.md"
+        );
+        assert_eq!(
+            subject(&[rename("a.md", "b.md"), rename("c.md", "dir/d.md")]),
+            "Rename a.md → b.md, c.md → dir/d.md"
+        );
+        assert_eq!(
+            subject(&[
+                rename("a.md", "b.md"),
+                rename("c.md", "d.md"),
+                rename("e.md", "f.md"),
+                rename("g.md", "h.md"),
+            ]),
+            "Rename 4 files"
+        );
+    }
+
+    #[test]
+    fn commit_subject_folds_link_only_updates_into_rename() {
+        let staged = vec![rename("Old.md", "New.md"), changes(&[('M', "ref.md")]).remove(0)];
+        let link_only: HashSet<String> = ["ref.md".to_string()].into();
+        assert_eq!(
+            commit_subject(&staged, &link_only),
+            "Rename Old.md → New.md and update links"
+        );
+        // A genuine edit alongside a rename lists each kind under its own verb.
+        assert_eq!(
+            commit_subject(&staged, &HashSet::new()),
+            "Rename Old.md → New.md, update ref.md"
+        );
+    }
+
+    #[test]
+    fn link_only_diffs_detected() {
+        let renames = vec![("dir/Old.md".to_string(), "dir/New.md".to_string())];
+        let link_diff = "\
+diff --git a/ref.md b/ref.md
+--- a/ref.md
++++ b/ref.md
+@@ -1,2 +1,2 @@
+-See [[Old]] and [link](dir/Old.md).
++See [[New]] and [link](dir/New.md).
+ unchanged";
+        assert!(is_link_only_update(link_diff, &renames));
+
+        let real_edit = "\
+@@ -1 +1 @@
+-See [[Old]] for context.
++See [[New]] for more context.";
+        assert!(!is_link_only_update(real_edit, &renames));
+
+        let addition = "\
+@@ -1 +1,2 @@
+ existing
++brand new line";
+        assert!(!is_link_only_update(addition, &renames));
+    }
+
+    #[test]
+    fn commit_subject_lists_few_files_with_matching_verb() {
+        assert_eq!(subject(&changes(&[('A', "a.md")])), "Add a.md");
+        assert_eq!(subject(&changes(&[('D', "a.md")])), "Delete a.md");
+        assert_eq!(
+            subject(&changes(&[('M', "a.md"), ('M', "dir/b.md")])),
             "Update a.md, dir/b.md"
         );
-        // Mixed change kinds fall back to "Update".
+        // Mixed change kinds each get their own verb.
         assert_eq!(
-            commit_subject(&changes(&[('A', "a.md"), ('D', "b.md")])),
-            "Update a.md, b.md"
+            subject(&changes(&[('A', "a.md"), ('D', "b.md")])),
+            "Add a.md, delete b.md"
+        );
+    }
+
+    #[test]
+    fn commit_subject_phrases_plugin_database_dumps() {
+        assert_eq!(
+            subject(&changes(&[('M', ".sql/my-plugin/tasks.sql")])),
+            "Update my-plugin plugin database (tasks)"
+        );
+        assert_eq!(
+            subject(&changes(&[('M', "a.md"), ('M', ".sql/my-plugin/tasks.sql")])),
+            "Update a.md, my-plugin plugin database (tasks)"
+        );
+        // All-dump commits beyond the listing limit count databases, not files.
+        assert_eq!(
+            subject(&changes(&[
+                ('M', ".sql/p1/a.sql"),
+                ('M', ".sql/p1/b.sql"),
+                ('M', ".sql/p2/a.sql"),
+                ('M', ".sql/p3/a.sql"),
+            ])),
+            "Update 4 plugin databases"
+        );
+        // A vault file that merely looks dump-like keeps its path.
+        assert_eq!(
+            subject(&changes(&[('M', "notes/.sql/x.sql")])),
+            "Update notes/.sql/x.sql"
         );
     }
 
     #[test]
     fn commit_subject_counts_many_files() {
         assert_eq!(
-            commit_subject(&changes(&[
+            subject(&changes(&[
                 ('M', "a.md"),
                 ('M', "b.md"),
                 ('A', "c.md"),
@@ -782,7 +1055,7 @@ mod tests {
             "Update 4 files"
         );
         assert_eq!(
-            commit_subject(&changes(&[
+            subject(&changes(&[
                 ('A', "a.md"),
                 ('A', "b.md"),
                 ('A', "c.md"),
@@ -876,7 +1149,7 @@ mod tests {
                 expires_at_ms: 0,
             },
         ];
-        let (author, message) = build_commit_meta("v1", &changes(&[('M', "a.md")]), &contributors, &config);
+        let (author, message) = build_commit_meta("v1", &changes(&[('M', "a.md")]), &HashSet::new(), &contributors, &config);
         assert_eq!(author, "Alice <a@x>");
         assert!(message.contains("Principal-Id: u1"));
         assert!(message.contains("Co-authored-by: Bob <b@x>"));
@@ -886,7 +1159,7 @@ mod tests {
     #[test]
     fn commit_meta_falls_back_to_bot() {
         let config = test_config();
-        let (author, message) = build_commit_meta("v1", &changes(&[('M', "a.md")]), &[], &config);
+        let (author, message) = build_commit_meta("v1", &changes(&[('M', "a.md")]), &HashSet::new(), &[], &config);
         assert_eq!(author, "Realtime <realtime@localhost>");
         assert!(!message.contains("Principal-Id"));
     }
@@ -907,7 +1180,7 @@ mod tests {
         }];
 
         let (author, message) =
-            build_commit_meta("v1", &changes(&[('M', "a.md")]), &contributors, &config);
+            build_commit_meta("v1", &changes(&[('M', "a.md")]), &HashSet::new(), &contributors, &config);
         assert_eq!(author, "Claude <cursor+app123@localhost>");
         assert!(message.contains("Principal-Type: cursor"));
         assert!(message.contains("Cursor-Id: c1"));

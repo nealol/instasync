@@ -2838,7 +2838,7 @@ async fn plugin_db_replication_dump_compaction_and_bootstrap() {
         .unwrap();
     assert!(none.is_empty(), "caught-up cursor should get no rows");
 
-    // Git dump: deterministic, committed under .realtime/plugin-dbs/, restorable.
+    // Git dump: deterministic, committed under .sql/, restorable.
     let d1 = state.plugindb.dumps_for_vault(&vault_id).await;
     let d2 = state.plugindb.dumps_for_vault(&vault_id).await;
     assert_eq!(d1, d2, "dumps must be deterministic");
@@ -2846,7 +2846,7 @@ async fn plugin_db_replication_dump_compaction_and_bootstrap() {
     let (rel, sql) = &d1[0];
     assert_eq!(
         rel.to_string_lossy(),
-        ".realtime/plugin-dbs/my-plugin/tasks.sql"
+        ".sql/my-plugin/tasks.sql"
     );
     assert!(sql.contains("-- crr: tasks"), "dump records CRR tables: {sql}");
 
@@ -2855,7 +2855,7 @@ async fn plugin_db_replication_dump_compaction_and_bootstrap() {
         .mark_write(&vault_id, &principal("u-alice", "Alice", "alice@example.com"))
         .await;
     wait_for_commit(&repo).await;
-    let committed = repo.join(".realtime/plugin-dbs/my-plugin/tasks.sql");
+    let committed = repo.join(".sql/my-plugin/tasks.sql");
     assert!(committed.exists(), "git tree must contain the dump");
 
     // Restore-from-dump round trip: fresh DB + dump + re-run crsql_as_crr.
@@ -2912,7 +2912,7 @@ async fn plugin_db_soft_delete_keeps_replica_and_purge_removes_everything() {
         .mark_write(&vault_id, &principal("u-alice", "Alice", "alice@example.com"))
         .await;
     wait_for_commit(&repo).await;
-    let committed_dump = repo.join(".realtime/plugin-dbs/my-plugin/tasks.sql");
+    let committed_dump = repo.join(".sql/my-plugin/tasks.sql");
     assert!(committed_dump.exists());
 
     // Soft delete: tombstone the doc. Replication stops but the replica stays.

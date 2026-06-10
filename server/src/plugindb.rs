@@ -617,8 +617,7 @@ impl PluginDbService {
             })
             .await;
             if let Ok(Ok(Some(sql))) = dump {
-                let rel = PathBuf::from(".realtime")
-                    .join("plugin-dbs")
+                let rel = PathBuf::from(crate::git::SQL_DUMP_DIR)
                     .join(&row.plugin_id)
                     .join(format!("{}.sql", row.name));
                 out.push((rel, sql));

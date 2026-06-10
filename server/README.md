@@ -120,7 +120,7 @@ in the Obsidian plugin's **Auth server URL** and you're done.
 | `ATTACHMENTS_PATH_MODE` | `relative` | `relative` or `subfolder`; `subfolder` requires attachment paths under `ATTACHMENTS_SUBFOLDER` |
 | `ATTACHMENTS_SUBFOLDER` | — | Required for subfolder path mode and used as the default signed-upload landing directory |
 | `UPLOAD_TOKEN` | `dev-upload-token-change-me` | HMAC key for signed single-use browser upload links; set a long random secret in production |
-| `CRSQLITE_EXT_PATH` | `/usr/local/lib/crsqlite/crsqlite.so` in Docker, else unset | Path to the cr-sqlite loadable extension that backs synced **plugin databases** (server-side replica + git dumps under `.realtime/plugin-dbs/`). When unset/missing, plugin-database replication degrades gracefully: client-to-client sync over the Y log is unaffected, but the server keeps no replica and git skips the per-DB SQL dumps. Its major version must match the client WASM's sync-format major. |
+| `CRSQLITE_EXT_PATH` | `/usr/local/lib/crsqlite/crsqlite.so` in Docker, else unset | Path to the cr-sqlite loadable extension that backs synced **plugin databases** (server-side replica + git dumps under `.sql/`). When unset/missing, plugin-database replication degrades gracefully: client-to-client sync over the Y log is unaffected, but the server keeps no replica and git skips the per-DB SQL dumps. Its major version must match the client WASM's sync-format major. |
 
 In the bundled Docker setup, `docker-entrypoint.sh` starts y-sweet on
 `YSWEET_INTERNAL_PORT` (default 8080) with a `FileSystemStore` at `YSWEET_STORE`
