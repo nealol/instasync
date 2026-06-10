@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map as JsonMap, Value as JsonValue};
 use std::collections::HashSet;
 
+use crate::audit::{self, AuditEntry};
 use crate::error::{AppError, AppResult};
 use crate::routes::{authorize_path, require_member};
 use crate::session::{now_millis, ApiPrincipal};
@@ -857,7 +858,7 @@ where
     .await
 }
 
-async fn read_structured_json(
+pub(crate) async fn read_structured_json(
     state: &AppState,
     principal: &ApiPrincipal,
     vault_id: &str,
@@ -876,7 +877,7 @@ async fn read_structured_json(
     })
 }
 
-async fn write_structured_json(
+pub(crate) async fn write_structured_json(
     state: &AppState,
     principal: &ApiPrincipal,
     vault_id: &str,
@@ -885,8 +886,28 @@ async fn write_structured_json(
     value: JsonValue,
 ) -> AppResult<StructuredResponse> {
     let entry = require_structured_access(state, principal, vault_id, path, kind, true).await?;
+    // The before-image is only needed for the cursor audit trail; spare human
+    // callers the extra y-sweet read.
+    let before = if audit::is_cursor(principal) {
+        let update = ydoc::read_update(state, &doc_id(vault_id, &entry.guid)).await?;
+        Some(ydoc::decode_structured(&update).map_err(|e| AppError::Internal(e.to_string()))?)
+    } else {
+        None
+    };
     ydoc::set_structured(state, &doc_id(vault_id, &entry.guid), &value).await?;
     mark_structured_write(state, vault_id, principal).await;
+    if let Some(before) = before {
+        audit::record(
+            state,
+            principal,
+            vault_id,
+            AuditEntry::new("structured_set", path)
+                .before(pretty_json(&before))
+                .after(pretty_json(&value))
+                .details(json!({ "kind": kind })),
+        )
+        .await;
+    }
     Ok(StructuredResponse {
         permalink: permalink_for_guid(state, &entry.guid),
         path: entry.path,
@@ -896,7 +917,7 @@ async fn write_structured_json(
     })
 }
 
-async fn create_structured(
+pub(crate) async fn create_structured(
     state: &AppState,
     principal: &ApiPrincipal,
     vault_id: &str,
@@ -922,6 +943,15 @@ async fn create_structured(
     ydoc::set_structured(state, &doc_id(vault_id, &guid), &value).await?;
     ydoc::index_set_structured(state, vault_id, path, &guid, kind).await?;
     mark_structured_write(state, vault_id, principal).await;
+    audit::record(
+        state,
+        principal,
+        vault_id,
+        AuditEntry::new("structured_create", path)
+            .after(pretty_json(&value))
+            .details(json!({ "kind": kind })),
+    )
+    .await;
     Ok(StructuredResponse {
         permalink: permalink_for_guid(state, &guid),
         path: path.into(),
@@ -953,6 +983,15 @@ pub(crate) async fn move_structured_inner(
     }
     ydoc::index_rename_structured(state, vault_id, &entry.path, &body.to_path).await?;
     mark_structured_write(state, vault_id, principal).await;
+    audit::record(
+        state,
+        principal,
+        vault_id,
+        AuditEntry::new("structured_move", &entry.path)
+            .to_path(&body.to_path)
+            .details(json!({ "kind": kind })),
+    )
+    .await;
     let mut out = read_structured_json(state, principal, vault_id, &body.to_path, kind).await?;
     if kind == "canvas" {
         out.value = canvas_to_file_json(out.value);
@@ -960,7 +999,7 @@ pub(crate) async fn move_structured_inner(
     Ok(out)
 }
 
-async fn delete_structured_inner(
+pub(crate) async fn delete_structured_inner(
     state: &AppState,
     principal: &ApiPrincipal,
     vault_id: &str,
@@ -968,9 +1007,32 @@ async fn delete_structured_inner(
     kind: &str,
 ) -> AppResult<()> {
     let entry = require_structured_access(state, principal, vault_id, path, kind, true).await?;
+    // Capture the document for the cursor audit trail so the delete can be
+    // undone; human deletes skip the extra read.
+    let before = if audit::is_cursor(principal) {
+        let update = ydoc::read_update(state, &doc_id(vault_id, &entry.guid)).await?;
+        Some(ydoc::decode_structured(&update).map_err(|e| AppError::Internal(e.to_string()))?)
+    } else {
+        None
+    };
     ydoc::index_remove_structured(state, vault_id, &entry.path).await?;
     mark_structured_write(state, vault_id, principal).await;
+    if let Some(before) = before {
+        audit::record(
+            state,
+            principal,
+            vault_id,
+            AuditEntry::new("structured_delete", &entry.path)
+                .before(pretty_json(&before))
+                .details(json!({ "kind": kind })),
+        )
+        .await;
+    }
     Ok(())
+}
+
+fn pretty_json(value: &JsonValue) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
 async fn require_structured_access(

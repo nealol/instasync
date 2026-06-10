@@ -5,6 +5,7 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value};
 
+use crate::audit::{self, AuditEntry};
 use crate::entities::vault_files;
 use crate::error::{AppError, AppResult};
 use crate::routes::{authorize_doc, require_member};
@@ -239,6 +240,13 @@ pub(crate) async fn create_note_inner(
             &principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000),
         )
         .await;
+    audit::record(
+        state,
+        principal,
+        vault_id,
+        AuditEntry::new("note_create", &body.path).after(body.content.clone()),
+    )
+    .await;
 
     Ok(NoteResponse {
         permalink: permalink_for_guid(state, &guid),
@@ -298,6 +306,14 @@ pub(crate) async fn replace_note_inner(
 ) -> AppResult<NoteResponse> {
     let file = require_note_access(state, principal, vault_id, path, true).await?;
     let doc_id = doc_id(vault_id, &file.guid);
+    // The before-image is only needed for the cursor audit trail; spare human
+    // callers the extra y-sweet read.
+    let before = if audit::is_cursor(principal) {
+        let update = ydoc::read_update(state, &doc_id).await?;
+        Some(ydoc::decode_text(&update, "contents").map_err(|e| AppError::Internal(e.to_string()))?)
+    } else {
+        None
+    };
     ydoc::set_text(state, &doc_id, &body.content).await?;
     best_effort_index(state, vault_id, &file.guid, &file.path, &body.content).await;
     state
@@ -307,6 +323,17 @@ pub(crate) async fn replace_note_inner(
             &principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000),
         )
         .await;
+    if let Some(before) = before {
+        audit::record(
+            state,
+            principal,
+            vault_id,
+            AuditEntry::new("note_replace", &file.path)
+                .before(before)
+                .after(body.content.clone()),
+        )
+        .await;
+    }
 
     Ok(NoteResponse {
         permalink: permalink_for_guid(state, &file.guid),
@@ -362,6 +389,15 @@ pub(crate) async fn patch_note_inner(
     ydoc::set_text(state, &doc_id, &new_content).await?;
     best_effort_index(state, vault_id, &file.guid, &file.path, &new_content).await;
     mark_note_write(state, vault_id, principal).await;
+    audit::record(
+        state,
+        principal,
+        vault_id,
+        AuditEntry::new("note_patch", &file.path)
+            .before(content)
+            .after(new_content.clone()),
+    )
+    .await;
     Ok(NoteResponse {
         permalink: permalink_for_guid(state, &file.guid),
         path: file.path,
@@ -408,6 +444,13 @@ pub(crate) async fn move_note_inner(
     best_effort_index(state, vault_id, &file.guid, &body.to_path, &content).await;
     rewrite_backlinks_after_move(state, vault_id, &file.guid, &file.path, &body.to_path).await;
     mark_note_write(state, vault_id, principal).await;
+    audit::record(
+        state,
+        principal,
+        vault_id,
+        AuditEntry::new("note_move", &file.path).to_path(&body.to_path),
+    )
+    .await;
     Ok(NoteResponse {
         permalink: permalink_for_guid(state, &file.guid),
         path: body.to_path,
@@ -432,15 +475,32 @@ pub(crate) async fn delete_note_inner(
     path: &str,
 ) -> AppResult<()> {
     let file = require_note_access(state, principal, vault_id, path, true).await?;
+    // Capture the content for the cursor audit trail so the delete can be
+    // undone; human deletes skip the extra read.
+    let before = if audit::is_cursor(principal) {
+        let update = ydoc::read_update(state, &doc_id(vault_id, &file.guid)).await?;
+        Some(ydoc::decode_text(&update, "contents").map_err(|e| AppError::Internal(e.to_string()))?)
+    } else {
+        None
+    };
     ydoc::index_remove_file(state, vault_id, &file.path).await?;
     if let Err(e) = crate::search::remove_note(state, vault_id, &file.guid).await {
         tracing::warn!("search remove failed for {}: {e}", file.path);
     }
     mark_note_write(state, vault_id, principal).await;
+    if let Some(before) = before {
+        audit::record(
+            state,
+            principal,
+            vault_id,
+            AuditEntry::new("note_delete", &file.path).before(before),
+        )
+        .await;
+    }
     Ok(())
 }
 
-async fn mark_note_write(state: &AppState, vault_id: &str, principal: &ApiPrincipal) {
+pub(crate) async fn mark_note_write(state: &AppState, vault_id: &str, principal: &ApiPrincipal) {
     let git_principal = principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000);
     state.git.mark_write(vault_id, &git_principal).await;
     state
@@ -449,7 +509,7 @@ async fn mark_note_write(state: &AppState, vault_id: &str, principal: &ApiPrinci
         .await;
 }
 
-async fn best_effort_index(
+pub(crate) async fn best_effort_index(
     state: &AppState,
     vault_id: &str,
     guid: &str,
@@ -579,6 +639,15 @@ pub(crate) async fn patch_frontmatter_inner(
     ydoc::set_text(state, &doc_id, &new_content).await?;
     best_effort_index(state, vault_id, &file.guid, &file.path, &new_content).await;
     mark_note_write(state, vault_id, principal).await;
+    audit::record(
+        state,
+        principal,
+        vault_id,
+        AuditEntry::new("note_frontmatter", &file.path)
+            .before(content)
+            .after(new_content.clone()),
+    )
+    .await;
     Ok(NoteResponse {
         permalink: permalink_for_guid(state, &file.guid),
         path: file.path,
@@ -603,6 +672,15 @@ pub(crate) async fn replace_body_inner(
     ydoc::set_text(state, &doc_id(vault_id, &file.guid), &new_content).await?;
     best_effort_index(state, vault_id, &file.guid, &file.path, &new_content).await;
     mark_note_write(state, vault_id, principal).await;
+    audit::record(
+        state,
+        principal,
+        vault_id,
+        AuditEntry::new("note_replace_body", &file.path)
+            .before(content)
+            .after(new_content.clone()),
+    )
+    .await;
     Ok(NoteResponse {
         permalink: permalink_for_guid(state, &file.guid),
         path: file.path,
@@ -660,6 +738,13 @@ pub(crate) async fn periodic_note_get_or_create_inner(
     ydoc::index_set_file(state, vault_id, &note_path, &guid).await?;
     best_effort_index(state, vault_id, &guid, &note_path, &body.content).await;
     mark_note_write(state, vault_id, principal).await;
+    audit::record(
+        state,
+        principal,
+        vault_id,
+        AuditEntry::new("note_create", &note_path).after(body.content.clone()),
+    )
+    .await;
     Ok(NoteResponse {
         permalink: permalink_for_guid(state, &guid),
         path: note_path,
@@ -706,7 +791,8 @@ pub(crate) async fn periodic_note_append_inner(
     if level == Level::ReadOnly {
         return Err(AppError::Forbidden);
     }
-    let mut content = existing.content;
+    let before = existing.content;
+    let mut content = before.clone();
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
     }
@@ -714,6 +800,15 @@ pub(crate) async fn periodic_note_append_inner(
     ydoc::set_text(state, &doc_id(vault_id, &file.guid), &content).await?;
     best_effort_index(state, vault_id, &file.guid, &existing.path, &content).await;
     mark_note_write(state, vault_id, principal).await;
+    audit::record(
+        state,
+        principal,
+        vault_id,
+        AuditEntry::new("note_periodic_append", &existing.path)
+            .before(before)
+            .after(content.clone()),
+    )
+    .await;
     Ok(NoteResponse {
         permalink: permalink_for_guid(state, &file.guid),
         path: existing.path,
@@ -736,7 +831,7 @@ async fn read_note_content(
     Ok((file, content))
 }
 
-async fn require_note_access(
+pub(crate) async fn require_note_access(
     state: &AppState,
     principal: &ApiPrincipal,
     vault_id: &str,

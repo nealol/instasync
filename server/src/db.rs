@@ -4,9 +4,9 @@ use sea_orm::{
 };
 
 use crate::entities::{
-    git_backups, invites, memberships, note_search, oauth_clients, oauth_codes, oauth_tokens,
-    permissions, plugin_db_replicas, remote_cursors, server_meta, sessions, upload_jtis, users,
-    vault_files, vaults,
+    cursor_audit_log, git_backups, invites, memberships, note_search, oauth_clients, oauth_codes,
+    oauth_tokens, permissions, plugin_db_replicas, remote_cursor_tokens, remote_cursors,
+    server_meta, sessions, upload_jtis, users, vault_files, vaults,
 };
 
 /// Create all tables (and the composite-unique indexes) if they do not exist.
@@ -34,6 +34,8 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
     create!(note_search::Entity);
     create!(permissions::Entity);
     create!(remote_cursors::Entity);
+    create!(remote_cursor_tokens::Entity);
+    create!(cursor_audit_log::Entity);
     create!(oauth_clients::Entity);
     create!(oauth_codes::Entity);
     create!(oauth_tokens::Entity);
@@ -41,7 +43,19 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
     create!(plugin_db_replicas::Entity);
     create!(git_backups::Entity);
 
-    let indexes: [IndexCreateStatement; 10] = [
+    // Existing databases predate the `plugin_id` column on `remote_cursors`;
+    // `if_not_exists` above skips the table, so add the column in place. SQLite
+    // has no "ADD COLUMN IF NOT EXISTS", hence the duplicate-column tolerance.
+    if let Err(e) = db
+        .execute_unprepared("ALTER TABLE remote_cursors ADD COLUMN plugin_id TEXT")
+        .await
+    {
+        if !e.to_string().contains("duplicate column name") {
+            return Err(e);
+        }
+    }
+
+    let indexes: [IndexCreateStatement; 13] = [
         Index::create()
             .if_not_exists()
             .name("idx_users_issuer_subject")
@@ -105,6 +119,27 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
             .name("idx_upload_jtis_expires_at")
             .table(upload_jtis::Entity)
             .col(upload_jtis::Column::ExpiresAt)
+            .to_owned(),
+        Index::create()
+            .if_not_exists()
+            .name("idx_remote_cursors_vault_plugin")
+            .table(remote_cursors::Entity)
+            .col(remote_cursors::Column::VaultId)
+            .col(remote_cursors::Column::PluginId)
+            .unique()
+            .to_owned(),
+        Index::create()
+            .if_not_exists()
+            .name("idx_cursor_audit_cursor_created")
+            .table(cursor_audit_log::Entity)
+            .col(cursor_audit_log::Column::CursorId)
+            .col(cursor_audit_log::Column::CreatedAt)
+            .to_owned(),
+        Index::create()
+            .if_not_exists()
+            .name("idx_cursor_audit_created")
+            .table(cursor_audit_log::Entity)
+            .col(cursor_audit_log::Column::CreatedAt)
             .to_owned(),
         Index::create()
             .if_not_exists()

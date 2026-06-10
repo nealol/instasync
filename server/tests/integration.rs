@@ -295,6 +295,218 @@ async fn fake_ysweet_store_with_docs() -> (String, FakeDocs) {
     (format!("http://{addr}"), docs)
 }
 
+/// Awareness states observed by the live fake y-sweet: `(clock, state_json)`
+/// per entry, in arrival order. The streaming caret test asserts on these.
+type AwarenessLog = Arc<Mutex<Vec<(u32, String)>>>;
+
+/// Like [`fake_ysweet_store_with_docs`], but additionally serves the y-sweet
+/// doc *WebSocket* (`/d/{docId}/{docId}?token=…`, the same path the real
+/// client and `stream.rs` use), speaking enough of the y-protocols handshake
+/// to act as the document peer: it greets with SyncStep1, answers SyncStep1
+/// with SyncStep2, applies incoming updates into the shared doc store, and
+/// records every awareness state it receives.
+async fn fake_ysweet_live() -> (String, FakeDocs, AwarenessLog) {
+    use axum::body::Bytes;
+    use axum::extract::ws::{Message as FakeWsMsg, WebSocket, WebSocketUpgrade};
+    use axum::extract::{Path, State};
+    use axum::http::HeaderMap;
+    use axum::response::Response;
+    use axum::routing::{any, get, post};
+    use axum::Json;
+    use y_sweet_core::sync::{Message as YMsg, SyncMessage};
+    use yrs::updates::decoder::Decode;
+    use yrs::updates::encoder::Encode;
+    use yrs::{ReadTxn, Transact};
+
+    #[derive(Clone)]
+    struct LiveState {
+        docs: FakeDocs,
+        awareness: AwarenessLog,
+    }
+
+    fn empty_update() -> Vec<u8> {
+        let doc = yrs::Doc::new();
+        let update = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        update
+    }
+
+    async fn new_doc(State(st): State<LiveState>, Json(body): Json<Value>) -> Json<Value> {
+        let doc_id = body
+            .get("docId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        st.docs
+            .lock()
+            .await
+            .entry(doc_id.clone())
+            .or_insert_with(empty_update);
+        Json(json!({ "docId": doc_id }))
+    }
+
+    async fn auth_doc(headers: HeaderMap, Path(doc_id): Path<String>) -> Json<Value> {
+        let host = headers
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("127.0.0.1")
+            .to_string();
+        Json(json!({
+            "url": format!("ws://{host}/d/{doc_id}"),
+            "baseUrl": format!("http://{host}/d/{doc_id}"),
+            "docId": doc_id,
+            "token": "fake-token",
+            "authorization": "full",
+        }))
+    }
+
+    async fn as_update(State(st): State<LiveState>, Path(doc_id): Path<String>) -> Vec<u8> {
+        st.docs
+            .lock()
+            .await
+            .get(&doc_id)
+            .cloned()
+            .unwrap_or_else(empty_update)
+    }
+
+    async fn update(
+        State(st): State<LiveState>,
+        Path(doc_id): Path<String>,
+        body: Bytes,
+    ) -> Json<Value> {
+        let base = st
+            .docs
+            .lock()
+            .await
+            .get(&doc_id)
+            .cloned()
+            .unwrap_or_else(empty_update);
+        let doc = yrs::Doc::new();
+        {
+            let mut txn = doc.transact_mut();
+            txn.apply_update(yrs::Update::decode_v1(&base).unwrap());
+            txn.apply_update(yrs::Update::decode_v1(&body).unwrap());
+        }
+        let merged = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        st.docs.lock().await.insert(doc_id, merged);
+        Json(json!({ "ok": true }))
+    }
+
+    /// Decode the awareness entries `(client, clock, json)` out of a raw
+    /// y-protocols awareness frame (`varint 1, buf[varint count, (client,
+    /// clock, string)…]`).
+    fn decode_awareness_entries(frame: &[u8]) -> Option<Vec<(u32, String)>> {
+        use yrs::encoding::read::Read;
+        use yrs::updates::decoder::DecoderV1;
+        let mut dec = DecoderV1::from(frame);
+        let msg_type: u8 = dec.read_var().ok()?;
+        if msg_type != 1 {
+            return None;
+        }
+        let payload = dec.read_buf().ok()?.to_vec();
+        let mut dec = DecoderV1::from(payload.as_slice());
+        let count: u32 = dec.read_var().ok()?;
+        let mut out = Vec::new();
+        for _ in 0..count {
+            let _client: u64 = dec.read_var().ok()?;
+            let clock: u32 = dec.read_var().ok()?;
+            let json = dec.read_string().ok()?.to_string();
+            out.push((clock, json));
+        }
+        Some(out)
+    }
+
+    async fn ws_doc(
+        State(st): State<LiveState>,
+        Path((doc_id, _doc_id2)): Path<(String, String)>,
+        ws: WebSocketUpgrade,
+    ) -> Response {
+        ws.on_upgrade(move |socket| handle_doc_ws(st, doc_id, socket))
+    }
+
+    async fn handle_doc_ws(st: LiveState, doc_id: String, mut socket: WebSocket) {
+        // Materialize the stored doc for this connection.
+        let doc = yrs::Doc::new();
+        if let Some(base) = st.docs.lock().await.get(&doc_id) {
+            let mut txn = doc.transact_mut();
+            txn.apply_update(yrs::Update::decode_v1(base).unwrap());
+        }
+
+        // Like the real y-sweet: greet with our state vector.
+        let sv = doc.transact().state_vector();
+        let greeting = YMsg::Sync(SyncMessage::SyncStep1(sv)).encode_v1();
+        if socket.send(FakeWsMsg::Binary(greeting.into())).await.is_err() {
+            return;
+        }
+
+        while let Some(Ok(msg)) = socket.recv().await {
+            let FakeWsMsg::Binary(data) = msg else { continue };
+            match YMsg::decode_v1(&data) {
+                Ok(YMsg::Sync(SyncMessage::SyncStep1(sv))) => {
+                    let diff = doc.transact().encode_state_as_update_v1(&sv);
+                    let reply = YMsg::Sync(SyncMessage::SyncStep2(diff)).encode_v1();
+                    if socket.send(FakeWsMsg::Binary(reply.into())).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(YMsg::Sync(SyncMessage::SyncStep2(update)))
+                | Ok(YMsg::Sync(SyncMessage::Update(update))) => {
+                    if let Ok(decoded) = yrs::Update::decode_v1(&update) {
+                        let mut txn = doc.transact_mut();
+                        txn.apply_update(decoded);
+                    }
+                    // Merge the *incremental* update into the shared store
+                    // rather than overwriting it with this connection's full
+                    // state: the real y-sweet has one authoritative doc, and
+                    // merging keeps edits from concurrent writers (HTTP
+                    // /update, direct store edits) alive.
+                    let mut docs = st.docs.lock().await;
+                    let base = docs.get(&doc_id).cloned().unwrap_or_else(empty_update);
+                    let merged_doc = yrs::Doc::new();
+                    {
+                        let mut txn = merged_doc.transact_mut();
+                        txn.apply_update(yrs::Update::decode_v1(&base).unwrap());
+                        if let Ok(decoded) = yrs::Update::decode_v1(&update) {
+                            txn.apply_update(decoded);
+                        }
+                    }
+                    let merged = merged_doc
+                        .transact()
+                        .encode_state_as_update_v1(&yrs::StateVector::default());
+                    docs.insert(doc_id.clone(), merged);
+                }
+                Ok(YMsg::Awareness(_)) => {
+                    if let Some(entries) = decode_awareness_entries(&data) {
+                        st.awareness.lock().await.extend(entries);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let state = LiveState {
+        docs: Arc::new(Mutex::new(HashMap::new())),
+        awareness: Arc::new(Mutex::new(Vec::new())),
+    };
+    let router = Router::new()
+        .route("/doc/new", post(new_doc))
+        .route("/doc/{doc_id}/auth", post(auth_doc))
+        .route("/d/{doc_id}/as-update", get(as_update))
+        .route("/d/{doc_id}/update", post(update))
+        .route("/d/{doc_id}/{doc_id2}", any(ws_doc))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    (format!("http://{addr}"), state.docs, state.awareness)
+}
+
 async fn fake_attachment_source() -> String {
     use axum::routing::get;
 
@@ -3326,4 +3538,335 @@ async fn concurrent_file_registry_upserts_for_same_guid_do_not_collide() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+// ---------- remote cursor streaming (WebSocket e2e) ----------
+
+type WsClient =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Read the next JSON text frame from the stream WebSocket, with a deadline so
+/// protocol regressions fail fast instead of hanging the suite.
+async fn next_stream_frame(ws: &mut WsClient) -> Value {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message as TtMsg;
+    let deadline = tokio::time::Duration::from_secs(10);
+    loop {
+        let msg = tokio::time::timeout(deadline, ws.next())
+            .await
+            .expect("timed out waiting for a stream frame")
+            .expect("stream socket closed unexpectedly")
+            .expect("stream socket errored");
+        if let TtMsg::Text(text) = msg {
+            return serde_json::from_str(&text).expect("stream frame must be JSON");
+        }
+    }
+}
+
+async fn send_stream_frame(ws: &mut WsClient, frame: Value) {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as TtMsg;
+    ws.send(TtMsg::Text(frame.to_string())).await.unwrap();
+}
+
+/// End-to-end streaming session over real sockets: REST setup → WebSocket
+/// token streaming into a live (fake) y-sweet doc → caret awareness published
+/// and cleared → Git/audit attribution → audit-log undo via REST.
+#[tokio::test]
+async fn stream_ws_e2e_tokens_caret_audit_and_undo() {
+    let (ysweet, _docs, awareness) = fake_ysweet_live().await;
+    let app = test_app(&ysweet, &ysweet).await;
+
+    // WebSocket upgrades need a real connection, not `oneshot`.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    {
+        let app = app.clone();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    }
+
+    // REST setup: vault, seed note, remote cursor.
+    let session = login(&app, "alice").await;
+    let (status, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&session),
+        Some(json!({ "name": "Stream Vault" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&session),
+        Some(json!({ "path": "stream.md", "content": "# Title\n" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, cursor) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/cursors"),
+        Some(&session),
+        Some(json!({ "name": "Streamy" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let cursor_id = cursor["id"].as_str().unwrap().to_string();
+    let secret = cursor["secretToken"].as_str().unwrap().to_string();
+
+    // An unknown token must be rejected during the HTTP upgrade.
+    let bad = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/api/vaults/{vault_id}/stream?token=not-a-token"
+    ))
+    .await;
+    assert!(bad.is_err(), "bad token must not upgrade");
+
+    // Stream a sentence in two token chunks.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/api/vaults/{vault_id}/stream?token={secret}"
+    ))
+    .await
+    .expect("cursor token should upgrade");
+    send_stream_frame(
+        &mut ws,
+        json!({ "type": "start", "path": "stream.md", "anchor": { "mode": "append" } }),
+    )
+    .await;
+    let started = next_stream_frame(&mut ws).await;
+    assert_eq!(started["type"], "started", "got: {started}");
+    assert!(started["guid"].is_string());
+
+    send_stream_frame(&mut ws, json!({ "type": "text", "text": "Hello " })).await;
+    send_stream_frame(&mut ws, json!({ "type": "text", "text": "world" })).await;
+    send_stream_frame(&mut ws, json!({ "type": "end" })).await;
+
+    let mut acked = 0u64;
+    let done = loop {
+        let frame = next_stream_frame(&mut ws).await;
+        match frame["type"].as_str() {
+            Some("ack") => acked += frame["applied"].as_u64().unwrap(),
+            Some("done") => break frame,
+            other => panic!("unexpected stream frame {other:?}: {frame}"),
+        }
+    };
+    assert_eq!(acked, 11, "every streamed byte must be acked");
+    assert_eq!(done["inserted"], 11);
+    let audit_id = done["auditId"].as_str().expect("session must be audited").to_string();
+
+    // The streamed text landed in the doc, visible over plain REST.
+    let (status, note) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/notes/stream.md"),
+        Some(&session),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(note["content"], "# Title\nHello world");
+
+    // The caret was published as Yjs awareness in the RemoteSelections shape,
+    // and cleared (state "null") when the session ended. The clear races our
+    // `done` frame, so poll briefly.
+    let log = {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            let log = awareness.lock().await.clone();
+            if log.last().is_some_and(|(_, json)| json == "null") {
+                break log;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "awareness was never cleared; log: {log:?}"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        }
+    };
+    let caret: Value = serde_json::from_str(
+        &log.iter()
+            .find(|(_, json)| json != "null")
+            .expect("a caret state must be published during the stream")
+            .1,
+    )
+    .unwrap();
+    assert_eq!(caret["user"]["name"], "Streamy");
+    assert!(caret["user"]["color"].as_str().unwrap().starts_with('#'));
+    assert_eq!(caret["cursor"]["anchor"], caret["cursor"]["head"]);
+    let anchor = &caret["cursor"]["anchor"];
+    assert!(
+        anchor["item"]["client"].is_u64() || anchor["tname"].is_string(),
+        "anchor must be a yjs-style relative position: {anchor}"
+    );
+    let clocks: Vec<u32> = log.iter().map(|(clock, _)| *clock).collect();
+    assert!(
+        clocks.windows(2).all(|w| w[0] < w[1]),
+        "awareness clocks must increase: {clocks:?}"
+    );
+
+    // The session shows up in the cursor's audit log with the full diff…
+    let (status, page) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/cursors/{cursor_id}/audit"),
+        Some(&session),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = page["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry["id"], audit_id.as_str());
+    assert_eq!(entry["operation"], "stream");
+    assert_eq!(entry["path"], "stream.md");
+    assert_eq!(entry["beforeContent"], "# Title\n");
+    assert_eq!(entry["afterContent"], "# Title\nHello world");
+    assert!(entry["undoneAt"].is_null());
+
+    // …and undoing it restores the pre-stream content.
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/cursors/{cursor_id}/audit/{audit_id}/undo"),
+        Some(&session),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, note) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/notes/stream.md"),
+        Some(&session),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(note["content"], "# Title\n");
+
+    let (_, page) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/cursors/{cursor_id}/audit"),
+        Some(&session),
+        None,
+    )
+    .await;
+    assert!(page["entries"][0]["undoneAt"].is_i64());
+}
+
+/// Streaming into a note after an anchor while a "human" concurrently edits
+/// the same doc through y-sweet: the stream position must shift with the
+/// concurrent edit instead of splitting or clobbering it.
+#[tokio::test]
+async fn stream_ws_e2e_anchor_survives_concurrent_edit() {
+    use yrs::updates::decoder::Decode;
+    use yrs::{GetString, ReadTxn, Text, Transact};
+
+    let (ysweet, docs, _awareness) = fake_ysweet_live().await;
+    let app = test_app(&ysweet, &ysweet).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    {
+        let app = app.clone();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    }
+
+    let session = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&session),
+        Some(json!({ "name": "V" })),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+    let (status, note) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&session),
+        Some(json!({ "path": "draft.md", "content": "intro\n## Draft\noutro" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let guid = note["guid"].as_str().unwrap().to_string();
+    let (_, cursor) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/cursors"),
+        Some(&session),
+        Some(json!({ "name": "Streamy" })),
+    )
+    .await;
+    let secret = cursor["secretToken"].as_str().unwrap().to_string();
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/api/vaults/{vault_id}/stream?token={secret}"
+    ))
+    .await
+    .unwrap();
+    send_stream_frame(
+        &mut ws,
+        json!({ "type": "start", "path": "draft.md", "anchor": { "mode": "after", "text": "## Draft" } }),
+    )
+    .await;
+    assert_eq!(next_stream_frame(&mut ws).await["type"], "started");
+
+    send_stream_frame(&mut ws, json!({ "type": "text", "text": "\nstreamed-a" })).await;
+    // Wait for the first batch to be applied before editing concurrently.
+    assert_eq!(next_stream_frame(&mut ws).await["type"], "ack");
+
+    // A "human" prepends text directly via the doc store (as a y-sweet client
+    // edit would): everything after this lands while the stream is mid-flight.
+    {
+        let doc_id = format!("{vault_id}__{guid}");
+        let mut docs = docs.lock().await;
+        let base = docs.get(&doc_id).cloned().unwrap();
+        let doc = yrs::Doc::new();
+        let text = doc.get_or_insert_text("contents");
+        let mut txn = doc.transact_mut();
+        txn.apply_update(yrs::Update::decode_v1(&base).unwrap());
+        text.insert(&mut txn, 0, "PREFIX ");
+        drop(txn);
+        let merged = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        docs.insert(doc_id, merged);
+    }
+    // NOTE: the store edit above isn't pushed over the session's WebSocket
+    // (the fake doesn't broadcast), but CRDT merge order makes the end state
+    // identical; the sticky position keeps the stream chained either way.
+
+    send_stream_frame(&mut ws, json!({ "type": "text", "text": "-b" })).await;
+    send_stream_frame(&mut ws, json!({ "type": "end" })).await;
+    loop {
+        let frame = next_stream_frame(&mut ws).await;
+        if frame["type"] == "done" {
+            // "\nstreamed-a" (11 bytes) + "-b" (2 bytes)
+            assert_eq!(frame["inserted"], 13);
+            break;
+        }
+        assert_eq!(frame["type"], "ack");
+    }
+
+    // Merge result: prefix kept, streamed text contiguous after the anchor.
+    let doc_id = format!("{vault_id}__{guid}");
+    let merged = docs.lock().await.get(&doc_id).cloned().unwrap();
+    let doc = yrs::Doc::new();
+    {
+        let mut txn = doc.transact_mut();
+        txn.apply_update(yrs::Update::decode_v1(&merged).unwrap());
+    }
+    let text = doc.get_or_insert_text("contents");
+    let content = text.get_string(&doc.transact());
+    assert_eq!(content, "PREFIX intro\n## Draft\nstreamed-a-b\noutro");
 }

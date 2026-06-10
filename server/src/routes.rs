@@ -1,4 +1,4 @@
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
@@ -6,10 +6,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::entities::{
-    git_backups, invites, memberships, permissions, remote_cursors, users, vault_files, vaults,
+    git_backups, invites, memberships, permissions, remote_cursor_tokens, remote_cursors, users,
+    vault_files, vaults,
 };
 use crate::error::{AppError, AppResult};
-use crate::session::{bearer_token, hash_token, now_millis, revoke_session, AuthUser};
+use crate::audit;
+use crate::session::{
+    bearer_token, hash_token, now_millis, revoke_session, ApiActor, ApiPrincipal, AuthUser,
+};
 use crate::state::{AppState, Principal, PrincipalActor};
 use crate::words::generate_invite_code;
 use crate::ysweet::{ensure_doc, mint_client_token, Level};
@@ -137,6 +141,12 @@ pub async fn create_vault(
     .await?;
 
     txn.commit().await?;
+
+    // Create the vault's index doc up front. Historically clients created it
+    // lazily via /api/doc-token on first connect, which left REST/MCP-only
+    // vaults without one — any cursor write touching the index (e.g.
+    // create_note) then failed with a y-sweet auth 404.
+    ensure_doc(&state, &vault_id).await?;
 
     Ok(Json(VaultResponse {
         id: vault_id,
@@ -437,6 +447,7 @@ pub struct RemoteCursorResponse {
     pub name: String,
     pub mcp_url: String,
     pub created_at: i64,
+    pub plugin_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -495,6 +506,7 @@ pub async fn create_cursor(
             name: Set(name.clone()),
             token_hash: Set(hash_token(&secret_token)),
             created_by: Set(user.id.clone()),
+            plugin_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         };
@@ -566,6 +578,7 @@ fn remote_cursor_response(state: &AppState, cursor: remote_cursors::Model) -> Re
         name: cursor.name,
         mcp_url: mcp_url(state, &cursor.app_id),
         created_at: cursor.created_at,
+        plugin_id: cursor.plugin_id,
     }
 }
 
@@ -598,6 +611,215 @@ pub(crate) fn mcp_url(state: &AppState, app_id: &str) -> String {
         "{}/mcp/i/{app_id}",
         state.config.public_base_url.trim_end_matches('/')
     )
+}
+
+// ---------- plugin-managed cursors ----------
+
+/// How long a plugin-acquired bearer token stays valid. Plugins re-acquire on
+/// expiry/401, so this mostly bounds the damage of a leaked token.
+const PLUGIN_CURSOR_TOKEN_TTL_MS: i64 = 1000 * 60 * 60 * 24 * 30;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginCursorBody {
+    pub plugin_id: String,
+    pub name: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginCursorResponse {
+    pub id: String,
+    pub app_id: String,
+    pub name: String,
+    pub vault_id: String,
+    pub plugin_id: String,
+    pub mcp_url: String,
+    pub stream_url: String,
+    pub secret_token: String,
+    pub expires_at: i64,
+}
+
+/// Get-or-create the plugin-managed cursor for `(vault, plugin_id)` and mint a
+/// fresh bearer token for it. Any vault member may acquire one: the cursor's
+/// `created_by` (the On-Behalf-Of user in Git) is whoever acquired it first,
+/// and each device gets its own token row so they don't invalidate each other.
+pub async fn acquire_plugin_cursor(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(vault_id): Path<String>,
+    Json(body): Json<PluginCursorBody>,
+) -> AppResult<Json<PluginCursorResponse>> {
+    require_member(&state, &user.id, &vault_id).await?;
+    let plugin_id = body.plugin_id.trim().to_string();
+    if plugin_id.is_empty() || plugin_id.len() > 128 {
+        return Err(AppError::BadRequest("invalid plugin id".into()));
+    }
+    let name = clean_cursor_name(body.name.unwrap_or_else(|| plugin_id.clone()))?;
+
+    let cursor = match plugin_cursor(&state, &vault_id, &plugin_id).await? {
+        Some(cursor) => cursor,
+        None => {
+            let now = now_millis();
+            let model = remote_cursors::ActiveModel {
+                id: Set(uuid::Uuid::new_v4().to_string()),
+                vault_id: Set(vault_id.clone()),
+                app_id: Set(nanoid::nanoid!()),
+                name: Set(name),
+                // Plugin cursors have no copy-once admin secret; burn the
+                // legacy slot with the hash of a token nobody ever sees.
+                token_hash: Set(hash_token(&random_cursor_token())),
+                created_by: Set(user.id.clone()),
+                plugin_id: Set(Some(plugin_id.clone())),
+                created_at: Set(now),
+                updated_at: Set(now),
+            };
+            match model.insert(&state.db).await {
+                Ok(cursor) => cursor,
+                // Lost the race on the (vault_id, plugin_id) unique index:
+                // another device created it concurrently, so use theirs.
+                Err(_) => plugin_cursor(&state, &vault_id, &plugin_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::Internal("plugin cursor create race lost twice".into())
+                    })?,
+            }
+        }
+    };
+
+    let secret_token = random_cursor_token();
+    let now = now_millis();
+    let expires_at = now + PLUGIN_CURSOR_TOKEN_TTL_MS;
+    remote_cursor_tokens::ActiveModel {
+        id: Set(uuid::Uuid::new_v4().to_string()),
+        cursor_id: Set(cursor.id.clone()),
+        token_hash: Set(hash_token(&secret_token)),
+        label: Set(format!("{} <{}>", user.display_name, user.email)),
+        created_at: Set(now),
+        expires_at: Set(expires_at),
+    }
+    .insert(&state.db)
+    .await?;
+
+    Ok(Json(PluginCursorResponse {
+        id: cursor.id,
+        app_id: cursor.app_id.clone(),
+        name: cursor.name,
+        vault_id: cursor.vault_id,
+        plugin_id,
+        mcp_url: mcp_url(&state, &cursor.app_id),
+        stream_url: stream_url(&state, &vault_id),
+        secret_token,
+        expires_at,
+    }))
+}
+
+async fn plugin_cursor(
+    state: &AppState,
+    vault_id: &str,
+    plugin_id: &str,
+) -> AppResult<Option<remote_cursors::Model>> {
+    Ok(remote_cursors::Entity::find()
+        .filter(remote_cursors::Column::VaultId.eq(vault_id))
+        .filter(remote_cursors::Column::PluginId.eq(plugin_id))
+        .one(&state.db)
+        .await?)
+}
+
+pub(crate) fn stream_url(state: &AppState, vault_id: &str) -> String {
+    format!(
+        "{}/api/vaults/{vault_id}/stream",
+        state.config.public_base_url.trim_end_matches('/')
+    )
+}
+
+// ---------- remote cursor audit log ----------
+
+#[derive(Deserialize)]
+pub struct AuditListQuery {
+    /// Keyset cursor: only entries created strictly before this epoch-millis.
+    pub before: Option<i64>,
+    pub limit: Option<u64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorAuditEntryResponse {
+    pub id: String,
+    pub created_at: i64,
+    pub operation: String,
+    pub path: String,
+    pub to_path: Option<String>,
+    pub before_content: Option<String>,
+    pub after_content: Option<String>,
+    pub details: Option<Value>,
+    pub undone_at: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorAuditListResponse {
+    pub entries: Vec<CursorAuditEntryResponse>,
+    pub has_more: bool,
+}
+
+#[derive(Deserialize)]
+pub struct UndoAuditBody {
+    #[serde(default)]
+    pub force: bool,
+}
+
+pub async fn list_cursor_audit(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((vault_id, cursor_id)): Path<(String, String)>,
+    Query(query): Query<AuditListQuery>,
+) -> AppResult<Json<CursorAuditListResponse>> {
+    require_admin(&state, &user.id, &vault_id).await?;
+    cursor_in_vault(&state, &vault_id, &cursor_id).await?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    // Over-fetch one row to learn whether another page exists.
+    let mut entries = audit::list(&state, &cursor_id, query.before, limit + 1).await?;
+    let has_more = entries.len() as u64 > limit;
+    entries.truncate(limit as usize);
+    Ok(Json(CursorAuditListResponse {
+        entries: entries
+            .into_iter()
+            .map(|entry| CursorAuditEntryResponse {
+                id: entry.id,
+                created_at: entry.created_at,
+                operation: entry.operation,
+                path: entry.path,
+                to_path: entry.to_path,
+                before_content: entry.before_content,
+                after_content: entry.after_content,
+                details: entry
+                    .details
+                    .as_deref()
+                    .and_then(|d| serde_json::from_str(d).ok()),
+                undone_at: entry.undone_at,
+            })
+            .collect(),
+        has_more,
+    }))
+}
+
+pub async fn undo_cursor_audit(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((vault_id, cursor_id, entry_id)): Path<(String, String, String)>,
+    Json(body): Json<UndoAuditBody>,
+) -> AppResult<Json<Value>> {
+    require_admin(&state, &user.id, &vault_id).await?;
+    cursor_in_vault(&state, &vault_id, &cursor_id).await?;
+    // The inverse operation is applied as the undoing human, so Git history
+    // attributes the revert to them rather than to the cursor.
+    let undoer = ApiPrincipal {
+        user,
+        actor: ApiActor::User,
+    };
+    audit::undo(&state, &undoer, &vault_id, &cursor_id, &entry_id, body.force).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 // ---------- git backup ----------

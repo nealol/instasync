@@ -111,18 +111,15 @@ async fn authenticate_mcp(
         .one(&state.db)
         .await?
         .ok_or(AppError::Unauthorized)?;
-    if cursor.token_hash == token_hash {
-        let user = users::Entity::find_by_id(cursor.created_by.clone())
-            .one(&state.db)
-            .await?
-            .ok_or(AppError::Unauthorized)?;
-        return Ok((
-            cursor.vault_id.clone(),
-            ApiPrincipal {
-                user,
-                actor: ApiActor::Cursor(cursor),
-            },
-        ));
+    // The bearer secret may be the cursor's legacy token or one of its
+    // plugin-issued tokens; either way it must resolve to this same cursor.
+    if let Some(matched) = crate::session::cursor_by_token_hash(&state.db, &token_hash).await? {
+        if matched.id == cursor.id {
+            let vault_id = cursor.vault_id.clone();
+            let principal = crate::session::cursor_principal(&state.db, cursor).await?;
+            return Ok((vault_id, principal));
+        }
+        return Err(AppError::Unauthorized);
     }
     let oauth = oauth_tokens::Entity::find_by_id(token_hash)
         .one(&state.db)

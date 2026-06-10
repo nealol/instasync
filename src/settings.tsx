@@ -3,7 +3,9 @@ import { createRoot, type Root } from 'react-dom/client'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type RealtimePlugin from './main'
-import { normalizeServerUrl, type GitBackupConfig, type KnownSession, type MemberInfo, type RemoteCursorInfo, type StorageUsage, type VaultInfo } from './auth'
+import { FileDiff } from '@pierre/diffs/react'
+import { parseDiffFromFile } from '@pierre/diffs'
+import { normalizeServerUrl, type CursorAuditEntry, type GitBackupConfig, type KnownSession, type MemberInfo, type RemoteCursorInfo, type StorageUsage, type VaultInfo } from './auth'
 import { PLUGIN_NAME } from './brand'
 import { generateClientIdentity } from './names'
 import { openTrashModal } from './TrashModal'
@@ -685,13 +687,17 @@ function RemoteCursorRow({ plugin, vault, cursor, reload }: {
     cursor: RemoteCursorInfo;
     reload: () => void;
 }) {
-    return <SettingRow name={<span className="realtime-row-title-action">{cursor.name}<ExtraButton icon="pencil" tooltip="Edit remote cursor" onClick={() => new RemoteCursorNameModal(plugin.app, plugin, vault, reload, cursor).open()}/></span>} desc={cursor.mcpUrl} control={<>
+    const desc = cursor.pluginId
+        ? <>Managed by plugin: <code>{cursor.pluginId}</code><br/>{cursor.mcpUrl}</>
+        : cursor.mcpUrl
+    return <SettingRow name={<span className="realtime-row-title-action">{cursor.name}<ExtraButton icon="pencil" tooltip="Edit remote cursor" onClick={() => new RemoteCursorNameModal(plugin.app, plugin, vault, reload, cursor).open()}/></span>} desc={desc} control={<>
         <button onClick={() => void copyText(cursor.mcpUrl, `${PLUGIN_NAME}: MCP URL copied.`)}>Copy MCP URL</button>
-        <button onClick={() => void runNotice(undefined, async () => {
+        {!cursor.pluginId ? <button onClick={() => void runNotice(undefined, async () => {
             if (!confirm(`Regenerate the secret token for "${cursor.name}"? The previous token will stop working.`)) return
             const result = await plugin.auth.regenerateCursorToken(vault.id, cursor.id)
             await copyText(result.secretToken, `${PLUGIN_NAME}: new secret token copied.`)
-        })}>Regen API Secret</button>
+        })}>Regen API Secret</button> : null}
+        <ExtraButton icon="history" tooltip="Audit log" onClick={() => new CursorAuditModal(plugin.app, plugin, vault, cursor).open()}/>
         <ExtraButton className="realtime-danger-icon" icon="trash-2" tooltip="Remove remote cursor" onClick={() => void runNotice(undefined, async () => {
             if (!confirm(`Remove remote cursor "${cursor.name}"?`)) return
             await plugin.auth.deleteCursor(vault.id, cursor.id)
@@ -699,6 +705,162 @@ function RemoteCursorRow({ plugin, vault, cursor, reload }: {
             reload()
         })}/>
     </>}/>
+}
+
+const AUDIT_OPERATION_LABELS: Record<string, string> = {
+    note_create: 'Created note',
+    note_replace: 'Replaced note',
+    note_patch: 'Patched note',
+    note_replace_body: 'Replaced note body',
+    note_frontmatter: 'Edited frontmatter',
+    note_periodic_append: 'Appended to periodic note',
+    note_move: 'Moved note',
+    note_delete: 'Deleted note',
+    stream: 'Streamed into note',
+    structured_set: 'Edited document',
+    structured_create: 'Created document',
+    structured_move: 'Moved document',
+    structured_delete: 'Deleted document',
+    attachment_upload: 'Uploaded attachment',
+    attachment_delete: 'Deleted attachment',
+    attachment_move: 'Moved attachment',
+}
+
+class CursorAuditModal extends Modal {
+    private plugin: RealtimePlugin
+    private vault: VaultInfo
+    private cursor: RemoteCursorInfo
+    private root: Root | null = null
+
+    constructor(app: App, plugin: RealtimePlugin, vault: VaultInfo, cursor: RemoteCursorInfo) {
+        super(app)
+        this.plugin = plugin
+        this.vault = vault
+        this.cursor = cursor
+    }
+
+    onOpen(): void {
+        this.modalEl.addClass('realtime-audit-modal')
+        this.root = createRoot(this.contentEl)
+        this.root.render(<CursorAuditView plugin={this.plugin} vault={this.vault} cursor={this.cursor}/>)
+    }
+
+    onClose(): void {
+        this.root?.unmount()
+        this.root = null
+        this.contentEl.empty()
+    }
+}
+
+function CursorAuditView({ plugin, vault, cursor }: {
+    plugin: RealtimePlugin;
+    vault: VaultInfo;
+    cursor: RemoteCursorInfo;
+}) {
+    const [entries, setEntries] = useState<CursorAuditEntry[] | null>(null)
+    const [hasMore, setHasMore] = useState(false)
+    const [error, setError] = useState('')
+    const [busy, setBusy] = useState(false)
+
+    const load = async (before?: number) => {
+        setError('')
+        try {
+            const page = await plugin.auth.listCursorAudit(vault.id, cursor.id, before)
+            setEntries((current) => before === undefined ? page.entries : [...(current ?? []), ...page.entries])
+            setHasMore(page.hasMore)
+        } catch (e) {
+            setError(`Could not load audit log: ${(e as Error).message}`)
+        }
+    }
+    useEffect(() => { void load() }, [plugin, vault.id, cursor.id])
+
+    return <>
+        <h3>Audit log: {cursor.name}</h3>
+        <p className="setting-item-description">
+            Operations this remote cursor performed via the API, MCP or streaming.
+            Entries are kept for 3 days; undo applies the inverse change as you.
+        </p>
+        {error ? <p className="realtime-error">{error}</p> : null}
+        {entries === null && !error ? <p className="setting-item-description">Loading audit log...</p> : null}
+        {entries?.length === 0 ? <p className="setting-item-description">No operations recorded in the last 3 days.</p> : null}
+        <div className="realtime-audit-entries">
+            {entries?.map((entry) => <AuditEntryRow key={entry.id} plugin={plugin} vault={vault} cursor={cursor}
+                                                    entry={entry} busy={busy} setBusy={setBusy}
+                                                    reload={() => void load()}/>)}
+        </div>
+        {hasMore && entries?.length ? <div className="realtime-actions">
+            <button onClick={() => void load(entries[entries.length - 1].createdAt)}>Load more</button>
+        </div> : null}
+    </>
+}
+
+function AuditEntryRow({ plugin, vault, cursor, entry, busy, setBusy, reload }: {
+    plugin: RealtimePlugin;
+    vault: VaultInfo;
+    cursor: RemoteCursorInfo;
+    entry: CursorAuditEntry;
+    busy: boolean;
+    setBusy: (busy: boolean) => void;
+    reload: () => void;
+}) {
+    const [expanded, setExpanded] = useState(false)
+    const truncated = entry.details?.truncated === true
+    const hasDiff = entry.beforeContent != null || entry.afterContent != null
+    const label = AUDIT_OPERATION_LABELS[entry.operation] ?? entry.operation
+    const pathText = entry.toPath ? `${entry.path} → ${entry.toPath}` : entry.path
+
+    const undo = () => void runNotice(setBusy, async () => {
+        try {
+            await plugin.auth.undoCursorAudit(vault.id, cursor.id, entry.id)
+        } catch (e) {
+            const message = (e as Error).message
+            if (message === 'changed_since') {
+                if (!confirm('The document changed after this operation. Undo anyway, overwriting the newer content?')) return
+                await plugin.auth.undoCursorAudit(vault.id, cursor.id, entry.id, true)
+            } else if (message === 'missing') {
+                throw new Error('Cannot undo: the document no longer exists.')
+            } else {
+                throw e
+            }
+        }
+        new Notice(`${PLUGIN_NAME}: operation undone.`)
+        reload()
+    })
+
+    return <div className="realtime-audit-entry">
+        <div className="realtime-audit-entry-row">
+            <div className="realtime-audit-entry-info">
+                <span className="realtime-audit-entry-op">{label}</span>
+                {entry.undoneAt ? <span className="realtime-audit-undone">Undone</span> : null}
+                <div className="setting-item-description">{pathText} · {new Date(entry.createdAt).toLocaleString()}</div>
+            </div>
+            <div className="realtime-audit-entry-actions">
+                {hasDiff ? <button onClick={() => setExpanded((value) => !value)}>{expanded ? 'Hide diff' : 'Show diff'}</button> : null}
+                {!entry.undoneAt && !truncated ? <button disabled={busy} onClick={undo}>Undo</button> : null}
+            </div>
+        </div>
+        {truncated ? <p className="setting-item-description">Content was too large to store fully; undo is unavailable.</p> : null}
+        {expanded && hasDiff ? <div className="realtime-audit-diff"><AuditEntryDiff entry={entry}/></div> : null}
+    </div>
+}
+
+function AuditEntryDiff({ entry }: { entry: CursorAuditEntry }) {
+    const lang = entry.operation.startsWith('structured') ? 'json' : 'markdown'
+    const fileDiff = parseDiffFromFile(
+        { name: `${entry.path} (before)`, contents: entry.beforeContent ?? '', lang },
+        { name: `${entry.path} (after)`, contents: entry.afterContent ?? '', lang },
+    )
+    return <FileDiff
+        fileDiff={fileDiff}
+        disableWorkerPool
+        options={{
+            diffStyle: 'unified',
+            overflow: 'wrap',
+            themeType: 'system',
+            lineDiffType: 'word',
+            disableVirtualizationBuffers: true,
+        }}
+    />
 }
 
 class RemoteCursorNameModal extends Modal {

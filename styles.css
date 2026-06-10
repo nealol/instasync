@@ -125,6 +125,60 @@
 	margin-bottom: 8px;
 }
 
+.modal.realtime-audit-modal {
+	width: min(100vw - 48px, 920px);
+	max-width: none;
+}
+
+.realtime-audit-entries {
+	display: flex;
+	flex-direction: column;
+	max-height: min(60vh, 640px);
+	overflow-y: auto;
+}
+
+.realtime-audit-entry {
+	padding: 10px 0;
+	border-top: 1px solid var(--background-modifier-border);
+}
+
+.realtime-audit-entry-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+}
+
+.realtime-audit-entry-op {
+	font-weight: var(--font-semibold);
+}
+
+.realtime-audit-undone {
+	margin-left: 8px;
+	padding: 1px 6px;
+	border-radius: 4px;
+	font-size: var(--font-ui-smaller);
+	background: var(--background-modifier-success);
+}
+
+.realtime-audit-entry-actions {
+	display: flex;
+	gap: 8px;
+	flex-shrink: 0;
+}
+
+.realtime-audit-diff {
+	margin-top: 10px;
+	max-height: 420px;
+	overflow: auto;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+}
+
+.realtime-audit-diff pre {
+	font-family: var(--font-monospace);
+}
+
 .modal.realtime-conflict-modal {
 	width: min(100vw - 24px, 1400px);
 	height: min(100vh - 24px, 980px);

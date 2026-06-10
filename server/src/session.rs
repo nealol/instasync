@@ -3,7 +3,7 @@ use axum::http::request::Parts;
 use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
 use sha2::{Digest, Sha256};
 
-use crate::entities::{oauth_tokens, remote_cursors, sessions, users};
+use crate::entities::{oauth_tokens, remote_cursor_tokens, remote_cursors, sessions, users};
 use crate::error::AppError;
 use crate::state::{AppState, Principal, PrincipalActor};
 
@@ -125,6 +125,54 @@ impl FromRequestParts<AppState> for AuthUser {
     }
 }
 
+/// Resolve a hashed bearer secret to a remote cursor, accepting both the
+/// legacy single `remote_cursors.token_hash` and rows in
+/// `remote_cursor_tokens` (plugin-managed cursors can hold several active
+/// tokens). Expired token rows are deleted lazily when touched.
+pub async fn cursor_by_token_hash(
+    db: &impl ConnectionTrait,
+    token_hash: &str,
+) -> Result<Option<remote_cursors::Model>, AppError> {
+    if let Some(cursor) = remote_cursors::Entity::find()
+        .filter(remote_cursors::Column::TokenHash.eq(token_hash))
+        .one(db)
+        .await?
+    {
+        return Ok(Some(cursor));
+    }
+    let Some(row) = remote_cursor_tokens::Entity::find()
+        .filter(remote_cursor_tokens::Column::TokenHash.eq(token_hash))
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if row.expires_at < now_millis() {
+        remote_cursor_tokens::Entity::delete_by_id(row.id)
+            .exec(db)
+            .await?;
+        return Ok(None);
+    }
+    Ok(remote_cursors::Entity::find_by_id(row.cursor_id)
+        .one(db)
+        .await?)
+}
+
+/// Build a cursor-actor principal by loading the cursor's authorizing user.
+pub async fn cursor_principal(
+    db: &impl ConnectionTrait,
+    cursor: remote_cursors::Model,
+) -> Result<ApiPrincipal, AppError> {
+    let user = users::Entity::find_by_id(cursor.created_by.clone())
+        .one(db)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    Ok(ApiPrincipal {
+        user,
+        actor: ApiActor::Cursor(cursor),
+    })
+}
+
 #[derive(Clone, Debug)]
 pub enum ApiActor {
     User,
@@ -208,19 +256,8 @@ impl FromRequestParts<AppState> for ApiPrincipal {
             });
         }
 
-        if let Some(cursor) = remote_cursors::Entity::find()
-            .filter(remote_cursors::Column::TokenHash.eq(token_hash.clone()))
-            .one(&state.db)
-            .await?
-        {
-            let user = users::Entity::find_by_id(cursor.created_by.clone())
-                .one(&state.db)
-                .await?
-                .ok_or(AppError::Unauthorized)?;
-            return Ok(ApiPrincipal {
-                user,
-                actor: ApiActor::Cursor(cursor),
-            });
+        if let Some(cursor) = cursor_by_token_hash(&state.db, &token_hash).await? {
+            return cursor_principal(&state.db, cursor).await;
         }
 
         let oauth = oauth_tokens::Entity::find_by_id(token_hash)

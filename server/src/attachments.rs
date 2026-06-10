@@ -17,6 +17,7 @@ use tokio_util::io::ReaderStream;
 use url::Url;
 use yrs::Any;
 
+use crate::audit::{self, AuditEntry};
 use crate::config::OidcMode;
 use crate::entities::upload_jtis;
 use crate::error::{AppError, AppResult};
@@ -224,6 +225,14 @@ pub(crate) async fn upload_attachment_bytes_inner(
             &principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000),
         )
         .await;
+    audit::record(
+        state,
+        principal,
+        vault_id,
+        AuditEntry::new("attachment_upload", path)
+            .details(serde_json::json!({ "hash": hash, "size": size })),
+    )
+    .await;
     Ok(UploadAttachmentResponse {
         path: path.to_string(),
         hash,
@@ -246,7 +255,7 @@ pub(crate) async fn delete_attachment_inner(
     vault_id: &str,
     path: &str,
 ) -> AppResult<()> {
-    require_attachment(state, principal, vault_id, path).await?;
+    let meta = require_attachment(state, principal, vault_id, path).await?;
     ydoc::index_remove_binary(state, vault_id, path).await?;
     state
         .git
@@ -255,6 +264,16 @@ pub(crate) async fn delete_attachment_inner(
             &principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000),
         )
         .await;
+    // Blobs are content-addressed and unaffected by the index removal, so the
+    // recorded hash/size are enough to restore the entry on undo.
+    audit::record(
+        state,
+        principal,
+        vault_id,
+        AuditEntry::new("attachment_delete", path)
+            .details(serde_json::json!({ "hash": meta.hash, "size": meta.size })),
+    )
+    .await;
     Ok(())
 }
 
@@ -295,6 +314,15 @@ pub(crate) async fn move_attachment_inner(
             &principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000),
         )
         .await;
+    audit::record(
+        state,
+        principal,
+        vault_id,
+        AuditEntry::new("attachment_move", path)
+            .to_path(&body.to_path)
+            .details(serde_json::json!({ "hash": meta.hash, "size": meta.size })),
+    )
+    .await;
     Ok(AttachmentSummary {
         path: body.to_path,
         hash: meta.hash,
@@ -359,6 +387,15 @@ pub(crate) async fn upload_attachment_url_inner(
             &principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000),
         )
         .await;
+    audit::record(
+        state,
+        principal,
+        vault_id,
+        AuditEntry::new("attachment_upload", &body.path).details(
+            serde_json::json!({ "hash": hash, "size": size, "sourceUrl": body.source_url }),
+        ),
+    )
+    .await;
     Ok(UploadAttachmentResponse {
         path: body.path,
         hash,

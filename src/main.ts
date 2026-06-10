@@ -13,6 +13,7 @@ import { yRemoteSelections, yRemoteSelectionsTheme } from "./editor/RemoteSelect
 import { setDiagnosticLoggingEnabled } from "./debug";
 import { openTrashModal } from "./TrashModal";
 import { RealtimeSqlAPI } from "./pluginDb/api";
+import { RealtimeCursorsAPI } from "./cursors/api";
 
 type ConnectionStatus = "offline" | "connecting" | "connected" | "error" | "signin";
 
@@ -34,6 +35,12 @@ export default class RealtimePlugin extends Plugin {
 	get sql(): RealtimeSqlAPI {
 		return this.sqlApi;
 	}
+	/** Plugin-managed remote cursor API for third-party plugins (see src/cursors/api.ts). */
+	cursorsApi!: RealtimeCursorsAPI;
+	/** Public handle: `app.plugins.plugins["realtime"].cursors`. */
+	get cursors(): RealtimeCursorsAPI {
+		return this.cursorsApi;
+	}
 	private statusBarEl!: HTMLElement;
 	private statusRoot: Root | null = null;
 	private status: ConnectionStatus = "offline";
@@ -44,6 +51,7 @@ export default class RealtimePlugin extends Plugin {
 		await this.loadSettings();
 		this.auth = new AuthClient(this);
 		this.sqlApi = new RealtimeSqlAPI(this);
+		this.cursorsApi = new RealtimeCursorsAPI(this);
 
 		this.addSettingTab(new RealtimeSettingTab(this.app, this));
 
@@ -135,6 +143,7 @@ export default class RealtimePlugin extends Plugin {
 	}
 
 	onunload(): void {
+		this.cursorsApi?.destroy();
 		void this.sqlApi?.destroy();
 		this.stopSync();
 		this.auth?.destroy();

@@ -42,6 +42,37 @@ export interface RemoteCursorInfo {
 	name: string;
 	mcpUrl: string;
 	createdAt: number;
+	/** Manifest id of the managing plugin; absent for admin-created cursors. */
+	pluginId?: string | null;
+}
+
+export interface PluginCursorGrant {
+	id: string;
+	appId: string;
+	name: string;
+	vaultId: string;
+	pluginId: string;
+	mcpUrl: string;
+	streamUrl: string;
+	secretToken: string;
+	expiresAt: number;
+}
+
+export interface CursorAuditEntry {
+	id: string;
+	createdAt: number;
+	operation: string;
+	path: string;
+	toPath?: string | null;
+	beforeContent?: string | null;
+	afterContent?: string | null;
+	details?: Record<string, unknown> | null;
+	undoneAt?: number | null;
+}
+
+export interface CursorAuditPage {
+	entries: CursorAuditEntry[];
+	hasMore: boolean;
 }
 
 export interface GitBackupConfig {
@@ -571,6 +602,29 @@ export class AuthClient {
 
 	async deleteCursor(vaultId: string, cursorId: string): Promise<void> {
 		await this.api(`/api/vaults/${vaultId}/cursors/${cursorId}`, { method: "DELETE" });
+	}
+
+	/** Get-or-create the plugin-managed cursor for (vault, plugin) and mint a fresh token. */
+	acquirePluginCursor(vaultId: string, pluginId: string, name?: string): Promise<PluginCursorGrant> {
+		return this.api<PluginCursorGrant>(`/api/vaults/${vaultId}/cursors/plugin`, {
+			method: "POST",
+			body: { pluginId, name },
+		});
+	}
+
+	listCursorAudit(vaultId: string, cursorId: string, before?: number, limit?: number): Promise<CursorAuditPage> {
+		const params = new URLSearchParams();
+		if (before !== undefined) params.set("before", String(before));
+		if (limit !== undefined) params.set("limit", String(limit));
+		const query = params.size ? `?${params.toString()}` : "";
+		return this.api<CursorAuditPage>(`/api/vaults/${vaultId}/cursors/${cursorId}/audit${query}`);
+	}
+
+	async undoCursorAudit(vaultId: string, cursorId: string, entryId: string, force = false): Promise<void> {
+		await this.api(`/api/vaults/${vaultId}/cursors/${cursorId}/audit/${entryId}/undo`, {
+			method: "POST",
+			body: { force },
+		});
 	}
 
 	getGitBackup(vaultId: string): Promise<GitBackupConfig> {

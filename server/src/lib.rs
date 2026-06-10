@@ -1,4 +1,5 @@
 pub mod attachments;
+pub mod audit;
 pub mod blobs;
 pub mod config;
 pub mod db;
@@ -18,6 +19,7 @@ pub mod search;
 pub mod session;
 pub mod state;
 pub mod storage;
+pub mod stream;
 pub mod structured;
 pub mod words;
 pub mod ydoc;
@@ -101,6 +103,7 @@ pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
         principals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     };
     search::spawn_startup_backfill(state.clone());
+    audit::spawn_retention_task(state.clone());
     Ok(state)
 }
 
@@ -164,12 +167,24 @@ pub fn app(state: AppState) -> Router {
             get(routes::list_cursors).post(routes::create_cursor),
         )
         .route(
+            "/api/vaults/{id}/cursors/plugin",
+            post(routes::acquire_plugin_cursor),
+        )
+        .route(
             "/api/vaults/{id}/cursors/{cursor_id}",
             post(routes::rename_cursor).delete(routes::delete_cursor),
         )
         .route(
             "/api/vaults/{id}/cursors/{cursor_id}/token",
             post(routes::regenerate_cursor_token),
+        )
+        .route(
+            "/api/vaults/{id}/cursors/{cursor_id}/audit",
+            get(routes::list_cursor_audit),
+        )
+        .route(
+            "/api/vaults/{id}/cursors/{cursor_id}/audit/{entry_id}/undo",
+            post(routes::undo_cursor_audit),
         )
         .route(
             "/api/vaults/{id}/backup",
@@ -189,6 +204,7 @@ pub fn app(state: AppState) -> Router {
             "/api/vaults/{id}/members/{user_id}",
             delete(routes::remove_member),
         )
+        .route("/api/vaults/{id}/stream", get(stream::stream_ws))
         .route("/api/vaults/{id}/files", post(routes::upsert_file))
         .route(
             "/api/vaults/{id}/notes",

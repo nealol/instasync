@@ -205,8 +205,72 @@ pub mod remote_cursors {
         pub name: String,
         pub token_hash: String,
         pub created_by: String,
+        /// Set when the cursor is managed by an Obsidian plugin (manifest id).
+        /// One plugin cursor per (vault_id, plugin_id); NULL for admin-created
+        /// cursors.
+        pub plugin_id: Option<String>,
         pub created_at: i64,
         pub updated_at: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod remote_cursor_tokens {
+    use sea_orm::entity::prelude::*;
+
+    /// Additional bearer tokens for a remote cursor, used by plugin-managed
+    /// cursors where several devices may acquire tokens independently. The
+    /// legacy single `remote_cursors.token_hash` keeps working alongside these.
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "remote_cursor_tokens")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub cursor_id: String,
+        #[sea_orm(unique)]
+        pub token_hash: String,
+        /// Free-form hint about who minted it (e.g. acquiring user).
+        pub label: String,
+        pub created_at: i64,
+        pub expires_at: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod cursor_audit_log {
+    use sea_orm::entity::prelude::*;
+
+    /// Short-lived (~3 days) audit trail of remote-cursor mutations across the
+    /// MCP, REST and streaming surfaces. `before_content`/`after_content` hold
+    /// the full note text (or pretty JSON for structured docs) so entries can
+    /// be diffed and undone; this is separate from the permanent Git log.
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "cursor_audit_log")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub vault_id: String,
+        pub cursor_id: String,
+        pub created_at: i64,
+        /// e.g. "note_create" | "note_replace" | "note_patch" | "note_move" |
+        /// "note_delete" | "stream" | "structured_*" | "attachment_*"
+        pub operation: String,
+        pub path: String,
+        /// Destination path for move operations.
+        pub to_path: Option<String>,
+        pub before_content: Option<String>,
+        pub after_content: Option<String>,
+        /// JSON object with operation-specific extras (hash/size, truncated…).
+        pub details: Option<String>,
+        pub undone_at: Option<i64>,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
