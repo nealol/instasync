@@ -215,6 +215,40 @@ pub mod remote_cursors {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+pub mod git_backups {
+    use sea_orm::entity::prelude::*;
+
+    /// Per-vault git backup remote. One row per vault; the server pushes the
+    /// vault's audit repo here after every commit. Secrets are stored in
+    /// plaintext by design (server-side trust model, no at-rest encryption).
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "git_backups")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub vault_id: String,
+        pub remote_url: String,
+        /// "ssh" | "https"
+        pub auth_method: String,
+        pub branch: String,
+        /// OpenSSH-format private key (auth_method == "ssh").
+        pub ssh_private_key: Option<String>,
+        pub ssh_public_key: Option<String>,
+        /// HTTPS access token (auth_method == "https").
+        pub https_token: Option<String>,
+        pub enabled: bool,
+        pub last_push_at: Option<i64>,
+        pub last_push_error: Option<String>,
+        pub created_by: String,
+        pub created_at: i64,
+        pub updated_at: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod oauth_clients {
     use sea_orm::entity::prelude::*;
 

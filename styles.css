@@ -82,6 +82,13 @@
 	background: var(--background-secondary);
 }
 
+.realtime-deploy-key {
+	flex: 1;
+	word-break: break-all;
+	user-select: all;
+	font-size: var(--font-ui-smaller);
+}
+
 .realtime-error {
 	color: var(--text-error);
 }

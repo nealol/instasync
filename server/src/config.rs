@@ -40,9 +40,6 @@ pub struct Config {
     pub git_bot_email: String,
     /// Domain used for synthetic cursor authors in git audit commits.
     pub cursor_email_domain: String,
-    /// Phase-2 hooks: remote to push each vault repo to (parsed but unused for now).
-    pub git_remote_url: Option<String>,
-    pub git_push_enabled: bool,
     pub daily_note_path_template: String,
     pub weekly_note_path_template: Option<String>,
     pub monthly_note_path_template: Option<String>,
@@ -112,8 +109,6 @@ impl Config {
                     .and_then(|email| email.split_once('@').map(|(_, domain)| domain.to_string()))
                     .unwrap_or_else(|| "localhost".to_string())
             }),
-            git_remote_url: opt("GIT_REMOTE_URL"),
-            git_push_enabled: opt("GIT_PUSH_ENABLED").as_deref() == Some("1"),
             daily_note_path_template: opt("DAILY_NOTE_PATH_TEMPLATE")
                 .unwrap_or_else(|| "Daily Notes/{{YYYY-MM-DD}}.md".to_string()),
             weekly_note_path_template: opt("WEEKLY_NOTE_PATH_TEMPLATE"),
@@ -194,8 +189,6 @@ impl Config {
             git_bot_name: "Realtime".into(),
             git_bot_email: "realtime@localhost".into(),
             cursor_email_domain: "localhost".into(),
-            git_remote_url: None,
-            git_push_enabled: false,
             daily_note_path_template: "Daily Notes/{{YYYY-MM-DD}}.md".into(),
             weekly_note_path_template: None,
             monthly_note_path_template: None,

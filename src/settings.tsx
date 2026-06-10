@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type RealtimePlugin from './main'
-import { normalizeServerUrl, type KnownSession, type MemberInfo, type RemoteCursorInfo, type StorageUsage, type VaultInfo } from './auth'
+import { normalizeServerUrl, type GitBackupConfig, type KnownSession, type MemberInfo, type RemoteCursorInfo, type StorageUsage, type VaultInfo } from './auth'
 import { PLUGIN_NAME } from './brand'
 import { generateClientIdentity } from './names'
 import { openTrashModal } from './TrashModal'
@@ -518,6 +518,7 @@ function VaultDetails({ plugin }: { app: App; plugin: RealtimePlugin }) {
             {activeVault?.role === 'admin' ? <InviteGenerator plugin={plugin} vault={activeVault}/> : null}
             {activeVault?.role === 'admin' ? <StorageSection plugin={plugin} vault={activeVault}/> : null}
             {activeVault?.role === 'admin' ? <RemoteCursors plugin={plugin} vault={activeVault}/> : null}
+            {activeVault?.role === 'admin' ? <GitBackupSection plugin={plugin} vault={activeVault}/> : null}
         </>
     )
 }
@@ -768,6 +769,133 @@ function RemoteCursorNameView({ plugin, vault, cursor, refresh, close }: {
                 }
             })}>{renameMode ? 'Rename' : 'Create'}</button> : null}
         </div>
+    </>
+}
+
+function useGitBackup(plugin: RealtimePlugin, vaultId: string) {
+    const [reloadKey, setReloadKey] = useState(0)
+    const [config, setConfig] = useState<GitBackupConfig | null>(null)
+    const [error, setError] = useState('')
+    useEffect(() => {
+        if (!vaultId) return
+        let cancelled = false
+        setError('')
+        void (async () => {
+            try {
+                const result = await plugin.auth.getGitBackup(vaultId)
+                if (!cancelled) setConfig(result)
+            } catch (e) {
+                if (!cancelled) setError(`Could not load backup settings: ${(e as Error).message}`)
+            }
+        })()
+        return () => {
+            cancelled = true
+        }
+    }, [plugin, vaultId, reloadKey])
+    return { config, error, reload: () => setReloadKey((key) => key + 1) }
+}
+
+function GitBackupSection({ plugin, vault }: { plugin: RealtimePlugin; vault: VaultInfo }) {
+    const { config, error, reload } = useGitBackup(plugin, vault.id)
+    const [remoteUrl, setRemoteUrl] = useState('')
+    const [branch, setBranch] = useState('main')
+    const [authMethod, setAuthMethod] = useState<'ssh' | 'https'>('ssh')
+    const [httpsToken, setHttpsToken] = useState('')
+    const [enabled, setEnabled] = useState(true)
+    const [busy, setBusy] = useState(false)
+    const [testResult, setTestResult] = useState('')
+
+    // Sync the form whenever a (re)load lands.
+    useEffect(() => {
+        if (!config) return
+        setRemoteUrl(config.remoteUrl ?? '')
+        setBranch(config.branch ?? 'main')
+        setAuthMethod(config.authMethod ?? 'ssh')
+        setEnabled(config.configured ? config.enabled : true)
+        setHttpsToken('')
+    }, [config])
+
+    const save = (regenerateKey = false) => void runNotice(setBusy, async () => {
+        await plugin.auth.putGitBackup(vault.id, {
+            remoteUrl: remoteUrl.trim(),
+            authMethod,
+            branch: branch.trim() || 'main',
+            httpsToken: httpsToken.trim() || undefined,
+            regenerateKey,
+            enabled,
+        })
+        new Notice(`${PLUGIN_NAME}: backup settings saved.`)
+        setTestResult('')
+        reload()
+    })
+
+    return <>
+        <h3>Git Backup</h3>
+        <p className="setting-item-description">Push this vault's server-side git history to a remote repository
+            after every commit.</p>
+        {error ? <p className="realtime-error">{error}</p> : null}
+        {!config && !error ? <p className="setting-item-description">Loading backup settings...</p> : null}
+        {config ? <>
+            <SettingRow name="Remote URL"
+                        desc={authMethod === 'ssh' ? 'SSH remote, e.g. git@github.com:user/repo.git' : 'HTTPS remote, e.g. https://github.com/user/repo.git'}
+                        control={<input type="text" className="realtime-modal-input" value={remoteUrl}
+                                        placeholder={authMethod === 'ssh' ? 'git@host:user/repo.git' : 'https://host/user/repo.git'}
+                                        onChange={(event) => setRemoteUrl(event.currentTarget.value)}/>}/>
+            <SettingRow name="Branch" desc="Remote branch to push to."
+                        control={<input type="text" className="realtime-modal-input" value={branch}
+                                        onChange={(event) => setBranch(event.currentTarget.value)}/>}/>
+            <SettingRow name="Authentication"
+                        desc="A deploy key is generated for you with SSH; use an access token if SSH is blocked."
+                        control={<select className="dropdown" value={authMethod}
+                                         onChange={(event) => setAuthMethod(event.currentTarget.value as 'ssh' | 'https')}>
+                            <option value="ssh">SSH deploy key</option>
+                            <option value="https">HTTPS token</option>
+                        </select>}/>
+            {authMethod === 'https' ? <SettingRow name="Access token"
+                        desc={config.hasHttpsToken ? 'A token is saved. Enter a new one to replace it.' : 'Personal access token with push permission.'}
+                        control={<input type="password" className="realtime-modal-input" value={httpsToken}
+                                        placeholder={config.hasHttpsToken ? '(unchanged)' : ''}
+                                        onChange={(event) => setHttpsToken(event.currentTarget.value)}/>}/> : null}
+            <SettingRow name="Enable backup" desc="Push after every commit when enabled."
+                        control={<input type="checkbox" checked={enabled}
+                                        onChange={(event) => setEnabled(event.currentTarget.checked)}/>}/>
+            {authMethod === 'ssh' && config.sshPublicKey ? <div className="realtime-warning-box">
+                <strong>Deploy key</strong>
+                <p>Add this public key to the remote repository as a deploy key <em>with write access</em>.</p>
+                <div className="realtime-actions">
+                    <code className="realtime-deploy-key">{config.sshPublicKey.trim()}</code>
+                    <button onClick={() => void copyText(config.sshPublicKey ?? '', `${PLUGIN_NAME}: public key copied.`)}>Copy</button>
+                    <button disabled={busy} onClick={() => {
+                        if (!confirm('Generate a new deploy key? The current key will stop working.')) return
+                        save(true)
+                    }}>Regenerate</button>
+                </div>
+            </div> : null}
+            {config.configured ? <p className="setting-item-description">
+                {config.lastPushError
+                    ? <span className="realtime-error">Last push failed: {config.lastPushError}</span>
+                    : config.lastPushAt
+                        ? `Last pushed ${new Date(config.lastPushAt).toLocaleString()}.`
+                        : 'No push yet — the next vault change will trigger one.'}
+            </p> : null}
+            {testResult ? <p className="setting-item-description">{testResult}</p> : null}
+            <div className="realtime-actions">
+                <button className="mod-cta" disabled={busy || !remoteUrl.trim()} onClick={() => save()}>
+                    {config.configured ? 'Save changes' : 'Set up backup'}</button>
+                {config.configured ? <button disabled={busy} onClick={() => void runNotice(setBusy, async () => {
+                    setTestResult('Testing connection...')
+                    const result = await plugin.auth.testGitBackup(vault.id)
+                    setTestResult(result.ok ? 'Connection OK — the remote is reachable.' : `Connection failed: ${result.error ?? 'unknown error'}`)
+                })}>Test connection</button> : null}
+                {config.configured ? <button className="mod-warning" disabled={busy} onClick={() => void runNotice(setBusy, async () => {
+                    if (!confirm('Remove the git backup configuration? The generated deploy key (if any) is deleted.')) return
+                    await plugin.auth.deleteGitBackup(vault.id)
+                    new Notice(`${PLUGIN_NAME}: backup removed.`)
+                    setTestResult('')
+                    reload()
+                })}>Remove backup</button> : null}
+            </div>
+        </> : null}
     </>
 }
 

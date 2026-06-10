@@ -45,6 +45,7 @@ hmac = "0.12"
 base64 = "0.22"
 regex = "1"
 rusqlite = { version = "0.32", features = ["bundled", "load_extension"] }
+ssh-key = { version = "0.6.7", features = ["ed25519"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

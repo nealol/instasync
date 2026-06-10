@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use sea_orm::DatabaseConnection;
+use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
 #[cfg(test)]
 use serde_json::json;
 use serde_json::Value as JsonValue;
@@ -31,7 +31,9 @@ use tokio::sync::Mutex;
 use y_sweet_core::auth::Authenticator;
 
 use crate::config::Config;
+use crate::entities::git_backups;
 use crate::plugindb::PluginDbService;
+use crate::session::now_millis;
 use crate::state::{Principal, PrincipalActor};
 use crate::structured::canvas_to_file_json;
 use crate::ydoc::{decode_files_map, decode_structured, decode_structured_index, decode_text};
@@ -54,7 +56,6 @@ struct Inner {
     config: Arc<Config>,
     #[allow(dead_code)]
     http: reqwest::Client,
-    #[allow(dead_code)] // reserved for future per-doc lookups / catch-up sweeps
     db: DatabaseConnection,
     authenticator: Arc<Authenticator>,
     plugindb: PluginDbService,
@@ -322,19 +323,127 @@ impl GitService {
         )
         .await?;
 
-        if let Err(e) = self.push(repo).await {
+        if let Err(e) = self.push(vault_id, repo).await {
             tracing::warn!("git audit: push for vault {vault_id} failed: {e}");
         }
         Ok(())
     }
 
-    /// Phase-2 hook: push the vault repo to a configured remote. No-op for now.
-    async fn push(&self, _repo: &Path) -> Result<()> {
-        if !self.0.config.git_push_enabled {
+    /// Push the vault repo to its configured backup remote (if any), recording
+    /// the outcome on the `git_backups` row. The remote URL is passed on the
+    /// command line each time, so neither it nor any credential ever lands in
+    /// the repo's `.git/config`.
+    async fn push(&self, vault_id: &str, repo: &Path) -> Result<()> {
+        let Some(cfg) = git_backups::Entity::find_by_id(vault_id.to_string())
+            .one(&self.0.db)
+            .await?
+        else {
+            return Ok(());
+        };
+        if !cfg.enabled {
             return Ok(());
         }
-        // Phase 2: `git -C <repo> push origin HEAD` with GIT_SSH_COMMAND / creds.
+
+        let refspec = format!("HEAD:refs/heads/{}", cfg.branch);
+        let remote_url = cfg.remote_url.clone();
+        let result = self
+            .run_remote_git(vault_id, &cfg, &["push", &remote_url, &refspec], Some(repo))
+            .await;
+
+        let mut active: git_backups::ActiveModel = cfg.into();
+        match &result {
+            Ok(()) => {
+                active.last_push_at = Set(Some(now_millis()));
+                active.last_push_error = Set(None);
+            }
+            Err(e) => active.last_push_error = Set(Some(format!("{e:#}"))),
+        }
+        active.updated_at = Set(now_millis());
+        active.update(&self.0.db).await?;
+        result
+    }
+
+    /// Validate a backup config by listing the remote's refs with the same
+    /// credential wiring a real push would use.
+    pub async fn test_remote(&self, vault_id: &str, cfg: &git_backups::Model) -> Result<()> {
+        let remote_url = cfg.remote_url.clone();
+        self.run_remote_git(vault_id, cfg, &["ls-remote", &remote_url, "HEAD"], None)
+            .await
+    }
+
+    /// Run a credentialed git command against a backup remote. For SSH the
+    /// private key is materialized (0600) next to the vault repo and wired via
+    /// `GIT_SSH_COMMAND`; for HTTPS the token reaches git through an inline
+    /// credential helper reading an env var, so it never appears in argv.
+    async fn run_remote_git(
+        &self,
+        vault_id: &str,
+        cfg: &git_backups::Model,
+        args: &[&str],
+        repo: Option<&Path>,
+    ) -> Result<()> {
+        let mut cmd = tokio::process::Command::new("git");
+        if let Some(repo) = repo {
+            cmd.arg("-C").arg(repo);
+        }
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
+        match cfg.auth_method.as_str() {
+            "ssh" => {
+                let key = cfg
+                    .ssh_private_key
+                    .as_deref()
+                    .context("ssh backup has no private key")?;
+                let key_path = self.ssh_key_path(vault_id)?;
+                write_private_key(&key_path, key).await?;
+                cmd.env(
+                    "GIT_SSH_COMMAND",
+                    format!(
+                        "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
+                        shell_quote(&key_path.to_string_lossy())
+                    ),
+                );
+            }
+            "https" => {
+                let token = cfg
+                    .https_token
+                    .as_deref()
+                    .context("https backup has no token")?;
+                cmd.arg("-c").arg(
+                    "credential.helper=!f() { echo \"username=x-token\"; echo \"password=$GIT_BACKUP_TOKEN\"; }; f",
+                );
+                cmd.env("GIT_BACKUP_TOKEN", token);
+            }
+            // "none": credential-less remotes (file:// paths in tests).
+            "none" => {}
+            other => bail!("unknown backup auth method {other:?}"),
+        }
+        cmd.args(args);
+
+        let out = tokio::time::timeout(Duration::from_secs(60), cmd.output())
+            .await
+            .context("git remote operation timed out")?
+            .with_context(|| format!("spawn git {args:?}"))?;
+        if !out.status.success() {
+            bail!(
+                "git {} failed ({}): {}",
+                args.first().copied().unwrap_or("?"),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
         Ok(())
+    }
+
+    fn ssh_key_path(&self, vault_id: &str) -> Result<PathBuf> {
+        let repo = self.repo_path(vault_id)?;
+        Ok(repo.with_extension("ssh_key"))
+    }
+
+    /// Best-effort removal of the materialized SSH key (on backup deletion).
+    pub async fn remove_backup_key_file(&self, vault_id: &str) {
+        if let Ok(path) = self.ssh_key_path(vault_id) {
+            let _ = tokio::fs::remove_file(path).await;
+        }
     }
 
     /// Run `git -C <repo> <args>`, returning an error on non-zero exit.
@@ -362,6 +471,33 @@ impl GitService {
             .await
             .with_context(|| format!("spawn git {args:?}"))
     }
+}
+
+/// Generate an ed25519 deploy keypair, returning (private OpenSSH, public OpenSSH).
+pub fn generate_ssh_keypair() -> Result<(String, String)> {
+    use ssh_key::{Algorithm, LineEnding, PrivateKey};
+    let key = PrivateKey::random(&mut rand::rngs::OsRng, Algorithm::Ed25519)
+        .context("generate ed25519 key")?;
+    let private = key.to_openssh(LineEnding::LF)?.to_string();
+    let public = key.public_key().to_openssh()?;
+    Ok((private, format!("{public}\n")))
+}
+
+/// Write an SSH private key with owner-only permissions (ssh refuses 0644 keys).
+async fn write_private_key(path: &Path, key: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::write(path, key)
+        .await
+        .with_context(|| format!("write ssh key {}", path.display()))?;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .with_context(|| format!("chmod ssh key {}", path.display()))?;
+    Ok(())
+}
+
+/// Single-quote a string for embedding in `GIT_SSH_COMMAND` (parsed by sh).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// Build the `--author` value and the commit message (with structured trailers).
@@ -550,6 +686,21 @@ mod tests {
     }
 
     #[test]
+    fn generated_keypair_is_valid_openssh() {
+        let (private, public) = generate_ssh_keypair().unwrap();
+        let parsed = ssh_key::PrivateKey::from_openssh(&private).unwrap();
+        let pub_parsed = ssh_key::PublicKey::from_openssh(&public).unwrap();
+        assert_eq!(parsed.public_key().key_data(), pub_parsed.key_data());
+        assert!(public.starts_with("ssh-ed25519 "));
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("/a/b"), "'/a/b'");
+        assert_eq!(shell_quote("a'b"), r"'a'\''b'");
+    }
+
+    #[test]
     fn safe_rel_path_rejects_traversal() {
         assert!(safe_rel_path("../etc/passwd").is_err());
         assert!(safe_rel_path("/abs").is_err());
@@ -680,8 +831,6 @@ mod tests {
             git_bot_name: "Realtime".into(),
             git_bot_email: "realtime@localhost".into(),
             cursor_email_domain: "localhost".into(),
-            git_remote_url: None,
-            git_push_enabled: false,
             daily_note_path_template: "Daily Notes/{{YYYY-MM-DD}}.md".into(),
             weekly_note_path_template: None,
             monthly_note_path_template: None,

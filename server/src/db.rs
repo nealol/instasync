@@ -4,9 +4,9 @@ use sea_orm::{
 };
 
 use crate::entities::{
-    invites, memberships, note_search, oauth_clients, oauth_codes, oauth_tokens, permissions,
-    plugin_db_replicas, remote_cursors, server_meta, sessions, upload_jtis, users, vault_files,
-    vaults,
+    git_backups, invites, memberships, note_search, oauth_clients, oauth_codes, oauth_tokens,
+    permissions, plugin_db_replicas, remote_cursors, server_meta, sessions, upload_jtis, users,
+    vault_files, vaults,
 };
 
 /// Create all tables (and the composite-unique indexes) if they do not exist.
@@ -39,6 +39,7 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
     create!(oauth_tokens::Entity);
     create!(upload_jtis::Entity);
     create!(plugin_db_replicas::Entity);
+    create!(git_backups::Entity);
 
     let indexes: [IndexCreateStatement; 10] = [
         Index::create()

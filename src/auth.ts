@@ -44,6 +44,27 @@ export interface RemoteCursorInfo {
 	createdAt: number;
 }
 
+export interface GitBackupConfig {
+	configured: boolean;
+	remoteUrl?: string;
+	authMethod?: "ssh" | "https";
+	branch?: string;
+	sshPublicKey?: string;
+	hasHttpsToken: boolean;
+	enabled: boolean;
+	lastPushAt?: number;
+	lastPushError?: string;
+}
+
+export interface PutGitBackupBody {
+	remoteUrl: string;
+	authMethod: "ssh" | "https";
+	branch?: string;
+	httpsToken?: string;
+	regenerateKey?: boolean;
+	enabled: boolean;
+}
+
 export interface SearchHit {
 	path: string;
 	guid: string;
@@ -550,6 +571,28 @@ export class AuthClient {
 
 	async deleteCursor(vaultId: string, cursorId: string): Promise<void> {
 		await this.api(`/api/vaults/${vaultId}/cursors/${cursorId}`, { method: "DELETE" });
+	}
+
+	getGitBackup(vaultId: string): Promise<GitBackupConfig> {
+		return this.api<GitBackupConfig>(`/api/vaults/${vaultId}/backup`);
+	}
+
+	putGitBackup(vaultId: string, body: PutGitBackupBody): Promise<GitBackupConfig> {
+		return this.api<GitBackupConfig>(`/api/vaults/${vaultId}/backup`, {
+			method: "PUT",
+			body,
+		});
+	}
+
+	async deleteGitBackup(vaultId: string): Promise<void> {
+		await this.api(`/api/vaults/${vaultId}/backup`, { method: "DELETE" });
+	}
+
+	testGitBackup(vaultId: string): Promise<{ ok: boolean; error?: string }> {
+		return this.api<{ ok: boolean; error?: string }>(`/api/vaults/${vaultId}/backup/test`, {
+			method: "POST",
+			body: {},
+		});
 	}
 
 	/** Resolve a stable, shareable permalink (`…/n/{guid}`) for a note by path. */

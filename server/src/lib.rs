@@ -171,6 +171,13 @@ pub fn app(state: AppState) -> Router {
             "/api/vaults/{id}/cursors/{cursor_id}/token",
             post(routes::regenerate_cursor_token),
         )
+        .route(
+            "/api/vaults/{id}/backup",
+            get(routes::get_backup)
+                .put(routes::put_backup)
+                .delete(routes::delete_backup),
+        )
+        .route("/api/vaults/{id}/backup/test", post(routes::test_backup))
         .route("/api/vaults/{id}/storage", get(storage::get_storage))
         .route(
             "/api/vaults/{id}/storage/gc-blobs",

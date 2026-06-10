@@ -287,8 +287,6 @@ async fn git_state_ext(
         git_bot_name: "Realtime".into(),
         git_bot_email: "realtime@localhost".into(),
         cursor_email_domain: "localhost".into(),
-        git_remote_url: None,
-        git_push_enabled: false,
         daily_note_path_template: "Daily Notes/{{YYYY-MM-DD}}.md".into(),
         weekly_note_path_template: None,
         monthly_note_path_template: None,
@@ -400,8 +398,6 @@ async fn test_app_with_attachment_max(
         git_bot_name: "Realtime".into(),
         git_bot_email: "realtime@localhost".into(),
         cursor_email_domain: "localhost".into(),
-        git_remote_url: None,
-        git_push_enabled: false,
         daily_note_path_template: "Daily Notes/{{YYYY-MM-DD}}.md".into(),
         weekly_note_path_template: None,
         monthly_note_path_template: None,
@@ -2102,6 +2098,235 @@ async fn git_audit_commits_attributed_to_principal() {
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     let (_, count) = git_out(&repo, &["rev-list", "--count", "HEAD"]);
     assert_eq!(count, "1", "no-op write must not create a second commit");
+}
+
+// ---------- git backup ----------
+
+/// Insert a backup config row directly (tests drive the push path itself with
+/// a credential-less `file://` remote; the route layer is covered separately).
+async fn insert_backup_row(
+    db: &sea_orm::DatabaseConnection,
+    vault_id: &str,
+    remote_url: &str,
+) {
+    use realtime_server::entities::git_backups;
+    use sea_orm::{ActiveModelTrait, Set};
+    git_backups::ActiveModel {
+        vault_id: Set(vault_id.to_string()),
+        remote_url: Set(remote_url.to_string()),
+        auth_method: Set("none".to_string()),
+        branch: Set("main".to_string()),
+        ssh_private_key: Set(None),
+        ssh_public_key: Set(None),
+        https_token: Set(None),
+        enabled: Set(true),
+        last_push_at: Set(None),
+        last_push_error: Set(None),
+        created_by: Set("u-test".to_string()),
+        created_at: Set(0),
+        updated_at: Set(0),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+}
+
+async fn backup_row(
+    db: &sea_orm::DatabaseConnection,
+    vault_id: &str,
+) -> realtime_server::entities::git_backups::Model {
+    use sea_orm::EntityTrait;
+    realtime_server::entities::git_backups::Entity::find_by_id(vault_id.to_string())
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn git_backup_pushes_to_remote_after_commit() {
+    let ys = fake_ysweet_as_update().await;
+    let (state, git_dir, vault_id) = git_state(&ys).await;
+
+    // A bare repo standing in for the remote.
+    let bare = git_dir.join("remote.git");
+    std::fs::create_dir_all(&bare).unwrap();
+    let (ok, _) = git_out(&bare, &["init", "--bare", "-q"]);
+    assert!(ok, "init bare remote");
+    insert_backup_row(&state.db, &vault_id, &format!("file://{}", bare.display())).await;
+
+    state
+        .git
+        .mark_write(&vault_id, &principal("u-a", "Alice", "a@x"))
+        .await;
+    wait_for_commit(&git_dir.join(&vault_id)).await;
+
+    // The push happens right after the commit; poll for the remote branch.
+    let mut pushed = String::new();
+    for _ in 0..100 {
+        let (ok, head) = git_out(&bare, &["rev-parse", "refs/heads/main"]);
+        if ok && !head.is_empty() {
+            pushed = head;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let (_, local) = git_out(&git_dir.join(&vault_id), &["rev-parse", "HEAD"]);
+    assert_eq!(pushed, local, "remote main should match local HEAD");
+
+    let row = backup_row(&state.db, &vault_id).await;
+    assert!(row.last_push_at.is_some(), "last_push_at recorded");
+    assert_eq!(row.last_push_error, None);
+}
+
+#[tokio::test]
+async fn git_backup_push_failure_recorded_without_breaking_commits() {
+    let ys = fake_ysweet_as_update().await;
+    let (state, git_dir, vault_id) = git_state(&ys).await;
+    insert_backup_row(
+        &state.db,
+        &vault_id,
+        &format!("file://{}/does-not-exist.git", git_dir.display()),
+    )
+    .await;
+
+    state
+        .git
+        .mark_write(&vault_id, &principal("u-a", "Alice", "a@x"))
+        .await;
+    // The commit must land even though the push fails.
+    wait_for_commit(&git_dir.join(&vault_id)).await;
+
+    let mut row = backup_row(&state.db, &vault_id).await;
+    for _ in 0..100 {
+        if row.last_push_error.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        row = backup_row(&state.db, &vault_id).await;
+    }
+    assert!(row.last_push_error.is_some(), "push failure recorded");
+    assert_eq!(row.last_push_at, None);
+}
+
+#[tokio::test]
+async fn git_backup_routes_admin_only_and_secrets_never_leak() {
+    let ys = fake_ysweet().await;
+    let app = test_app(&ys, &ys).await;
+    let alice = login(&app, "alice").await;
+    let bob = login(&app, "bob").await;
+
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&alice),
+        Some(json!({"name": "V"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+    let uri = format!("/api/vaults/{vault_id}/backup");
+
+    // Non-member is refused.
+    let (status, _) = send(&app, "GET", &uri, Some(&bob), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Unconfigured: GET reports configured=false; test endpoint 404s.
+    let (status, body) = send(&app, "GET", &uri, Some(&alice), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["configured"], json!(false));
+    let (status, _) = send(&app, "POST", &format!("{uri}/test"), Some(&alice), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // HTTPS config requires a token.
+    let (status, _) = send(
+        &app,
+        "PUT",
+        &uri,
+        Some(&alice),
+        Some(json!({"remoteUrl": "https://example.com/r.git", "authMethod": "https", "enabled": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // URL scheme must match the auth method.
+    let (status, _) = send(
+        &app,
+        "PUT",
+        &uri,
+        Some(&alice),
+        Some(json!({"remoteUrl": "https://example.com/r.git", "authMethod": "ssh", "enabled": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // SSH config generates a deploy key and returns only the public half.
+    let (status, body) = send(
+        &app,
+        "PUT",
+        &uri,
+        Some(&alice),
+        Some(json!({"remoteUrl": "git@example.com:me/r.git", "authMethod": "ssh", "enabled": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let public_key = body["sshPublicKey"].as_str().unwrap().to_string();
+    assert!(public_key.starts_with("ssh-ed25519 "), "{public_key}");
+    let serialized = body.to_string();
+    assert!(!serialized.contains("PRIVATE KEY"), "private key leaked");
+
+    // Updating without regenerateKey keeps the same public key.
+    let (_, body) = send(
+        &app,
+        "PUT",
+        &uri,
+        Some(&alice),
+        Some(json!({"remoteUrl": "git@example.com:me/r2.git", "authMethod": "ssh", "enabled": false})),
+    )
+    .await;
+    assert_eq!(body["sshPublicKey"].as_str().unwrap(), public_key);
+
+    // ... while regenerateKey mints a new one.
+    let (_, body) = send(
+        &app,
+        "PUT",
+        &uri,
+        Some(&alice),
+        Some(json!({"remoteUrl": "git@example.com:me/r2.git", "authMethod": "ssh", "enabled": false, "regenerateKey": true})),
+    )
+    .await;
+    assert_ne!(body["sshPublicKey"].as_str().unwrap(), public_key);
+
+    // Switching to HTTPS stores the token but never echoes it back.
+    let (status, body) = send(
+        &app,
+        "PUT",
+        &uri,
+        Some(&alice),
+        Some(json!({"remoteUrl": "https://example.com/r.git", "authMethod": "https", "httpsToken": "sekrit-token", "enabled": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["hasHttpsToken"], json!(true));
+    assert!(!body.to_string().contains("sekrit-token"), "token leaked");
+
+    // Omitting the token on update keeps the stored one.
+    let (status, body) = send(
+        &app,
+        "PUT",
+        &uri,
+        Some(&alice),
+        Some(json!({"remoteUrl": "https://example.com/r.git", "authMethod": "https", "enabled": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["hasHttpsToken"], json!(true));
+
+    // Delete, then GET reports unconfigured again.
+    let (status, _) = send(&app, "DELETE", &uri, Some(&alice), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = send(&app, "GET", &uri, Some(&alice), None).await;
+    assert_eq!(body["configured"], json!(false));
 }
 
 #[tokio::test]

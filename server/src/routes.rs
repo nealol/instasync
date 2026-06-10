@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::entities::{
-    invites, memberships, permissions, remote_cursors, users, vault_files, vaults,
+    git_backups, invites, memberships, permissions, remote_cursors, users, vault_files, vaults,
 };
 use crate::error::{AppError, AppResult};
 use crate::session::{bearer_token, hash_token, now_millis, revoke_session, AuthUser};
@@ -598,6 +598,215 @@ pub(crate) fn mcp_url(state: &AppState, app_id: &str) -> String {
         "{}/mcp/i/{app_id}",
         state.config.public_base_url.trim_end_matches('/')
     )
+}
+
+// ---------- git backup ----------
+
+const BACKUP_AUTH_SSH: &str = "ssh";
+const BACKUP_AUTH_HTTPS: &str = "https";
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBackupResponse {
+    pub configured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_public_key: Option<String>,
+    pub has_https_token: bool,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_push_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_push_error: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PutGitBackupBody {
+    pub remote_url: String,
+    pub auth_method: String,
+    pub branch: Option<String>,
+    pub https_token: Option<String>,
+    #[serde(default)]
+    pub regenerate_key: bool,
+    pub enabled: bool,
+}
+
+/// Secrets (private key, token) are deliberately never serialized back out.
+fn git_backup_response(cfg: git_backups::Model) -> GitBackupResponse {
+    GitBackupResponse {
+        configured: true,
+        remote_url: Some(cfg.remote_url),
+        auth_method: Some(cfg.auth_method),
+        branch: Some(cfg.branch),
+        ssh_public_key: cfg.ssh_public_key,
+        has_https_token: cfg.https_token.is_some(),
+        enabled: cfg.enabled,
+        last_push_at: cfg.last_push_at,
+        last_push_error: cfg.last_push_error,
+    }
+}
+
+fn unconfigured_backup_response() -> GitBackupResponse {
+    GitBackupResponse {
+        configured: false,
+        remote_url: None,
+        auth_method: None,
+        branch: None,
+        ssh_public_key: None,
+        has_https_token: false,
+        enabled: false,
+        last_push_at: None,
+        last_push_error: None,
+    }
+}
+
+fn validate_backup_url(auth_method: &str, url: &str) -> AppResult<()> {
+    let ok = match auth_method {
+        BACKUP_AUTH_SSH => url.starts_with("ssh://") || (url.contains('@') && url.contains(':')),
+        BACKUP_AUTH_HTTPS => url.starts_with("https://"),
+        _ => return Err(AppError::BadRequest("authMethod must be 'ssh' or 'https'".into())),
+    };
+    if !ok {
+        return Err(AppError::BadRequest(format!(
+            "remote URL does not match {auth_method} auth (expected {})",
+            if auth_method == BACKUP_AUTH_SSH {
+                "ssh:// or git@host:path"
+            } else {
+                "https://"
+            }
+        )));
+    }
+    Ok(())
+}
+
+pub async fn get_backup(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(vault_id): Path<String>,
+) -> AppResult<Json<GitBackupResponse>> {
+    require_admin(&state, &user.id, &vault_id).await?;
+    let cfg = git_backups::Entity::find_by_id(vault_id).one(&state.db).await?;
+    Ok(Json(match cfg {
+        Some(cfg) => git_backup_response(cfg),
+        None => unconfigured_backup_response(),
+    }))
+}
+
+pub async fn put_backup(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(vault_id): Path<String>,
+    Json(body): Json<PutGitBackupBody>,
+) -> AppResult<Json<GitBackupResponse>> {
+    require_admin(&state, &user.id, &vault_id).await?;
+
+    let remote_url = body.remote_url.trim().to_string();
+    if remote_url.is_empty() {
+        return Err(AppError::BadRequest("remote URL is required".into()));
+    }
+    validate_backup_url(&body.auth_method, &remote_url)?;
+    let branch = match body.branch.map(|b| b.trim().to_string()) {
+        Some(b) if !b.is_empty() => {
+            if b.contains(|c: char| c.is_whitespace()) || b.starts_with('-') {
+                return Err(AppError::BadRequest("invalid branch name".into()));
+            }
+            b
+        }
+        _ => "main".to_string(),
+    };
+
+    let existing = git_backups::Entity::find_by_id(vault_id.clone())
+        .one(&state.db)
+        .await?;
+    let now = now_millis();
+
+    // Carry forward / generate the per-method secret.
+    let (ssh_private_key, ssh_public_key, https_token) = match body.auth_method.as_str() {
+        BACKUP_AUTH_SSH => {
+            let existing_pair = existing.as_ref().and_then(|e| {
+                Some((e.ssh_private_key.clone()?, e.ssh_public_key.clone()?))
+            });
+            let (private, public) = match (existing_pair, body.regenerate_key) {
+                (Some(pair), false) => pair,
+                _ => crate::git::generate_ssh_keypair()
+                    .map_err(|e| AppError::Internal(format!("keygen failed: {e}")))?,
+            };
+            (Some(private), Some(public), None)
+        }
+        _ => {
+            let token = body
+                .https_token
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .or_else(|| existing.as_ref().and_then(|e| e.https_token.clone()));
+            let Some(token) = token else {
+                return Err(AppError::BadRequest("an HTTPS token is required".into()));
+            };
+            (None, None, Some(token))
+        }
+    };
+
+    let model = git_backups::ActiveModel {
+        vault_id: Set(vault_id.clone()),
+        remote_url: Set(remote_url),
+        auth_method: Set(body.auth_method),
+        branch: Set(branch),
+        ssh_private_key: Set(ssh_private_key),
+        ssh_public_key: Set(ssh_public_key),
+        https_token: Set(https_token),
+        enabled: Set(body.enabled),
+        // Reset push status: it described the previous configuration.
+        last_push_at: Set(None),
+        last_push_error: Set(None),
+        created_by: Set(existing
+            .as_ref()
+            .map(|e| e.created_by.clone())
+            .unwrap_or_else(|| user.id.clone())),
+        created_at: Set(existing.as_ref().map(|e| e.created_at).unwrap_or(now)),
+        updated_at: Set(now),
+    };
+    let saved = if existing.is_some() {
+        model.update(&state.db).await?
+    } else {
+        model.insert(&state.db).await?
+    };
+
+    Ok(Json(git_backup_response(saved)))
+}
+
+pub async fn delete_backup(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(vault_id): Path<String>,
+) -> AppResult<Json<Value>> {
+    require_admin(&state, &user.id, &vault_id).await?;
+    git_backups::Entity::delete_by_id(vault_id.clone())
+        .exec(&state.db)
+        .await?;
+    state.git.remove_backup_key_file(&vault_id).await;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+pub async fn test_backup(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(vault_id): Path<String>,
+) -> AppResult<Json<Value>> {
+    require_admin(&state, &user.id, &vault_id).await?;
+    let cfg = git_backups::Entity::find_by_id(vault_id.clone())
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    match state.git.test_remote(&vault_id, &cfg).await {
+        Ok(()) => Ok(Json(serde_json::json!({ "ok": true }))),
+        Err(e) => Ok(Json(serde_json::json!({ "ok": false, "error": format!("{e:#}") }))),
+    }
 }
 
 // ---------- file registry ----------

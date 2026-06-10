@@ -33,6 +33,12 @@ MCP clients can use OAuth 2.1 against this server, and direct REST automation ca
 use the generated cursor secret as a bearer token. Both paths attribute writes to
 the owning user and cursor in the git audit log.
 
+**Git backup** lets vault admins mirror the audit repo to a remote
+(`/api/vaults/{id}/backup`, also in the plugin's settings UI). The server pushes
+after every audit commit, authenticating with either a server-generated ed25519
+deploy key (add the public key to the remote with write access) or an HTTPS
+access token. Push failures are recorded per vault and retried on the next commit.
+
 ## Running with Docker (recommended)
 
 The image bundles y-sweet and runs it internally, so you only expose **one port**
@@ -106,7 +112,6 @@ in the Obsidian plugin's **Auth server URL** and you're done.
 | `GIT_DEBOUNCE_MS` | `5000` | Idle debounce before writing a git audit commit |
 | `GIT_BOT_NAME` / `GIT_BOT_EMAIL` | `Realtime` / `realtime@localhost` | Git committer identity and fallback author |
 | `CURSOR_EMAIL_DOMAIN` | domain from `GIT_BOT_EMAIL`, else `localhost` | Synthetic email domain for cursor-attributed git authors |
-| `GIT_REMOTE_URL` / `GIT_PUSH_ENABLED` | — / disabled | Parsed remote push config for future backup workflows |
 | `DAILY_NOTE_PATH_TEMPLATE` | `Daily Notes/{{YYYY-MM-DD}}.md` | Daily periodic note template |
 | `WEEKLY_NOTE_PATH_TEMPLATE` / `MONTHLY_NOTE_PATH_TEMPLATE` / `QUARTERLY_NOTE_PATH_TEMPLATE` / `YEARLY_NOTE_PATH_TEMPLATE` | — | Optional periodic note templates |
 | `ATTACHMENT_FETCH_HOST_ALLOWLIST` | — | Comma-separated hostnames allowed for server-side attachment fetches from URL |
