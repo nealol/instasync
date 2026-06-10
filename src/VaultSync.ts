@@ -23,12 +23,19 @@ type FileKind = "text" | "structured" | "binary" | "ignore";
 type StructuredKind = "canvas" | "base";
 interface StructuredMeta { guid: string; kind: StructuredKind }
 
-/** Document kind recorded for a trashed (deleted but recoverable) file. */
-export type TrashKind = "text" | "canvas" | "base" | "binary";
+/**
+ * Document kind recorded for a trashed (deleted but recoverable) file.
+ * `plugindb` is a third-party plugin's synced-SQLite database (see src/pluginDb).
+ */
+export type TrashKind = "text" | "canvas" | "base" | "binary" | "plugindb";
 
 /** Stored value of a `trash` map entry (the map key is the entry id). */
 export interface TrashEntryValue {
-	/** Vault-relative path the file had when it was deleted. */
+	/**
+	 * Vault-relative path the file had when it was deleted. For `plugindb`
+	 * entries this is a human-readable label (`${pluginId}/${name}`) so the
+	 * existing path filter/column keeps working.
+	 */
 	path: string;
 	kind: TrashKind;
 	/** Document guid for text/structured kinds; lets restore re-pull content. */
@@ -36,6 +43,10 @@ export interface TrashEntryValue {
 	/** Blob hash + byte size for binary kinds; lets restore re-download bytes. */
 	hash?: string;
 	size?: number;
+	/** Owning plugin id (only for `plugindb` kind). */
+	pluginId?: string;
+	/** Database name (only for `plugindb` kind). */
+	name?: string;
 	/** Deletion time (ms epoch), for newest-first ordering. */
 	deletedAt: number;
 }
@@ -604,16 +615,18 @@ export class VaultSync {
 	// --- Trash -----------------------------------------------------------------
 
 	/** Write a trash entry inside an already-open index transaction. */
-	private recordTrashIn(entry: { path: string; kind: TrashKind; guid?: string; hash?: string; size?: number }): void {
+	private recordTrashIn(entry: { path: string; kind: TrashKind; guid?: string; hash?: string; size?: number; pluginId?: string; name?: string }): void {
 		const value: TrashEntryValue = { path: entry.path, kind: entry.kind, deletedAt: Date.now() };
 		if (entry.guid !== undefined) value.guid = entry.guid;
 		if (entry.hash !== undefined) value.hash = entry.hash;
 		if (entry.size !== undefined) value.size = entry.size;
+		if (entry.pluginId !== undefined) value.pluginId = entry.pluginId;
+		if (entry.name !== undefined) value.name = entry.name;
 		this.trash.set(newGuid(), value);
 	}
 
 	/** Record a deleted file in the shared trash (its own transaction). */
-	recordTrash(entry: { path: string; kind: TrashKind; guid?: string; hash?: string; size?: number }): void {
+	recordTrash(entry: { path: string; kind: TrashKind; guid?: string; hash?: string; size?: number; pluginId?: string; name?: string }): void {
 		if (this.destroyed) return;
 		this.indexDoc.transact(() => this.recordTrashIn(entry));
 	}
@@ -651,6 +664,24 @@ export class VaultSync {
 		if (this.destroyed) return;
 		const value = this.trash.get(id);
 		if (!value) throw new Error("This trash entry no longer exists.");
+
+		// Plugin databases have no destination path to retarget: restore re-opens
+		// the per-DB doc by clearing its `meta.deletedAt` tombstone. We must not
+		// touch `files`/`structured` or run the `pathInUse` guard for these.
+		if (value.kind === "plugindb") {
+			const pluginId = value.pluginId;
+			const name = value.name;
+			if (!pluginId || !name) throw new Error("Trash entry is missing its database identity.");
+			const sqlApi = this.plugin.sqlApi;
+			if (!sqlApi) throw new Error("The SQL API is not available.");
+			if (await sqlApi.isLive({ pluginId, name })) {
+				throw new Error(`A database "${pluginId}/${name}" is already active — delete it first.`);
+			}
+			await sqlApi.restore({ pluginId, name });
+			this.indexDoc.transact(() => this.trash.delete(id));
+			return;
+		}
+
 		const path = (targetPath ?? "").trim() || value.path;
 		if (this.pathInUse(path)) throw new Error(`"${path}" already exists — restore under a different name.`);
 
@@ -689,6 +720,18 @@ export class VaultSync {
 				await this.plugin.auth.deleteBlob(this.plugin.settings.activeVaultId, value.hash);
 			} catch (e) {
 				console.error(`[Realtime] failed to delete blob for trashed ${value.path}`, e);
+			}
+		} else if (value.kind === "plugindb" && value.pluginId && value.name) {
+			// Purge the server replica + git dump and trim the per-DB doc. Mirror
+			// the binary branch: log a server failure but still drop the entry.
+			try {
+				await this.plugin.auth.deletePluginDb(
+					this.plugin.settings.activeVaultId,
+					value.pluginId,
+					value.name,
+				);
+			} catch (e) {
+				console.error(`[Realtime] failed to purge plugin db for trashed ${value.path}`, e);
 			}
 		}
 		this.indexDoc.transact(() => this.trash.delete(id));

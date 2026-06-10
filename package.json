@@ -51,6 +51,7 @@
   },
   "dependencies": {
     "@pierre/diffs": "^1.2.7",
+    "@vlcn.io/crsqlite-wasm": "0.16.0",
     "@y-sweet/client": "^0.9.1",
     "lib0": "^0.2.93",
     "picomatch": "^4.0.3",

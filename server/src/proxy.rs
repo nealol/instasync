@@ -31,6 +31,10 @@ struct Attribution {
     vault_id: String,
     principal: Principal,
     state: AppState,
+    /// `(plugin, name)` when this connection syncs a plugin database doc, so
+    /// content writes also arm the plugin-db replication debounce (a safety net
+    /// for clients whose explicit `/touch` call is lost — e.g. dropped offline).
+    plugin_db: Option<(String, String)>,
 }
 
 /// Hop-by-hop headers must not be forwarded across the proxy.
@@ -182,10 +186,13 @@ async fn resolve_attribution(state: &AppState, uri: &axum::http::Uri) -> Option<
     let principal = state.principal_for_token(&token).await?;
     // Index docId is the bare vaultId; file docIds are `{vaultId}__{guid}`.
     let vault_id = doc_id.split("__").next().unwrap_or(doc_id).to_string();
+    let plugin_db =
+        crate::plugindb::parse_doc_id(doc_id).map(|(_vault, plugin, name)| (plugin, name));
     Some(Attribution {
         vault_id,
         principal,
         state: state.clone(),
+        plugin_db,
     })
 }
 
@@ -256,6 +263,12 @@ async fn relay_ws(
                         .search
                         .mark_write(attr.state.clone(), &attr.vault_id, &attr.principal)
                         .await;
+                    if let Some((plugin, name)) = &attr.plugin_db {
+                        attr.state
+                            .plugindb
+                            .mark_write(&attr.vault_id, plugin, name)
+                            .await;
+                    }
                 }
             }
             if let Some(out) = axum_to_tungstenite(msg) {

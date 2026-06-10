@@ -10,6 +10,7 @@ const KIND_LABELS: Record<TrashKind, string> = {
 	canvas: "Canvas",
 	base: "Base",
 	binary: "Attachment",
+	plugindb: "Database",
 };
 
 /** Open the trash browser modal. */
@@ -121,7 +122,9 @@ function TrashRow({ plugin, entry }: { plugin: RealtimePlugin; entry: TrashEntry
 		</div>
 		{!renaming ? <div className="realtime-trash-actions">
 			<button className="mod-cta" disabled={busy} onClick={() => restore()}>Restore</button>
-			<button disabled={busy} onClick={() => { setTarget(entry.path); setRenaming(true); }}>Restore as…</button>
+			{entry.kind !== "plugindb"
+				? <button disabled={busy} onClick={() => { setTarget(entry.path); setRenaming(true); }}>Restore as…</button>
+				: null}
 			<button className="mod-warning" disabled={busy} onClick={purge}>Delete</button>
 		</div> : null}
 	</div>;

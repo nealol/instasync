@@ -1,5 +1,6 @@
 import { browser, expect } from "@wdio/globals";
 import { startWdioSession } from "wdio-obsidian-service";
+import * as fs from "fs";
 import * as path from "path";
 import * as net from "net";
 import { fileURLToPath } from "url";
@@ -38,6 +39,16 @@ import {
 	listTrash,
 	restoreTrashEntry,
 	permanentlyDeleteTrashEntry,
+	sqlOpen,
+	sqlInsert,
+	sqlTitles,
+	sqlDelete,
+	sqlRestoreFromTrash,
+	sqlHasTrashEntry,
+	sqlTrashEntryInfo,
+	sqlState,
+	sqlRebaseFromServer,
+	SQL_E2E_IDS,
 } from "./helpers.js";
 import { apiCreateVault, apiPromoteMember, apiRedeemInvite, apiRemoveMember, mockLogin } from "../../support/authServer.js";
 
@@ -203,6 +214,130 @@ describe("Realtime — two isolated Obsidian devices", function () {
 				async () => (await readNote(A, "Paused.md")) === "written while A is paused",
 				{ timeout: 60 * SECONDS, timeoutMsg: "A did not catch up after unpausing" },
 			);
+		});
+	});
+
+	describe("plugin SQL API", function () {
+		it("propagates rows A <-> B over the Y log", async function () {
+			await sqlOpen(A);
+			await sqlOpen(B);
+
+			await sqlInsert(A, "a1", "from-A");
+			await sqlInsert(B, "b1", "from-B");
+
+			// Both devices converge on both rows over the Y log.
+			await A.waitUntil(async () => (await sqlTitles(A)).length === 2, {
+				timeout: 60 * SECONDS,
+				timeoutMsg: "A never saw both SQL rows",
+			});
+			await B.waitUntil(async () => (await sqlTitles(B)).length === 2, {
+				timeout: 60 * SECONDS,
+				timeoutMsg: "B never saw both SQL rows",
+			});
+			expect(await sqlTitles(A)).toEqual(["from-A", "from-B"]);
+			expect(await sqlTitles(B)).toEqual(["from-A", "from-B"]);
+			expect(await sqlState(A)).toBe("live");
+			expect(await sqlState(B)).toBe("live");
+		});
+
+		it("writes a deterministic SQL dump into the vault's git history", async function () {
+			// Requires the server-side cr-sqlite extension; the harness wires it
+			// through from CRSQLITE_EXT_PATH (see wdio.conf.mts).
+			const gitDataDir = process.env.E2E_GIT_DATA_DIR;
+			if (!process.env.CRSQLITE_EXT_PATH || !gitDataDir) this.skip();
+
+			// The client's publish debounce calls /touch, which arms the server's
+			// replication + git debounces; the commit then materializes the dump.
+			const dumpPath = path.join(
+				gitDataDir,
+				vaultId,
+				".realtime",
+				"plugin-dbs",
+				SQL_E2E_IDS.pluginId,
+				`${SQL_E2E_IDS.name}.sql`,
+			);
+			let lastSeen = "<missing>";
+			await A.waitUntil(
+				async () => {
+					try {
+						lastSeen = await fs.promises.readFile(dumpPath, "utf8");
+					} catch {
+						return false;
+					}
+					return lastSeen.includes("from-A") && lastSeen.includes("from-B");
+				},
+				{
+					timeout: 90 * SECONDS,
+					timeoutMsg: `git dump never materialized both rows at ${dumpPath}: ${lastSeen.slice(0, 400)}`,
+				},
+			);
+			// The dump is restorable: user-table DDL + ordered INSERTs + CRR header.
+			expect(lastSeen).toContain("CREATE TABLE tasks");
+			expect(lastSeen).toContain("-- crr: tasks");
+		});
+
+		it("rebases a device from the server and converges to the same rows", async function () {
+			// Discards B's local DB + snapshot and rebuilds through the real
+			// bootstrap endpoint (replica-backed when the extension is installed,
+			// Y-log fallback otherwise).
+			await sqlRebaseFromServer(B);
+			await B.waitUntil(
+				async () => {
+					const titles = await sqlTitles(B);
+					return titles.length === 2 && (await sqlState(B)) === "live";
+				},
+				{ timeout: 60 * SECONDS, timeoutMsg: "B did not recover both rows after rebase" },
+			);
+			expect(await sqlTitles(B)).toEqual(["from-A", "from-B"]);
+		});
+
+		it("soft-deletes into the shared trash bin on both devices", async function () {
+			await sqlDelete(A);
+
+			// The entry appears in the shared bin with the plugindb shape.
+			const entryA = await sqlTrashEntryInfo(A);
+			expect(entryA?.kind).toBe("plugindb");
+			expect(entryA?.path).toBe(`${SQL_E2E_IDS.pluginId}/${SQL_E2E_IDS.name}`);
+			expect(entryA?.pluginId).toBe(SQL_E2E_IDS.pluginId);
+			expect(entryA?.name).toBe(SQL_E2E_IDS.name);
+			await B.waitUntil(async () => await sqlHasTrashEntry(B), {
+				timeout: 60 * SECONDS,
+				timeoutMsg: "B never saw the database in the trash bin",
+			});
+
+			// The tombstone propagates: B's open handle dies with the typed reason.
+			await B.waitUntil(async () => (await sqlState(B)) === "error", {
+				timeout: 60 * SECONDS,
+				timeoutMsg: "B's open handle never saw the tombstone",
+			});
+		});
+
+		it("restores from the trash bin and re-syncs on both devices", async function () {
+			await sqlRestoreFromTrash(A);
+
+			// The trash entry clears on both devices.
+			expect(await sqlHasTrashEntry(A)).toBe(false);
+			await B.waitUntil(async () => !(await sqlHasTrashEntry(B)), {
+				timeout: 60 * SECONDS,
+				timeoutMsg: "trash entry lingered on B after restore",
+			});
+
+			// A fresh open() on each device re-bootstraps with all rows intact —
+			// including on B, whose previous engine was tombstoned.
+			await sqlOpen(A);
+			await A.waitUntil(async () => (await sqlTitles(A)).length === 2, {
+				timeout: 60 * SECONDS,
+				timeoutMsg: "A did not recover both rows after restore",
+			});
+			await sqlOpen(B);
+			await B.waitUntil(async () => (await sqlTitles(B)).length === 2, {
+				timeout: 60 * SECONDS,
+				timeoutMsg: "B did not recover both rows after restore",
+			});
+			expect(await sqlTitles(A)).toEqual(["from-A", "from-B"]);
+			expect(await sqlTitles(B)).toEqual(["from-A", "from-B"]);
+			expect(await sqlState(A)).toBe("live");
+			expect(await sqlState(B)).toBe("live");
 		});
 	});
 

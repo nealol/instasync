@@ -303,3 +303,30 @@ pub mod upload_jtis {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+pub mod plugin_db_replicas {
+    use sea_orm::entity::prelude::*;
+
+    /// Per synced plugin database: the server's applied cursor (JSON
+    /// `{siteHex: dbVersion}`) into the on-disk replica, so restarts don't
+    /// re-scan the whole Y log.
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "plugin_db_replicas")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub vault_id: String,
+        pub plugin_id: String,
+        pub name: String,
+        /// JSON object: applied cursor `{siteHex: dbVersion}`.
+        pub cursor_json: String,
+        /// Whether the database has been purged (tombstoned).
+        pub deleted: bool,
+        pub updated_at: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}

@@ -44,7 +44,9 @@ utoipa-swagger-ui = { version = "9", features = ["axum"] }
 hmac = "0.12"
 base64 = "0.22"
 regex = "1"
+rusqlite = { version = "0.32", features = ["bundled", "load_extension"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+rusqlite = { version = "0.32", features = ["bundled", "load_extension"] }

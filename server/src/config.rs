@@ -54,6 +54,11 @@ pub struct Config {
     pub attachments_path_mode: String,
     pub attachments_subfolder: Option<String>,
     pub upload_token: String,
+    /// Filesystem path to the cr-sqlite loadable extension (matching the client
+    /// WASM's sync-format major). When unset/missing, plugin-database replication
+    /// degrades gracefully: changes still flow client-to-client over the Y log,
+    /// but the server keeps no replica and git skips the per-DB SQL dumps.
+    pub crsqlite_ext_path: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,6 +153,7 @@ impl Config {
             attachments_subfolder: opt("ATTACHMENTS_SUBFOLDER"),
             upload_token: opt("UPLOAD_TOKEN")
                 .unwrap_or_else(|| "dev-upload-token-change-me".to_string()),
+            crsqlite_ext_path: opt("CRSQLITE_EXT_PATH"),
         }
     }
 
@@ -159,6 +165,50 @@ impl Config {
                 self.public_base_url.trim_end_matches('/')
             )
         })
+    }
+}
+
+#[cfg(test)]
+impl Config {
+    /// A minimal, self-contained Config for unit tests.
+    pub(crate) fn test_default() -> Self {
+        Config {
+            database_url: String::new(),
+            bind_addr: String::new(),
+            public_base_url: String::new(),
+            ysweet_url: String::new(),
+            blob_dir: String::new(),
+            ysweet_store_dir: None,
+            ysweet_public_url: String::new(),
+            ysweet_auth_key: String::new(),
+            oidc_mode: OidcMode::Mock,
+            oidc_issuer: None,
+            oidc_client_id: None,
+            oidc_client_secret: None,
+            oidc_redirect_url: None,
+            allowed_login_redirects: vec![],
+            cors_allowed_origins: vec![],
+            git_data_dir: ".".into(),
+            git_enabled: true,
+            git_debounce_ms: 5000,
+            git_bot_name: "Realtime".into(),
+            git_bot_email: "realtime@localhost".into(),
+            cursor_email_domain: "localhost".into(),
+            git_remote_url: None,
+            git_push_enabled: false,
+            daily_note_path_template: "Daily Notes/{{YYYY-MM-DD}}.md".into(),
+            weekly_note_path_template: None,
+            monthly_note_path_template: None,
+            quarterly_note_path_template: None,
+            yearly_note_path_template: None,
+            attachment_fetch_host_allowlist: vec![],
+            attachment_allowed_extensions: vec!["png".into(), "txt".into()],
+            attachment_max_bytes: crate::blobs::MAX_BLOB_BYTES,
+            attachments_path_mode: "relative".into(),
+            attachments_subfolder: None,
+            upload_token: "test-upload-token".into(),
+            crsqlite_ext_path: None,
+        }
     }
 }
 

@@ -119,6 +119,12 @@ export async function startAuthServer(opts: {
 	authKey: string;
 	/** When provided, sets `YSWEET_STORE` so the server can report y-sweet store usage. */
 	ysweetStoreDir?: string;
+	/** When provided, enables git audit commits into this directory (one repo per vault). */
+	gitDataDir?: string;
+	/** Git/plugin-db debounce in ms (default 500 in tests for fast assertions). */
+	gitDebounceMs?: number;
+	/** Path to the cr-sqlite loadable extension (enables plugin-db replicas + git dumps). */
+	crsqliteExtPath?: string;
 }): Promise<AuthServer> {
 	buildServerOnce();
 
@@ -139,6 +145,14 @@ export async function startAuthServer(opts: {
 			YSWEET_PUBLIC_URL: opts.ysweetUrl,
 			YSWEET_AUTH_KEY: opts.authKey,
 			...(opts.ysweetStoreDir ? { YSWEET_STORE: opts.ysweetStoreDir } : {}),
+			...(opts.gitDataDir
+				? {
+						GIT_AUDIT_ENABLED: "1",
+						GIT_DATA_DIR: opts.gitDataDir,
+						GIT_DEBOUNCE_MS: String(opts.gitDebounceMs ?? 500),
+					}
+				: { GIT_AUDIT_ENABLED: "0" }),
+			...(opts.crsqliteExtPath ? { CRSQLITE_EXT_PATH: opts.crsqliteExtPath } : {}),
 			OIDC_MODE: "mock",
 			ALLOW_MOCK_OIDC: "1",
 			ALLOWED_LOGIN_REDIRECTS: "http://app",

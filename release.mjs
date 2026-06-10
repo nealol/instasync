@@ -69,7 +69,9 @@ if (!existsSync("main.js")) {
 }
 
 // 4. GitHub release
-const assets = ["manifest.json", "main.js", "styles.css"].filter((f) => existsSync(f));
+// crsqlite.wasm backs the synced-SQLite plugin API; ship it so clients can fetch
+// it by version when it is not already cached in the plugin directory.
+const assets = ["manifest.json", "main.js", "styles.css", "crsqlite.wasm"].filter((f) => existsSync(f));
 const ghArgs = [
   "release",
   "create",

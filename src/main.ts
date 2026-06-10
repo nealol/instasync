@@ -12,6 +12,7 @@ import { liveEdit } from "./editor/LiveEdit";
 import { yRemoteSelections, yRemoteSelectionsTheme } from "./editor/RemoteSelections";
 import { setDiagnosticLoggingEnabled } from "./debug";
 import { openTrashModal } from "./TrashModal";
+import { RealtimeSqlAPI } from "./pluginDb/api";
 
 type ConnectionStatus = "offline" | "connecting" | "connected" | "error" | "signin";
 
@@ -27,6 +28,12 @@ export default class RealtimePlugin extends Plugin {
 	settings!: RealtimeSettings;
 	auth!: AuthClient;
 	vaultSync: VaultSync | null = null;
+	/** Synced-SQLite API for third-party plugins (see src/pluginDb, docs/plugin-sql). */
+	sqlApi!: RealtimeSqlAPI;
+	/** Public handle: `app.plugins.plugins["realtime"].sql`. */
+	get sql(): RealtimeSqlAPI {
+		return this.sqlApi;
+	}
 	private statusBarEl!: HTMLElement;
 	private statusRoot: Root | null = null;
 	private status: ConnectionStatus = "offline";
@@ -36,6 +43,7 @@ export default class RealtimePlugin extends Plugin {
 	async onload(): Promise<void> {
 		await this.loadSettings();
 		this.auth = new AuthClient(this);
+		this.sqlApi = new RealtimeSqlAPI(this);
 
 		this.addSettingTab(new RealtimeSettingTab(this.app, this));
 
@@ -80,6 +88,16 @@ export default class RealtimePlugin extends Plugin {
 			},
 		});
 		this.addCommand({
+			id: "realtime-rebase-plugin-dbs",
+			name: "Rebase plugin databases from server",
+			callback: () => {
+				void (async () => {
+					const n = await this.sqlApi.rebaseAll();
+					new Notice(`${PLUGIN_NAME}: rebased ${n} plugin database(s) from server.`);
+				})();
+			},
+		});
+		this.addCommand({
 			id: "realtime-setup-vault",
 			name: "Set up vault",
 			callback: () => {
@@ -117,6 +135,7 @@ export default class RealtimePlugin extends Plugin {
 	}
 
 	onunload(): void {
+		void this.sqlApi?.destroy();
 		this.stopSync();
 		this.auth?.destroy();
 		this.statusRoot?.unmount();

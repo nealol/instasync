@@ -5,7 +5,8 @@ use sea_orm::{
 
 use crate::entities::{
     invites, memberships, note_search, oauth_clients, oauth_codes, oauth_tokens, permissions,
-    remote_cursors, server_meta, sessions, upload_jtis, users, vault_files, vaults,
+    plugin_db_replicas, remote_cursors, server_meta, sessions, upload_jtis, users, vault_files,
+    vaults,
 };
 
 /// Create all tables (and the composite-unique indexes) if they do not exist.
@@ -37,8 +38,9 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
     create!(oauth_codes::Entity);
     create!(oauth_tokens::Entity);
     create!(upload_jtis::Entity);
+    create!(plugin_db_replicas::Entity);
 
-    let indexes: [IndexCreateStatement; 9] = [
+    let indexes: [IndexCreateStatement; 10] = [
         Index::create()
             .if_not_exists()
             .name("idx_users_issuer_subject")
@@ -102,6 +104,15 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
             .name("idx_upload_jtis_expires_at")
             .table(upload_jtis::Entity)
             .col(upload_jtis::Column::ExpiresAt)
+            .to_owned(),
+        Index::create()
+            .if_not_exists()
+            .name("idx_plugin_db_replicas_vault_plugin_name")
+            .table(plugin_db_replicas::Entity)
+            .col(plugin_db_replicas::Column::VaultId)
+            .col(plugin_db_replicas::Column::PluginId)
+            .col(plugin_db_replicas::Column::Name)
+            .unique()
             .to_owned(),
     ];
     for idx in indexes {

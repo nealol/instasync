@@ -11,6 +11,7 @@ pub mod oauth;
 pub mod oidc;
 pub mod openapi;
 pub mod permalink;
+pub mod plugindb;
 pub mod proxy;
 pub mod routes;
 pub mod search;
@@ -71,11 +72,18 @@ pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
         .build()?;
 
     let config = Arc::new(config);
+    let plugindb = plugindb::PluginDbService::new(
+        config.clone(),
+        http.clone(),
+        db.clone(),
+        authenticator.clone(),
+    );
     let git = git::GitService::new(
         config.clone(),
         http.clone(),
         db.clone(),
         authenticator.clone(),
+        plugindb.clone(),
     );
     let search = search::SearchService::new(config.clone());
 
@@ -88,6 +96,7 @@ pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
         oidc: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         git,
+        plugindb,
         search,
         principals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     };
@@ -314,6 +323,19 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/api/invites/redeem", post(routes::redeem_invite))
         .route("/api/doc-token", post(routes::doc_token))
+        // Synced plugin databases (cr-sqlite).
+        .route(
+            "/api/vaults/{id}/plugin-dbs/{plugin}/{name}/changes",
+            get(plugindb::routes::get_changes),
+        )
+        .route(
+            "/api/vaults/{id}/plugin-dbs/{plugin}/{name}/touch",
+            post(plugindb::routes::touch),
+        )
+        .route(
+            "/api/vaults/{id}/plugin-dbs/{plugin}/{name}",
+            delete(plugindb::routes::delete_plugin_db),
+        )
         // Reverse-proxy the bundled y-sweet so clients need only this server's URL.
         .route("/d/{*rest}", any(proxy::proxy))
         .layer(cors)

@@ -800,7 +800,7 @@ fn decode_string_map(update: &[u8], name: &str) -> Result<Vec<(String, String)>>
     Ok(out)
 }
 
-fn any_to_json(value: &Any) -> JsonValue {
+pub(crate) fn any_to_json(value: &Any) -> JsonValue {
     match value {
         Any::Null | Any::Undefined => JsonValue::Null,
         Any::Bool(v) => JsonValue::Bool(*v),

@@ -111,6 +111,32 @@ and `/api/doc-token`.
 
 The status bar shows `Realtime: connecting… / live / error`.
 
+## Plugin SQL API for developers
+
+Realtime exposes a synced, conflict-free **SQLite** database to other Obsidian
+plugins via `app.plugins.plugins["realtime"].sql`. Your plugin gets a local
+cr-sqlite database that replicates to every device in the vault — offline-first,
+last-writer-wins per column, with snapshots, a server-side replica, deterministic
+git dumps, and trash-bin deletion. See the full guide:
+**[docs/plugin-sql/](docs/plugin-sql/README.md)**.
+
+```ts
+const realtime = (this.app as any).plugins.plugins["realtime"];
+await realtime.sql.whenAvailable();
+const db = await realtime.sql.open({
+  pluginId: this.manifest.id,
+  name: "tasks",
+  schemaVersion: 1,
+  migrate: async (tx, fromVersion) => {
+    if (fromVersion < 1) {
+      await tx.exec(`CREATE TABLE tasks (id PRIMARY KEY NOT NULL, title, done)`);
+      await tx.exec(`SELECT crsql_as_crr('tasks')`);
+    }
+  },
+});
+await db.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, [crypto.randomUUID(), "Hi"]);
+```
+
 ## Development
 
 ```bash

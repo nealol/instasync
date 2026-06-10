@@ -3,7 +3,10 @@ export async function waitFor(
 	predicate: () => boolean | Promise<boolean>,
 	opts: { timeout?: number; interval?: number; label?: string } = {},
 ): Promise<void> {
-	const timeout = opts.timeout ?? 10_000;
+	// Generous default: unit files run in parallel workers, each spawning its
+	// own y-sweet + auth server; sync round-trips can stall well past 10s on a
+	// loaded machine (an observed source of spurious document.test.ts failures).
+	const timeout = opts.timeout ?? 30_000;
 	const interval = opts.interval ?? 25;
 	const start = Date.now();
 	for (;;) {

@@ -83,7 +83,10 @@ use utoipa::{Modify, OpenApi};
         base_view_filters,
         base_formulas,
         base_properties,
-        move_base
+        move_base,
+        plugin_db_changes,
+        plugin_db_touch,
+        plugin_db_delete
     ),
     tags(
         (name = "auth", description = "Browser login and session management"),
@@ -94,6 +97,7 @@ use utoipa::{Modify, OpenApi};
         (name = "canvas", description = "Vault-scoped Obsidian Canvas APIs"),
         (name = "bases", description = "Vault-scoped Obsidian Base APIs"),
         (name = "attachments", description = "Vault-scoped attachment APIs and signed uploads"),
+        (name = "plugin-dbs", description = "Synced plugin database (cr-sqlite) bootstrap, replication, and purge APIs"),
         (name = "permalinks", description = "Public note redirect endpoints")
     )
 )]
@@ -328,6 +332,15 @@ async fn move_attachment() {}
 
 #[utoipa::path(post, path = "/upload", tag = "attachments", request_body(content = String, content_type = "multipart/form-data"), responses((status = 200, description = "Uploaded via signed link"), (status = 401, description = "Invalid or expired upload token"), (status = 409, description = "Upload token already used"), (status = 413, description = "Too large")))]
 async fn public_upload() {}
+
+#[utoipa::path(get, path = "/api/vaults/{id}/plugin-dbs/{plugin}/{name}/changes", tag = "plugin-dbs", security(("bearerAuth" = [])), params(("id" = String, Path), ("plugin" = String, Path), ("name" = String, Path), ("since" = Option<String>, Query, description = "JSON cursor {siteHex: dbVersion}")), responses((status = 200, description = "Bootstrap changeset (crsql_changes rows past the cursor)"), (status = 400, description = "Invalid plugin db id")))]
+async fn plugin_db_changes() {}
+
+#[utoipa::path(post, path = "/api/vaults/{id}/plugin-dbs/{plugin}/{name}/touch", tag = "plugin-dbs", security(("bearerAuth" = [])), params(("id" = String, Path), ("plugin" = String, Path), ("name" = String, Path)), responses((status = 200, description = "Replication and git commit debounces armed"), (status = 400, description = "Invalid plugin db id")))]
+async fn plugin_db_touch() {}
+
+#[utoipa::path(delete, path = "/api/vaults/{id}/plugin-dbs/{plugin}/{name}", tag = "plugin-dbs", security(("bearerAuth" = [])), params(("id" = String, Path), ("plugin" = String, Path), ("name" = String, Path)), responses((status = 200, description = "Database purged: replica, git dump, and batch log removed (irreversible)"), (status = 400, description = "Invalid plugin db id")))]
+async fn plugin_db_delete() {}
 
 #[utoipa::path(get, path = "/n/{guid}", tag = "permalinks", params(("guid" = String, Path)), responses((status = 303, description = "Redirects to note deep link or path redirect"), (status = 404, description = "Not found")))]
 async fn note_by_guid() {}

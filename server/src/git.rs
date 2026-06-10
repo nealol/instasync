@@ -31,6 +31,7 @@ use tokio::sync::Mutex;
 use y_sweet_core::auth::Authenticator;
 
 use crate::config::Config;
+use crate::plugindb::PluginDbService;
 use crate::state::{Principal, PrincipalActor};
 use crate::structured::canvas_to_file_json;
 use crate::ydoc::{decode_files_map, decode_structured, decode_structured_index, decode_text};
@@ -56,6 +57,7 @@ struct Inner {
     #[allow(dead_code)] // reserved for future per-doc lookups / catch-up sweeps
     db: DatabaseConnection,
     authenticator: Arc<Authenticator>,
+    plugindb: PluginDbService,
     vaults: Mutex<HashMap<String, VaultState>>,
 }
 
@@ -68,12 +70,14 @@ impl GitService {
         http: reqwest::Client,
         db: DatabaseConnection,
         authenticator: Arc<Authenticator>,
+        plugindb: PluginDbService,
     ) -> Self {
         GitService(Arc::new(Inner {
             config,
             http,
             db,
             authenticator,
+            plugindb,
             vaults: Mutex::new(HashMap::new()),
         }))
     }
@@ -212,6 +216,13 @@ impl GitService {
                 },
                 Err(e) => tracing::warn!("git audit: fetch {doc_id} failed: {e}"),
             }
+        }
+
+        // 2b. Deterministic SQL dumps of synced plugin databases (when the
+        // cr-sqlite extension is configured). Purged DBs are excluded, so the
+        // prune step in materialize_tree removes their dumps → "deleted" commits.
+        for (rel, sql) in self.0.plugindb.dumps_for_vault(vault_id).await {
+            tree.push((rel, sql));
         }
 
         // 3. Write the tree to disk (and prune anything no longer present).
@@ -691,6 +702,7 @@ mod tests {
             attachments_path_mode: "relative".into(),
             attachments_subfolder: None,
             upload_token: "test-upload-token".into(),
+            crsqlite_ext_path: None,
         }
     }
 }

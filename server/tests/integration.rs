@@ -129,7 +129,16 @@ async fn fake_ysweet_as_update() -> String {
     format!("http://{addr}")
 }
 
+/// Shared doc store for [`fake_ysweet_store_with_docs`].
+type FakeDocs = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+
 async fn fake_ysweet_store() -> String {
+    fake_ysweet_store_with_docs().await.0
+}
+
+/// Like [`fake_ysweet_store`] but also returns the backing doc map so tests can
+/// seed and inspect raw doc state directly (used by the plugin-db tests).
+async fn fake_ysweet_store_with_docs() -> (String, FakeDocs) {
     use axum::body::Bytes;
     use axum::extract::{Path, State};
     use axum::http::HeaderMap;
@@ -138,7 +147,7 @@ async fn fake_ysweet_store() -> String {
     use yrs::updates::decoder::Decode;
     use yrs::{ReadTxn, Transact};
 
-    type Docs = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+    type Docs = FakeDocs;
 
     fn empty_update() -> Vec<u8> {
         let doc = yrs::Doc::new();
@@ -214,13 +223,13 @@ async fn fake_ysweet_store() -> String {
         .route("/doc/{doc_id}/auth", post(auth_doc))
         .route("/d/{doc_id}/as-update", get(as_update))
         .route("/d/{doc_id}/update", post(update))
-        .with_state(docs);
+        .with_state(docs.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), docs)
 }
 
 async fn fake_attachment_source() -> String {
@@ -242,6 +251,14 @@ async fn fake_attachment_source() -> String {
 /// Build a git-enabled `AppState` plus its repo dir and a synthetic vault id.
 async fn git_state(
     ysweet_url: &str,
+) -> (realtime_server::state::AppState, std::path::PathBuf, String) {
+    git_state_ext(ysweet_url, None).await
+}
+
+/// Like [`git_state`], optionally wiring the cr-sqlite loadable extension.
+async fn git_state_ext(
+    ysweet_url: &str,
+    crsqlite_ext_path: Option<String>,
 ) -> (realtime_server::state::AppState, std::path::PathBuf, String) {
     let mut db_path = std::env::temp_dir();
     db_path.push(format!("realtime-test-{}.db", uuid::Uuid::new_v4()));
@@ -292,6 +309,7 @@ async fn git_state(
         attachments_path_mode: "relative".into(),
         attachments_subfolder: None,
         upload_token: "test-upload-token".into(),
+        crsqlite_ext_path,
     };
     let state = build_state(config).await.unwrap();
     let vault_id = uuid::Uuid::new_v4().to_string();
@@ -404,6 +422,7 @@ async fn test_app_with_attachment_max(
         attachments_path_mode: "relative".into(),
         attachments_subfolder: None,
         upload_token: "test-upload-token".into(),
+        crsqlite_ext_path: None,
     };
     let state = build_state(config).await.unwrap();
     app(state)
@@ -2288,4 +2307,559 @@ async fn search_tags_backlinks_reindex_and_rename_rewrite() {
         "expected rewritten link, got {}",
         alpha["content"]
     );
+}
+
+// ---------- plugin databases (cr-sqlite) ----------
+//
+// The replica/dump/compaction tests need the cr-sqlite loadable extension and
+// are gated on CRSQLITE_EXT_PATH (they skip cleanly when it is not set), e.g.:
+//   CRSQLITE_EXT_PATH=/path/to/crsqlite.dylib cargo test plugin_db
+
+fn crsqlite_ext() -> Option<String> {
+    std::env::var("CRSQLITE_EXT_PATH")
+        .ok()
+        .filter(|p| std::path::Path::new(p).exists())
+}
+
+fn open_crsqlite(path: &std::path::Path, ext: &str) -> rusqlite::Connection {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let conn = rusqlite::Connection::open(path).unwrap();
+    // SAFETY: loading the operator-supplied test extension.
+    unsafe {
+        conn.load_extension_enable().unwrap();
+        conn.load_extension(ext, Some("sqlite3_crsqlite_init")).unwrap();
+        conn.load_extension_disable().unwrap();
+    }
+    conn
+}
+
+fn b64(bytes: &[u8]) -> String {
+    // Tiny local base64 (std has none; avoids another dev-dependency).
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Read every `crsql_changes` row from a scratch source DB as wire-format JSON.
+/// Returns `(site_hex, max_db_version, change_rows)`.
+fn read_source_changes(conn: &rusqlite::Connection) -> (String, i64, Vec<Value>) {
+    let mut stmt = conn
+        .prepare(
+            "SELECT \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq \
+             FROM crsql_changes ORDER BY db_version, seq",
+        )
+        .unwrap();
+    let mut site_hex = String::new();
+    let mut max_v = 0i64;
+    let rows = stmt
+        .query_map([], |row| {
+            let pk: Vec<u8> = row.get(1)?;
+            let val: rusqlite::types::Value = row.get(3)?;
+            let site: Vec<u8> = row.get(6)?;
+            Ok((
+                pk,
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(2)?,
+                val,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                site,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let changes = rows
+        .into_iter()
+        .map(|(pk, table, cid, val, col_version, db_version, site, cl, seq)| {
+            site_hex = hex(&site);
+            max_v = max_v.max(db_version);
+            let val_json = match val {
+                rusqlite::types::Value::Null => Value::Null,
+                rusqlite::types::Value::Integer(i) => json!(i),
+                rusqlite::types::Value::Real(f) => json!(f),
+                rusqlite::types::Value::Text(t) => json!(t),
+                rusqlite::types::Value::Blob(b) => json!({ "$blob": b64(&b) }),
+            };
+            json!({
+                "table": table,
+                "pk": b64(&pk),
+                "cid": cid,
+                "val": val_json,
+                "col_version": col_version,
+                "db_version": db_version,
+                "site_id": b64(&site),
+                "cl": cl,
+                "seq": seq,
+            })
+        })
+        .collect();
+    (site_hex, max_v, changes)
+}
+
+fn json_to_any(v: &Value) -> yrs::Any {
+    use yrs::Any;
+    match v {
+        Value::Null => Any::Null,
+        Value::Bool(b) => Any::Bool(*b),
+        Value::Number(n) => match n.as_i64() {
+            Some(i) => Any::BigInt(i),
+            None => Any::Number(n.as_f64().unwrap_or(0.0)),
+        },
+        Value::String(s) => Any::String(s.clone().into()),
+        Value::Array(a) => Any::Array(a.iter().map(json_to_any).collect::<Vec<_>>().into()),
+        Value::Object(o) => Any::Map(
+            o.iter()
+                .map(|(k, v)| (k.clone(), json_to_any(v)))
+                .collect::<HashMap<_, _>>()
+                .into(),
+        ),
+    }
+}
+
+/// Encode a full plugin-db Y.Doc state: `batches`, `meta.schema`, optional tombstone.
+fn plugin_db_doc_update(schema: &[String], batches: &Value, deleted_at: Option<i64>) -> Vec<u8> {
+    use yrs::{Array, Map, ReadTxn, Transact};
+    let doc = yrs::Doc::new();
+    let batches_arr = doc.get_or_insert_array("batches");
+    let meta = doc.get_or_insert_map("meta");
+    {
+        let mut txn = doc.transact_mut();
+        for b in batches.as_array().unwrap() {
+            batches_arr.push_back(&mut txn, json_to_any(b));
+        }
+        meta.insert(&mut txn, "schema", json_to_any(&json!(schema)));
+        meta.insert(&mut txn, "schemaVersion", yrs::Any::BigInt(1));
+        if let Some(ms) = deleted_at {
+            meta.insert(&mut txn, "deletedAt", yrs::Any::BigInt(ms));
+        }
+    }
+    let update = doc
+        .transact()
+        .encode_state_as_update_v1(&yrs::StateVector::default());
+    update
+}
+
+/// Merge `meta.deletedAt` into an existing raw doc state.
+async fn set_doc_deleted_at(docs: &FakeDocs, doc_id: &str, ms: i64) {
+    use yrs::updates::decoder::Decode;
+    use yrs::{Map, ReadTxn, Transact};
+    let mut guard = docs.lock().await;
+    let base = guard.get(doc_id).cloned().unwrap_or_default();
+    let doc = yrs::Doc::new();
+    {
+        let mut txn = doc.transact_mut();
+        if !base.is_empty() {
+            txn.apply_update(yrs::Update::decode_v1(&base).unwrap());
+        }
+    }
+    let meta = doc.get_or_insert_map("meta");
+    {
+        let mut txn = doc.transact_mut();
+        meta.insert(&mut txn, "deletedAt", yrs::Any::BigInt(ms));
+    }
+    let merged = doc
+        .transact()
+        .encode_state_as_update_v1(&yrs::StateVector::default());
+    guard.insert(doc_id.to_string(), merged);
+}
+
+/// Scratch source DB with a CRR `tasks` table and two rows; returns the wire
+/// batch JSON + schema DDL the client would publish.
+fn make_source_batch(ext: &str) -> (Vec<String>, Value, String, i64) {
+    let src = std::env::temp_dir().join(format!("crsql-src-{}.sqlite", uuid::Uuid::new_v4()));
+    let conn = open_crsqlite(&src, ext);
+    conn.execute_batch("CREATE TABLE tasks (id PRIMARY KEY NOT NULL, title)")
+        .unwrap();
+    conn.execute_batch("SELECT crsql_as_crr('tasks')").unwrap();
+    conn.execute("INSERT INTO tasks (id, title) VALUES ('a', 'alpha')", [])
+        .unwrap();
+    conn.execute("INSERT INTO tasks (id, title) VALUES ('b', 'beta')", [])
+        .unwrap();
+    let (site_hex, max_v, changes) = read_source_changes(&conn);
+    let _ = conn.query_row("SELECT crsql_finalize()", [], |_| Ok(()));
+    let batch = json!({
+        "id": "batch-1",
+        "siteId": site_hex,
+        "fromDbVersion": 0,
+        "toDbVersion": max_v,
+        "schemaVersion": 1,
+        "createdAt": 0,
+        "format": "crsqlite-1",
+        "changes": changes,
+    });
+    let schema = vec![
+        "CREATE TABLE tasks (id PRIMARY KEY NOT NULL, title)".to_string(),
+        "SELECT crsql_as_crr('tasks')".to_string(),
+    ];
+    (schema, json!([batch]), site_hex, max_v)
+}
+
+fn replica_file(git_dir: &std::path::Path, vault: &str, plugin: &str, name: &str) -> std::path::PathBuf {
+    // replica_root derives from git_data_dir's parent (see plugindb.rs).
+    git_dir
+        .parent()
+        .unwrap()
+        .join("plugin-db-replicas")
+        .join(vault)
+        .join(plugin)
+        .join(format!("{name}.sqlite"))
+}
+
+fn replica_titles(path: &std::path::Path, ext: &str) -> Vec<String> {
+    let conn = open_crsqlite(path, ext);
+    let mut stmt = conn
+        .prepare("SELECT title FROM tasks ORDER BY id")
+        .unwrap();
+    let titles = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    drop(stmt);
+    let _ = conn.query_row("SELECT crsql_finalize()", [], |_| Ok(()));
+    titles
+}
+
+#[tokio::test]
+async fn plugin_db_replication_dump_compaction_and_bootstrap() {
+    let Some(ext) = crsqlite_ext() else {
+        eprintln!("skipping plugin_db_replication test: CRSQLITE_EXT_PATH not set");
+        return;
+    };
+    let (ys, docs) = fake_ysweet_store_with_docs().await;
+    let (state, git_dir, vault_id) = git_state_ext(&ys, Some(ext.clone())).await;
+    let repo = git_dir.join(&vault_id);
+
+    // Seed the per-DB doc with one published batch (two task rows).
+    let (schema, batches, site_hex, max_v) = make_source_batch(&ext);
+    let doc_id = format!("{vault_id}__plugindb__my-plugin__tasks");
+    docs.lock()
+        .await
+        .insert(doc_id.clone(), plugin_db_doc_update(&schema, &batches, None));
+
+    // Replay batches -> replica matches the source.
+    state.plugindb.mark_write(&vault_id, "my-plugin", "tasks").await;
+    let replica = replica_file(&git_dir, &vault_id, "my-plugin", "tasks");
+    for _ in 0..100 {
+        if replica.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(replica.exists(), "replica file should be created");
+    assert_eq!(replica_titles(&replica, &ext), vec!["alpha", "beta"]);
+
+    // Compaction: the server replica covers the lone batch and no device
+    // cursors hold it back, so the doc log gets trimmed.
+    let mut compacted = false;
+    for _ in 0..100 {
+        let raw = docs.lock().await.get(&doc_id).cloned().unwrap();
+        let view = realtime_server::plugindb::decode_doc(&raw).unwrap();
+        if view.batches.is_empty() {
+            assert_eq!(
+                view.compacted_through.get(&site_hex),
+                Some(&max_v),
+                "compactedThrough must record the trimmed high-water mark"
+            );
+            compacted = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(compacted, "server should compact the fully-replicated log");
+
+    // Bootstrap survives compaction: a fresh client (empty cursor) still gets
+    // the full changeset, served from the replica.
+    let rows = state
+        .plugindb
+        .bootstrap_changes(&vault_id, "my-plugin", "tasks", &HashMap::new())
+        .await
+        .unwrap();
+    assert!(!rows.is_empty(), "bootstrap must serve compacted history");
+    let tables: std::collections::HashSet<_> = rows.iter().map(|r| r.table.as_str()).collect();
+    assert_eq!(tables, std::collections::HashSet::from(["tasks"]));
+    // A caught-up cursor gets nothing.
+    let mut caught_up = HashMap::new();
+    caught_up.insert(site_hex.clone(), max_v);
+    let none = state
+        .plugindb
+        .bootstrap_changes(&vault_id, "my-plugin", "tasks", &caught_up)
+        .await
+        .unwrap();
+    assert!(none.is_empty(), "caught-up cursor should get no rows");
+
+    // Git dump: deterministic, committed under .realtime/plugin-dbs/, restorable.
+    let d1 = state.plugindb.dumps_for_vault(&vault_id).await;
+    let d2 = state.plugindb.dumps_for_vault(&vault_id).await;
+    assert_eq!(d1, d2, "dumps must be deterministic");
+    assert_eq!(d1.len(), 1);
+    let (rel, sql) = &d1[0];
+    assert_eq!(
+        rel.to_string_lossy(),
+        ".realtime/plugin-dbs/my-plugin/tasks.sql"
+    );
+    assert!(sql.contains("-- crr: tasks"), "dump records CRR tables: {sql}");
+
+    state
+        .git
+        .mark_write(&vault_id, &principal("u-alice", "Alice", "alice@example.com"))
+        .await;
+    wait_for_commit(&repo).await;
+    let committed = repo.join(".realtime/plugin-dbs/my-plugin/tasks.sql");
+    assert!(committed.exists(), "git tree must contain the dump");
+
+    // Restore-from-dump round trip: fresh DB + dump + re-run crsql_as_crr.
+    let restored = std::env::temp_dir().join(format!("crsql-restore-{}.sqlite", uuid::Uuid::new_v4()));
+    let conn = open_crsqlite(&restored, &ext);
+    let crr_tables: Vec<String> = sql
+        .lines()
+        .find_map(|l| l.strip_prefix("-- crr: "))
+        .unwrap()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
+    conn.execute_batch(sql).unwrap();
+    for t in &crr_tables {
+        conn.execute_batch(&format!("SELECT crsql_as_crr('{t}')")).unwrap();
+    }
+    let mut stmt = conn.prepare("SELECT title FROM tasks ORDER BY id").unwrap();
+    let titles: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(titles, vec!["alpha", "beta"], "dump restore round-trips");
+}
+
+#[tokio::test]
+async fn plugin_db_soft_delete_keeps_replica_and_purge_removes_everything() {
+    let Some(ext) = crsqlite_ext() else {
+        eprintln!("skipping plugin_db_purge test: CRSQLITE_EXT_PATH not set");
+        return;
+    };
+    let (ys, docs) = fake_ysweet_store_with_docs().await;
+    let (state, git_dir, vault_id) = git_state_ext(&ys, Some(ext.clone())).await;
+    let repo = git_dir.join(&vault_id);
+
+    let (schema, batches, _site_hex, _max_v) = make_source_batch(&ext);
+    let doc_id = format!("{vault_id}__plugindb__my-plugin__tasks");
+    docs.lock()
+        .await
+        .insert(doc_id.clone(), plugin_db_doc_update(&schema, &batches, None));
+
+    // Replicate, then commit the dump.
+    state.plugindb.mark_write(&vault_id, "my-plugin", "tasks").await;
+    let replica = replica_file(&git_dir, &vault_id, "my-plugin", "tasks");
+    for _ in 0..100 {
+        if replica.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(replica.exists());
+    state
+        .git
+        .mark_write(&vault_id, &principal("u-alice", "Alice", "alice@example.com"))
+        .await;
+    wait_for_commit(&repo).await;
+    let committed_dump = repo.join(".realtime/plugin-dbs/my-plugin/tasks.sql");
+    assert!(committed_dump.exists());
+
+    // Soft delete: tombstone the doc. Replication stops but the replica stays.
+    set_doc_deleted_at(&docs, &doc_id, 12345).await;
+    state.plugindb.mark_write(&vault_id, "my-plugin", "tasks").await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        replica.exists(),
+        "soft-deleted database must keep its replica (it is restorable)"
+    );
+
+    // Purge: replica gone, doc trimmed + tombstoned, dump dropped from git.
+    state
+        .plugindb
+        .purge(&vault_id, "my-plugin", "tasks")
+        .await
+        .unwrap();
+    assert!(!replica.exists(), "purge must delete the replica file");
+    let raw = docs.lock().await.get(&doc_id).cloned().unwrap();
+    let view = realtime_server::plugindb::decode_doc(&raw).unwrap();
+    assert!(view.batches.is_empty(), "purge must trim the batch log");
+    assert!(view.deleted_at.is_some(), "purge must set the tombstone");
+    assert!(
+        state.plugindb.dumps_for_vault(&vault_id).await.is_empty(),
+        "purged databases must not be dumped"
+    );
+
+    state
+        .git
+        .mark_write(&vault_id, &principal("u-alice", "Alice", "alice@example.com"))
+        .await;
+    for _ in 0..100 {
+        let (_, count) = git_out(&repo, &["rev-list", "--count", "HEAD"]);
+        if count == "2" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let (_, count) = git_out(&repo, &["rev-list", "--count", "HEAD"]);
+    assert_eq!(count, "2", "purge should produce a delete commit");
+    assert!(
+        !committed_dump.exists(),
+        "the delete commit must remove the dump from the git tree"
+    );
+}
+
+#[tokio::test]
+async fn plugin_db_routes_validate_ids_and_membership() {
+    // The store-backed fake serves /as-update, which the bootstrap route reads.
+    let ys = fake_ysweet_store().await;
+    let app = test_app(&ys, &ys).await;
+    let alice = login(&app, "alice").await;
+
+    let (status, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&alice),
+        Some(json!({"name": "Notes"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+
+    // Invalid plugin id -> 400 (matches the client-side [A-Za-z0-9_-]{1,80} rule).
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/plugin-dbs/bad!id/tasks/touch"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // `__` is the doc-id separator and is rejected to keep doc ids unambiguous.
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/plugin-dbs/bad__id/tasks/touch"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Non-members are rejected.
+    let bob = login(&app, "bob").await;
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/plugin-dbs/my-plugin/tasks/touch"),
+        Some(&bob),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A member can touch (arms replication + git debounces).
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/plugin-dbs/my-plugin/tasks/touch"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+
+    // Bootstrap on an empty/unknown db returns an empty changeset.
+    let (status, body) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/plugin-dbs/my-plugin/tasks/changes"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["changes"], json!([]));
+}
+
+// ---------- cross-stack wire-format regression ----------
+//
+// `tests/fixtures/client-published-doc.bin` is a Y.Doc update produced by the
+// REAL TypeScript client engine (SyncedPluginDatabase publishing through
+// cr-sqlite WASM). Regenerate it after wire-format changes with:
+//
+//   npx tsx tests/support/genPluginDbDocFixture.mts
+//
+// This guards against drift between the client's JS/Yjs encoding (e.g. lib0
+// float-vs-int number encoding) and the server's serde decode, which fabricated
+// Rust-side batches can never catch.
+
+#[tokio::test]
+async fn plugin_db_decodes_and_replicates_a_real_client_published_doc() {
+    let raw = include_bytes!("fixtures/client-published-doc.bin");
+    let view = realtime_server::plugindb::decode_doc(raw).expect("decode client doc");
+
+    // The client published one batch with four change rows (two task rows,
+    // title + done columns each).
+    assert_eq!(view.batches.len(), 1, "client batch must deserialize");
+    let batch = &view.batches[0];
+    assert_eq!(batch.changes.len(), 4, "all change rows must deserialize");
+    assert!(
+        view.schema.iter().any(|s| s.contains("crsql_as_crr")),
+        "client-published schema must include the CRR call: {:?}",
+        view.schema
+    );
+
+    // With the extension available, the batch must replay into a replica and
+    // the dump must contain the client's rows.
+    let Some(ext) = crsqlite_ext() else {
+        eprintln!("skipping replica half: CRSQLITE_EXT_PATH not set");
+        return;
+    };
+    let (ys, docs) = fake_ysweet_store_with_docs().await;
+    let (state, git_dir, vault_id) = git_state_ext(&ys, Some(ext.clone())).await;
+    let doc_id = format!("{vault_id}__plugindb__client-plugin__tasks");
+    docs.lock().await.insert(doc_id.clone(), raw.to_vec());
+
+    state
+        .plugindb
+        .mark_write(&vault_id, "client-plugin", "tasks")
+        .await;
+    let replica = replica_file(&git_dir, &vault_id, "client-plugin", "tasks");
+    for _ in 0..100 {
+        if replica.exists() && !replica_titles(&replica, &ext).is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        replica_titles(&replica, &ext),
+        vec!["from-A", "from-B"],
+        "replica must contain the client's rows"
+    );
+
+    let dumps = state.plugindb.dumps_for_vault(&vault_id).await;
+    assert_eq!(dumps.len(), 1, "dump must exist for the replicated client db");
+    assert!(dumps[0].1.contains("from-A") && dumps[0].1.contains("from-B"));
 }

@@ -682,6 +682,41 @@ export class AuthClient {
 	async deleteBlob(vaultId: string, hash: string): Promise<void> {
 		await this.api(`/api/vaults/${vaultId}/blobs/${hash}`, { method: "DELETE" });
 	}
+
+	// --- plugin databases (synced SQLite) --------------------------------------
+
+	private pluginDbPath(vaultId: string, pluginId: string, name: string, suffix = ""): string {
+		const p = encodeURIComponent(pluginId);
+		const n = encodeURIComponent(name);
+		return `/api/vaults/${vaultId}/plugin-dbs/${p}/${n}${suffix}`;
+	}
+
+	/** Pull the server replica's changeset past `cursor` (bootstrap / rebase). */
+	async pluginDbChanges(
+		vaultId: string,
+		pluginId: string,
+		name: string,
+		cursor: Record<string, number>,
+	): Promise<import("./pluginDb/types").ChangeRow[]> {
+		const since = encodeURIComponent(JSON.stringify(cursor ?? {}));
+		const res = await this.api<{ changes: import("./pluginDb/types").ChangeRow[] }>(
+			this.pluginDbPath(vaultId, pluginId, name, `/changes?since=${since}`),
+		);
+		return res.changes ?? [];
+	}
+
+	/** Tell the server a publish happened, so it replicates + commits to git. */
+	async touchPluginDb(vaultId: string, pluginId: string, name: string): Promise<void> {
+		await this.api(this.pluginDbPath(vaultId, pluginId, name, "/touch"), {
+			method: "POST",
+			body: {},
+		});
+	}
+
+	/** Purge a plugin database: delete the server replica + git dump (irreversible). */
+	async deletePluginDb(vaultId: string, pluginId: string, name: string): Promise<void> {
+		await this.api(this.pluginDbPath(vaultId, pluginId, name), { method: "DELETE" });
+	}
 }
 
 /**

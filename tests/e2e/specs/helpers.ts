@@ -435,3 +435,121 @@ export async function permanentlyDeleteTrashEntry(b: any, id: string): Promise<v
 		id,
 	);
 }
+
+// --- Plugin SQL API --------------------------------------------------------
+//
+// Drives `app.plugins.plugins.realtime.sql` inside the renderer. A single shared
+// "tasks" database is opened per device and stashed on `window` so each call can
+// reuse the same handle (the API is refcounted per pluginId/name).
+
+const SQL_PLUGIN_ID = "e2e-plugin";
+const SQL_DB_NAME = "tasks";
+
+/** Open (and remember) a synced SQLite database on a device. */
+export async function sqlOpen(b: any): Promise<void> {
+	await b.executeObsidian(
+		async ({ app }: any, pluginId: string, name: string) => {
+			const sql = (app as any).plugins.plugins.realtime.sql;
+			await sql.whenAvailable();
+			const handle = await sql.open({
+				pluginId,
+				name,
+				schemaVersion: 1,
+				migrate: async (tx: any) => {
+					await tx.exec(`CREATE TABLE tasks (id PRIMARY KEY NOT NULL, title, done)`);
+					await tx.exec(`SELECT crsql_as_crr('tasks')`);
+				},
+			});
+			(window as any).__e2eSqlDb = handle;
+			await handle.whenLive();
+		},
+		SQL_PLUGIN_ID,
+		SQL_DB_NAME,
+	);
+}
+
+/** Insert a task row on a device. */
+export async function sqlInsert(b: any, id: string, title: string): Promise<void> {
+	await b.executeObsidian(
+		async (_ctx: any, rowId: string, t: string) => {
+			await (window as any).__e2eSqlDb.exec(
+				`INSERT INTO tasks (id, title) VALUES (?, ?)`,
+				[rowId, t],
+			);
+		},
+		id,
+		title,
+	);
+}
+
+/** Read all task titles on a device, sorted. */
+export async function sqlTitles(b: any): Promise<string[]> {
+	return b.executeObsidian(async () => {
+		const rows = await (window as any).__e2eSqlDb.query(`SELECT title FROM tasks ORDER BY id`);
+		return rows.map((r: any) => r.title);
+	});
+}
+
+/** Soft-delete the shared database (lands in the vault trash bin). */
+export async function sqlDelete(b: any): Promise<void> {
+	await b.executeObsidian(
+		async ({ app }: any, pluginId: string, name: string) => {
+			await (app as any).plugins.plugins.realtime.sql.delete({ pluginId, name });
+		},
+		SQL_PLUGIN_ID,
+		SQL_DB_NAME,
+	);
+}
+
+/** Restore the shared database from the trash bin and reopen it. */
+export async function sqlRestoreFromTrash(b: any): Promise<void> {
+	await b.executeObsidian(
+		async ({ app }: any, pluginId: string, name: string) => {
+			const vs = (app as any).plugins.plugins.realtime.vaultSync;
+			const entry = vs.listTrash().find((e: any) => e.kind === "plugindb" && e.pluginId === pluginId && e.name === name);
+			if (entry) await vs.restoreTrashEntry(entry.id);
+		},
+		SQL_PLUGIN_ID,
+		SQL_DB_NAME,
+	);
+}
+
+/** True when a `plugindb` trash entry for the shared database exists on a device. */
+export async function sqlHasTrashEntry(b: any): Promise<boolean> {
+	return (await sqlTrashEntryInfo(b)) !== null;
+}
+
+/** The `plugindb` trash entry for the shared database (or null), for shape assertions. */
+export async function sqlTrashEntryInfo(
+	b: any,
+): Promise<{ id: string; kind: string; path: string; pluginId?: string; name?: string } | null> {
+	return b.executeObsidian(
+		async ({ app }: any, pluginId: string, name: string) => {
+			const vs = (app as any).plugins.plugins.realtime.vaultSync;
+			const e = vs
+				.listTrash()
+				.find((e: any) => e.kind === "plugindb" && e.pluginId === pluginId && e.name === name);
+			return e ? { id: e.id, kind: e.kind, path: e.path, pluginId: e.pluginId, name: e.name } : null;
+		},
+		SQL_PLUGIN_ID,
+		SQL_DB_NAME,
+	);
+}
+
+/** The current lifecycle state of the shared database handle on a device. */
+export async function sqlState(b: any): Promise<string> {
+	return b.executeObsidian(async () => (window as any).__e2eSqlDb.state);
+}
+
+/**
+ * Discard the device's local DB + snapshot and rebuild from the server
+ * (exercises the real bootstrap endpoint end-to-end).
+ */
+export async function sqlRebaseFromServer(b: any): Promise<void> {
+	await b.executeObsidian(async () => {
+		await (window as any).__e2eSqlDb.rebaseFromServer();
+	});
+}
+
+/** The pluginId/name the e2e SQL helpers use (for git-dump path assertions). */
+export const SQL_E2E_IDS = { pluginId: SQL_PLUGIN_ID, name: SQL_DB_NAME };

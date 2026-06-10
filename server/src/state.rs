@@ -9,6 +9,7 @@ use crate::session::now_millis;
 
 use crate::config::Config;
 use crate::git::GitService;
+use crate::plugindb::PluginDbService;
 use crate::search::SearchService;
 
 /// The actor that initiated a write attributed to a real authenticated user.
@@ -98,6 +99,8 @@ pub struct AppState {
     pub oauth_flows: Arc<Mutex<HashMap<String, OAuthFlow>>>,
     /// Per-vault git audit log + backup engine.
     pub git: GitService,
+    /// Synced plugin-database replication engine.
+    pub plugindb: PluginDbService,
     /// Per-vault debounced search indexer.
     pub search: SearchService,
     /// Maps a minted y-sweet connection token to the principal it was issued to,
