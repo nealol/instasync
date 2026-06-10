@@ -393,10 +393,19 @@ describe("Document sync", () => {
 			doc.ensureConnected();
 			await waitFor(() => doc.provider.status === "connected", { label: "reconnected" });
 
-			// Sync resumes after reconnect.
+			// Sync resumes after reconnect. The provider self-heals transient
+			// reconnect races (stale-socket close events, token refetch) through
+			// retry loops with backoff sleeps, so on a loaded CI box this can
+			// legitimately take well over the default budget. Asserting the doc
+			// and the disk separately pinpoints the failing layer if it recurs.
 			peer.setText("after reconnect");
+			await waitFor(() => doc.content === "after reconnect", {
+				label: "update reached reconnected doc",
+				timeout: 60_000,
+			});
 			await waitFor(() => vault.files.get("note.md") === "after reconnect", {
 				label: "sync resumed",
+				timeout: 60_000,
 			});
 		} finally {
 			doc.destroy();
