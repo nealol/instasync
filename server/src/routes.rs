@@ -616,28 +616,10 @@ pub async fn upsert_file(
 ) -> AppResult<Json<Value>> {
     require_member(&state, &user.id, &vault_id).await?;
 
-    let existing = vault_files::Entity::find()
-        .filter(vault_files::Column::VaultId.eq(&vault_id))
-        .filter(vault_files::Column::Guid.eq(&body.guid))
-        .one(&state.db)
-        .await?;
-
-    if let Some(model) = existing {
-        let mut active: vault_files::ActiveModel = model.into();
-        active.path = Set(body.path.clone());
-        active.updated_at = Set(now_millis());
-        active.update(&state.db).await?;
-    } else {
-        vault_files::ActiveModel {
-            id: Set(uuid::Uuid::new_v4().to_string()),
-            vault_id: Set(vault_id.clone()),
-            guid: Set(body.guid.clone()),
-            path: Set(body.path.clone()),
-            updated_at: Set(now_millis()),
-        }
-        .insert(&state.db)
-        .await?;
-    }
+    // Atomic upsert: the client fires registry updates fire-and-forget on every
+    // file event, so the same guid can arrive concurrently (delete/restore/move)
+    // and a find-then-insert would collide on the unique (vault_id, guid) index.
+    crate::ydoc::upsert_vault_file(&state, &vault_id, &body.path, &body.guid).await?;
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }

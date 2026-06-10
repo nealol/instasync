@@ -59,9 +59,9 @@ console.log(`Set version to ${version} (minAppVersion ${manifest.minAppVersion})
 
 // 3. Build
 console.log("Building…");
-// `npm` is a .cmd shim on Windows and must be launched through a shell. Its
-// args are fixed (no spaces/metacharacters), so shell quoting is not a concern.
-run("npm", ["run", "build"], { shell: process.platform === "win32" });
+// `bun` is launched directly; its args are fixed (no spaces/metacharacters),
+// so shell quoting is not a concern.
+run("bun", ["run", "build"], { shell: process.platform === "win32" });
 
 if (!existsSync("main.js")) {
   console.error("Build did not produce main.js — aborting.");

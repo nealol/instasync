@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::sea_query::OnConflict;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -668,28 +669,25 @@ pub(crate) async fn upsert_vault_file(
     path: &str,
     guid: &str,
 ) -> AppResult<()> {
-    let existing = vault_files::Entity::find()
-        .filter(vault_files::Column::VaultId.eq(vault_id))
-        .filter(vault_files::Column::Guid.eq(guid))
-        .one(&state.db)
-        .await?;
-
-    if let Some(model) = existing {
-        let mut active: vault_files::ActiveModel = model.into();
-        active.path = Set(path.to_string());
-        active.updated_at = Set(now_millis());
-        active.update(&state.db).await?;
-    } else {
-        vault_files::ActiveModel {
-            id: Set(uuid::Uuid::new_v4().to_string()),
-            vault_id: Set(vault_id.to_string()),
-            guid: Set(guid.to_string()),
-            path: Set(path.to_string()),
-            updated_at: Set(now_millis()),
-        }
-        .insert(&state.db)
-        .await?;
-    }
+    // Atomic upsert keyed on the unique (vault_id, guid) index. A find-then-
+    // insert here races: rapid file events for the same guid (e.g. delete →
+    // restore → restore-to-new-path) fire concurrent calls that all see "no
+    // row" and then collide on INSERT with
+    // `UNIQUE constraint failed: vault_files.vault_id, vault_files.guid`.
+    vault_files::Entity::insert(vault_files::ActiveModel {
+        id: Set(uuid::Uuid::new_v4().to_string()),
+        vault_id: Set(vault_id.to_string()),
+        guid: Set(guid.to_string()),
+        path: Set(path.to_string()),
+        updated_at: Set(now_millis()),
+    })
+    .on_conflict(
+        OnConflict::columns([vault_files::Column::VaultId, vault_files::Column::Guid])
+            .update_columns([vault_files::Column::Path, vault_files::Column::UpdatedAt])
+            .to_owned(),
+    )
+    .exec(&state.db)
+    .await?;
     Ok(())
 }
 

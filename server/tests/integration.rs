@@ -2863,3 +2863,66 @@ async fn plugin_db_decodes_and_replicates_a_real_client_published_doc() {
     assert_eq!(dumps.len(), 1, "dump must exist for the replicated client db");
     assert!(dumps[0].1.contains("from-A") && dumps[0].1.contains("from-B"));
 }
+
+/// The client fires `POST /api/vaults/{id}/files` fire-and-forget on every file
+/// event, so a single guid (e.g. an attachment being deleted, restored from
+/// trash, then restored to a new path) produces a burst of concurrent registry
+/// updates. A find-then-insert raced and surfaced as
+/// `UNIQUE constraint failed: vault_files.vault_id, vault_files.guid` (HTTP 500).
+/// The handler now does an atomic upsert, so every concurrent request succeeds.
+#[tokio::test]
+async fn concurrent_file_registry_upserts_for_same_guid_do_not_collide() {
+    let ys = fake_ysweet().await;
+    let app = test_app(&ys, &ys).await;
+    let token = login(&app, "alice").await;
+
+    let (status, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&token),
+        Some(json!({ "name": "Files" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+
+    let guid = "shared-guid";
+    let mut handles = Vec::new();
+    for i in 0..16 {
+        let app = app.clone();
+        let token = token.clone();
+        let vault_id = vault_id.clone();
+        handles.push(tokio::spawn(async move {
+            send(
+                &app,
+                "POST",
+                &format!("/api/vaults/{vault_id}/files"),
+                Some(&token),
+                Some(json!({ "guid": guid, "path": format!("attachments/img-{i}.png") })),
+            )
+            .await
+            .0
+        }));
+    }
+
+    for h in handles {
+        assert_eq!(
+            h.await.unwrap(),
+            StatusCode::OK,
+            "concurrent registry upsert for the same guid must not 500 on a unique-index collision"
+        );
+    }
+
+    // A subsequent update for the same guid still succeeds (the row is updated,
+    // not duplicated or rejected).
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/files"),
+        Some(&token),
+        Some(json!({ "guid": guid, "path": "attachments/final.png" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
