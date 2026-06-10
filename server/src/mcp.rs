@@ -390,7 +390,14 @@ fn base_view_fields(
 
 #[tool_router]
 impl InstaMcp {
-    #[tool(description = "List Obsidian Canvas files in the cursor vault")]
+    #[tool(
+        description = "List Obsidian Canvas files in the cursor vault",
+        annotations(
+            title = "Canvas: List canvases",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn list_canvases(
         &self,
         context: RequestContext<RoleServer>,
@@ -402,7 +409,14 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "Read an Obsidian Canvas as file-form arrays")]
+    #[tool(
+        description = "Read an Obsidian Canvas as file-form arrays",
+        annotations(
+            title = "Canvas: Read canvas",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn read_canvas(
         &self,
         context: RequestContext<RoleServer>,
@@ -415,7 +429,13 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Create an Obsidian Canvas; writes are CRDT-merged and appear live in open Canvas views"
+        description = "Create an Obsidian Canvas; writes are CRDT-merged and appear live in open Canvas views",
+        annotations(
+            title = "Canvas: Create canvas",
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn create_canvas(
         &self,
@@ -438,7 +458,13 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Add a Canvas node; writes are CRDT-merged and appear live in open Canvas views"
+        description = "Add a Canvas node; writes are CRDT-merged and appear live in open Canvas views",
+        annotations(
+            title = "Canvas: Add node",
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn add_canvas_node(
         &self,
@@ -462,7 +488,14 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Update a Canvas node; writes are CRDT-merged and appear live in open Canvas views"
+        description = "Update a Canvas node; writes are CRDT-merged and appear live in open Canvas views",
+        annotations(
+            title = "Canvas: Update node",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn update_canvas_node(
         &self,
@@ -486,7 +519,14 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Delete a Canvas node and connected edges; writes are CRDT-merged and appear live in open Canvas views"
+        description = "Delete a Canvas node and connected edges; writes are CRDT-merged and appear live in open Canvas views",
+        annotations(
+            title = "Canvas: Delete node",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn delete_canvas_node(
         &self,
@@ -507,7 +547,13 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Add a Canvas edge; writes are CRDT-merged and appear live in open Canvas views"
+        description = "Add a Canvas edge; writes are CRDT-merged and appear live in open Canvas views",
+        annotations(
+            title = "Canvas: Add edge",
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn add_canvas_edge(
         &self,
@@ -533,7 +579,14 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Update a Canvas edge; writes are CRDT-merged and appear live in open Canvas views"
+        description = "Update a Canvas edge; writes are CRDT-merged and appear live in open Canvas views",
+        annotations(
+            title = "Canvas: Update edge",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn update_canvas_edge(
         &self,
@@ -557,7 +610,14 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Delete a Canvas edge; writes are CRDT-merged and appear live in open Canvas views"
+        description = "Delete a Canvas edge; writes are CRDT-merged and appear live in open Canvas views",
+        annotations(
+            title = "Canvas: Delete edge",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn delete_canvas_edge(
         &self,
@@ -578,7 +638,13 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Move or rename a Canvas; writes are CRDT-merged and appear live in open Canvas views"
+        description = "Move or rename a Canvas; writes are CRDT-merged and appear live in open Canvas views",
+        annotations(
+            title = "Canvas: Move canvas",
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn move_canvas(
         &self,
@@ -601,7 +667,16 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "Delete a Canvas")]
+    #[tool(
+        description = "Delete a Canvas",
+        annotations(
+            title = "Canvas: Delete canvas",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn delete_canvas(
         &self,
         context: RequestContext<RoleServer>,
@@ -613,7 +688,14 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "List Obsidian Bases in the cursor vault")]
+    #[tool(
+        description = "List Obsidian Bases in the cursor vault",
+        annotations(
+            title = "Base: List bases",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn list_bases(
         &self,
         context: RequestContext<RoleServer>,
@@ -625,7 +707,14 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "Read an Obsidian Base")]
+    #[tool(
+        description = "Read an Obsidian Base",
+        annotations(
+            title = "Base: Read base",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn read_base(
         &self,
         context: RequestContext<RoleServer>,
@@ -638,7 +727,13 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Create an Obsidian Base; writes are CRDT-merged and appear live in open Base views"
+        description = "Create an Obsidian Base; writes are CRDT-merged and appear live in open Base views",
+        annotations(
+            title = "Base: Create base",
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn create_base(
         &self,
@@ -661,7 +756,14 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Add or replace a Base view by name; writes are CRDT-merged and appear live in open Base views"
+        description = "Add or replace a Base view by name; writes are CRDT-merged and appear live in open Base views",
+        annotations(
+            title = "Base: Add view",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn add_base_view(
         &self,
@@ -691,7 +793,14 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "List views in an Obsidian Base")]
+    #[tool(
+        description = "List views in an Obsidian Base",
+        annotations(
+            title = "Base: List views",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn list_base_views(
         &self,
         context: RequestContext<RoleServer>,
@@ -705,7 +814,14 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Update a Base view by name; writes are CRDT-merged and appear live in open Base views"
+        description = "Update a Base view by name; writes are CRDT-merged and appear live in open Base views",
+        annotations(
+            title = "Base: Update view",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn update_base_view(
         &self,
@@ -735,7 +851,14 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Delete a Base view by name; writes are CRDT-merged and appear live in open Base views"
+        description = "Delete a Base view by name; writes are CRDT-merged and appear live in open Base views",
+        annotations(
+            title = "Base: Delete view",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn delete_base_view(
         &self,
@@ -756,7 +879,14 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Set global Base filters; writes are CRDT-merged and appear live in open Base views"
+        description = "Set global Base filters; writes are CRDT-merged and appear live in open Base views",
+        annotations(
+            title = "Base: Set filters",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn set_base_filters(
         &self,
@@ -777,7 +907,14 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Set Base view filters by view name; writes are CRDT-merged and appear live in open Base views"
+        description = "Set Base view filters by view name; writes are CRDT-merged and appear live in open Base views",
+        annotations(
+            title = "Base: Set view filters",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn set_base_view_filters(
         &self,
@@ -804,7 +941,14 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Set a Base formula by name; writes are CRDT-merged and appear live in open Base views"
+        description = "Set a Base formula by name; writes are CRDT-merged and appear live in open Base views",
+        annotations(
+            title = "Base: Set formula",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn set_base_formula(
         &self,
@@ -831,7 +975,14 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Delete a Base formula by name; writes are CRDT-merged and appear live in open Base views"
+        description = "Delete a Base formula by name; writes are CRDT-merged and appear live in open Base views",
+        annotations(
+            title = "Base: Delete formula",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn delete_base_formula(
         &self,
@@ -852,7 +1003,14 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Set a Base property by name; writes are CRDT-merged and appear live in open Base views"
+        description = "Set a Base property by name; writes are CRDT-merged and appear live in open Base views",
+        annotations(
+            title = "Base: Set property",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn set_base_property(
         &self,
@@ -879,7 +1037,14 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Delete a Base property by name; writes are CRDT-merged and appear live in open Base views"
+        description = "Delete a Base property by name; writes are CRDT-merged and appear live in open Base views",
+        annotations(
+            title = "Base: Delete property",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn delete_base_property(
         &self,
@@ -900,7 +1065,13 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Move or rename a Base; writes are CRDT-merged and appear live in open Base views"
+        description = "Move or rename a Base; writes are CRDT-merged and appear live in open Base views",
+        annotations(
+            title = "Base: Move base",
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn move_base(
         &self,
@@ -923,7 +1094,16 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "Delete a Base")]
+    #[tool(
+        description = "Delete a Base",
+        annotations(
+            title = "Base: Delete base",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn delete_base(
         &self,
         context: RequestContext<RoleServer>,
@@ -935,7 +1115,14 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "List notes in the cursor vault")]
+    #[tool(
+        description = "List notes in the cursor vault",
+        annotations(
+            title = "Note: List notes",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn list_notes(
         &self,
         context: RequestContext<RoleServer>,
@@ -944,7 +1131,14 @@ impl InstaMcp {
         tool_result(notes::list_notes_inner(&c.state, &c.principal, &c.vault_id).await)
     }
 
-    #[tool(description = "Read a note by path")]
+    #[tool(
+        description = "Read a note by path",
+        annotations(
+            title = "Note: Read note",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn read_note(
         &self,
         context: RequestContext<RoleServer>,
@@ -954,7 +1148,15 @@ impl InstaMcp {
         tool_result(notes::read_note_inner(&c.state, &c.principal, &c.vault_id, &args.path).await)
     }
 
-    #[tool(description = "Create a note")]
+    #[tool(
+        description = "Create a note",
+        annotations(
+            title = "Note: Create note",
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
     async fn create_note(
         &self,
         context: RequestContext<RoleServer>,
@@ -975,7 +1177,16 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "Replace a full note including frontmatter")]
+    #[tool(
+        description = "Replace a full note including frontmatter",
+        annotations(
+            title = "Note: Replace note",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn replace_note(
         &self,
         context: RequestContext<RoleServer>,
@@ -996,7 +1207,16 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "Replace only the body of a note, preserving existing frontmatter")]
+    #[tool(
+        description = "Replace only the body of a note, preserving existing frontmatter",
+        annotations(
+            title = "Note: Replace body",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn replace_body(
         &self,
         context: RequestContext<RoleServer>,
@@ -1009,7 +1229,15 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "Patch note text")]
+    #[tool(
+        description = "Patch note text",
+        annotations(
+            title = "Note: Patch note",
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn patch_note(
         &self,
         context: RequestContext<RoleServer>,
@@ -1032,7 +1260,15 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "Move or rename a note")]
+    #[tool(
+        description = "Move or rename a note",
+        annotations(
+            title = "Note: Move note",
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
     async fn move_note(
         &self,
         context: RequestContext<RoleServer>,
@@ -1053,7 +1289,16 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "Delete a note")]
+    #[tool(
+        description = "Delete a note",
+        annotations(
+            title = "Note: Delete note",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn delete_note(
         &self,
         context: RequestContext<RoleServer>,
@@ -1063,7 +1308,14 @@ impl InstaMcp {
         tool_unit(notes::delete_note_inner(&c.state, &c.principal, &c.vault_id, &args.path).await)
     }
 
-    #[tool(description = "Parse note frontmatter")]
+    #[tool(
+        description = "Parse note frontmatter",
+        annotations(
+            title = "Note: Parse frontmatter",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn parse_frontmatter(
         &self,
         context: RequestContext<RoleServer>,
@@ -1075,7 +1327,16 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "Patch note frontmatter keys")]
+    #[tool(
+        description = "Patch note frontmatter keys",
+        annotations(
+            title = "Note: Patch frontmatter",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn patch_frontmatter(
         &self,
         context: RequestContext<RoleServer>,
@@ -1098,7 +1359,12 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Generate a stable permalink for a note. Returns a URL of the form <public-base>/n/<guid>. Opening it in a browser issues an HTTP redirect to an obsidian://realtime-open deeplink, which opens the note in the user's Obsidian vault via the Realtime plugin. The permalink tracks the note by stable guid, so it keeps working after the note is renamed or moved. Share this URL as-is; do not rewrite it into an obsidian:// link yourself."
+        description = "Generate a stable permalink for a note. Returns a URL of the form <public-base>/n/<guid>. Opening it in a browser issues an HTTP redirect to an obsidian://realtime-open deeplink, which opens the note in the user's Obsidian vault via the Realtime plugin. The permalink tracks the note by stable guid, so it keeps working after the note is renamed or moved. Share this URL as-is; do not rewrite it into an obsidian:// link yourself.",
+        annotations(
+            title = "Note: Generate permalink",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn generate_permalink(
         &self,
@@ -1111,7 +1377,16 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "Get or create a periodic note")]
+    #[tool(
+        description = "Get or create a periodic note",
+        annotations(
+            title = "Note: Get or create periodic note",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn periodic_note_get_or_create(
         &self,
         context: RequestContext<RoleServer>,
@@ -1133,7 +1408,15 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "Append text to a periodic note")]
+    #[tool(
+        description = "Append text to a periodic note",
+        annotations(
+            title = "Note: Append to periodic note",
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
     async fn periodic_note_append(
         &self,
         context: RequestContext<RoleServer>,
@@ -1155,7 +1438,14 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "List attachments in the cursor vault")]
+    #[tool(
+        description = "List attachments in the cursor vault",
+        annotations(
+            title = "Attachment: List attachments",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn list_attachments(
         &self,
         context: RequestContext<RoleServer>,
@@ -1164,7 +1454,14 @@ impl InstaMcp {
         tool_result(attachments::list_attachments_inner(&c.state, &c.principal, &c.vault_id).await)
     }
 
-    #[tool(description = "Check whether an attachment exists")]
+    #[tool(
+        description = "Check whether an attachment exists",
+        annotations(
+            title = "Attachment: Check attachment",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn head_attachment(
         &self,
         context: RequestContext<RoleServer>,
@@ -1178,7 +1475,12 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Read an attachment; images are returned as image content, other files as base64"
+        description = "Read an attachment; images are returned as image content, other files as base64",
+        annotations(
+            title = "Attachment: Read attachment",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn read_attachment(
         &self,
@@ -1208,7 +1510,16 @@ impl InstaMcp {
         }
     }
 
-    #[tool(description = "Upload an attachment from base64 content")]
+    #[tool(
+        description = "Upload an attachment from base64 content",
+        annotations(
+            title = "Attachment: Upload attachment",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn upload_attachment(
         &self,
         context: RequestContext<RoleServer>,
@@ -1220,7 +1531,7 @@ impl InstaMcp {
             Err(_) => {
                 return Ok(CallToolResult::structured_error(
                     json!({ "ok": false, "reason": "invalid_base64" }),
-                ))
+                ));
             }
         };
         tool_result(
@@ -1235,7 +1546,16 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "Delete an attachment")]
+    #[tool(
+        description = "Delete an attachment",
+        annotations(
+            title = "Attachment: Delete attachment",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn delete_attachment(
         &self,
         context: RequestContext<RoleServer>,
@@ -1248,7 +1568,15 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "Move or rename an attachment")]
+    #[tool(
+        description = "Move or rename an attachment",
+        annotations(
+            title = "Attachment: Move attachment",
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
     async fn move_attachment(
         &self,
         context: RequestContext<RoleServer>,
@@ -1270,7 +1598,15 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "Fetch an attachment from an allowlisted URL")]
+    #[tool(
+        description = "Fetch an attachment from an allowlisted URL",
+        annotations(
+            title = "Attachment: Upload from URL",
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
+    )]
     async fn upload_attachment_url(
         &self,
         context: RequestContext<RoleServer>,
@@ -1291,7 +1627,15 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "Create a signed single-use browser upload link")]
+    #[tool(
+        description = "Create a signed single-use browser upload link",
+        annotations(
+            title = "Attachment: Create upload link",
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
     async fn create_upload_link(
         &self,
         context: RequestContext<RoleServer>,
@@ -1312,7 +1656,14 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "Search notes")]
+    #[tool(
+        description = "Search notes",
+        annotations(
+            title = "Search: Search notes",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn search_notes(
         &self,
         context: RequestContext<RoleServer>,
@@ -1331,7 +1682,14 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "List tags")]
+    #[tool(
+        description = "List tags",
+        annotations(
+            title = "Search: List tags",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn list_tags(
         &self,
         context: RequestContext<RoleServer>,
@@ -1340,7 +1698,14 @@ impl InstaMcp {
         tool_result(search::list_tags_inner(&c.state, &c.principal, &c.vault_id).await)
     }
 
-    #[tool(description = "List backlinks")]
+    #[tool(
+        description = "List backlinks",
+        annotations(
+            title = "Search: List backlinks",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn list_backlinks(
         &self,
         context: RequestContext<RoleServer>,
@@ -1352,7 +1717,16 @@ impl InstaMcp {
         )
     }
 
-    #[tool(description = "Backfill note ids")]
+    #[tool(
+        description = "Backfill note ids",
+        annotations(
+            title = "Search: Backfill note ids",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn backfill_ids(
         &self,
         context: RequestContext<RoleServer>,

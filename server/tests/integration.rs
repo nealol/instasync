@@ -1401,6 +1401,29 @@ async fn mcp_lists_tools_and_round_trips_note_edits() {
     let tools = list["result"]["tools"].as_array().unwrap();
     assert!(tools.iter().any(|tool| tool["name"] == "create_note"));
     assert!(tools.iter().any(|tool| tool["name"] == "read_attachment"));
+    // Every tool advertises annotations so clients can auto-allow read-only
+    // tools; titles carry the category prefix (Canvas/Base/Note/Attachment/Search).
+    for tool in tools {
+        let annotations = &tool["annotations"];
+        assert!(
+            annotations["readOnlyHint"].is_boolean(),
+            "missing readOnlyHint on {}",
+            tool["name"]
+        );
+        let title = annotations["title"].as_str().unwrap();
+        assert!(
+            ["Canvas: ", "Base: ", "Note: ", "Attachment: ", "Search: "]
+                .iter()
+                .any(|prefix| title.starts_with(prefix)),
+            "uncategorized title {title:?} on {}",
+            tool["name"]
+        );
+    }
+    let read_note = tools.iter().find(|t| t["name"] == "read_note").unwrap();
+    assert_eq!(read_note["annotations"]["readOnlyHint"], json!(true));
+    let delete_note = tools.iter().find(|t| t["name"] == "delete_note").unwrap();
+    assert_eq!(delete_note["annotations"]["readOnlyHint"], json!(false));
+    assert_eq!(delete_note["annotations"]["destructiveHint"], json!(true));
 
     let (status, created) = mcp_call(
         &app,
