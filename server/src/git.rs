@@ -236,7 +236,7 @@ impl GitService {
         .context("materialize task panicked")??;
 
         // 4. Commit the diff, if any.
-        self.commit(&repo, vault_id, tree.len(), contributors).await
+        self.commit(&repo, vault_id, contributors).await
     }
 
     /// Lazily create the vault's repo with a bot identity. Idempotent.
@@ -282,23 +282,29 @@ impl GitService {
     }
 
     /// Stage everything and commit if the working tree actually changed.
-    async fn commit(
-        &self,
-        repo: &Path,
-        vault_id: &str,
-        file_count: usize,
-        contributors: &[Contributor],
-    ) -> Result<()> {
+    async fn commit(&self, repo: &Path, vault_id: &str, contributors: &[Contributor]) -> Result<()> {
         self.git(repo, &["add", "-A"]).await?;
 
-        // `diff --cached --quiet` exits non-zero iff there are staged changes.
-        let diff = self.git_raw(repo, &["diff", "--cached", "--quiet"]).await?;
-        if diff.status.success() {
+        // The staged diff drives both the no-op check and the commit subject.
+        // `--no-renames` keeps statuses to A/M/D so a rename reads as its two
+        // visible effects rather than needing a third phrasing.
+        let diff = self
+            .git_raw(repo, &["diff", "--cached", "--name-status", "--no-renames"])
+            .await?;
+        if !diff.status.success() {
+            bail!(
+                "git diff --cached failed ({}): {}",
+                diff.status,
+                String::from_utf8_lossy(&diff.stderr).trim()
+            );
+        }
+        let changes = parse_name_status(&String::from_utf8_lossy(&diff.stdout));
+        if changes.is_empty() {
             return Ok(()); // nothing changed — idempotent no-op
         }
 
         let (author, message) =
-            build_commit_meta(vault_id, file_count, contributors, &self.0.config);
+            build_commit_meta(vault_id, &changes, contributors, &self.0.config);
         // Pin the committer to the Realtime bot via command-scoped (`-c`) config so
         // it never falls back to the server's *global* git identity — regardless of
         // what (if anything) is in global config or whether ensure_repo's local
@@ -500,10 +506,54 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// One staged change: git name-status letter (A/M/D) plus the path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StagedChange {
+    status: char,
+    path: String,
+}
+
+/// Parse `git diff --cached --name-status --no-renames` output (`X\tpath` lines).
+fn parse_name_status(output: &str) -> Vec<StagedChange> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (status, path) = line.split_once('\t')?;
+            Some(StagedChange {
+                status: status.chars().next()?,
+                path: path.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Most files listed in a commit subject before falling back to a count.
+const SUBJECT_MAX_FILES: usize = 3;
+
+/// Summarize staged changes as a commit subject: a verb matching the change
+/// kinds (Add/Update/Delete, "Update" when mixed) plus the paths themselves,
+/// or just a count when more than [`SUBJECT_MAX_FILES`] files changed.
+fn commit_subject(changes: &[StagedChange]) -> String {
+    let verb = match changes.iter().map(|c| c.status).collect::<HashSet<_>>() {
+        s if s.len() == 1 => match changes[0].status {
+            'A' => "Add",
+            'D' => "Delete",
+            _ => "Update",
+        },
+        _ => "Update",
+    };
+    if changes.len() <= SUBJECT_MAX_FILES {
+        let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
+        format!("{verb} {}", paths.join(", "))
+    } else {
+        format!("{verb} {} files", changes.len())
+    }
+}
+
 /// Build the `--author` value and the commit message (with structured trailers).
 fn build_commit_meta(
     vault_id: &str,
-    file_count: usize,
+    changes: &[StagedChange],
     contributors: &[Contributor],
     config: &Config,
 ) -> (String, String) {
@@ -513,7 +563,7 @@ fn build_commit_meta(
     };
     let author = format!("{author_name} <{author_email}>");
 
-    let mut message = format!("Sync {file_count} file(s)\n\n");
+    let mut message = format!("{}\n\n", commit_subject(changes));
     message.push_str(&format!("Vault-Id: {vault_id}\n"));
     if let Some(p) = contributors.first() {
         append_principal_trailers(&mut message, p);
@@ -685,6 +735,63 @@ mod tests {
         );
     }
 
+    fn changes(entries: &[(char, &str)]) -> Vec<StagedChange> {
+        entries
+            .iter()
+            .map(|(status, path)| StagedChange {
+                status: *status,
+                path: path.to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parses_name_status_output() {
+        let parsed = parse_name_status("M\tnote.md\nA\tdir/new.md\nD\told.md\n");
+        assert_eq!(
+            parsed,
+            changes(&[('M', "note.md"), ('A', "dir/new.md"), ('D', "old.md")])
+        );
+        assert!(parse_name_status("").is_empty());
+    }
+
+    #[test]
+    fn commit_subject_lists_few_files_with_matching_verb() {
+        assert_eq!(commit_subject(&changes(&[('A', "a.md")])), "Add a.md");
+        assert_eq!(commit_subject(&changes(&[('D', "a.md")])), "Delete a.md");
+        assert_eq!(
+            commit_subject(&changes(&[('M', "a.md"), ('M', "dir/b.md")])),
+            "Update a.md, dir/b.md"
+        );
+        // Mixed change kinds fall back to "Update".
+        assert_eq!(
+            commit_subject(&changes(&[('A', "a.md"), ('D', "b.md")])),
+            "Update a.md, b.md"
+        );
+    }
+
+    #[test]
+    fn commit_subject_counts_many_files() {
+        assert_eq!(
+            commit_subject(&changes(&[
+                ('M', "a.md"),
+                ('M', "b.md"),
+                ('A', "c.md"),
+                ('M', "d.md"),
+            ])),
+            "Update 4 files"
+        );
+        assert_eq!(
+            commit_subject(&changes(&[
+                ('A', "a.md"),
+                ('A', "b.md"),
+                ('A', "c.md"),
+                ('A', "d.md"),
+            ])),
+            "Add 4 files"
+        );
+    }
+
     #[test]
     fn generated_keypair_is_valid_openssh() {
         let (private, public) = generate_ssh_keypair().unwrap();
@@ -769,7 +876,7 @@ mod tests {
                 expires_at_ms: 0,
             },
         ];
-        let (author, message) = build_commit_meta("v1", 2, &contributors, &config);
+        let (author, message) = build_commit_meta("v1", &changes(&[('M', "a.md")]), &contributors, &config);
         assert_eq!(author, "Alice <a@x>");
         assert!(message.contains("Principal-Id: u1"));
         assert!(message.contains("Co-authored-by: Bob <b@x>"));
@@ -779,7 +886,7 @@ mod tests {
     #[test]
     fn commit_meta_falls_back_to_bot() {
         let config = test_config();
-        let (author, message) = build_commit_meta("v1", 0, &[], &config);
+        let (author, message) = build_commit_meta("v1", &changes(&[('M', "a.md")]), &[], &config);
         assert_eq!(author, "Realtime <realtime@localhost>");
         assert!(!message.contains("Principal-Id"));
     }
@@ -799,7 +906,8 @@ mod tests {
             expires_at_ms: 0,
         }];
 
-        let (author, message) = build_commit_meta("v1", 2, &contributors, &config);
+        let (author, message) =
+            build_commit_meta("v1", &changes(&[('M', "a.md")]), &contributors, &config);
         assert_eq!(author, "Claude <cursor+app123@localhost>");
         assert!(message.contains("Principal-Type: cursor"));
         assert!(message.contains("Cursor-Id: c1"));

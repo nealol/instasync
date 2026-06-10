@@ -2063,7 +2063,7 @@ async fn git_audit_commits_attributed_to_principal() {
 
     let log = wait_for_commit(&repo).await;
     assert_eq!(
-        log, "Alice|alice@example.com|Sync 1 file(s)",
+        log, "Alice|alice@example.com|Add note.md",
         "author/subject"
     );
 
@@ -2174,7 +2174,15 @@ async fn git_backup_pushes_to_remote_after_commit() {
     let (_, local) = git_out(&git_dir.join(&vault_id), &["rev-parse", "HEAD"]);
     assert_eq!(pushed, local, "remote main should match local HEAD");
 
-    let row = backup_row(&state.db, &vault_id).await;
+    // The status row is written just after the push lands on the remote.
+    let mut row = backup_row(&state.db, &vault_id).await;
+    for _ in 0..100 {
+        if row.last_push_at.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        row = backup_row(&state.db, &vault_id).await;
+    }
     assert!(row.last_push_at.is_some(), "last_push_at recorded");
     assert_eq!(row.last_push_error, None);
 }
