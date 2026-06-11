@@ -131,6 +131,16 @@ export interface PatchNoteBody {
 	replaceAll?: boolean;
 }
 
+/** A public read-only share link for a note (rendered at `/view/{id}`). */
+export interface PublicShare {
+	id: string;
+	/** Absolute URL of the public viewer page. */
+	url: string;
+	path: string;
+	guid: string;
+	createdAt: number;
+}
+
 /** Stable permalink for a note, returned by the note-permalinks endpoint. */
 export interface PermalinkResponse {
 	kind: string;

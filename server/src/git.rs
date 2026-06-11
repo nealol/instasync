@@ -1720,6 +1720,7 @@ diff --git a/ref.md b/ref.md
             attachments_subfolder: None,
             upload_token: "test-upload-token".into(),
             crsqlite_ext_path: None,
+            web_dist_path: "../packages/web/dist".into(),
         }
     }
 }

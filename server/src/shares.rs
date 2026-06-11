@@ -1,0 +1,500 @@
+//! Public read-only note sharing.
+//!
+//! A share row maps a nanoid to a `(vault_id, guid)` pair; the SPA served at
+//! `/view/{id}` fetches the note snapshot from `GET /api/view/{id}` and then
+//! listens on `GET /api/view/{id}/events` (SSE) for incremental Yjs updates,
+//! which it applies to a local `Y.Doc` and re-renders. Diffs are computed
+//! server-side by polling y-sweet's `as-update` and encoding the state since
+//! the previously observed state vector, so clients receive minimal
+//! CRDT-correct updates rather than text diffs.
+
+use std::convert::Infallible;
+use std::time::Duration;
+
+use axum::extract::{Path, Query, State};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::Response;
+use axum::Json;
+use base64::Engine;
+use futures_util::stream::Stream;
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use serde::{Deserialize, Serialize};
+use yrs::updates::decoder::Decode;
+use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
+
+use crate::attachments;
+use crate::entities::{public_shares, vault_files};
+use crate::error::{AppError, AppResult};
+use crate::routes::require_member;
+use crate::session::{now_millis, ApiPrincipal};
+use crate::state::AppState;
+use crate::ydoc;
+
+/// How often an SSE connection polls y-sweet for changes.
+const POLL_INTERVAL: Duration = Duration::from_millis(1500);
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareResponse {
+    pub id: String,
+    pub url: String,
+    pub path: String,
+    pub guid: String,
+    pub created_at: i64,
+}
+
+#[derive(Deserialize)]
+pub struct CreateShareBody {
+    pub path: String,
+}
+
+#[derive(Deserialize)]
+pub struct SharePathQuery {
+    pub path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewResponse {
+    pub title: String,
+    pub path: String,
+    /// Full Yjs document state (base64, v1 encoding); the note text lives in
+    /// the root `Y.Text("contents")`.
+    pub update_b64: String,
+    pub updated_at: i64,
+}
+
+#[derive(Deserialize)]
+pub struct ResolveQuery {
+    pub target: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveResponse {
+    pub share_id: String,
+    pub title: String,
+    pub path: String,
+}
+
+fn doc_id(vault_id: &str, guid: &str) -> String {
+    format!("{vault_id}__{guid}")
+}
+
+fn share_url(state: &AppState, id: &str) -> String {
+    format!(
+        "{}/view/{id}",
+        state.config.public_base_url.trim_end_matches('/')
+    )
+}
+
+fn title_for_path(path: &str) -> String {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.strip_suffix(".md").unwrap_or(name).to_string()
+}
+
+async fn file_by_path(
+    state: &AppState,
+    vault_id: &str,
+    path: &str,
+) -> AppResult<Option<vault_files::Model>> {
+    Ok(vault_files::Entity::find()
+        .filter(vault_files::Column::VaultId.eq(vault_id))
+        .filter(vault_files::Column::Path.eq(path))
+        .one(&state.db)
+        .await?)
+}
+
+async fn share_by_guid(
+    state: &AppState,
+    vault_id: &str,
+    guid: &str,
+) -> AppResult<Option<public_shares::Model>> {
+    Ok(public_shares::Entity::find()
+        .filter(public_shares::Column::VaultId.eq(vault_id))
+        .filter(public_shares::Column::Guid.eq(guid))
+        .one(&state.db)
+        .await?)
+}
+
+/// Look up a live share and the current path of the note it points at.
+/// Returns 404 if the share is gone or its note no longer exists.
+async fn resolve_share(
+    state: &AppState,
+    share_id: &str,
+) -> AppResult<(public_shares::Model, vault_files::Model)> {
+    let share = public_shares::Entity::find_by_id(share_id.to_string())
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let file = vault_files::Entity::find()
+        .filter(vault_files::Column::VaultId.eq(&share.vault_id))
+        .filter(vault_files::Column::Guid.eq(&share.guid))
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok((share, file))
+}
+
+// ---------------------------------------------------------------------------
+// Authenticated share management
+// ---------------------------------------------------------------------------
+
+pub async fn create_share(
+    State(state): State<AppState>,
+    principal: ApiPrincipal,
+    Path(vault_id): Path<String>,
+    Json(body): Json<CreateShareBody>,
+) -> AppResult<Json<ShareResponse>> {
+    principal.require_vault(&vault_id)?;
+    require_member(&state, &principal.user.id, &vault_id).await?;
+    let file = file_by_path(&state, &vault_id, &body.path)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    // Idempotent: re-sharing an already-shared note returns the existing link.
+    if let Some(existing) = share_by_guid(&state, &vault_id, &file.guid).await? {
+        return Ok(Json(ShareResponse {
+            url: share_url(&state, &existing.id),
+            id: existing.id,
+            path: file.path,
+            guid: file.guid,
+            created_at: existing.created_at,
+        }));
+    }
+
+    let id = nanoid::nanoid!(16, &nanoid::alphabet::SAFE);
+    let created_at = now_millis();
+    public_shares::ActiveModel {
+        id: Set(id.clone()),
+        vault_id: Set(vault_id.clone()),
+        guid: Set(file.guid.clone()),
+        created_by: Set(principal.user.id.clone()),
+        created_at: Set(created_at),
+    }
+    .insert(&state.db)
+    .await?;
+
+    Ok(Json(ShareResponse {
+        url: share_url(&state, &id),
+        id,
+        path: file.path,
+        guid: file.guid,
+        created_at,
+    }))
+}
+
+pub async fn get_share(
+    State(state): State<AppState>,
+    principal: ApiPrincipal,
+    Path(vault_id): Path<String>,
+    Query(query): Query<SharePathQuery>,
+) -> AppResult<Json<serde_json::Value>> {
+    principal.require_vault(&vault_id)?;
+    require_member(&state, &principal.user.id, &vault_id).await?;
+    let Some(file) = file_by_path(&state, &vault_id, &query.path).await? else {
+        return Ok(Json(serde_json::json!({ "share": null })));
+    };
+    let share = share_by_guid(&state, &vault_id, &file.guid).await?;
+    Ok(Json(match share {
+        Some(share) => serde_json::json!({
+            "share": ShareResponse {
+                url: share_url(&state, &share.id),
+                id: share.id,
+                path: file.path,
+                guid: file.guid,
+                created_at: share.created_at,
+            }
+        }),
+        None => serde_json::json!({ "share": null }),
+    }))
+}
+
+pub async fn delete_share(
+    State(state): State<AppState>,
+    principal: ApiPrincipal,
+    Path(vault_id): Path<String>,
+    Query(query): Query<SharePathQuery>,
+) -> AppResult<Json<serde_json::Value>> {
+    principal.require_vault(&vault_id)?;
+    require_member(&state, &principal.user.id, &vault_id).await?;
+    let file = file_by_path(&state, &vault_id, &query.path)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let share = share_by_guid(&state, &vault_id, &file.guid)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    public_shares::Entity::delete_by_id(share.id)
+        .exec(&state.db)
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// ---------------------------------------------------------------------------
+// Public view API (no auth)
+// ---------------------------------------------------------------------------
+
+pub async fn view_share(
+    State(state): State<AppState>,
+    Path(share_id): Path<String>,
+) -> AppResult<Json<ViewResponse>> {
+    let (share, file) = resolve_share(&state, &share_id).await?;
+    let update = ydoc::read_update(&state, &doc_id(&share.vault_id, &share.guid)).await?;
+    Ok(Json(ViewResponse {
+        title: title_for_path(&file.path),
+        update_b64: base64::engine::general_purpose::STANDARD.encode(&update),
+        path: file.path,
+        updated_at: file.updated_at,
+    }))
+}
+
+pub async fn view_events(
+    State(state): State<AppState>,
+    Path(share_id): Path<String>,
+) -> AppResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
+    let (share, _) = resolve_share(&state, &share_id).await?;
+    let note_doc_id = doc_id(&share.vault_id, &share.guid);
+
+    // Establish the baseline so the stream only carries changes made after the
+    // client's snapshot fetch. A change between the snapshot and this read is
+    // folded into the baseline; the client tolerates that because Yjs updates
+    // are idempotent and the next poll re-delivers anything newer.
+    let initial = ydoc::read_update(&state, &note_doc_id).await?;
+    let last_sv = state_vector_of(&initial)?;
+
+    struct Poller {
+        state: AppState,
+        share_id: String,
+        note_doc_id: String,
+        sv: StateVector,
+        done: bool,
+    }
+
+    let poller = Poller {
+        state,
+        share_id,
+        note_doc_id,
+        sv: last_sv,
+        done: false,
+    };
+
+    let stream = futures_util::stream::unfold(poller, |mut p| async move {
+        if p.done {
+            return None;
+        }
+        loop {
+            tokio::time::sleep(POLL_INTERVAL).await;
+
+            // Stop streaming as soon as the share is revoked.
+            match public_shares::Entity::find_by_id(p.share_id.clone())
+                .one(&p.state.db)
+                .await
+            {
+                Ok(Some(_)) => {}
+                _ => {
+                    p.done = true;
+                    return Some((Ok(Event::default().event("revoked").data("{}")), p));
+                }
+            }
+
+            // Transient y-sweet failures just skip a tick.
+            let Ok(update) = ydoc::read_update(&p.state, &p.note_doc_id).await else {
+                continue;
+            };
+            let Ok((delta, new_sv)) = delta_since(&update, &p.sv) else {
+                continue;
+            };
+            if new_sv == p.sv {
+                continue;
+            }
+            p.sv = new_sv;
+            let payload = serde_json::json!({
+                "update": base64::engine::general_purpose::STANDARD.encode(&delta),
+            });
+            return Some((
+                Ok(Event::default().event("update").data(payload.to_string())),
+                p,
+            ));
+        }
+    });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(25))))
+}
+
+/// Decode a full-state v1 update into its state vector.
+fn state_vector_of(update: &[u8]) -> AppResult<StateVector> {
+    let doc = Doc::new();
+    let decoded =
+        Update::decode_v1(update).map_err(|e| AppError::Internal(format!("decode update: {e:?}")))?;
+    {
+        let mut txn = doc.transact_mut();
+        txn.apply_update(decoded);
+    }
+    let sv = doc.transact().state_vector();
+    Ok(sv)
+}
+
+/// Compute the minimal Yjs update covering everything in `update` that is not
+/// yet covered by `since`, plus the new full state vector.
+fn delta_since(update: &[u8], since: &StateVector) -> AppResult<(Vec<u8>, StateVector)> {
+    let doc = Doc::new();
+    let decoded =
+        Update::decode_v1(update).map_err(|e| AppError::Internal(format!("decode update: {e:?}")))?;
+    {
+        let mut txn = doc.transact_mut();
+        txn.apply_update(decoded);
+    }
+    let txn = doc.transact();
+    Ok((txn.encode_state_as_update_v1(since), txn.state_vector()))
+}
+
+pub async fn view_attachment(
+    State(state): State<AppState>,
+    Path((share_id, path)): Path<(String, String)>,
+) -> AppResult<Response> {
+    let (share, _) = resolve_share(&state, &share_id).await?;
+    attachments::read_attachment_public(&state, &share.vault_id, &path).await
+}
+
+pub async fn view_resolve(
+    State(state): State<AppState>,
+    Path(share_id): Path<String>,
+    Query(query): Query<ResolveQuery>,
+) -> AppResult<Json<ResolveResponse>> {
+    let (share, _) = resolve_share(&state, &share_id).await?;
+    let target = query.target.trim().trim_matches('/');
+    if target.is_empty() {
+        return Err(AppError::BadRequest("missing target".into()));
+    }
+
+    let files = vault_files::Entity::find()
+        .filter(vault_files::Column::VaultId.eq(&share.vault_id))
+        .all(&state.db)
+        .await?;
+    let file = resolve_wikilink_target(&files, target).ok_or(AppError::NotFound)?;
+
+    // Only reveal notes that are themselves publicly shared.
+    let other = share_by_guid(&state, &share.vault_id, &file.guid)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(ResolveResponse {
+        share_id: other.id,
+        title: title_for_path(&file.path),
+        path: file.path.clone(),
+    }))
+}
+
+/// Resolve a wikilink target the way Obsidian does, approximately: exact path,
+/// path with `.md` appended, then unique basename match (case-insensitive).
+fn resolve_wikilink_target<'a>(
+    files: &'a [vault_files::Model],
+    target: &str,
+) -> Option<&'a vault_files::Model> {
+    let with_md = format!("{target}.md");
+    if let Some(file) = files.iter().find(|f| f.path == target || f.path == with_md) {
+        return Some(file);
+    }
+    let lower = target.to_lowercase();
+    files.iter().find(|f| {
+        let name = f.path.rsplit('/').next().unwrap_or(&f.path);
+        let stem = name.strip_suffix(".md").unwrap_or(name);
+        stem.to_lowercase() == lower
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yrs::{GetString, Text};
+
+    fn text_doc(value: &str) -> Doc {
+        let doc = Doc::new();
+        let text = doc.get_or_insert_text("contents");
+        {
+            let mut txn = doc.transact_mut();
+            text.insert(&mut txn, 0, value);
+        }
+        doc
+    }
+
+    fn full_update(doc: &Doc) -> Vec<u8> {
+        doc.transact()
+            .encode_state_as_update_v1(&StateVector::default())
+    }
+
+    #[test]
+    fn delta_since_carries_only_new_changes_and_applies_cleanly() {
+        let doc = text_doc("hello");
+        let base = full_update(&doc);
+        let base_sv = state_vector_of(&base).unwrap();
+
+        let text = doc.get_or_insert_text("contents");
+        {
+            let mut txn = doc.transact_mut();
+            text.insert(&mut txn, 5, " world");
+        }
+        let next = full_update(&doc);
+
+        let (delta, new_sv) = delta_since(&next, &base_sv).unwrap();
+        assert_ne!(new_sv, base_sv);
+        assert!(delta.len() < next.len());
+
+        // A client doc holding only the snapshot ends up with the new text.
+        let client = Doc::new();
+        {
+            let mut txn = client.transact_mut();
+            txn.apply_update(Update::decode_v1(&base).unwrap());
+            txn.apply_update(Update::decode_v1(&delta).unwrap());
+        }
+        let text = client.get_or_insert_text("contents");
+        assert_eq!(text.get_string(&client.transact()), "hello world");
+    }
+
+    #[test]
+    fn delta_since_reports_unchanged_state_vector_when_idle() {
+        let doc = text_doc("hello");
+        let base = full_update(&doc);
+        let sv = state_vector_of(&base).unwrap();
+        let (_, new_sv) = delta_since(&base, &sv).unwrap();
+        assert_eq!(new_sv, sv);
+    }
+
+    #[test]
+    fn title_strips_directories_and_extension() {
+        assert_eq!(title_for_path("Folder/Sub/My Note.md"), "My Note");
+        assert_eq!(title_for_path("Plain.md"), "Plain");
+        assert_eq!(title_for_path("noext"), "noext");
+    }
+
+    fn file(path: &str, guid: &str) -> vault_files::Model {
+        vault_files::Model {
+            id: guid.to_string(),
+            vault_id: "v".into(),
+            guid: guid.to_string(),
+            path: path.to_string(),
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn wikilink_resolution_prefers_exact_path_then_basename() {
+        let files = vec![
+            file("A/Note.md", "g1"),
+            file("B/Other.md", "g2"),
+            file("Exact.md", "g3"),
+        ];
+        assert_eq!(
+            resolve_wikilink_target(&files, "Exact").unwrap().guid,
+            "g3"
+        );
+        assert_eq!(
+            resolve_wikilink_target(&files, "A/Note").unwrap().guid,
+            "g1"
+        );
+        assert_eq!(
+            resolve_wikilink_target(&files, "other").unwrap().guid,
+            "g2"
+        );
+        assert!(resolve_wikilink_target(&files, "Missing").is_none());
+    }
+}

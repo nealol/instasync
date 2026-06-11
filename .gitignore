@@ -170,3 +170,5 @@
 /packages/sdk/node_modules/
 /packages/cli/dist/
 /packages/cli/node_modules/
+/packages/web/node_modules/
+/packages/web/dist/

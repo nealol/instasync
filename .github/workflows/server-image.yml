@@ -6,10 +6,16 @@ on:
     tags: ["*.*.*"]
     paths:
       - "server/**"
+      - "packages/web/**"
+      - "package.json"
+      - "bun.lock"
       - ".github/workflows/server-image.yml"
   pull_request:
     paths:
       - "server/**"
+      - "packages/web/**"
+      - "package.json"
+      - "bun.lock"
       - ".github/workflows/server-image.yml"
 
 env:
@@ -53,7 +59,9 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: ./server
+          # Repo-root context: the image also bundles the packages/web SPA.
+          context: .
+          file: ./server/Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

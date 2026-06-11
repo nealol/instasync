@@ -5,8 +5,8 @@ use sea_orm::{
 
 use crate::entities::{
     cursor_audit_log, git_backups, invites, memberships, note_search, oauth_clients, oauth_codes,
-    oauth_tokens, permissions, plugin_db_replicas, remote_cursor_tokens, remote_cursors,
-    server_meta, sessions, upload_jtis, users, vault_files, vaults,
+    oauth_tokens, permissions, plugin_db_replicas, public_shares, remote_cursor_tokens,
+    remote_cursors, server_meta, sessions, upload_jtis, users, vault_files, vaults,
 };
 
 /// Create all tables (and the composite-unique indexes) if they do not exist.
@@ -42,6 +42,7 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
     create!(upload_jtis::Entity);
     create!(plugin_db_replicas::Entity);
     create!(git_backups::Entity);
+    create!(public_shares::Entity);
 
     // Existing databases predate the `plugin_id` column on `remote_cursors`;
     // `if_not_exists` above skips the table, so add the column in place. SQLite
@@ -55,7 +56,15 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
         }
     }
 
-    let indexes: [IndexCreateStatement; 13] = [
+    let indexes: [IndexCreateStatement; 14] = [
+        Index::create()
+            .if_not_exists()
+            .name("idx_public_shares_vault_guid")
+            .table(public_shares::Entity)
+            .col(public_shares::Column::VaultId)
+            .col(public_shares::Column::Guid)
+            .unique()
+            .to_owned(),
         Index::create()
             .if_not_exists()
             .name("idx_users_issuer_subject")

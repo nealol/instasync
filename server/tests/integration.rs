@@ -584,6 +584,7 @@ async fn git_state_ext(
         attachments_subfolder: None,
         upload_token: "test-upload-token".into(),
         crsqlite_ext_path,
+        web_dist_path: "../packages/web/dist".into(),
     };
     let state = build_state(config).await.unwrap();
     let vault_id = uuid::Uuid::new_v4().to_string();
@@ -696,6 +697,7 @@ async fn test_app_with_attachment_max(
         attachments_subfolder: None,
         upload_token: "test-upload-token".into(),
         crsqlite_ext_path: None,
+        web_dist_path: "../packages/web/dist".into(),
     };
     let state = build_state(config).await.unwrap();
     app(state)
@@ -3941,6 +3943,7 @@ async fn history_test_app(ysweet_url: &str) -> (Router, std::path::PathBuf, std:
         attachments_subfolder: None,
         upload_token: "test-upload-token".into(),
         crsqlite_ext_path: None,
+        web_dist_path: "../packages/web/dist".into(),
     };
     let state = build_state(config).await.unwrap();
     (app(state), git_dir, blob_dir)
@@ -4343,4 +4346,140 @@ async fn rollback_restores_attachment_blob_from_git_after_gc() {
     let (status, body) = send_raw(&app, "GET", &att_url, Some(&alice), Vec::new()).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, payload);
+}
+
+#[tokio::test]
+async fn public_share_lifecycle_create_view_and_revoke() {
+    let ys = fake_ysweet_store().await;
+    let app = test_app(&ys, &ys).await;
+    let alice = login(&app, "alice").await;
+    let (status, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&alice),
+        Some(json!({"name":"v"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&alice),
+        Some(json!({"path": "Folder/Shared.md", "content": "# Hello\npublic"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Create a share; re-creating returns the same id (idempotent).
+    let (status, share) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/shares"),
+        Some(&alice),
+        Some(json!({"path": "Folder/Shared.md"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let share_id = share["id"].as_str().unwrap().to_string();
+    assert!(share["url"].as_str().unwrap().ends_with(&format!("/view/{share_id}")));
+    let (status, again) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/shares"),
+        Some(&alice),
+        Some(json!({"path": "Folder/Shared.md"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(again["id"], share["id"]);
+
+    // GET by path reports the share; sharing requires membership.
+    let (status, looked_up) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/shares?path=Folder%2FShared.md"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(looked_up["share"]["id"], share["id"]);
+    let mallory = login(&app, "mallory").await;
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/shares"),
+        Some(&mallory),
+        Some(json!({"path": "Folder/Shared.md"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // The public view endpoint needs no auth and carries the note as a Yjs update.
+    let (status, view) = send(&app, "GET", &format!("/api/view/{share_id}"), None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(view["title"], "Shared");
+    assert_eq!(view["path"], "Folder/Shared.md");
+    {
+        use base64::Engine;
+        use yrs::updates::decoder::Decode;
+        use yrs::{GetString, Transact};
+        let update = base64::engine::general_purpose::STANDARD
+            .decode(view["updateB64"].as_str().unwrap())
+            .unwrap();
+        let doc = yrs::Doc::new();
+        {
+            let mut txn = doc.transact_mut();
+            txn.apply_update(yrs::Update::decode_v1(&update).unwrap());
+        }
+        let text = doc.get_or_insert_text("contents");
+        assert_eq!(text.get_string(&doc.transact()), "# Hello\npublic");
+    }
+
+    // Unknown wikilink targets and unshared notes don't resolve.
+    let (status, _) = send(
+        &app,
+        "GET",
+        &format!("/api/view/{share_id}/resolve?target=Nope"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // A note that *is* shared resolves to its share id.
+    let (status, resolved) = send(
+        &app,
+        "GET",
+        &format!("/api/view/{share_id}/resolve?target=Shared"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resolved["shareId"], share["id"]);
+
+    // Revoke; the public endpoints stop working.
+    let (status, _) = send(
+        &app,
+        "DELETE",
+        &format!("/api/vaults/{vault_id}/shares?path=Folder%2FShared.md"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(&app, "GET", &format!("/api/view/{share_id}"), None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(
+        &app,
+        "DELETE",
+        &format!("/api/vaults/{vault_id}/shares?path=Folder%2FShared.md"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

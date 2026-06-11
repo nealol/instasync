@@ -59,6 +59,9 @@ pub struct Config {
     /// degrades gracefully: changes still flow client-to-client over the Y log,
     /// but the server keeps no replica and git skips the per-DB SQL dumps.
     pub crsqlite_ext_path: Option<String>,
+    /// Vite build output of the read-only web viewer (packages/web/dist),
+    /// served at /view/{share_id}.
+    pub web_dist_path: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,6 +158,8 @@ impl Config {
             upload_token: opt("UPLOAD_TOKEN")
                 .unwrap_or_else(|| "dev-upload-token-change-me".to_string()),
             crsqlite_ext_path: opt("CRSQLITE_EXT_PATH"),
+            web_dist_path: opt("WEB_DIST_PATH")
+                .unwrap_or_else(|| "../packages/web/dist".to_string()),
         }
     }
 
@@ -208,6 +213,7 @@ impl Config {
             attachments_subfolder: None,
             upload_token: "test-upload-token".into(),
             crsqlite_ext_path: None,
+            web_dist_path: "../packages/web/dist".into(),
         }
     }
 }

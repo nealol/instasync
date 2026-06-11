@@ -115,6 +115,15 @@ export interface PermalinkResponse {
 	url: string;
 }
 
+/** A public read-only share link for a note (rendered at `/view/{id}`). */
+export interface PublicShareResponse {
+	id: string;
+	url: string;
+	path: string;
+	guid: string;
+	createdAt: number;
+}
+
 /** Per-vault storage breakdown, from `GET /api/vaults/{id}/storage`. */
 export interface StorageUsage {
 	blobsCurrentBytes: number;
@@ -656,6 +665,23 @@ export class AuthClient {
 			`/api/vaults/${vaultId}/note-permalinks/${encoded}`,
 			{ method: "POST", body: {} },
 		);
+	}
+
+	/**
+	 * Create (or return the existing) public read-only share link for a note.
+	 * Idempotent server-side; the returned `url` points at `/view/{id}`.
+	 */
+	createPublicShare(vaultId: string, path: string): Promise<PublicShareResponse> {
+		return this.api<PublicShareResponse>(`/api/vaults/${vaultId}/shares`, {
+			method: "POST",
+			body: { path },
+		});
+	}
+
+	/** Stop publicly sharing a note. Rejects with a 404 error if not shared. */
+	async deletePublicShare(vaultId: string, path: string): Promise<void> {
+		const params = new URLSearchParams({ path });
+		await this.api(`/api/vaults/${vaultId}/shares?${params.toString()}`, { method: "DELETE" });
 	}
 
 	search(vaultId: string, q: string, limit?: number): Promise<SearchHit[]> {

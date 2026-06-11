@@ -1,5 +1,6 @@
 # Multi-stage build for the Realtime auth server.
-# Build context is the `server/` directory.
+# Build context is the REPO ROOT (the read-only web viewer SPA lives in
+# packages/web): `docker build -f server/Dockerfile .`
 #
 # The final image bundles a stock y-sweet binary and runs it internally; the auth
 # server reverse-proxies it under /d/*, so only one URL/port needs to be exposed
@@ -11,7 +12,7 @@ RUN cargo install cargo-chef --locked
 WORKDIR /app
 
 FROM chef AS planner
-COPY . .
+COPY server/ .
 RUN cargo chef prepare --recipe-path recipe.json
 
 # --- build -----------------------------------------------------------------
@@ -19,8 +20,25 @@ FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 # Compile dependencies first; this layer is cached unless Cargo.toml/lock change.
 RUN cargo chef cook --release --recipe-path recipe.json
-COPY . .
+COPY server/ .
 RUN cargo build --release --bin realtime-server
+
+# --- web viewer SPA ----------------------------------------------------------
+# Vite build of the read-only public-share viewer, served by the auth server at
+# /view/{share_id}. Only the workspace manifests are copied before `bun install`
+# so the dependency layer caches independently of source changes.
+FROM oven/bun:1 AS web
+WORKDIR /app
+COPY package.json bun.lock ./
+COPY packages/plugin-api-types/package.json packages/plugin-api-types/
+COPY packages/sdk/package.json packages/sdk/
+COPY packages/cli/package.json packages/cli/
+COPY packages/web/package.json packages/web/
+# --ignore-scripts: the root postinstall builds plugin-api-types, which isn't
+# needed for (and has no sources in) this image.
+RUN bun install --frozen-lockfile --ignore-scripts
+COPY packages/web/ packages/web/
+RUN bun run --cwd packages/web build
 
 # --- y-sweet binary --------------------------------------------------------
 # Download the prebuilt y-sweet release matching the `y-sweet` npm version used
@@ -91,7 +109,8 @@ COPY --from=builder /app/target/release/realtime-server /usr/local/bin/realtime-
 COPY --from=ysweet /usr/local/bin/y-sweet /usr/local/bin/y-sweet
 # Install the cr-sqlite extension if it was fetched (the dir always exists).
 COPY --from=crsqlite /opt/crsqlite/ /usr/local/lib/crsqlite/
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY --from=web /app/packages/web/dist /usr/local/share/realtime-web
+COPY server/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 # Persist the sqlite db and y-sweet store under /data (mount a volume here).
@@ -109,6 +128,7 @@ ENV BIND_ADDR=0.0.0.0:8081 \
     GIT_DATA_DIR=/data/git \
     DATABASE_URL=sqlite:///data/realtime.db?mode=rwc \
     CRSQLITE_EXT_PATH=/usr/local/lib/crsqlite/crsqlite.so \
+    WEB_DIST_PATH=/usr/local/share/realtime-web \
     RUST_LOG=realtime_server=info,warn
 
 EXPOSE 8081

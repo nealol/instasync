@@ -47,6 +47,14 @@ export default defineConfig({
 			},
 			{
 				test: {
+					name: "web-unit",
+					environment: "node",
+					include: ["packages/web/tests/unit/**/*.test.{ts,tsx}"],
+					testTimeout: 30_000,
+				},
+			},
+			{
+				test: {
 					name: "sdk-e2e",
 					environment: "node",
 					include: ["packages/sdk/tests/e2e/**/*.test.ts"],

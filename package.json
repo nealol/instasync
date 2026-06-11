@@ -1,6 +1,6 @@
 {
   "name": "realtime",
-  "version": "0.3.0-alpha.3",
+  "version": "0.3.0-alpha.4",
   "description": "Google-docs-like collaborative editing for Obsidian, powered by Yjs and y-sweet.",
   "main": "main.js",
   "private": true,
@@ -12,8 +12,9 @@
     "dev": "node esbuild.config.mjs watch",
     "build": "bun run typecheck && node esbuild.config.mjs production",
     "typecheck": "tsc -noEmit",
+    "build:web": "bun run --cwd packages/web build",
     "test": "vitest run --project plugin --project sdk-unit",
-    "test:unit": "vitest run --project plugin --project sdk-unit --project cli-unit",
+    "test:unit": "vitest run --project plugin --project sdk-unit --project cli-unit --project web-unit",
     "test:sdk": "vitest run --project sdk-unit",
     "test:sdk:e2e": "vitest run --project sdk-e2e",
     "test:server": "cargo test --manifest-path server/Cargo.toml",

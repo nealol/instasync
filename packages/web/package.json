@@ -1,0 +1,40 @@
+{
+	"name": "@realtime-md/web",
+	"version": "0.1.0",
+	"description": "Read-only web viewer for publicly shared Realtime.md notes, served by the Rust server at /view/{id}.",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "vite",
+		"build": "tsc -noEmit && vite build",
+		"preview": "vite preview"
+	},
+	"dependencies": {
+		"highlight.js": "^11.11.1",
+		"katex": "^0.16.21",
+		"mermaid": "^11.4.1",
+		"react": "^19.2.7",
+		"react-dom": "^19.2.7",
+		"react-markdown": "^10.1.0",
+		"rehype-highlight": "^7.0.2",
+		"rehype-katex": "^7.0.1",
+		"remark-frontmatter": "^5.0.0",
+		"remark-gfm": "^4.0.1",
+		"remark-math": "^6.0.0",
+		"unist-util-visit": "^5.0.0",
+		"yaml": "^2.8.2",
+		"yjs": "^13.6.0"
+	},
+	"devDependencies": {
+		"@types/mdast": "^4.0.4",
+		"rehype-stringify": "^10.0.1",
+		"remark-parse": "^11.0.0",
+		"remark-rehype": "^11.1.2",
+		"unified": "^11.0.5",
+		"@types/react": "^19.2.16",
+		"@types/react-dom": "^19.2.3",
+		"@vitejs/plugin-react": "^4.3.4",
+		"typescript": "^5.4.5",
+		"vite": "^6.3.6"
+	}
+}

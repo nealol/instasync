@@ -174,6 +174,33 @@ pub async fn read_attachment(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
 }
 
+/// Read an attachment without an authenticated principal. Used by the public
+/// share viewer (`/api/view/{id}/attachments/...`), which authorizes by share
+/// id before calling; this only validates the path and streams the blob.
+pub(crate) async fn read_attachment_public(
+    state: &AppState,
+    vault_id: &str,
+    path: &str,
+) -> AppResult<Response> {
+    validate_attachment_path(state, path)?;
+    let update = ydoc::read_update(state, vault_id).await?;
+    let meta = ydoc::decode_binaries_map(&update)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .into_iter()
+        .find_map(|(p, meta)| if p == path { binary_meta(meta) } else { None })
+        .ok_or(AppError::NotFound)?;
+    let (hash, size) = meta;
+    let file = tokio::fs::File::open(blob_path(state, vault_id, &hash)?)
+        .await
+        .map_err(|_| AppError::NotFound)?;
+    let body = Body::from_stream(ReaderStream::new(file));
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, content_type_for_path(path))
+        .header(header::CONTENT_LENGTH, size.to_string())
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
+}
+
 pub(crate) async fn read_attachment_inner(
     state: &AppState,
     principal: &ApiPrincipal,

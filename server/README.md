@@ -91,6 +91,16 @@ in the Obsidian plugin's **Auth server URL** and you're done.
    cargo run --release
    ```
 
+4. (Optional) Build the read-only web viewer for public share links
+   (`/view/{id}`), served from `WEB_DIST_PATH`:
+
+   ```sh
+   bun run build:web   # from the repo root; outputs packages/web/dist
+   ```
+
+   Without it the share API still works, but `/view/*` pages return an error.
+   The Docker image bundles a prebuilt copy.
+
 ## Configuration (environment)
 
 | Variable | Default | Meaning |
@@ -121,6 +131,7 @@ in the Obsidian plugin's **Auth server URL** and you're done.
 | `ATTACHMENTS_PATH_MODE` | `relative` | `relative` or `subfolder`; `subfolder` requires attachment paths under `ATTACHMENTS_SUBFOLDER` |
 | `ATTACHMENTS_SUBFOLDER` | — | Required for subfolder path mode and used as the default signed-upload landing directory |
 | `UPLOAD_TOKEN` | `dev-upload-token-change-me` | HMAC key for signed single-use browser upload links; set a long random secret in production |
+| `WEB_DIST_PATH` | `/usr/local/share/realtime-web` in Docker, else `../packages/web/dist` | Vite build output of the read-only web viewer (`packages/web`), served at `/view/{share_id}` for public note shares |
 | `CRSQLITE_EXT_PATH` | `/usr/local/lib/crsqlite/crsqlite.so` in Docker, else unset | Path to the cr-sqlite loadable extension that backs synced **plugin databases** (server-side replica + git dumps under `.sql/`). When unset/missing, plugin-database replication degrades gracefully: client-to-client sync over the Y log is unaffected, but the server keeps no replica and git skips the per-DB SQL dumps. Its major version must match the client WASM's sync-format major. |
 
 In the bundled Docker setup, `docker-entrypoint.sh` starts y-sweet on

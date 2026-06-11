@@ -19,6 +19,8 @@ pub mod rollback;
 pub mod routes;
 pub mod search;
 pub mod session;
+pub mod shares;
+pub mod web;
 pub mod state;
 pub mod storage;
 pub mod stream;
@@ -154,6 +156,23 @@ pub fn app(state: AppState) -> Router {
             post(attachments::public_upload)
                 .layer(DefaultBodyLimit::max(blobs::MAX_BLOB_BYTES as usize)),
         )
+        .route(
+            "/api/vaults/{id}/shares",
+            get(shares::get_share)
+                .post(shares::create_share)
+                .delete(shares::delete_share),
+        )
+        // Public (unauthenticated) read-only share viewer API.
+        .route("/api/view/{share_id}", get(shares::view_share))
+        .route("/api/view/{share_id}/events", get(shares::view_events))
+        .route("/api/view/{share_id}/resolve", get(shares::view_resolve))
+        .route(
+            "/api/view/{share_id}/attachments/{*path}",
+            get(shares::view_attachment),
+        )
+        // The read-only web viewer SPA (packages/web build output).
+        .route("/view/{share_id}", get(web::serve_index))
+        .route("/view/assets/{*path}", get(web::serve_asset))
         .route("/n/{guid}", get(permalink::note_by_guid))
         .route("/p", get(permalink::note_by_path))
         .route("/api/server-info", get(routes::server_info))

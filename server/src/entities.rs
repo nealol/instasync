@@ -146,6 +146,29 @@ pub mod vault_files {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+pub mod public_shares {
+    use sea_orm::entity::prelude::*;
+
+    /// Public read-only share links. The id is the nanoid in `/view/{id}`;
+    /// shares reference the stable note guid so they survive renames. Revoking
+    /// a share deletes the row.
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "public_shares")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub vault_id: String,
+        pub guid: String,
+        pub created_by: String,
+        pub created_at: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod note_search {
     use sea_orm::entity::prelude::*;
 

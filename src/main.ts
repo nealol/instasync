@@ -158,9 +158,29 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
 		// Add "as Realtime Permalink" under the file tree's native "Copy path >" submenu.
 		this.registerEvent(
 			this.app.workspace.on("file-menu", (menu, file) => {
-				if (file instanceof TFile) this.addPermalinkMenuItem(menu, file);
+				if (!(file instanceof TFile)) return;
+				this.addPermalinkMenuItem(menu, file);
+				if (file.extension === "md") this.addPublicShareMenuItems(menu, file);
 			}),
 		);
+		this.addCommand({
+			id: "realtime-share-publicly",
+			name: "Share current note publicly",
+			callback: () => {
+				const file = this.app.workspace.getActiveFile();
+				if (file) void this.sharePublicly(file);
+				else new Notice(`${PLUGIN_NAME}: no active note to share.`);
+			},
+		});
+		this.addCommand({
+			id: "realtime-stop-sharing-publicly",
+			name: "Stop publicly sharing current note",
+			callback: () => {
+				const file = this.app.workspace.getActiveFile();
+				if (file) void this.stopSharingPublicly(file);
+				else new Notice(`${PLUGIN_NAME}: no active note.`);
+			},
+		});
 
 		// Wait for the vault to finish loading before scanning files.
 		this.app.workspace.onLayoutReady(() => void this.maybeStartSync());
@@ -337,6 +357,76 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
 				`${PLUGIN_NAME}: failed to copy permalink: ${e instanceof Error ? e.message : String(e)}`,
 			);
 		}
+	}
+
+	/**
+	 * Public-share actions in the file context menu. Both items are always shown
+	 * (no async share lookup before the menu opens): "Share publicly" is
+	 * idempotent server-side and re-copies the existing link, and "Stop publicly
+	 * sharing" reports when the note was not shared.
+	 */
+	private addPublicShareMenuItems(menu: Menu, file: TFile): void {
+		menu.addItem((item) => {
+			item
+				.setTitle("Share publicly")
+				.setIcon("globe")
+				.onClick(() => void this.sharePublicly(file));
+		});
+		menu.addItem((item) => {
+			item
+				.setTitle("Stop publicly sharing")
+				.setIcon("globe")
+				.onClick(() => void this.stopSharingPublicly(file));
+		});
+	}
+
+	/** Create (or fetch) the public share link for a note and copy it. */
+	private async sharePublicly(file: TFile): Promise<void> {
+		const vaultId = this.requireShareContext("share a note");
+		if (!vaultId) return;
+		try {
+			const share = await this.auth.createPublicShare(vaultId, file.path);
+			await navigator.clipboard?.writeText(share.url);
+			new Notice(`${PLUGIN_NAME}: public link copied.`);
+		} catch (e) {
+			console.error(`[${PLUGIN_NAME}] failed to share publicly`, e);
+			new Notice(
+				`${PLUGIN_NAME}: failed to share: ${e instanceof Error ? e.message : String(e)}`,
+			);
+		}
+	}
+
+	/** Revoke the public share link for a note, if any. */
+	private async stopSharingPublicly(file: TFile): Promise<void> {
+		const vaultId = this.requireShareContext("stop sharing a note");
+		if (!vaultId) return;
+		try {
+			await this.auth.deletePublicShare(vaultId, file.path);
+			new Notice(`${PLUGIN_NAME}: note is no longer publicly shared.`);
+		} catch (e) {
+			if (e instanceof Error && e.message.includes("not found")) {
+				new Notice(`${PLUGIN_NAME}: note was not publicly shared.`);
+				return;
+			}
+			console.error(`[${PLUGIN_NAME}] failed to stop sharing`, e);
+			new Notice(
+				`${PLUGIN_NAME}: failed to stop sharing: ${e instanceof Error ? e.message : String(e)}`,
+			);
+		}
+	}
+
+	/** Common guard for share actions: needs an active vault and a session. */
+	private requireShareContext(action: string): string | null {
+		const vaultId = this.settings.activeVaultId;
+		if (!vaultId) {
+			new Notice(`${PLUGIN_NAME}: set up a vault before you ${action}.`);
+			return null;
+		}
+		if (!this.auth.isLoggedIn) {
+			new Notice(`${PLUGIN_NAME}: sign in to ${action}.`);
+			return null;
+		}
+		return vaultId;
 	}
 
 	/** Create a new server vault from the current local files and start syncing it. */
