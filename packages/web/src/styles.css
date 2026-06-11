@@ -1,23 +1,12 @@
 :root {
-	--bg: #ffffff;
-	--fg: #1f2328;
-	--muted: #6a737d;
-	--accent: #5b6ee8;
-	--border: #e2e4e8;
-	--code-bg: #f5f6f8;
-	--mark-bg: #fff1a8;
-}
-
-@media (prefers-color-scheme: dark) {
-	:root {
-		--bg: #1e1f22;
-		--fg: #e3e4e8;
-		--muted: #9aa0a6;
-		--accent: #8b9bff;
-		--border: #36373b;
-		--code-bg: #2a2b30;
-		--mark-bg: #6b5d1a;
-	}
+	color-scheme: dark;
+	--bg: #1e1e1e;
+	--fg: #e3e4e8;
+	--muted: #9aa0a6;
+	--accent: #895cf3;
+	--border: #36373b;
+	--code-bg: #2a2b30;
+	--mark-bg: #6b5d1a;
 }
 
 * {
@@ -82,7 +71,7 @@ a {
 .note blockquote {
 	margin: 0.8em 0;
 	padding: 0.1em 1em;
-	border-left: 3px solid var(--border);
+	border-left: 3px solid var(--accent);
 	color: var(--muted);
 }
 
@@ -123,6 +112,11 @@ a {
 	padding: 0;
 }
 
+/* shiki sets its theme background inline; keep the container chrome ours */
+.note pre.shiki {
+	background: var(--code-bg) !important;
+}
+
 mark {
 	background: var(--mark-bg);
 	color: inherit;
@@ -148,10 +142,28 @@ mark {
 	cursor: default;
 }
 
-/* task lists */
-.note li:has(> input[type="checkbox"]) {
+/* task lists — remark-gfm tags checkbox items with .task-list-item, so a
+   plain bullet list merged into the same <ul> keeps its bullets */
+.note li.task-list-item {
 	list-style: none;
 	margin-left: -1.2em;
+}
+
+.note li.task-list-item input[type="checkbox"] {
+	accent-color: var(--accent);
+	margin-right: 0.45em;
+	vertical-align: -0.1em;
+}
+
+.note li.task-list-item:has(input[type="checkbox"]:checked) {
+	text-decoration: line-through;
+	color: var(--muted);
+}
+
+/* loose lists: collapse the paragraph wrappers so items don't gain
+   paragraph-sized gaps */
+.note li > p {
+	margin: 0.2em 0;
 }
 
 /* --- frontmatter --------------------------------------------------------- */

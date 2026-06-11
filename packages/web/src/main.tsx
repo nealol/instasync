@@ -1,7 +1,6 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import "katex/dist/katex.min.css";
-import "highlight.js/styles/github.css";
 import "./styles.css";
 import { App } from "./App";
 
