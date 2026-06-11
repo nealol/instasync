@@ -5,6 +5,7 @@ import { VaultsResource, InvitesResource, MembersResource, CursorsResource } fro
 import { AttachmentsResource, BlobsResource } from "./resources/attachments";
 import { CanvasesResource, BasesResource } from "./resources/structured";
 import { SearchResource, StorageResource, BackupResource, PluginDbResource } from "./resources/misc";
+import { HistoryResource } from "./resources/history";
 
 export interface RealtimeClientOptions {
 	/** Server origin, e.g. `https://realtime.example.com`. */
@@ -34,6 +35,7 @@ export class VaultHandle {
 	readonly backup: BackupResource;
 	readonly members: MembersResource;
 	readonly cursors: CursorsResource;
+	readonly history: HistoryResource;
 
 	constructor(
 		private http: Http,
@@ -51,6 +53,7 @@ export class VaultHandle {
 		this.backup = new BackupResource(http, vaultId);
 		this.members = new MembersResource(http, vaultId);
 		this.cursors = new CursorsResource(http, vaultId);
+		this.history = new HistoryResource(http, vaultId);
 	}
 
 	/** Replication endpoints for one synced plugin database. */

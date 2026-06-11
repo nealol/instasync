@@ -3893,3 +3893,454 @@ async fn stream_ws_e2e_anchor_survives_concurrent_edit() {
     let content = text.get_string(&doc.transact());
     assert_eq!(content, "PREFIX intro\n## Draft\nstreamed-a-b\noutro");
 }
+
+// ---------- git history + rollback e2e ----------
+
+/// Git-enabled app over the stateful fake y-sweet, returning the dirs the
+/// history tests need to inspect (per-vault repo, blob store).
+async fn history_test_app(ysweet_url: &str) -> (Router, std::path::PathBuf, std::path::PathBuf) {
+    let mut db_path = std::env::temp_dir();
+    db_path.push(format!("realtime-test-{}.db", uuid::Uuid::new_v4()));
+    let mut blob_dir = std::env::temp_dir();
+    blob_dir.push(format!("realtime-blobs-{}", uuid::Uuid::new_v4()));
+    let mut git_dir = std::env::temp_dir();
+    git_dir.push(format!("realtime-git-{}", uuid::Uuid::new_v4()));
+
+    let config = Config {
+        database_url: format!("sqlite://{}?mode=rwc", db_path.display()),
+        bind_addr: "127.0.0.1:0".into(),
+        public_base_url: "http://auth.test".into(),
+        blob_dir: blob_dir.display().to_string(),
+        ysweet_store_dir: None,
+        ysweet_url: ysweet_url.to_string(),
+        ysweet_public_url: ysweet_url.to_string(),
+        ysweet_auth_key: gen_auth_key(),
+        oidc_mode: OidcMode::Mock,
+        oidc_issuer: None,
+        oidc_client_id: None,
+        oidc_client_secret: None,
+        oidc_redirect_url: None,
+        allowed_login_redirects: vec!["http://app".into()],
+        cors_allowed_origins: vec![],
+        git_data_dir: git_dir.display().to_string(),
+        git_enabled: true,
+        git_debounce_ms: 50,
+        git_bot_name: "Realtime".into(),
+        git_bot_email: "realtime@localhost".into(),
+        git_inline_attachment_max_bytes: 5 * 1024 * 1024,
+        cursor_email_domain: "localhost".into(),
+        daily_note_path_template: "Daily Notes/{{YYYY-MM-DD}}.md".into(),
+        weekly_note_path_template: None,
+        monthly_note_path_template: None,
+        quarterly_note_path_template: None,
+        yearly_note_path_template: None,
+        attachment_fetch_host_allowlist: vec![],
+        attachment_allowed_extensions: vec!["png".into(), "txt".into()],
+        attachment_max_bytes: realtime_server::blobs::MAX_BLOB_BYTES,
+        attachments_path_mode: "relative".into(),
+        attachments_subfolder: None,
+        upload_token: "test-upload-token".into(),
+        crsqlite_ext_path: None,
+    };
+    let state = build_state(config).await.unwrap();
+    (app(state), git_dir, blob_dir)
+}
+
+/// Poll a vault repo until it holds at least `n` commits; returns HEAD's hash.
+async fn wait_for_commit_count(repo: &std::path::Path, n: u64) -> String {
+    for _ in 0..200 {
+        let (ok, count) = git_out(repo, &["rev-list", "--count", "HEAD"]);
+        if ok && count.parse::<u64>().map(|c| c >= n).unwrap_or(false) {
+            return git_out(repo, &["rev-parse", "HEAD"]).1;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!(
+        "repo {} never reached {n} commits (have {:?})",
+        repo.display(),
+        git_out(repo, &["rev-list", "--count", "HEAD"]).1
+    );
+}
+
+#[tokio::test]
+async fn history_endpoints_browse_commits_changes_trees_and_files() {
+    let ys = fake_ysweet_store().await;
+    let (app, git_dir, _blobs) = history_test_app(&ys).await;
+    let alice = login(&app, "alice").await;
+    let (_, vault) = send(&app, "POST", "/api/vaults", Some(&alice), Some(json!({"name": "V"}))).await;
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+    let repo = git_dir.join(&vault_id);
+
+    // Empty history: no repo yet -> empty list, unknown hash -> 404.
+    let base = format!("/api/vaults/{vault_id}/history/commits");
+    let (status, page) = send(&app, "GET", &base, Some(&alice), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["commits"].as_array().unwrap().len(), 0);
+    let (status, _) = send(&app, "GET", &format!("{base}/abcdef12"), Some(&alice), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Commit 1: create a note (unicode path) through the REST API.
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&alice),
+        Some(json!({"path": "nötes/hello one.md", "content": "# v1\n"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let c1 = wait_for_commit_count(&repo, 1).await;
+
+    // Commit 2: edit it.
+    let (status, _) = send(
+        &app,
+        "PUT",
+        &format!("/api/vaults/{vault_id}/notes/n%C3%B6tes/hello%20one.md"),
+        Some(&alice),
+        Some(json!({"content": "# v2\nmore\n"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let c2 = wait_for_commit_count(&repo, 2).await;
+    assert_ne!(c1, c2);
+
+    // List: newest first, attributed to alice via trailers.
+    let (status, page) = send(&app, "GET", &base, Some(&alice), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let commits = page["commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 2);
+    assert_eq!(page["hasMore"], false);
+    assert_eq!(commits[0]["hash"], json!(c2));
+    assert_eq!(commits[1]["hash"], json!(c1));
+    assert_eq!(commits[0]["parents"][0], json!(c1));
+    assert_eq!(commits[0]["authorName"], "alice");
+    assert!(commits[0]["principalId"].as_str().unwrap().len() > 0);
+    assert_eq!(commits[0]["principalType"], "user");
+
+    // Keyset paging: limit=1 has more; before=c2 yields only c1; before=c1 (root) is empty.
+    let (_, page) = send(&app, "GET", &format!("{base}?limit=1"), Some(&alice), None).await;
+    assert_eq!(page["commits"].as_array().unwrap().len(), 1);
+    assert_eq!(page["hasMore"], true);
+    let (_, page) = send(&app, "GET", &format!("{base}?before={c2}"), Some(&alice), None).await;
+    assert_eq!(page["commits"][0]["hash"], json!(c1));
+    assert_eq!(page["hasMore"], false);
+    let (_, page) = send(&app, "GET", &format!("{base}?before={c1}"), Some(&alice), None).await;
+    assert_eq!(page["commits"].as_array().unwrap().len(), 0);
+
+    // Per-file history (--follow) sees both commits for the note's path.
+    let (_, page) = send(
+        &app,
+        "GET",
+        &format!("{base}?path=n%C3%B6tes%2Fhello%20one.md"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(page["commits"].as_array().unwrap().len(), 2);
+
+    // Commit detail: change list with unicode path intact.
+    let (status, detail) = send(&app, "GET", &format!("{base}/{c2}"), Some(&alice), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["commit"]["hash"], json!(c2));
+    let changes = detail["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["path"], "nötes/hello one.md");
+    assert_eq!(changes[0]["status"], "modified");
+    assert_eq!(changes[0]["kind"], "markdown");
+
+    // Short (abbreviated) hashes resolve too.
+    let (status, _) = send(&app, "GET", &format!("{base}/{}", &c2[..8]), Some(&alice), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Tree at each commit.
+    let (_, tree) = send(&app, "GET", &format!("{base}/{c1}/tree"), Some(&alice), None).await;
+    let entries = tree["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["path"], "nötes/hello one.md");
+    assert_eq!(entries[0]["kind"], "markdown");
+
+    // File content at both versions, and "absent" before it existed.
+    let file_q = format!("path=n%C3%B6tes%2Fhello%20one.md");
+    let (_, f1) = send(&app, "GET", &format!("{base}/{c1}/file?{file_q}"), Some(&alice), None).await;
+    assert_eq!(f1["type"], "text");
+    assert_eq!(f1["content"], "# v1\n");
+    assert_eq!(f1["lang"], "markdown");
+    let (_, f2) = send(&app, "GET", &format!("{base}/{c2}/file?{file_q}"), Some(&alice), None).await;
+    assert_eq!(f2["content"], "# v2\nmore\n");
+    let (_, missing) = send(
+        &app,
+        "GET",
+        &format!("{base}/{c1}/file?path=never.md"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(missing["type"], "absent");
+
+    // Raw blob bytes round-trip.
+    let (status, bytes) = send_raw(
+        &app,
+        "GET",
+        &format!("{base}/{c1}/blob?{file_q}"),
+        Some(&alice),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, b"# v1\n");
+
+    // Path traversal is rejected; non-members are forbidden.
+    let (status, _) = send(
+        &app,
+        "GET",
+        &format!("{base}/{c1}/file?path=..%2Fetc%2Fpasswd"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let mallory = login(&app, "mallory").await;
+    let (status, _) = send(&app, "GET", &base, Some(&mallory), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn rollback_restores_notes_requires_admin_and_stamps_trailer() {
+    let ys = fake_ysweet_store().await;
+    let (app, git_dir, _blobs) = history_test_app(&ys).await;
+    let alice = login(&app, "alice").await;
+    let (_, vault) = send(&app, "POST", "/api/vaults", Some(&alice), Some(json!({"name": "V"}))).await;
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+    let repo = git_dir.join(&vault_id);
+    let base = format!("/api/vaults/{vault_id}/history/commits");
+
+    // Commit 1: note A at v1.
+    send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&alice),
+        Some(json!({"path": "a.md", "content": "alpha v1\n"})),
+    )
+    .await;
+    let c1 = wait_for_commit_count(&repo, 1).await;
+
+    // Commit(s) 2: A edited and B created.
+    send(
+        &app,
+        "PUT",
+        &format!("/api/vaults/{vault_id}/notes/a.md"),
+        Some(&alice),
+        Some(json!({"content": "alpha v2 — changed\n"})),
+    )
+    .await;
+    send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&alice),
+        Some(json!({"path": "b.md", "content": "bravo\n"})),
+    )
+    .await;
+    wait_for_commit_count(&repo, 2).await;
+
+    // A member (non-admin) may browse history but not roll back.
+    let (_, invite) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/invites"),
+        Some(&alice),
+        Some(json!({"role": "member"})),
+    )
+    .await;
+    let bob = login(&app, "bob").await;
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/invites/redeem",
+        Some(&bob),
+        Some(json!({"code": invite["code"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(&app, "GET", &base, Some(&bob), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("{base}/{c1}/rollback/preview"),
+        Some(&bob),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("{base}/{c1}/rollback"),
+        Some(&bob),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Admin preview: modify a.md, delete b.md, nothing unrecoverable.
+    let (status, plan) = send(
+        &app,
+        "POST",
+        &format!("{base}/{c1}/rollback/preview"),
+        Some(&alice),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(plan["targetCommit"], json!(c1));
+    let changes = plan["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 2);
+    let by_path = |p: &str| changes.iter().find(|c| c["path"] == p).unwrap();
+    assert_eq!(by_path("a.md")["action"], "modify");
+    assert_eq!(by_path("b.md")["action"], "delete");
+    assert_eq!(plan["unrecoverableBinaries"].as_array().unwrap().len(), 0);
+
+    // Preview is a dry run: nothing changed yet.
+    let (_, a) = send(&app, "GET", &format!("/api/vaults/{vault_id}/notes/a.md"), Some(&alice), None).await;
+    assert_eq!(a["content"], "alpha v2 — changed\n");
+
+    // Execute.
+    let (status, result) = send(
+        &app,
+        "POST",
+        &format!("{base}/{c1}/rollback"),
+        Some(&alice),
+        Some(json!({"pluginDbs": []})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["applied"], 1);
+    assert_eq!(result["deleted"], 1);
+    let rb_commit = result["commit"].as_str().expect("rollback commit hash").to_string();
+
+    // Authoritative state is restored: A back at v1, B gone.
+    let (_, a) = send(&app, "GET", &format!("/api/vaults/{vault_id}/notes/a.md"), Some(&alice), None).await;
+    assert_eq!(a["content"], "alpha v1\n");
+    let (status, _) = send(&app, "GET", &format!("/api/vaults/{vault_id}/notes/b.md"), Some(&alice), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The rollback commit is HEAD, attributed to alice, with subject + trailer,
+    // and its tree matches the target commit exactly.
+    let (ok, head) = git_out(&repo, &["rev-parse", "HEAD"]);
+    assert!(ok);
+    assert_eq!(head, rb_commit);
+    let (_, meta) = git_out(&repo, &["log", "-1", "--format=%an|%s"]);
+    assert!(meta.starts_with("alice|Rollback to "), "got {meta}");
+    let (_, body) = git_out(&repo, &["log", "-1", "--format=%B"]);
+    assert!(body.contains(&format!("Rollback-Of: {c1}")), "got {body}");
+    let (ok, diff) = git_out(&repo, &["diff", "--name-only", &c1, "HEAD"]);
+    assert!(ok);
+    assert_eq!(diff, "", "rollback tree must match the target commit");
+
+    // History API surfaces the rollbackOf marker.
+    let (_, page) = send(&app, "GET", &base, Some(&alice), None).await;
+    assert_eq!(page["commits"][0]["rollbackOf"], json!(c1));
+
+    // Rolling back to the same target again is a no-op (no new commit).
+    let (status, result) = send(
+        &app,
+        "POST",
+        &format!("{base}/{c1}/rollback"),
+        Some(&alice),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["applied"], 0);
+    assert_eq!(result["deleted"], 0);
+    assert_eq!(result["commit"], Value::Null);
+    let (_, head_after) = git_out(&repo, &["rev-parse", "HEAD"]);
+    assert_eq!(head_after, rb_commit);
+}
+
+#[tokio::test]
+async fn rollback_restores_attachment_blob_from_git_after_gc() {
+    let ys = fake_ysweet_store().await;
+    let (app, git_dir, blob_dir) = history_test_app(&ys).await;
+    let alice = login(&app, "alice").await;
+    let (_, vault) = send(&app, "POST", "/api/vaults", Some(&alice), Some(json!({"name": "V"}))).await;
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+    let repo = git_dir.join(&vault_id);
+    let base = format!("/api/vaults/{vault_id}/history/commits");
+
+    // Commit 1: a small attachment (inlined verbatim into git).
+    let payload = b"\x89PNG fake image bytes".to_vec();
+    let att_url = format!("/api/vaults/{vault_id}/attachments/img/pic.png");
+    let (status, up) = send_raw(&app, "PUT", &att_url, Some(&alice), payload.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let up: Value = serde_json::from_slice(&up).unwrap();
+    let hash = up["hash"].as_str().unwrap().to_string();
+    let c1 = wait_for_commit_count(&repo, 1).await;
+
+    // The file endpoint reports it as an inline binary.
+    let (_, f) = send(
+        &app,
+        "GET",
+        &format!("{base}/{c1}/file?path=img%2Fpic.png"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(f["type"], "binary");
+    assert_eq!(f["hash"], json!(hash));
+    assert_eq!(f["inline"], true);
+
+    // Delete the attachment, then GC the now-orphaned blob.
+    let (status, _) = send(&app, "DELETE", &att_url, Some(&alice), None).await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_commit_count(&repo, 2).await;
+    let (status, gc) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/storage/gc-blobs"),
+        Some(&alice),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "gc failed: {gc}");
+    let blob_path = blob_dir.join(&vault_id).join(&hash);
+    assert!(!blob_path.exists(), "blob should be GC'd");
+
+    // Preview: the attachment comes back via blob re-insert from git bytes.
+    let (status, plan) = send(
+        &app,
+        "POST",
+        &format!("{base}/{c1}/rollback/preview"),
+        Some(&alice),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let restore = plan["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["path"] == "img/pic.png")
+        .expect("attachment in plan");
+    assert_eq!(restore["action"], "restoreBlob");
+    assert_eq!(plan["unrecoverableBinaries"].as_array().unwrap().len(), 0);
+
+    // Execute, then the attachment downloads byte-identically again.
+    let (status, result) = send(
+        &app,
+        "POST",
+        &format!("{base}/{c1}/rollback"),
+        Some(&alice),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["blobsRestored"], 1);
+    assert!(blob_path.exists(), "blob restored to the store");
+    assert_eq!(std::fs::read(&blob_path).unwrap(), payload);
+    let (status, body) = send_raw(&app, "GET", &att_url, Some(&alice), Vec::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, payload);
+}

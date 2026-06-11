@@ -346,3 +346,89 @@ export interface StreamResult {
 	/** Total UTF-8 bytes inserted into the note. */
 	inserted: number;
 }
+
+// ---------- git history + rollback ----------
+
+export interface HistoryCommit {
+	hash: string;
+	shortHash: string;
+	parents: string[];
+	authorName: string;
+	authorEmail: string;
+	timestampMs: number;
+	subject: string;
+	principalId?: string;
+	principalType?: string;
+	cursorId?: string;
+	cursorName?: string;
+	onBehalfOf?: string;
+	rollbackOf?: string;
+}
+
+export interface HistoryCommitListPage {
+	commits: HistoryCommit[];
+	hasMore: boolean;
+}
+
+export interface HistoryCommitChange {
+	path: string;
+	status: "added" | "modified" | "deleted" | "renamed" | "other";
+	renamedTo?: string;
+	kind: string;
+}
+
+export interface HistoryCommitDetail {
+	commit: HistoryCommit;
+	changes: HistoryCommitChange[];
+}
+
+export interface HistoryTreeEntry {
+	path: string;
+	size: number;
+	kind: string;
+}
+
+export interface HistoryTreeResponse {
+	entries: HistoryTreeEntry[];
+}
+
+export type HistoryFileAtCommit =
+	| { type: "text"; content: string; lang: string }
+	| { type: "binary"; hash: string; size: number; inline: boolean; blobAvailable: boolean }
+	| { type: "absent" };
+
+export interface HistoryPlannedChange {
+	path: string;
+	kind: string;
+	action: "create" | "modify" | "delete" | "restoreBlob";
+}
+
+export interface HistoryUnrecoverableBinary {
+	path: string;
+	hash: string;
+	currentKept: boolean;
+}
+
+export interface HistoryPluginDbPlan {
+	plugin: string;
+	name: string;
+	changed: boolean;
+	rollbackable: boolean;
+	reason?: string;
+}
+
+export interface HistoryRollbackPlan {
+	targetCommit: string;
+	changes: HistoryPlannedChange[];
+	unrecoverableBinaries: HistoryUnrecoverableBinary[];
+	pluginDbs: HistoryPluginDbPlan[];
+}
+
+export interface HistoryRollbackResult {
+	commit: string | null;
+	applied: number;
+	deleted: number;
+	blobsRestored: number;
+	pluginDbsRolledBack: number;
+	unrecoverableBinaries: HistoryUnrecoverableBinary[];
+}

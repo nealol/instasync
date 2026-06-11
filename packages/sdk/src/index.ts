@@ -47,3 +47,4 @@ export {
 export { AttachmentsResource, BlobsResource } from "./resources/attachments";
 export { CanvasesResource, BasesResource } from "./resources/structured";
 export { SearchResource, StorageResource, BackupResource, PluginDbResource } from "./resources/misc";
+export { HistoryResource } from "./resources/history";

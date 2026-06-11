@@ -88,6 +88,30 @@ struct VaultState {
     deadline: Instant,
     /// A debounce/commit task is already running for this vault.
     running: bool,
+    /// Serializes actual commit work per vault, including out-of-band
+    /// [`GitService::commit_now`] calls (rollback), so two materializations
+    /// never interleave.
+    commit_lock: Arc<Mutex<()>>,
+}
+
+impl VaultState {
+    fn new() -> Self {
+        VaultState {
+            dirty: false,
+            contributors: Vec::new(),
+            deadline: Instant::now(),
+            running: false,
+            commit_lock: Arc::new(Mutex::new(())),
+        }
+    }
+}
+
+/// Overrides the generated commit subject and appends extra trailers; used by
+/// rollback to stamp `Rollback to …` / `Rollback-Of:` on its commit.
+#[derive(Clone, Debug, Default)]
+pub struct CommitOverride {
+    pub subject: String,
+    pub trailers: Vec<(String, String)>,
 }
 
 struct Inner {
@@ -134,12 +158,7 @@ impl GitService {
         let mut vaults = self.0.vaults.lock().await;
         let entry = vaults
             .entry(vault_id.to_string())
-            .or_insert_with(|| VaultState {
-                dirty: false,
-                contributors: Vec::new(),
-                deadline: Instant::now(),
-                running: false,
-            });
+            .or_insert_with(VaultState::new);
         entry.dirty = true;
         let actor_key = who.actor_key();
         if !entry
@@ -178,7 +197,7 @@ impl GitService {
             }
 
             // Claim the pending work.
-            let contributors = {
+            let (contributors, commit_lock) = {
                 let mut vaults = self.0.vaults.lock().await;
                 let Some(s) = vaults.get_mut(&vault_id) else {
                     return;
@@ -188,11 +207,14 @@ impl GitService {
                     return;
                 }
                 s.dirty = false;
-                std::mem::take(&mut s.contributors)
+                (std::mem::take(&mut s.contributors), s.commit_lock.clone())
             };
 
-            if let Err(e) = self.commit_once(&vault_id, &contributors).await {
-                tracing::error!("git audit commit for vault {vault_id} failed: {e:#}");
+            {
+                let _guard = commit_lock.lock().await;
+                if let Err(e) = self.commit_once(&vault_id, &contributors, None).await {
+                    tracing::error!("git audit commit for vault {vault_id} failed: {e:#}");
+                }
             }
 
             // More writes during the commit? Loop and wait again; otherwise stop.
@@ -209,8 +231,67 @@ impl GitService {
         }
     }
 
+    /// Commit the vault's current state immediately, bypassing the debounce.
+    /// Holds the per-vault commit lock and claims any pending debounce window
+    /// (so it won't double-commit), then returns the new HEAD hash if a commit
+    /// was made. Used by rollback so the "Rollback to …" commit's tree matches
+    /// the rollback target instead of coalescing later edits.
+    pub async fn commit_now(
+        &self,
+        vault_id: &str,
+        who: &Principal,
+        ov: CommitOverride,
+    ) -> Result<Option<String>> {
+        if !self.0.config.git_enabled {
+            return Ok(None);
+        }
+        let commit_lock = {
+            let mut vaults = self.0.vaults.lock().await;
+            let entry = vaults
+                .entry(vault_id.to_string())
+                .or_insert_with(VaultState::new);
+            // Claim pending debounce work: this commit covers it.
+            entry.dirty = false;
+            entry.contributors.clear();
+            entry.commit_lock.clone()
+        };
+        let _guard = commit_lock.lock().await;
+        let committed = self
+            .commit_once(vault_id, &[who.clone()], Some(&ov))
+            .await?;
+        if !committed {
+            return Ok(None);
+        }
+        let repo = self.repo_path(vault_id)?;
+        let out = self.git_raw(&repo, &["rev-parse", "HEAD"]).await?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        Ok(Some(
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        ))
+    }
+
+    /// The vault repo's directory, if the repo has been initialized.
+    pub fn repo_dir(&self, vault_id: &str) -> Result<Option<PathBuf>> {
+        let repo = self.repo_path(vault_id)?;
+        Ok(repo.join(".git").is_dir().then_some(repo))
+    }
+
+    /// Run a git command in the vault's repo, returning the raw output.
+    pub async fn git_output(&self, vault_id: &str, args: &[&str]) -> Result<std::process::Output> {
+        let repo = self.repo_path(vault_id)?;
+        self.git_raw(&repo, args).await
+    }
+
     /// Materialize the vault's current state from y-sweet and commit the diff.
-    async fn commit_once(&self, vault_id: &str, contributors: &[Contributor]) -> Result<()> {
+    /// Returns whether a commit was actually made.
+    async fn commit_once(
+        &self,
+        vault_id: &str,
+        contributors: &[Contributor],
+        ov: Option<&CommitOverride>,
+    ) -> Result<bool> {
         let repo = self.ensure_repo(vault_id).await?;
 
         // 1. Authoritative file set from the vault index doc's `files` map.
@@ -311,7 +392,7 @@ impl GitService {
             .context("materialize task panicked")??;
 
         // 4. Commit the diff, if any.
-        self.commit(&repo, vault_id, contributors).await
+        self.commit(&repo, vault_id, contributors, ov).await
     }
 
     /// Lazily create the vault's repo with a bot identity. Idempotent.
@@ -357,12 +438,14 @@ impl GitService {
     }
 
     /// Stage everything and commit if the working tree actually changed.
+    /// Returns whether a commit was made.
     async fn commit(
         &self,
         repo: &Path,
         vault_id: &str,
         contributors: &[Contributor],
-    ) -> Result<()> {
+        ov: Option<&CommitOverride>,
+    ) -> Result<bool> {
         self.git(repo, &["add", "-A"]).await?;
 
         // The staged diff drives both the no-op check and the commit subject.
@@ -381,12 +464,12 @@ impl GitService {
         }
         let changes = parse_name_status(&String::from_utf8_lossy(&diff.stdout));
         if changes.is_empty() {
-            return Ok(()); // nothing changed — idempotent no-op
+            return Ok(false); // nothing changed — idempotent no-op
         }
         let link_only = self.link_only_updates(repo, &changes).await;
 
         let (author, message) =
-            build_commit_meta(vault_id, &changes, &link_only, contributors, &self.0.config);
+            build_commit_meta(vault_id, &changes, &link_only, contributors, &self.0.config, ov);
         // Pin the committer to the Realtime bot via command-scoped (`-c`) config so
         // it never falls back to the server's *global* git identity — regardless of
         // what (if anything) is in global config or whether ensure_repo's local
@@ -414,7 +497,7 @@ impl GitService {
         if let Err(e) = self.push(vault_id, repo).await {
             tracing::warn!("git audit: push for vault {vault_id} failed: {e}");
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Of the staged modifications, find the ones that are purely link updates
@@ -657,7 +740,7 @@ const SUBJECT_MAX_FILES: usize = 3;
 pub(crate) const SQL_DUMP_DIR: &str = ".sql";
 
 /// Parse a `.sql/{plugin_id}/{db_name}.sql` dump path into (plugin_id, db_name).
-fn sql_dump_parts(path: &str) -> Option<(&str, &str)> {
+pub(crate) fn sql_dump_parts(path: &str) -> Option<(&str, &str)> {
     let rest = path.strip_prefix(SQL_DUMP_DIR)?.strip_prefix('/')?;
     let (plugin, file) = rest.split_once('/')?;
     let name = file.strip_suffix(".sql")?;
@@ -835,6 +918,7 @@ fn build_commit_meta(
     link_only: &HashSet<String>,
     contributors: &[Contributor],
     config: &Config,
+    ov: Option<&CommitOverride>,
 ) -> (String, String) {
     let (author_name, author_email) = match contributors.first() {
         Some(p) => author_identity(p, config),
@@ -842,7 +926,11 @@ fn build_commit_meta(
     };
     let author = format!("{author_name} <{author_email}>");
 
-    let mut message = format!("{}\n\n", commit_subject(changes, link_only));
+    let subject = match ov {
+        Some(ov) if !ov.subject.is_empty() => ov.subject.clone(),
+        _ => commit_subject(changes, link_only),
+    };
+    let mut message = format!("{subject}\n\n");
     message.push_str(&format!("Vault-Id: {vault_id}\n"));
     if let Some(p) = contributors.first() {
         append_principal_trailers(&mut message, p);
@@ -851,6 +939,11 @@ fn build_commit_meta(
         let (name, email) = author_identity(p, config);
         message.push_str(&format!("Co-authored-by: {} <{}>\n", name, email));
         append_principal_trailers(&mut message, p);
+    }
+    if let Some(ov) = ov {
+        for (key, value) in &ov.trailers {
+            message.push_str(&format!("{key}: {value}\n"));
+        }
     }
     (author, message)
 }
@@ -894,7 +987,7 @@ fn append_principal_trailers(message: &mut String, principal: &Principal) {
 
 /// Validate a vault-relative path and turn it into a safe relative `PathBuf`.
 /// Rejects absolute paths, `..`, `.`, empty components, and backslashes.
-fn safe_rel_path(path: &str) -> Result<PathBuf> {
+pub(crate) fn safe_rel_path(path: &str) -> Result<PathBuf> {
     if path.is_empty() || path.contains('\\') {
         bail!("unsafe path {path:?}");
     }
@@ -1500,6 +1593,7 @@ diff --git a/ref.md b/ref.md
             &HashSet::new(),
             &contributors,
             &config,
+            None,
         );
         assert_eq!(author, "Alice <a@x>");
         assert!(message.contains("Principal-Id: u1"));
@@ -1516,6 +1610,7 @@ diff --git a/ref.md b/ref.md
             &HashSet::new(),
             &[],
             &config,
+            None,
         );
         assert_eq!(author, "Realtime <realtime@localhost>");
         assert!(!message.contains("Principal-Id"));
@@ -1542,6 +1637,7 @@ diff --git a/ref.md b/ref.md
             &HashSet::new(),
             &contributors,
             &config,
+            None,
         );
         assert_eq!(author, "Claude <cursor+app123@localhost>");
         assert!(message.contains("Principal-Type: cursor"));
@@ -1549,6 +1645,34 @@ diff --git a/ref.md b/ref.md
         assert!(message.contains("Cursor-Name: Claude"));
         assert!(message.contains("On-Behalf-Of: Alice <a@x>"));
         assert!(message.contains("Authorized-User-Id: u1"));
+    }
+
+    #[test]
+    fn commit_meta_override_replaces_subject_and_appends_trailer() {
+        let config = test_config();
+        let contributors = vec![Principal {
+            user_id: "u1".into(),
+            display_name: "Alice".into(),
+            email: "a@x".into(),
+            actor: PrincipalActor::User,
+            expires_at_ms: 0,
+        }];
+        let ov = CommitOverride {
+            subject: "Rollback to abc123 (2026-06-10 12:00)".into(),
+            trailers: vec![("Rollback-Of".into(), "abc123".repeat(6))],
+        };
+        let (author, message) = build_commit_meta(
+            "v1",
+            &changes(&[('M', "a.md")]),
+            &HashSet::new(),
+            &contributors,
+            &config,
+            Some(&ov),
+        );
+        assert_eq!(author, "Alice <a@x>");
+        assert!(message.starts_with("Rollback to abc123 (2026-06-10 12:00)\n\n"));
+        assert!(message.contains(&format!("Rollback-Of: {}", "abc123".repeat(6))));
+        assert!(message.contains("Principal-Id: u1"));
     }
 
     fn test_config() -> Config {

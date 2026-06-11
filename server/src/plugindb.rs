@@ -595,6 +595,119 @@ impl PluginDbService {
             .await?)
     }
 
+    /// Whether a rollback to `target_sql` is currently possible:
+    /// `(rollbackable, reason-when-not)`. Requires the extension, an existing
+    /// replica, and a dump whose table schema matches the replica's.
+    pub async fn rollback_check(
+        &self,
+        vault: &str,
+        plugin: &str,
+        name: &str,
+        target_sql: &str,
+    ) -> (bool, Option<String>) {
+        if !self.ext_available() {
+            return (false, Some("cr-sqlite extension unavailable".into()));
+        }
+        let path = replica_path(&self.0.config, vault, plugin, name);
+        if !path.exists() {
+            return (false, Some("no server replica for this database".into()));
+        }
+        let config = self.0.config.clone();
+        let (vault, plugin, name, sql) = (
+            vault.to_string(),
+            plugin.to_string(),
+            name.to_string(),
+            target_sql.to_string(),
+        );
+        let res = tokio::task::spawn_blocking(move || {
+            schema_matches(&config, &vault, &plugin, &name, &sql)
+        })
+        .await;
+        match res {
+            Ok(Ok(true)) => (true, None),
+            Ok(Ok(false)) => (false, Some("dump schema differs from the replica".into())),
+            Ok(Err(e)) => (false, Some(format!("schema check failed: {e:#}"))),
+            Err(_) => (false, Some("schema check task panicked".into())),
+        }
+    }
+
+    /// Roll the replica back to `target_sql` (a dump previously produced by
+    /// [`dump_replica`]) and publish the resulting cr-sqlite changes as a
+    /// server-authored batch appended to the database's Y.Doc log, so every
+    /// client converges on the dumped state like any peer's edit.
+    pub async fn rollback_to_dump(
+        &self,
+        vault: &str,
+        plugin: &str,
+        name: &str,
+        target_sql: &str,
+    ) -> Result<()> {
+        if !self.ext_available() {
+            return Err(anyhow!("cr-sqlite extension unavailable"));
+        }
+        let config = self.0.config.clone();
+        let (vault_s, plugin_s, name_s, sql) = (
+            vault.to_string(),
+            plugin.to_string(),
+            name.to_string(),
+            target_sql.to_string(),
+        );
+        let (rows, site_hex, site_b64, post) = tokio::task::spawn_blocking(move || {
+            apply_dump_rollback(&config, &vault_s, &plugin_s, &name_s, &sql)
+        })
+        .await
+        .context("rollback task panicked")??;
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        // Append the batch to the Y.Doc log.
+        let doc_id = Self::doc_id(vault, plugin, name);
+        let view = self.fetch_doc(&doc_id).await.unwrap_or_default();
+        let schema_version = view
+            .batches
+            .last()
+            .map(|b| b.schema_version)
+            .unwrap_or(1);
+        let format = view
+            .batches
+            .last()
+            .map(|b| b.format.clone())
+            .filter(|f| !f.is_empty())
+            .unwrap_or_else(|| "crsqlite-1".to_string());
+        let from = rows.iter().map(|r| r.db_version).min().unwrap_or(post) - 1;
+        let batch = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "siteId": site_b64,
+            "fromDbVersion": from,
+            "toDbVersion": post,
+            "schemaVersion": schema_version,
+            "changes": serde_json::to_value(&rows)?,
+            "format": format,
+        });
+        let current = crate::ydoc::read_update_with(
+            &self.0.config,
+            &self.0.http,
+            &self.0.authenticator,
+            &doc_id,
+        )
+        .await
+        .map_err(|e| anyhow!(e.to_string()))?;
+        let update = build_append_batch_update(&current, &batch)?;
+        if !update.is_empty() {
+            self.write_doc(&doc_id, update).await?;
+        }
+
+        // Advance the stored server cursor past its own site so replication
+        // doesn't re-apply the batch we just produced from the replica.
+        let mut cursor = self.load_cursor(vault, plugin, name).await?;
+        let entry = cursor.entry(site_hex).or_insert(0);
+        *entry = (*entry).max(post);
+        self.store_cursor(vault, plugin, name, &cursor).await?;
+        Ok(())
+    }
+
     /// Deterministic SQL dumps for a vault's live plugin databases, for git.
     /// Returns `(relative_path, sql)` pairs. Empty when the extension is absent.
     pub async fn dumps_for_vault(&self, vault: &str) -> Vec<(PathBuf, String)> {
@@ -753,6 +866,293 @@ fn build_compaction_update(current: &[u8], drop_count: usize, safe: &Cursor) -> 
     }
     let update = doc.transact().encode_state_as_update_v1(&before);
     Ok(update)
+}
+
+/// Build an update appending one batch (JSON-shaped) to the `batches` array.
+/// Append-at-end is safe versus concurrent compaction (which trims the front).
+fn build_append_batch_update(current: &[u8], batch: &JsonValue) -> Result<Vec<u8>> {
+    let doc = doc_from_update(current)?;
+    let before = doc.transact().state_vector();
+    let batches = doc.get_or_insert_array("batches");
+    {
+        let mut txn = doc.transact_mut();
+        let len = batches.len(&txn);
+        batches.insert(&mut txn, len, crate::ydoc::json_to_any(batch));
+    }
+    let update = doc.transact().encode_state_as_update_v1(&before);
+    Ok(update)
+}
+
+// ---------- dump-based rollback (blocking side) ----------
+
+/// The `-- crr: t1,t2` trailer of a dump.
+fn dump_crr_tables(dump: &str) -> Vec<String> {
+    dump.lines()
+        .rev()
+        .find_map(|l| l.strip_prefix("-- crr: "))
+        .map(|list| {
+            list.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Normalize CREATE TABLE SQL for comparison (whitespace-insensitive).
+fn normalize_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// CREATE TABLE statements in a dump, keyed by an opaque normalized form.
+fn dump_create_statements(dump: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in dump.split(";\n") {
+        let trimmed = stmt.trim_start();
+        if trimmed
+            .get(..12)
+            .map(|s| s.eq_ignore_ascii_case("CREATE TABLE"))
+            .unwrap_or(false)
+        {
+            out.push(normalize_sql(trimmed));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Whether the dump's user-table schema matches the replica's.
+fn schema_matches(
+    config: &Config,
+    vault: &str,
+    plugin: &str,
+    name: &str,
+    dump: &str,
+) -> Result<bool> {
+    let path = replica_path(config, vault, plugin, name);
+    let (conn, _is_new) = open_replica(config, &path)?;
+    let mut replica_creates = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT sql FROM sqlite_master WHERE type='table' \
+             AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'crsql_%' \
+             AND name NOT LIKE '%__crsql_clock' AND name NOT LIKE '%__crsql_pks' \
+             ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for r in rows {
+            replica_creates.push(normalize_sql(&r?));
+        }
+    }
+    let _ = conn.query_row("SELECT crsql_finalize()", [], |_| Ok(()));
+    replica_creates.sort();
+    Ok(replica_creates == dump_create_statements(dump))
+}
+
+/// Diff the replica's CRR tables against a materialized dump and apply the
+/// difference in one transaction, returning the resulting own-site changes
+/// `(rows, site_hex, site_b64, post_db_version)`.
+fn apply_dump_rollback(
+    config: &Config,
+    vault: &str,
+    plugin: &str,
+    name: &str,
+    dump: &str,
+) -> Result<(Vec<ChangeRow>, String, String, i64)> {
+    if !schema_matches(config, vault, plugin, name, dump)? {
+        return Err(anyhow!("dump schema differs from the replica"));
+    }
+    let path = replica_path(config, vault, plugin, name);
+    if !path.exists() {
+        return Err(anyhow!("no server replica for this database"));
+    }
+    let (mut conn, _is_new) = open_replica(config, &path)?;
+
+    // Materialize the dump into a plain temporary database.
+    let temp = Connection::open_in_memory()?;
+    temp.execute_batch(dump).context("materialize dump")?;
+    let crr = dump_crr_tables(dump);
+
+    let pre: i64 = conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
+    let site_bytes: Vec<u8> = conn.query_row("SELECT crsql_site_id()", [], |row| row.get(0))?;
+    let site_hex = bytes_to_hex(&site_bytes);
+    let site_b64 = bytes_to_b64(&site_bytes);
+
+    let tx = conn.transaction()?;
+    for table in &crr {
+        diff_apply_table(&tx, &temp, table)?;
+    }
+    tx.commit()?;
+
+    let post: i64 = conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
+
+    // Collect the changes this rollback produced (our own site, past `pre`).
+    let mut rows = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq \
+             FROM crsql_changes \
+             WHERE db_version > ?1 AND site_id = crsql_site_id() \
+             ORDER BY db_version, seq",
+        )?;
+        let mapped = stmt.query_map([pre], |row| {
+            let pk: Vec<u8> = row.get(1)?;
+            let val: SqlValue = row.get(3)?;
+            let site: Vec<u8> = row.get(6)?;
+            Ok(ChangeRow {
+                table: row.get(0)?,
+                pk: bytes_to_b64(&pk),
+                cid: row.get(2)?,
+                val: sql_to_json(&val),
+                col_version: row.get(4)?,
+                db_version: row.get(5)?,
+                site_id: bytes_to_b64(&site),
+                cl: row.get(7)?,
+                seq: row.get(8)?,
+            })
+        })?;
+        for r in mapped {
+            rows.push(r?);
+        }
+    }
+    let _ = conn.query_row("SELECT crsql_finalize()", [], |_| Ok(()));
+    Ok((rows, site_hex, site_b64, post))
+}
+
+/// Table column metadata: `(all_columns, pk_columns)` in declared order.
+fn table_columns(conn: &Connection, table: &str) -> Result<(Vec<String>, Vec<String>)> {
+    let table = table.replace('"', "");
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{table}\")"))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+    })?;
+    let mut cols = Vec::new();
+    let mut pks: Vec<(i64, String)> = Vec::new();
+    for r in rows {
+        let (name, pk) = r?;
+        if pk > 0 {
+            pks.push((pk, name.clone()));
+        }
+        cols.push(name);
+    }
+    pks.sort();
+    Ok((cols, pks.into_iter().map(|(_, n)| n).collect()))
+}
+
+fn read_table_rows(
+    conn: &Connection,
+    table: &str,
+    cols: &[String],
+    pks: &[String],
+) -> Result<HashMap<String, Vec<SqlValue>>> {
+    let table = table.replace('"', "");
+    let col_list = cols
+        .iter()
+        .map(|c| format!("\"{}\"", c.replace('"', "")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut stmt = conn.prepare(&format!("SELECT {col_list} FROM \"{table}\""))?;
+    let pk_idx: Vec<usize> = pks
+        .iter()
+        .filter_map(|pk| cols.iter().position(|c| c == pk))
+        .collect();
+    let n = cols.len();
+    let mut out = HashMap::new();
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let mut vals = Vec::with_capacity(n);
+        for i in 0..n {
+            vals.push(row.get::<_, SqlValue>(i)?);
+        }
+        let key = pk_idx
+            .iter()
+            .map(|i| format_sql_value(&vals[*i]))
+            .collect::<Vec<_>>()
+            .join("\u{1f}");
+        out.insert(key, vals);
+    }
+    Ok(out)
+}
+
+/// Make `tx`'s `table` rows equal to `temp`'s, via keyed INSERT/UPDATE/DELETE.
+fn diff_apply_table(
+    tx: &rusqlite::Transaction<'_>,
+    temp: &Connection,
+    table: &str,
+) -> Result<()> {
+    let (cols, pks) = table_columns(temp, table)?;
+    if cols.is_empty() || pks.is_empty() {
+        return Ok(());
+    }
+    let target = read_table_rows(temp, table, &cols, &pks)?;
+    let current = read_table_rows(tx, table, &cols, &pks)?;
+    let table_q = format!("\"{}\"", table.replace('"', ""));
+    let col_list = cols
+        .iter()
+        .map(|c| format!("\"{}\"", c.replace('"', "")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let placeholders = (1..=cols.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let pk_idx: Vec<usize> = pks
+        .iter()
+        .filter_map(|pk| cols.iter().position(|c| c == pk))
+        .collect();
+    let where_pk = pks
+        .iter()
+        .enumerate()
+        .map(|(i, pk)| format!("\"{}\" = ?{}", pk.replace('"', ""), i + 1))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+
+    for (key, vals) in &current {
+        if !target.contains_key(key) {
+            let pk_vals: Vec<&SqlValue> = pk_idx.iter().map(|i| &vals[*i]).collect();
+            tx.execute(
+                &format!("DELETE FROM {table_q} WHERE {where_pk}"),
+                rusqlite::params_from_iter(pk_vals),
+            )?;
+        }
+    }
+    for (key, vals) in &target {
+        match current.get(key) {
+            None => {
+                tx.execute(
+                    &format!("INSERT INTO {table_q} ({col_list}) VALUES ({placeholders})"),
+                    rusqlite::params_from_iter(vals.iter()),
+                )?;
+            }
+            Some(cur) if cur != vals => {
+                let non_pk: Vec<usize> = (0..cols.len()).filter(|i| !pk_idx.contains(i)).collect();
+                if non_pk.is_empty() {
+                    continue;
+                }
+                let set = non_pk
+                    .iter()
+                    .enumerate()
+                    .map(|(j, i)| format!("\"{}\" = ?{}", cols[*i].replace('"', ""), j + 1))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let where_off = non_pk.len();
+                let where_pk_off = pks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, pk)| format!("\"{}\" = ?{}", pk.replace('"', ""), where_off + i + 1))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                let mut params: Vec<&SqlValue> = non_pk.iter().map(|i| &vals[*i]).collect();
+                params.extend(pk_idx.iter().map(|i| &vals[*i]));
+                tx.execute(
+                    &format!("UPDATE {table_q} SET {set} WHERE {where_pk_off}"),
+                    rusqlite::params_from_iter(params),
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 // ---------- rusqlite replica ----------
@@ -1318,6 +1718,80 @@ mod tests {
         assert_eq!(d1, d2, "dump must be byte-identical across runs");
         assert!(d1.contains("-- crr: tasks"));
         assert!(d1.contains("INSERT INTO \"tasks\""));
+    }
+
+    #[test]
+    fn dump_rollback_diffs_rows_and_replays_onto_fresh_replica() {
+        let Some(config) = ext_config() else {
+            eprintln!("skipping rollback test: CRSQLITE_EXT_PATH not set");
+            return;
+        };
+        // Build a replica, dump it (the rollback target), then mutate it.
+        let path = replica_path(&config, "v", "p", "n");
+        {
+            let (conn, _new) = open_replica(&config, &path).unwrap();
+            conn.execute_batch("CREATE TABLE tasks (id PRIMARY KEY NOT NULL, title)")
+                .unwrap();
+            conn.execute_batch("SELECT crsql_as_crr('tasks')").unwrap();
+            conn.execute("INSERT INTO tasks (id, title) VALUES ('a', 'x')", [])
+                .unwrap();
+            conn.execute("SELECT crsql_finalize()", []).ok();
+        }
+        let target = dump_replica(&config, "v", "p", "n").unwrap().unwrap();
+        {
+            let (conn, _new) = open_replica(&config, &path).unwrap();
+            conn.execute("UPDATE tasks SET title = 'changed' WHERE id = 'a'", [])
+                .unwrap();
+            conn.execute("INSERT INTO tasks (id, title) VALUES ('b', 'y')", [])
+                .unwrap();
+            conn.execute("SELECT crsql_finalize()", []).ok();
+        }
+        assert!(schema_matches(&config, "v", "p", "n", &target).unwrap());
+
+        // Roll back: replica must equal the dumped state again, and the
+        // produced changes must replay onto a fresh replica to the same state.
+        let (rows, _site_hex, _site_b64, _post) =
+            apply_dump_rollback(&config, "v", "p", "n", &target).unwrap();
+        assert!(!rows.is_empty());
+        let after = dump_replica(&config, "v", "p", "n").unwrap().unwrap();
+        assert_eq!(after, target, "replica must match the dump after rollback");
+
+        // Fresh replica at the *mutated* state, then apply the rollback batch.
+        let path2 = replica_path(&config, "v2", "p", "n");
+        {
+            let (conn, _new) = open_replica(&config, &path2).unwrap();
+            conn.execute_batch("CREATE TABLE tasks (id PRIMARY KEY NOT NULL, title)")
+                .unwrap();
+            conn.execute_batch("SELECT crsql_as_crr('tasks')").unwrap();
+            let mut insert = conn
+                .prepare(
+                    "INSERT INTO crsql_changes \
+                     (\"table\", pk, cid, val, col_version, db_version, site_id, cl, seq) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                )
+                .unwrap();
+            for c in &rows {
+                insert
+                    .execute(rusqlite::params![
+                        c.table,
+                        b64_to_bytes(&c.pk),
+                        c.cid,
+                        json_to_sql(&c.val),
+                        c.col_version,
+                        c.db_version,
+                        b64_to_bytes(&c.site_id),
+                        c.cl,
+                        c.seq,
+                    ])
+                    .unwrap();
+            }
+            drop(insert);
+            conn.execute("SELECT crsql_finalize()", []).ok();
+        }
+        let replayed = dump_replica(&config, "v2", "p", "n").unwrap().unwrap();
+        // Row contents must converge on the dumped state (whole-dump equality
+        // would also compare nothing else here since the schema is identical).
+        assert_eq!(replayed, target, "replayed batch must reach the dumped state");
     }
 
     #[test]

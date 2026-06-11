@@ -6,6 +6,7 @@ pub mod db;
 pub mod entities;
 pub mod error;
 pub mod git;
+pub mod history;
 pub mod mcp;
 pub mod notes;
 pub mod oauth;
@@ -14,6 +15,7 @@ pub mod openapi;
 pub mod permalink;
 pub mod plugindb;
 pub mod proxy;
+pub mod rollback;
 pub mod routes;
 pub mod search;
 pub mod session;
@@ -193,6 +195,35 @@ pub fn app(state: AppState) -> Router {
                 .delete(routes::delete_backup),
         )
         .route("/api/vaults/{id}/backup/test", post(routes::test_backup))
+        // Git history browsing + vault rollback.
+        .route(
+            "/api/vaults/{id}/history/commits",
+            get(history::list_commits),
+        )
+        .route(
+            "/api/vaults/{id}/history/commits/{hash}",
+            get(history::get_commit),
+        )
+        .route(
+            "/api/vaults/{id}/history/commits/{hash}/tree",
+            get(history::get_tree),
+        )
+        .route(
+            "/api/vaults/{id}/history/commits/{hash}/file",
+            get(history::get_file),
+        )
+        .route(
+            "/api/vaults/{id}/history/commits/{hash}/blob",
+            get(history::get_blob),
+        )
+        .route(
+            "/api/vaults/{id}/history/commits/{hash}/rollback/preview",
+            post(rollback::rollback_preview),
+        )
+        .route(
+            "/api/vaults/{id}/history/commits/{hash}/rollback",
+            post(rollback::rollback),
+        )
         .route("/api/vaults/{id}/storage", get(storage::get_storage))
         .route("/api/vaults/{id}/storage/gc-blobs", post(storage::gc_blobs))
         .route("/api/vaults/{id}/members", get(routes::list_members))

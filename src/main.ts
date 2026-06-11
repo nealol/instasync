@@ -12,6 +12,8 @@ import { liveEdit } from "./editor/LiveEdit";
 import { yRemoteSelections, yRemoteSelectionsTheme } from "./editor/RemoteSelections";
 import { setDiagnosticLoggingEnabled } from "./debug";
 import { openTrashModal } from "./TrashModal";
+import { FILE_HISTORY_VIEW_TYPE, FileHistoryView } from "./history/FileHistoryView";
+import { openTimelineModal } from "./history/TimelineModal";
 import { RealtimeSqlAPI } from "./pluginDb/api";
 import { RealtimeCursorsAPI } from "./cursors/api";
 import type { RealtimeCursors, RealtimePluginApi, RealtimeSql } from "@realtime-md/plugin-api-types";
@@ -96,6 +98,27 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
 				openTrashModal(this);
 			},
 		});
+		this.registerView(FILE_HISTORY_VIEW_TYPE, (leaf) => new FileHistoryView(leaf, this));
+		this.addCommand({
+			id: "realtime-open-file-history",
+			name: "Open file history",
+			callback: () => void this.activateFileHistoryView(),
+		});
+		this.addCommand({
+			id: "realtime-open-timeline",
+			name: "Open vault history timeline",
+			callback: () => {
+				if (!this.settings.activeVaultId) {
+					new Notice(`${PLUGIN_NAME}: connect to your vault to view history.`);
+					return;
+				}
+				openTimelineModal(this);
+			},
+		});
+		this.addRibbonIcon("history", "Realtime: file history", () => {
+			void this.activateFileHistoryView();
+		});
+
 		this.addCommand({
 			id: "realtime-rebase-plugin-dbs",
 			name: "Rebase plugin databases from server",
@@ -202,6 +225,19 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
 		this.vaultSync = null;
 		this.uploadStatus = "idle";
 		this.setStatus("offline");
+	}
+
+	/** Reveal (or create) the file-history leaf in the right sidebar. */
+	async activateFileHistoryView(): Promise<void> {
+		const existing = this.app.workspace.getLeavesOfType(FILE_HISTORY_VIEW_TYPE)[0];
+		if (existing) {
+			await this.app.workspace.revealLeaf(existing);
+			return;
+		}
+		const leaf = this.app.workspace.getRightLeaf(false);
+		if (!leaf) return;
+		await leaf.setViewState({ type: FILE_HISTORY_VIEW_TYPE, active: true });
+		await this.app.workspace.revealLeaf(leaf);
 	}
 
 	async reloadSync(): Promise<void> {

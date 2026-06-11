@@ -273,6 +273,129 @@ pub async fn index_rename_structured(
     Ok(())
 }
 
+/// One index-doc mutation in a rollback batch.
+#[derive(Clone, Debug)]
+pub enum IndexOp {
+    SetFile { path: String, guid: String },
+    RemoveFile { path: String },
+    SetBinary { path: String, hash: String, size: i64 },
+    RemoveBinary { path: String },
+    SetStructured { path: String, guid: String, kind: String },
+    RemoveStructured { path: String },
+}
+
+/// Build a single update applying every op in one transaction, including the
+/// trash entries that the per-op helpers above would write (so batched deletes
+/// stay recoverable). Removes that target a missing entry are no-ops.
+pub fn build_index_batch_update(current_update: &[u8], ops: &[IndexOp]) -> AppResult<Vec<u8>> {
+    let files = decode_files_map(current_update).map_err(|e| AppError::Internal(e.to_string()))?;
+    let binaries =
+        decode_binaries_map(current_update).map_err(|e| AppError::Internal(e.to_string()))?;
+    let structured =
+        decode_structured_index(current_update).map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let doc = doc_from_update(current_update)?;
+    let before = doc.transact().state_vector();
+    let files_map = doc.get_or_insert_map("files");
+    let binaries_map = doc.get_or_insert_map("binaries");
+    let structured_map = doc.get_or_insert_map("structured");
+    let trash = doc.get_or_insert_map("trash");
+    {
+        let mut txn = doc.transact_mut();
+        let add_trash = |txn: &mut yrs::TransactionMut, entry: HashMap<String, Any>| {
+            trash.insert(txn, uuid::Uuid::new_v4().to_string(), entry);
+        };
+        for op in ops {
+            match op {
+                IndexOp::SetFile { path, guid } => {
+                    files_map.insert(&mut txn, path.to_string(), guid.to_string());
+                }
+                IndexOp::RemoveFile { path } => {
+                    if let Some((_, guid)) = files.iter().find(|(p, _)| p == path) {
+                        let mut entry = trash_entry_common(path, "text");
+                        entry.insert("guid".to_string(), Any::String(guid.as_str().into()));
+                        add_trash(&mut txn, entry);
+                    }
+                    files_map.remove(&mut txn, path);
+                }
+                IndexOp::SetBinary { path, hash, size } => {
+                    let metadata = HashMap::from([
+                        ("hash".to_string(), Any::String(hash.as_str().into())),
+                        ("size".to_string(), Any::BigInt(*size)),
+                    ]);
+                    binaries_map.insert(&mut txn, path.to_string(), metadata);
+                }
+                IndexOp::RemoveBinary { path } => {
+                    if let Some((hash, size)) = binaries
+                        .iter()
+                        .find(|(p, _)| p == path)
+                        .and_then(|(_, meta)| binary_hash_size(meta))
+                    {
+                        let mut entry = trash_entry_common(path, "binary");
+                        entry.insert("hash".to_string(), Any::String(hash.into()));
+                        entry.insert("size".to_string(), Any::BigInt(size));
+                        add_trash(&mut txn, entry);
+                    }
+                    binaries_map.remove(&mut txn, path);
+                }
+                IndexOp::SetStructured { path, guid, kind } => {
+                    let metadata = HashMap::from([
+                        ("guid".to_string(), Any::String(guid.as_str().into())),
+                        ("kind".to_string(), Any::String(kind.as_str().into())),
+                    ]);
+                    structured_map.insert(&mut txn, path.to_string(), metadata);
+                }
+                IndexOp::RemoveStructured { path } => {
+                    if let Some(meta) = structured.iter().find(|e| &e.path == path) {
+                        let mut entry = trash_entry_common(path, &meta.kind);
+                        entry.insert("guid".to_string(), Any::String(meta.guid.as_str().into()));
+                        add_trash(&mut txn, entry);
+                    }
+                    structured_map.remove(&mut txn, path);
+                }
+            }
+        }
+    }
+    let update = doc.transact().encode_state_as_update_v1(&before);
+    Ok(update)
+}
+
+/// Apply a batch of index ops in one read/write round trip, then mirror the
+/// `vault_files` DB registry the same way the per-op helpers do.
+pub async fn index_apply_batch(
+    state: &AppState,
+    vault_id: &str,
+    ops: &[IndexOp],
+) -> AppResult<()> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+    let current = read_update(state, vault_id).await?;
+    let files = decode_files_map(&current).map_err(|e| AppError::Internal(e.to_string()))?;
+    let update = build_index_batch_update(&current, ops)?;
+    if !update.is_empty() {
+        write_update(state, vault_id, update).await?;
+    }
+    for op in ops {
+        match op {
+            IndexOp::SetFile { path, guid } => {
+                upsert_vault_file(state, vault_id, path, guid).await?;
+            }
+            IndexOp::RemoveFile { path } => {
+                if let Some((_, guid)) = files.iter().find(|(p, _)| p == path) {
+                    vault_files::Entity::delete_many()
+                        .filter(vault_files::Column::VaultId.eq(vault_id))
+                        .filter(vault_files::Column::Guid.eq(guid))
+                        .exec(&state.db)
+                        .await?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub fn build_structured_update(current_update: &[u8], value: &JsonValue) -> AppResult<Vec<u8>> {
     if decode_structured(current_update).map_err(|e| AppError::Internal(e.to_string()))? == *value {
         return Ok(Vec::new());
@@ -466,7 +589,7 @@ fn apply_string_to_ytext(txn: &mut yrs::TransactionMut, ytext: &yrs::TextRef, ne
     }
 }
 
-fn json_to_any(value: &JsonValue) -> Any {
+pub(crate) fn json_to_any(value: &JsonValue) -> Any {
     match value {
         JsonValue::Null => Any::Null,
         JsonValue::Bool(v) => Any::Bool(*v),
@@ -1046,6 +1169,61 @@ mod tests {
             decode_files_map(&merged).unwrap(),
             vec![("b.md".into(), "guid-a".into())]
         );
+    }
+
+    #[test]
+    fn build_index_batch_update_applies_all_ops_in_one_update() {
+        let base = files_update(&[("old.md", "guid-old"), ("keep.md", "guid-keep")]);
+        let ops = vec![
+            IndexOp::SetFile {
+                path: "new.md".into(),
+                guid: "guid-new".into(),
+            },
+            IndexOp::RemoveFile {
+                path: "old.md".into(),
+            },
+            IndexOp::SetBinary {
+                path: "img/a.png".into(),
+                hash: "a".repeat(64),
+                size: 9,
+            },
+            IndexOp::SetStructured {
+                path: "b.canvas".into(),
+                guid: "guid-c".into(),
+                kind: "canvas".into(),
+            },
+        ];
+        let update = build_index_batch_update(&base, &ops).unwrap();
+        let merged = apply_update(&base, &update);
+
+        let mut files = decode_files_map(&merged).unwrap();
+        files.sort();
+        assert_eq!(
+            files,
+            vec![
+                ("keep.md".to_string(), "guid-keep".to_string()),
+                ("new.md".to_string(), "guid-new".to_string()),
+            ]
+        );
+        let bins = decode_binaries_entries(&merged).unwrap();
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins[0].path, "img/a.png");
+        let structured = decode_structured_index(&merged).unwrap();
+        assert_eq!(structured.len(), 1);
+        assert_eq!(structured[0].kind, "canvas");
+
+        // The removed file landed in trash with its guid.
+        let doc = doc_from_update(&merged).unwrap();
+        let trash = doc.get_or_insert_map("trash");
+        let txn = doc.transact();
+        let Any::Map(entries) = trash.to_json(&txn) else {
+            panic!("trash map missing");
+        };
+        assert_eq!(entries.len(), 1);
+        let Some((_, Any::Map(value))) = entries.iter().next() else {
+            panic!("trash entry not a map");
+        };
+        assert_eq!(value.get("guid"), Some(&Any::String("guid-old".into())));
     }
 
     #[test]

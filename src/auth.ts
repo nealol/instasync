@@ -814,6 +814,81 @@ export class AuthClient {
 	async deletePluginDb(vaultId: string, pluginId: string, name: string): Promise<void> {
 		await this.api(this.pluginDbPath(vaultId, pluginId, name), { method: "DELETE" });
 	}
+
+	// --- git history + rollback --------------------------------------------------
+
+	/** Page through the vault's git history (optionally one file's, `--follow`). */
+	listHistoryCommits(
+		vaultId: string,
+		opts?: { limit?: number; before?: string; path?: string },
+	): Promise<import("./history/types").CommitListPage> {
+		const params = new URLSearchParams();
+		if (opts?.limit) params.set("limit", String(opts.limit));
+		if (opts?.before) params.set("before", opts.before);
+		if (opts?.path) params.set("path", opts.path);
+		const qs = params.toString();
+		return this.api(`/api/vaults/${vaultId}/history/commits${qs ? `?${qs}` : ""}`);
+	}
+
+	/** Commit metadata plus its change list. */
+	getHistoryCommit(vaultId: string, hash: string): Promise<import("./history/types").CommitDetail> {
+		return this.api(`/api/vaults/${vaultId}/history/commits/${hash}`);
+	}
+
+	/** Full file tree at a commit. */
+	getHistoryTree(vaultId: string, hash: string): Promise<import("./history/types").HistoryTree> {
+		return this.api(`/api/vaults/${vaultId}/history/commits/${hash}/tree`);
+	}
+
+	/** One path's content at a commit (text, binary metadata, or absent). */
+	getHistoryFile(
+		vaultId: string,
+		hash: string,
+		path: string,
+	): Promise<import("./history/types").FileAtCommit> {
+		return this.api(
+			`/api/vaults/${vaultId}/history/commits/${hash}/file?path=${encodeURIComponent(path)}`,
+		);
+	}
+
+	/** Raw bytes of a path at a commit; throws "blob no longer available" on 410. */
+	async getHistoryBlob(vaultId: string, hash: string, path: string): Promise<ArrayBuffer> {
+		const res = await requestUrl({
+			url: `${this.baseUrl}/api/vaults/${vaultId}/history/commits/${hash}/blob?path=${encodeURIComponent(path)}`,
+			method: "GET",
+			headers: this.authHeaders,
+			throw: false,
+		});
+		if (res.status === 401) {
+			await this.clearSession();
+			throw new AuthError("Session expired. Please sign in again.");
+		}
+		if (res.status === 410) throw new Error("blob no longer available");
+		if (res.status < 200 || res.status >= 300) {
+			throw new Error(`history blob download failed: ${blobErrorMessage(res)}`);
+		}
+		return res.arrayBuffer;
+	}
+
+	/** Dry-run a rollback (admin only). */
+	rollbackPreview(vaultId: string, hash: string): Promise<import("./history/types").RollbackPlan> {
+		return this.api(`/api/vaults/${vaultId}/history/commits/${hash}/rollback/preview`, {
+			method: "POST",
+			body: {},
+		});
+	}
+
+	/** Execute a rollback (admin only); `pluginDbs` opts databases in. */
+	rollbackVault(
+		vaultId: string,
+		hash: string,
+		pluginDbs: { plugin: string; name: string }[] = [],
+	): Promise<import("./history/types").RollbackResult> {
+		return this.api(`/api/vaults/${vaultId}/history/commits/${hash}/rollback`, {
+			method: "POST",
+			body: { pluginDbs },
+		});
+	}
 }
 
 /**

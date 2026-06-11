@@ -373,3 +373,235 @@
 .realtime-trash-rename .realtime-modal-input {
 	margin-bottom: 0;
 }
+
+/* ---------- git history: sidebar view ---------- */
+
+.realtime-history-view {
+	padding: 0 8px;
+	overflow-y: auto;
+}
+
+.realtime-history-header h4 {
+	margin: 8px 0;
+	word-break: break-all;
+}
+
+.realtime-history-error {
+	color: var(--text-error);
+}
+
+.realtime-history-list {
+	display: flex;
+	flex-direction: column;
+}
+
+.realtime-history-row {
+	border-bottom: 1px solid var(--background-modifier-border);
+	padding: 6px 0;
+}
+
+.realtime-history-row-head {
+	cursor: pointer;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+
+.realtime-history-row-head:hover {
+	background: var(--background-modifier-hover);
+}
+
+.realtime-history-subject {
+	font-weight: 500;
+}
+
+.realtime-history-meta {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+}
+
+.realtime-history-diff {
+	margin-top: 6px;
+	max-height: 360px;
+	overflow: auto;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+}
+
+.realtime-history-footer {
+	margin: 10px 0;
+}
+
+/* ---------- git history: timeline modal ---------- */
+
+.realtime-timeline-modal {
+	width: 96vw;
+	height: 92vh;
+	max-width: none;
+	max-height: none;
+}
+
+.realtime-timeline-modal .modal-content,
+.realtime-timeline-shell {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	min-height: 0;
+}
+
+.realtime-timeline-header {
+	display: flex;
+	align-items: baseline;
+	gap: 12px;
+}
+
+.realtime-timeline-header h2 {
+	margin: 0 0 8px;
+}
+
+.realtime-timeline-strip {
+	flex-shrink: 0;
+	overflow-x: auto;
+	height: 64px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	margin-bottom: 10px;
+}
+
+.realtime-timeline-chip {
+	height: 56px;
+	margin: 4px;
+	padding: 6px 10px;
+	border-radius: 6px;
+	background: var(--background-secondary);
+	cursor: pointer;
+	overflow: hidden;
+	box-sizing: border-box;
+}
+
+.realtime-timeline-chip:hover {
+	background: var(--background-modifier-hover);
+}
+
+.realtime-timeline-chip.is-selected {
+	outline: 2px solid var(--interactive-accent);
+}
+
+.realtime-timeline-chip.is-rollback {
+	border-left: 3px solid var(--color-orange);
+}
+
+.realtime-timeline-chip-subject {
+	font-size: var(--font-ui-small);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.realtime-timeline-chip-meta {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.realtime-timeline-detail {
+	display: flex;
+	flex: 1;
+	gap: 10px;
+	min-height: 0;
+}
+
+.realtime-timeline-files {
+	width: 280px;
+	flex-shrink: 0;
+	display: flex;
+	flex-direction: column;
+	min-height: 0;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	padding: 6px;
+}
+
+.realtime-timeline-toggle {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin-bottom: 6px;
+}
+
+.realtime-timeline-tree {
+	flex: 1;
+	min-height: 0;
+	overflow: auto;
+}
+
+.realtime-timeline-diff {
+	flex: 1;
+	min-width: 0;
+	overflow: auto;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	padding: 4px;
+}
+
+.realtime-timeline-rollback {
+	flex-shrink: 0;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	margin-top: 10px;
+}
+
+.realtime-rollback-warning {
+	border: 1px solid var(--color-orange);
+	border-radius: 6px;
+	padding: 8px;
+	margin: 8px 0;
+}
+
+.realtime-rollback-db-row {
+	padding: 4px 0;
+}
+
+.realtime-history-binary {
+	display: flex;
+	gap: 16px;
+	padding: 12px;
+	flex-wrap: wrap;
+}
+
+.realtime-history-binary-pane img {
+	max-width: 40vw;
+	max-height: 60vh;
+	border-radius: 6px;
+}
+
+.realtime-history-binary-label {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+	margin-bottom: 4px;
+}
+
+.realtime-history-hash {
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+}
+
+.is-mobile .realtime-timeline-detail {
+	flex-direction: column;
+}
+
+.is-mobile .realtime-timeline-files {
+	width: auto;
+	max-height: 30vh;
+}
+
+.is-mobile .realtime-history-binary-pane img {
+	max-width: 90vw;
+}

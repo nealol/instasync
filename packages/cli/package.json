@@ -1,0 +1,38 @@
+{
+	"name": "@realtime-md/cli",
+	"version": "0.1.0",
+	"description": "Command-line client for the Realtime.md server: clone vaults into local folders, sync, and manage vaults from the terminal.",
+	"type": "module",
+	"bin": {
+		"rtmd": "./dist/cli.js"
+	},
+	"files": [
+		"dist"
+	],
+	"engines": {
+		"node": ">=20"
+	},
+	"keywords": [
+		"realtime",
+		"obsidian",
+		"cli",
+		"markdown"
+	],
+	"license": "MIT",
+	"scripts": {
+		"build": "tsup",
+		"typecheck": "tsc -noEmit",
+		"test": "vitest run --project cli-unit --config ../../vitest.config.ts",
+		"prepublishOnly": "bun run build",
+		"release": "npm publish --access public"
+	},
+	"dependencies": {
+		"@realtime-md/sdk": "workspace:*",
+		"commander": "^14.0.0"
+	},
+	"devDependencies": {
+		"@types/node": "^20.11.0",
+		"tsup": "^8.5.0",
+		"typescript": "^5.4.5"
+	}
+}

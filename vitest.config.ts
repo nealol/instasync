@@ -39,6 +39,14 @@ export default defineConfig({
 			},
 			{
 				test: {
+					name: "cli-unit",
+					environment: "node",
+					include: ["packages/cli/tests/unit/**/*.test.ts"],
+					testTimeout: 30_000,
+				},
+			},
+			{
+				test: {
 					name: "sdk-e2e",
 					environment: "node",
 					include: ["packages/sdk/tests/e2e/**/*.test.ts"],

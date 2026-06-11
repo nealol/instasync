@@ -165,4 +165,8 @@
 /instasync.zip
 /realtime.zip
 /packages/plugin-api-types/dist/
+/packages/plugin-api-types/node_modules/
 /packages/sdk/dist/
+/packages/sdk/node_modules/
+/packages/cli/dist/
+/packages/cli/node_modules/

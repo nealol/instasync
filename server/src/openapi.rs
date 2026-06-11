@@ -86,7 +86,14 @@ use utoipa::{Modify, OpenApi};
         move_base,
         plugin_db_changes,
         plugin_db_touch,
-        plugin_db_delete
+        plugin_db_delete,
+        history_list_commits,
+        history_get_commit,
+        history_get_tree,
+        history_get_file,
+        history_get_blob,
+        history_rollback_preview,
+        history_rollback
     ),
     tags(
         (name = "auth", description = "Browser login and session management"),
@@ -98,7 +105,8 @@ use utoipa::{Modify, OpenApi};
         (name = "bases", description = "Vault-scoped Obsidian Base APIs"),
         (name = "attachments", description = "Vault-scoped attachment APIs and signed uploads"),
         (name = "plugin-dbs", description = "Synced plugin database (cr-sqlite) bootstrap, replication, and purge APIs"),
-        (name = "permalinks", description = "Public note redirect endpoints")
+        (name = "permalinks", description = "Public note redirect endpoints"),
+        (name = "history", description = "Vault git history browsing and admin rollback")
     )
 )]
 pub struct ApiDoc;
@@ -341,6 +349,27 @@ async fn plugin_db_touch() {}
 
 #[utoipa::path(delete, path = "/api/vaults/{id}/plugin-dbs/{plugin}/{name}", tag = "plugin-dbs", security(("bearerAuth" = [])), params(("id" = String, Path), ("plugin" = String, Path), ("name" = String, Path)), responses((status = 200, description = "Database purged: replica, git dump, and batch log removed (irreversible)"), (status = 400, description = "Invalid plugin db id")))]
 async fn plugin_db_delete() {}
+
+#[utoipa::path(get, path = "/api/vaults/{id}/history/commits", tag = "history", security(("bearerAuth" = [])), params(("id" = String, Path), ("limit" = Option<u64>, Query), ("before" = Option<String>, Query, description = "Keyset cursor: commits strictly before this hash"), ("path" = Option<String>, Query, description = "Restrict to one file's history (--follow)")), responses((status = 200, description = "Commit list with hasMore")))]
+async fn history_list_commits() {}
+
+#[utoipa::path(get, path = "/api/vaults/{id}/history/commits/{hash}", tag = "history", security(("bearerAuth" = [])), params(("id" = String, Path), ("hash" = String, Path)), responses((status = 200, description = "Commit metadata and change list"), (status = 404, description = "Unknown commit")))]
+async fn history_get_commit() {}
+
+#[utoipa::path(get, path = "/api/vaults/{id}/history/commits/{hash}/tree", tag = "history", security(("bearerAuth" = [])), params(("id" = String, Path), ("hash" = String, Path)), responses((status = 200, description = "Full file tree at this commit")))]
+async fn history_get_tree() {}
+
+#[utoipa::path(get, path = "/api/vaults/{id}/history/commits/{hash}/file", tag = "history", security(("bearerAuth" = [])), params(("id" = String, Path), ("hash" = String, Path), ("path" = String, Query)), responses((status = 200, description = "File content at this commit: text, binary metadata, or absent")))]
+async fn history_get_file() {}
+
+#[utoipa::path(get, path = "/api/vaults/{id}/history/commits/{hash}/blob", tag = "history", security(("bearerAuth" = [])), params(("id" = String, Path), ("hash" = String, Path), ("path" = String, Query)), responses((status = 200, description = "Raw bytes"), (status = 410, description = "Blob no longer available")))]
+async fn history_get_blob() {}
+
+#[utoipa::path(post, path = "/api/vaults/{id}/history/commits/{hash}/rollback/preview", tag = "history", security(("bearerAuth" = [])), params(("id" = String, Path), ("hash" = String, Path)), responses((status = 200, description = "Dry-run rollback plan"), (status = 403, description = "Admin required")))]
+async fn history_rollback_preview() {}
+
+#[utoipa::path(post, path = "/api/vaults/{id}/history/commits/{hash}/rollback", tag = "history", security(("bearerAuth" = [])), params(("id" = String, Path), ("hash" = String, Path)), request_body = Object, responses((status = 200, description = "Rollback applied; returns the new commit"), (status = 403, description = "Admin required")))]
+async fn history_rollback() {}
 
 #[utoipa::path(get, path = "/n/{guid}", tag = "permalinks", params(("guid" = String, Path)), responses((status = 303, description = "Redirects to note deep link or path redirect"), (status = 404, description = "Not found")))]
 async fn note_by_guid() {}

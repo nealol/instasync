@@ -13,7 +13,7 @@
     "build": "bun run typecheck && node esbuild.config.mjs production",
     "typecheck": "tsc -noEmit",
     "test": "vitest run --project plugin --project sdk-unit",
-    "test:unit": "vitest run --project plugin --project sdk-unit",
+    "test:unit": "vitest run --project plugin --project sdk-unit --project cli-unit",
     "test:sdk": "vitest run --project sdk-unit",
     "test:sdk:e2e": "vitest run --project sdk-e2e",
     "test:server": "cargo test --manifest-path server/Cargo.toml",
@@ -58,16 +58,18 @@
   },
   "dependencies": {
     "@pierre/diffs": "^1.2.7",
+    "@pierre/trees": "^1.0.0-beta.4",
     "@realtime-md/plugin-api-types": "workspace:*",
+    "@tanstack/react-virtual": "^3.14.2",
     "@vlcn.io/crsqlite-wasm": "0.16.0",
     "@y-sweet/client": "^0.9.1",
     "lib0": "^0.2.93",
     "picomatch": "^4.0.3",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
-    "yaml": "^2.8.2",
     "y-indexeddb": "^9.0.12",
     "y-protocols": "^1.0.6",
+    "yaml": "^2.8.2",
     "yjs": "^13.6.0"
   }
 }

@@ -1071,7 +1071,7 @@ async fn structured_entry_by_path(
         .find(|e| e.path == path))
 }
 
-fn canvas_file_to_map(value: JsonValue) -> JsonValue {
+pub(crate) fn canvas_file_to_map(value: JsonValue) -> JsonValue {
     let mut root = JsonMap::new();
     let nodes = value
         .get("nodes")
