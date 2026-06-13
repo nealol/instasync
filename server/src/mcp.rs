@@ -317,9 +317,26 @@ struct BacklinksArgs {
     path: String,
 }
 
+/// Schema helpers for `serde_json::Value` fields.
+///
+/// schemars renders a bare `serde_json::Value` as the boolean schema `true`
+/// ("accept any JSON"). That is legal JSON Schema, so lenient MCP clients accept
+/// it, but Claude Code validates each tool's input schema with a stricter model
+/// that requires every property to be a schema *object* and rejects a bare
+/// boolean (`{"code":"custom","message":"Invalid input"}`), which aborts the
+/// whole `tools/list`. Emitting an object schema instead keeps these tools
+/// loadable in Claude Code while remaining permissive everywhere else.
+fn any_object_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": "object" })
+}
+fn any_json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({})
+}
+
 #[derive(Deserialize, JsonSchema)]
 struct JsonPathArgs {
     path: String,
+    #[schemars(schema_with = "any_json_schema")]
     value: serde_json::Value,
 }
 
@@ -366,9 +383,15 @@ struct BaseViewArgs {
     name: String,
     #[serde(rename = "type")]
     view_type: String,
+    #[serde(default)]
+    #[schemars(schema_with = "any_object_schema")]
     filters: Option<serde_json::Value>,
     order: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    #[schemars(schema_with = "any_object_schema")]
     sort: Option<serde_json::Value>,
+    #[serde(default)]
+    #[schemars(schema_with = "any_object_schema")]
     group_by: Option<serde_json::Value>,
     columns: Option<Vec<serde_json::Value>>,
 }
@@ -377,9 +400,15 @@ struct BaseViewArgs {
 struct BaseViewPatchArgs {
     path: String,
     name: String,
+    #[serde(default)]
+    #[schemars(schema_with = "any_object_schema")]
     filters: Option<serde_json::Value>,
     order: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    #[schemars(schema_with = "any_object_schema")]
     sort: Option<serde_json::Value>,
+    #[serde(default)]
+    #[schemars(schema_with = "any_object_schema")]
     group_by: Option<serde_json::Value>,
     columns: Option<Vec<serde_json::Value>>,
 }
@@ -392,6 +421,7 @@ struct NamePathArgs {
 struct SetValueArgs {
     path: String,
     name: Option<String>,
+    #[schemars(schema_with = "any_json_schema")]
     value: serde_json::Value,
 }
 
