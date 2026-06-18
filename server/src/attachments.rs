@@ -903,6 +903,7 @@ impl UploadPrincipal {
             user_id: self.user_id.clone(),
             display_name: self.display_name.clone(),
             email: self.email.clone(),
+            git_email: None,
             actor,
             expires_at_ms,
         }

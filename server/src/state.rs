@@ -31,6 +31,7 @@ pub struct Principal {
     pub user_id: String,
     pub display_name: String,
     pub email: String,
+    pub git_email: Option<String>,
     pub actor: PrincipalActor,
     /// Epoch millis after which this token->principal mapping is evicted.
     pub expires_at_ms: i64,

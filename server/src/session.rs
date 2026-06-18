@@ -50,6 +50,7 @@ pub async fn upsert_user(
             oidc_issuer: Set(issuer.to_string()),
             oidc_subject: Set(subject.to_string()),
             email: Set(email.to_string()),
+            git_email: Set(None),
             display_name: Set(display_name.to_string()),
             created_at: Set(now_millis()),
         };
@@ -218,6 +219,7 @@ impl ApiPrincipal {
             user_id: self.user.id.clone(),
             display_name: self.user.display_name.clone(),
             email: self.user.email.clone(),
+            git_email: self.user.git_email.clone(),
             actor,
             expires_at_ms,
         }

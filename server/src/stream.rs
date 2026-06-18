@@ -640,6 +640,7 @@ mod tests {
                 oidc_issuer: "iss".into(),
                 oidc_subject: "sub".into(),
                 email: "a@x".into(),
+                git_email: None,
                 display_name: "Alice".into(),
                 created_at: now,
             },

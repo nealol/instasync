@@ -31,6 +31,7 @@ pub mod users {
         pub oidc_issuer: String,
         pub oidc_subject: String,
         pub email: String,
+        pub git_email: Option<String>,
         pub display_name: String,
         pub created_at: i64,
     }

@@ -145,6 +145,34 @@ export interface GcBlobsResult {
 export class AuthError extends Error {}
 
 /**
+ * Validate a self-settable git author email. Mirrors the server-side
+ * `validate_git_email` (server/src/routes.rs): the value flows unescaped into
+ * `Name <email>` passed to `git commit --author` and into `Co-authored-by`
+ * trailers, so it must not contain control chars, whitespace, or angle
+ * brackets, and must have a basic email shape. Returns a human-readable error
+ * message, or `null` when the value is valid — including the empty string,
+ * which clears the field (falling back to the login email).
+ */
+export function validateGitEmail(value: string): string | null {
+  const trimmed = value.trim();
+  if (trimmed === "") return null;
+  if (trimmed.length > 254) return "Git author email is too long.";
+  if (/[\x00-\x1f\x7f<>\s]/.test(trimmed)) {
+    return "Git author email must not contain spaces, angle brackets, or line breaks.";
+  }
+  const at = trimmed.indexOf("@");
+  if (at < 0 || at !== trimmed.lastIndexOf("@")) {
+    return "Enter a valid email address.";
+  }
+  const local = trimmed.slice(0, at);
+  const domain = trimmed.slice(at + 1);
+  if (local === "" || domain === "" || !domain.includes(".")) {
+    return "Enter a valid email address.";
+  }
+  return null;
+}
+
+/**
  * Talks to the Realtime auth server: SSO login (via an `obsidian://` deep link,
  * with a paste-code fallback), session management, and the vault/sharing/token
  * endpoints. Uses Obsidian's `requestUrl` so it works around desktop CORS.

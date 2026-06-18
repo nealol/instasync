@@ -950,7 +950,13 @@ fn build_commit_meta(
 
 fn author_identity(principal: &Principal, config: &Config) -> (String, String) {
     match &principal.actor {
-        PrincipalActor::User => (principal.display_name.clone(), principal.email.clone()),
+        PrincipalActor::User => (
+            principal.display_name.clone(),
+            principal
+                .git_email
+                .clone()
+                .unwrap_or_else(|| principal.email.clone()),
+        ),
         PrincipalActor::Cursor {
             app_id,
             cursor_name,
@@ -1576,6 +1582,7 @@ diff --git a/ref.md b/ref.md
                 user_id: "u1".into(),
                 display_name: "Alice".into(),
                 email: "a@x".into(),
+                git_email: None,
                 actor: PrincipalActor::User,
                 expires_at_ms: 0,
             },
@@ -1583,6 +1590,7 @@ diff --git a/ref.md b/ref.md
                 user_id: "u2".into(),
                 display_name: "Bob".into(),
                 email: "b@x".into(),
+                git_email: None,
                 actor: PrincipalActor::User,
                 expires_at_ms: 0,
             },
@@ -1623,6 +1631,7 @@ diff --git a/ref.md b/ref.md
             user_id: "u1".into(),
             display_name: "Alice".into(),
             email: "a@x".into(),
+            git_email: None,
             actor: PrincipalActor::Cursor {
                 cursor_id: "c1".into(),
                 app_id: "app123".into(),
@@ -1654,6 +1663,7 @@ diff --git a/ref.md b/ref.md
             user_id: "u1".into(),
             display_name: "Alice".into(),
             email: "a@x".into(),
+            git_email: None,
             actor: PrincipalActor::User,
             expires_at_ms: 0,
         }];

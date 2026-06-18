@@ -14,6 +14,7 @@ import { FileDiff } from "@pierre/diffs/react";
 import { parseDiffFromFile } from "@pierre/diffs";
 import {
   normalizeServerUrl,
+  validateGitEmail,
   type CursorAuditEntry,
   type GitBackupConfig,
   type KnownSession,
@@ -511,6 +512,7 @@ function FullSettings({
 
 function AccountSection({ plugin, refresh }: { plugin: RealtimePlugin; refresh: () => void }) {
   const [gitEmail, setGitEmail] = useState(plugin.settings.gitEmail || "");
+  const [emailError, setEmailError] = useState("");
   return (
     <>
       <h3>Account</h3>
@@ -540,19 +542,32 @@ function AccountSection({ plugin, refresh }: { plugin: RealtimePlugin; refresh: 
             type="email"
             value={gitEmail}
             placeholder={plugin.settings.userEmail}
-            onChange={(event) => setGitEmail(event.currentTarget.value)}
-            onBlur={() =>
+            onChange={(event) => {
+              setGitEmail(event.currentTarget.value);
+              if (emailError) setEmailError("");
+            }}
+            onBlur={() => {
+              const trimmed = gitEmail.trim();
+              if (trimmed === plugin.settings.gitEmail) {
+                if (emailError) setEmailError("");
+                return;
+              }
+              const msg = validateGitEmail(trimmed);
+              if (msg) {
+                setEmailError(msg);
+                return;
+              }
+              setEmailError("");
               void runNotice(undefined, async () => {
-                const trimmed = gitEmail.trim();
-                if (trimmed === plugin.settings.gitEmail) return;
                 await plugin.auth.updateMe({ gitEmail: trimmed || undefined });
                 setGitEmail(trimmed);
                 new Notice(`${PLUGIN_NAME}: Git author email updated.`);
-              })
-            }
+              });
+            }}
           />
         }
       />
+      {emailError ? <p className="realtime-error">{emailError}</p> : null}
     </>
   );
 }

@@ -176,7 +176,7 @@ pub fn app(state: AppState) -> Router {
         .route("/n/{guid}", get(permalink::note_by_guid))
         .route("/p", get(permalink::note_by_path))
         .route("/api/server-info", get(routes::server_info))
-        .route("/api/me", get(routes::me))
+        .route("/api/me", get(routes::me).patch(routes::update_me))
         .route("/api/logout", post(routes::logout))
         .route(
             "/api/vaults",

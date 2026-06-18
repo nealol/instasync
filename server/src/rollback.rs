@@ -704,6 +704,7 @@ pub async fn rollback(
         user_id: user.id.clone(),
         display_name: user.display_name.clone(),
         email: user.email.clone(),
+        git_email: user.git_email.clone(),
         actor: PrincipalActor::User,
         expires_at_ms: now_millis() + 24 * 60 * 60 * 1000,
     };

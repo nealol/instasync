@@ -31,7 +31,14 @@ const PRINCIPAL_TTL_MS: i64 = 1000 * 60 * 60 * 24;
 pub struct MeResponse {
     pub user_id: String,
     pub email: String,
+    pub git_email: Option<String>,
     pub display_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateMeBody {
+    pub git_email: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -100,8 +107,72 @@ pub async fn me(AuthUser(user): AuthUser) -> Json<MeResponse> {
     Json(MeResponse {
         user_id: user.id,
         email: user.email,
+        git_email: user.git_email,
         display_name: user.display_name,
     })
+}
+
+pub async fn update_me(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Json(body): Json<UpdateMeBody>,
+) -> AppResult<Json<MeResponse>> {
+    let git_email = match body.git_email {
+        Some(email) => {
+            let trimmed = email.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                validate_git_email(trimmed)?;
+                Some(trimmed.to_string())
+            }
+        }
+        None => None,
+    };
+    let mut active: users::ActiveModel = user.into();
+    active.git_email = Set(git_email);
+    let user = active.update(&state.db).await?;
+    Ok(Json(MeResponse {
+        user_id: user.id,
+        email: user.email,
+        git_email: user.git_email,
+        display_name: user.display_name,
+    }))
+}
+
+/// Validate a self-settable git author email before persisting it. The value
+/// flows unescaped into `format!("{name} <{email}>")` passed to
+/// `git commit --author`, and into `Co-authored-by: {name} <{email}>` trailers
+/// (see `git::build_commit_meta`). A malicious value like
+/// `a@b.com>\nSigned-off-by: attacker <a@x>\n` would inject arbitrary trailers
+/// / corrupt the author line in the shared audit history, so reject anything
+/// that could break out of the `Name <email>` envelope or inject `Key: Value`
+/// lines, and require a basic email shape.
+fn validate_git_email(value: &str) -> Result<(), AppError> {
+    if value.len() > 254 {
+        return Err(AppError::BadRequest("git_email too long".into()));
+    }
+    // No control chars, whitespace, or angle brackets: these could close the
+    // `<...>` envelope early or start a new trailer line.
+    if value.chars().any(|c| c.is_control() || c.is_whitespace() || c == '<' || c == '>') {
+        return Err(AppError::BadRequest(
+            "git_email contains invalid characters".into(),
+        ));
+    }
+    // Basic email shape: exactly one '@', non-empty local and domain, domain
+    // contains at least one '.'.
+    if value.matches('@').count() != 1 {
+        return Err(AppError::BadRequest(
+            "git_email is not a valid email address".into(),
+        ));
+    }
+    let (local, domain) = value.split_once('@').expect("checked exactly one '@'");
+    if local.is_empty() || domain.is_empty() || !domain.contains('.') {
+        return Err(AppError::BadRequest(
+            "git_email is not a valid email address".into(),
+        ));
+    }
+    Ok(())
 }
 
 // ---------- vaults ----------
@@ -1104,6 +1175,7 @@ pub async fn doc_token(
                     user_id: user.id.clone(),
                     display_name: user.display_name.clone(),
                     email: user.email.clone(),
+                    git_email: user.git_email.clone(),
                     actor: PrincipalActor::User,
                     expires_at_ms: now_millis() + PRINCIPAL_TTL_MS,
                 },

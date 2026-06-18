@@ -621,6 +621,7 @@ fn principal(id: &str, name: &str, email: &str) -> realtime_server::state::Princ
         user_id: id.into(),
         display_name: name.into(),
         email: email.into(),
+        git_email: None,
         actor: realtime_server::state::PrincipalActor::User,
         expires_at_ms: i64::MAX,
     }
@@ -968,6 +969,69 @@ async fn login_creates_session_and_me_works() {
     let (status, me) = send(&app, "GET", "/api/me", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(me["displayName"], "alice");
+    assert_eq!(me["gitEmail"], Value::Null);
+
+    let (status, me) = send(
+        &app,
+        "PATCH",
+        "/api/me",
+        Some(&token),
+        Some(json!({ "gitEmail": "alice+git@example.com" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(me["gitEmail"], "alice+git@example.com");
+
+    let (status, me) = send(&app, "GET", "/api/me", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(me["gitEmail"], "alice+git@example.com");
+
+    // git_email is self-settable and flows unescaped into the git author line
+    // and Co-authored-by trailers, so injection attempts must be rejected.
+    let cases = [
+        ("a@b.com>\nSigned-off-by: attacker <a@x>\n", "trailer injection via '>'"),
+        ("a@b.com\r\nX: y", "crlf trailer injection"),
+        ("alice<@example.com", "angle bracket in local"),
+        ("alice @example.com", "whitespace in local part"),
+        ("alice\n@example.com", "newline in local"),
+        ("not-an-email", "missing '@'"),
+        ("alice@", "empty domain"),
+        ("@example.com", "empty local"),
+        ("alice@example", "domain without dot"),
+        ("a@b@example.com", "multiple '@'"),
+    ];
+    for (email, label) in cases {
+        let (status, me) = send(
+            &app,
+            "PATCH",
+            "/api/me",
+            Some(&token),
+            Some(json!({ "gitEmail": email })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "case {label:?}: {email:?}");
+        assert!(
+            me["gitEmail"].is_null(),
+            "case {label:?}: gitEmail should be absent in error body"
+        );
+    }
+
+    // The last accepted value is still in place (no partial write).
+    let (status, me) = send(&app, "GET", "/api/me", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(me["gitEmail"], "alice+git@example.com");
+
+    // Empty string clears the stored value.
+    let (status, me) = send(
+        &app,
+        "PATCH",
+        "/api/me",
+        Some(&token),
+        Some(json!({ "gitEmail": "" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(me["gitEmail"], Value::Null);
 
     // No bearer -> 401.
     let (status, _) = send(&app, "GET", "/api/me", None, None).await;
