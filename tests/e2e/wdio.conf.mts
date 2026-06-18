@@ -27,55 +27,55 @@ let ysweet: YSweetServer | undefined;
 let authServer: AuthServer | undefined;
 
 export const config: WebdriverIO.Config = {
-	runner: "local",
-	framework: "mocha",
-	specs: [path.resolve(here, "specs/**/*.e2e.ts")],
-	maxInstances: 1,
+  runner: "local",
+  framework: "mocha",
+  specs: [path.resolve(here, "specs/**/*.e2e.ts")],
+  maxInstances: 1,
 
-	capabilities: [
-		{
-			browserName: "obsidian",
-			browserVersion: "latest",
-			"wdio:obsidianOptions": {
-				installerVersion: "earliest",
-				plugins: [repoRoot],
-				vault: path.resolve(here, "vaults/vaultA"),
-				copy: true,
-			},
-		} as any,
-	],
+  capabilities: [
+    {
+      browserName: "obsidian",
+      browserVersion: "latest",
+      "wdio:obsidianOptions": {
+        installerVersion: "earliest",
+        plugins: [repoRoot],
+        vault: path.resolve(here, "vaults/vaultA"),
+        copy: true,
+      },
+    } as any,
+  ],
 
-	services: ["obsidian"],
-	reporters: ["obsidian"],
-	cacheDir: path.resolve(repoRoot, ".obsidian-cache"),
-	mochaOpts: { ui: "bdd", timeout: 240_000 },
-	logLevel: "warn",
+  services: ["obsidian"],
+  reporters: ["obsidian"],
+  cacheDir: path.resolve(repoRoot, ".obsidian-cache"),
+  mochaOpts: { ui: "bdd", timeout: 240_000 },
+  logLevel: "warn",
 
-	async onPrepare() {
-		const authKey = await genAuthKey();
-		const ysweetStoreDir = fs.mkdtempSync(path.join(os.tmpdir(), "realtime-ysweet-store-"));
-		// Git audit commits go to a temp dir the spec can inspect (plugin-db git
-		// dump assertions). The cr-sqlite loadable extension is passed through
-		// from the environment when available (enables server replicas + dumps);
-		// the corresponding spec assertions skip when it is not set.
-		const gitDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "realtime-git-"));
-		process.env.E2E_GIT_DATA_DIR = gitDataDir;
-		const crsqliteExtPath =
-			process.env.CRSQLITE_EXT_PATH && fs.existsSync(process.env.CRSQLITE_EXT_PATH)
-				? process.env.CRSQLITE_EXT_PATH
-				: undefined;
-		ysweet = await startYSweetServer(YSWEET_PORT, authKey, ysweetStoreDir);
-		authServer = await startAuthServer({
-			port: AUTH_PORT,
-			ysweetUrl: ysweet.url,
-			authKey,
-			ysweetStoreDir,
-			gitDataDir,
-			crsqliteExtPath,
-		});
-	},
-	async onComplete() {
-		await authServer?.stop();
-		await ysweet?.stop();
-	},
+  async onPrepare() {
+    const authKey = await genAuthKey();
+    const ysweetStoreDir = fs.mkdtempSync(path.join(os.tmpdir(), "realtime-ysweet-store-"));
+    // Git audit commits go to a temp dir the spec can inspect (plugin-db git
+    // dump assertions). The cr-sqlite loadable extension is passed through
+    // from the environment when available (enables server replicas + dumps);
+    // the corresponding spec assertions skip when it is not set.
+    const gitDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "realtime-git-"));
+    process.env.E2E_GIT_DATA_DIR = gitDataDir;
+    const crsqliteExtPath =
+      process.env.CRSQLITE_EXT_PATH && fs.existsSync(process.env.CRSQLITE_EXT_PATH)
+        ? process.env.CRSQLITE_EXT_PATH
+        : undefined;
+    ysweet = await startYSweetServer(YSWEET_PORT, authKey, ysweetStoreDir);
+    authServer = await startAuthServer({
+      port: AUTH_PORT,
+      ysweetUrl: ysweet.url,
+      authKey,
+      ysweetStoreDir,
+      gitDataDir,
+      crsqliteExtPath,
+    });
+  },
+  async onComplete() {
+    await authServer?.stop();
+    await ysweet?.stop();
+  },
 };

@@ -12,7 +12,7 @@ import { resetTokenRetryStateForTests } from "../../src/ysweet";
 // past the test timeout (the observed document.test.ts flake). Clear the state
 // before each test and shrink the backoff so an in-test hiccup recovers fast.
 beforeEach(() => {
-	resetTokenRetryStateForTests(500);
+  resetTokenRetryStateForTests(500);
 });
 
 // Force the `ws` implementation as the global WebSocket. On Node 22+ a global
@@ -24,6 +24,6 @@ beforeEach(() => {
 // Opt-in sync diagnostics for debugging test failures:
 //   REALTIME_DEBUG=1 npx vitest run tests/unit/document.test.ts
 if (process.env.REALTIME_DEBUG) {
-	const { setDiagnosticLoggingEnabled } = await import("../../src/debug");
-	setDiagnosticLoggingEnabled(true);
+  const { setDiagnosticLoggingEnabled } = await import("../../src/debug");
+  setDiagnosticLoggingEnabled(true);
 }

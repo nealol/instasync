@@ -12,42 +12,42 @@ export const RTMD_FILE = ".rtmd";
 export type FileKind = "note" | "canvas" | "base" | "attachment";
 
 export interface OAuthStoredTokens {
-	accessToken: string;
-	tokenType: string;
-	refreshToken: string;
-	scope: string;
-	/** Epoch ms; recomputed into `expiresIn` when reconstructing the provider. */
-	expiresAt: number;
+  accessToken: string;
+  tokenType: string;
+  refreshToken: string;
+  scope: string;
+  /** Epoch ms; recomputed into `expiresIn` when reconstructing the provider. */
+  expiresAt: number;
 }
 
 export type AuthConfig =
-	| { mode: "user"; token: string }
-	| { mode: "cursor"; token: string; cursorId?: string; cursorName?: string }
-	| { mode: "cursor-oauth"; clientId: string; tokens: OAuthStoredTokens; cursorName?: string };
+  | { mode: "user"; token: string }
+  | { mode: "cursor"; token: string; cursorId?: string; cursorName?: string }
+  | { mode: "cursor-oauth"; clientId: string; tokens: OAuthStoredTokens; cursorName?: string };
 
 export interface SyncFileState {
-	kind: FileKind;
-	/** sha256 hex of the last-synced (normalized) content. */
-	hash: string;
-	size: number;
-	/** Local mtime at last sync; size+mtime fast path skips re-hashing. */
-	mtimeMs: number;
-	/** Notes only. */
-	guid?: string;
+  kind: FileKind;
+  /** sha256 hex of the last-synced (normalized) content. */
+  hash: string;
+  size: number;
+  /** Local mtime at last sync; size+mtime fast path skips re-hashing. */
+  mtimeMs: number;
+  /** Notes only. */
+  guid?: string;
 }
 
 export interface SyncState {
-	lastSyncedAt: string;
-	files: Record<string, SyncFileState>;
+  lastSyncedAt: string;
+  files: Record<string, SyncFileState>;
 }
 
 export interface RtmdConfig {
-	version: 1;
-	baseUrl: string;
-	vaultId: string;
-	vaultName?: string;
-	auth?: AuthConfig;
-	sync?: SyncState;
+  version: 1;
+  baseUrl: string;
+  vaultId: string;
+  vaultName?: string;
+  auth?: AuthConfig;
+  sync?: SyncState;
 }
 
 export class CliError extends Error {}
@@ -62,52 +62,52 @@ which also stores your login. Create one with:
   rtmd init [dir]             log in and create a new vault from a folder`;
 
 export function readRtmd(dir: string): RtmdConfig {
-	const file = path.join(dir, RTMD_FILE);
-	let raw: string;
-	try {
-		raw = fs.readFileSync(file, "utf8");
-	} catch (e) {
-		throw new CliError(`cannot read ${file}: ${(e as Error).message}`);
-	}
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(raw);
-	} catch {
-		throw new CliError(`${file} is not valid JSON`);
-	}
-	const cfg = parsed as RtmdConfig;
-	if (cfg.version !== 1 || typeof cfg.baseUrl !== "string" || typeof cfg.vaultId !== "string") {
-		throw new CliError(`${file} is missing required fields (version, baseUrl, vaultId)`);
-	}
-	return cfg;
+  const file = path.join(dir, RTMD_FILE);
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (e) {
+    throw new CliError(`cannot read ${file}: ${(e as Error).message}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new CliError(`${file} is not valid JSON`);
+  }
+  const cfg = parsed as RtmdConfig;
+  if (cfg.version !== 1 || typeof cfg.baseUrl !== "string" || typeof cfg.vaultId !== "string") {
+    throw new CliError(`${file} is missing required fields (version, baseUrl, vaultId)`);
+  }
+  return cfg;
 }
 
 /** Atomic write: temp file + rename, so an interrupted sync never corrupts it. */
 export function writeRtmd(dir: string, config: RtmdConfig): void {
-	const file = path.join(dir, RTMD_FILE);
-	const tmp = path.join(dir, `${RTMD_FILE}.tmp-${process.pid}`);
-	fs.writeFileSync(tmp, `${JSON.stringify(config, null, "\t")}\n`, { mode: 0o600 });
-	fs.renameSync(tmp, file);
+  const file = path.join(dir, RTMD_FILE);
+  const tmp = path.join(dir, `${RTMD_FILE}.tmp-${process.pid}`);
+  fs.writeFileSync(tmp, `${JSON.stringify(config, null, "\t")}\n`, { mode: 0o600 });
+  fs.renameSync(tmp, file);
 }
 
 /** Walk up from `startDir` to the filesystem root looking for `.rtmd`. */
 export function findRtmdDir(startDir: string): string | null {
-	let dir = path.resolve(startDir);
-	for (;;) {
-		if (fs.existsSync(path.join(dir, RTMD_FILE))) return dir;
-		const parent = path.dirname(dir);
-		if (parent === dir) return null;
-		dir = parent;
-	}
+  let dir = path.resolve(startDir);
+  for (;;) {
+    if (fs.existsSync(path.join(dir, RTMD_FILE))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
 }
 
 export interface Workspace {
-	dir: string;
-	config: RtmdConfig;
+  dir: string;
+  config: RtmdConfig;
 }
 
 export function requireWorkspace(startDir: string): Workspace {
-	const dir = findRtmdDir(startDir);
-	if (!dir) throw new CliError(NO_RTMD_HELP);
-	return { dir, config: readRtmd(dir) };
+  const dir = findRtmdDir(startDir);
+  if (!dir) throw new CliError(NO_RTMD_HELP);
+  return { dir, config: readRtmd(dir) };
 }

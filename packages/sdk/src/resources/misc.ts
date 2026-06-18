@@ -1,112 +1,116 @@
 import type { Http } from "../http";
 import { encodePath } from "../http";
 import type {
-	GcBlobsResult,
-	GitBackupConfig,
-	PluginDbChangeRow,
-	PluginDbCursor,
-	PutGitBackupBody,
-	ReindexResponse,
-	SearchHit,
-	StorageUsage,
-	TagCount,
+  GcBlobsResult,
+  GitBackupConfig,
+  PluginDbChangeRow,
+  PluginDbCursor,
+  PutGitBackupBody,
+  ReindexResponse,
+  SearchHit,
+  StorageUsage,
+  TagCount,
 } from "../types";
 
 export class SearchResource {
-	constructor(
-		private http: Http,
-		private vaultId: string,
-	) {}
+  constructor(
+    private http: Http,
+    private vaultId: string,
+  ) {}
 
-	search(q: string, opts: { limit?: number } = {}): Promise<SearchHit[]> {
-		return this.http.request("GET", `/api/vaults/${this.vaultId}/search`, {
-			query: { q, limit: opts.limit },
-		});
-	}
+  search(q: string, opts: { limit?: number } = {}): Promise<SearchHit[]> {
+    return this.http.request("GET", `/api/vaults/${this.vaultId}/search`, {
+      query: { q, limit: opts.limit },
+    });
+  }
 
-	tags(): Promise<TagCount[]> {
-		return this.http.request("GET", `/api/vaults/${this.vaultId}/tags`);
-	}
+  tags(): Promise<TagCount[]> {
+    return this.http.request("GET", `/api/vaults/${this.vaultId}/tags`);
+  }
 
-	backlinks(path: string): Promise<SearchHit[]> {
-		return this.http.request("GET", `/api/vaults/${this.vaultId}/backlinks/${encodePath(path)}`);
-	}
+  backlinks(path: string): Promise<SearchHit[]> {
+    return this.http.request("GET", `/api/vaults/${this.vaultId}/backlinks/${encodePath(path)}`);
+  }
 
-	reindex(): Promise<ReindexResponse> {
-		return this.http.request("POST", `/api/vaults/${this.vaultId}/reindex`);
-	}
+  reindex(): Promise<ReindexResponse> {
+    return this.http.request("POST", `/api/vaults/${this.vaultId}/reindex`);
+  }
 }
 
 export class StorageResource {
-	constructor(
-		private http: Http,
-		private vaultId: string,
-	) {}
+  constructor(
+    private http: Http,
+    private vaultId: string,
+  ) {}
 
-	usage(): Promise<StorageUsage> {
-		return this.http.request("GET", `/api/vaults/${this.vaultId}/storage`);
-	}
+  usage(): Promise<StorageUsage> {
+    return this.http.request("GET", `/api/vaults/${this.vaultId}/storage`);
+  }
 
-	/** Delete orphaned blobs at least `minBytes` large (default 0). */
-	gcBlobs(opts: { minBytes?: number } = {}): Promise<GcBlobsResult> {
-		return this.http.request("POST", `/api/vaults/${this.vaultId}/storage/gc-blobs`, {
-			body: { minBytes: opts.minBytes },
-		});
-	}
+  /** Delete orphaned blobs at least `minBytes` large (default 0). */
+  gcBlobs(opts: { minBytes?: number } = {}): Promise<GcBlobsResult> {
+    return this.http.request("POST", `/api/vaults/${this.vaultId}/storage/gc-blobs`, {
+      body: { minBytes: opts.minBytes },
+    });
+  }
 }
 
 export class BackupResource {
-	constructor(
-		private http: Http,
-		private vaultId: string,
-	) {}
+  constructor(
+    private http: Http,
+    private vaultId: string,
+  ) {}
 
-	get(): Promise<GitBackupConfig> {
-		return this.http.request("GET", `/api/vaults/${this.vaultId}/backup`);
-	}
+  get(): Promise<GitBackupConfig> {
+    return this.http.request("GET", `/api/vaults/${this.vaultId}/backup`);
+  }
 
-	put(config: PutGitBackupBody): Promise<GitBackupConfig> {
-		return this.http.request("PUT", `/api/vaults/${this.vaultId}/backup`, { body: config });
-	}
+  put(config: PutGitBackupBody): Promise<GitBackupConfig> {
+    return this.http.request("PUT", `/api/vaults/${this.vaultId}/backup`, { body: config });
+  }
 
-	async delete(): Promise<void> {
-		await this.http.request("DELETE", `/api/vaults/${this.vaultId}/backup`);
-	}
+  async delete(): Promise<void> {
+    await this.http.request("DELETE", `/api/vaults/${this.vaultId}/backup`);
+  }
 
-	/** Test the configured remote without pushing. */
-	test(): Promise<unknown> {
-		return this.http.request("POST", `/api/vaults/${this.vaultId}/backup/test`);
-	}
+  /** Test the configured remote without pushing. */
+  test(): Promise<unknown> {
+    return this.http.request("POST", `/api/vaults/${this.vaultId}/backup/test`);
+  }
 }
 
 /** Replication endpoints for a synced plugin database (cr-sqlite). */
 export class PluginDbResource {
-	constructor(
-		private http: Http,
-		private vaultId: string,
-		private pluginId: string,
-		private name: string,
-	) {}
+  constructor(
+    private http: Http,
+    private vaultId: string,
+    private pluginId: string,
+    private name: string,
+  ) {}
 
-	private get base(): string {
-		return `/api/vaults/${this.vaultId}/plugin-dbs/${this.pluginId}/${this.name}`;
-	}
+  private get base(): string {
+    return `/api/vaults/${this.vaultId}/plugin-dbs/${this.pluginId}/${this.name}`;
+  }
 
-	/** Bootstrap changes since a cursor (`{siteHex: dbVersion}`). */
-	async changes(since?: PluginDbCursor): Promise<PluginDbChangeRow[]> {
-		const res = await this.http.request<{ changes: PluginDbChangeRow[] }>("GET", `${this.base}/changes`, {
-			query: { since: since ? JSON.stringify(since) : undefined },
-		});
-		return res.changes;
-	}
+  /** Bootstrap changes since a cursor (`{siteHex: dbVersion}`). */
+  async changes(since?: PluginDbCursor): Promise<PluginDbChangeRow[]> {
+    const res = await this.http.request<{ changes: PluginDbChangeRow[] }>(
+      "GET",
+      `${this.base}/changes`,
+      {
+        query: { since: since ? JSON.stringify(since) : undefined },
+      },
+    );
+    return res.changes;
+  }
 
-	/** Mark a write: replicate pending doc changes and produce a git commit. */
-	async touch(): Promise<void> {
-		await this.http.request("POST", `${this.base}/touch`);
-	}
+  /** Mark a write: replicate pending doc changes and produce a git commit. */
+  async touch(): Promise<void> {
+    await this.http.request("POST", `${this.base}/touch`);
+  }
 
-	/** Purge the database server-side (irreversible). */
-	async delete(): Promise<void> {
-		await this.http.request("DELETE", this.base);
-	}
+  /** Purge the database server-side (irreversible). */
+  async delete(): Promise<void> {
+    await this.http.request("DELETE", this.base);
+  }
 }

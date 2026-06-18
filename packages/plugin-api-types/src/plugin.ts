@@ -18,8 +18,8 @@ import type { RealtimeCursors } from "./cursors";
  * ```
  */
 export interface RealtimePluginApi {
-	/** Synced-SQLite databases. See {@link RealtimeSql}. */
-	readonly sql: RealtimeSql;
-	/** Plugin-managed remote cursors. See {@link RealtimeCursors}. */
-	readonly cursors: RealtimeCursors;
+  /** Synced-SQLite databases. See {@link RealtimeSql}. */
+  readonly sql: RealtimeSql;
+  /** Plugin-managed remote cursors. See {@link RealtimeCursors}. */
+  readonly cursors: RealtimeCursors;
 }

@@ -7,14 +7,14 @@
  */
 
 export type {
-	SqlValue,
-	EncodedVal,
-	ChangeRow,
-	Batch,
-	Cursor,
-	DbState,
-	DbErrorReason,
-	RemoteChange,
+  SqlValue,
+  EncodedVal,
+  ChangeRow,
+  Batch,
+  Cursor,
+  DbState,
+  DbErrorReason,
+  RemoteChange,
 } from "@realtime-md/plugin-api-types";
 
 /** Current sync wire/format version. Must match the server extension's major. */
@@ -32,5 +32,5 @@ export const ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
  * — so allowing it would make those ids ambiguous to parse.)
  */
 export function isValidId(id: string): boolean {
-	return ID_RE.test(id) && !id.includes("__");
+  return ID_RE.test(id) && !id.includes("__");
 }

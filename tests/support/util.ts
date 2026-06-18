@@ -1,24 +1,24 @@
 /** Polls `predicate` until it returns truthy or the timeout elapses. */
 export async function waitFor(
-	predicate: () => boolean | Promise<boolean>,
-	opts: { timeout?: number; interval?: number; label?: string } = {},
+  predicate: () => boolean | Promise<boolean>,
+  opts: { timeout?: number; interval?: number; label?: string } = {},
 ): Promise<void> {
-	// Generous default: unit files run in parallel workers, each spawning its
-	// own y-sweet + auth server; sync round-trips can stall well past 10s on a
-	// loaded machine (an observed source of spurious document.test.ts failures).
-	const timeout = opts.timeout ?? 30_000;
-	const interval = opts.interval ?? 25;
-	const start = Date.now();
-	for (;;) {
-		if (await predicate()) return;
-		if (Date.now() - start > timeout) {
-			throw new Error(`waitFor timed out${opts.label ? `: ${opts.label}` : ""}`);
-		}
-		await new Promise((r) => setTimeout(r, interval));
-	}
+  // Generous default: unit files run in parallel workers, each spawning its
+  // own y-sweet + auth server; sync round-trips can stall well past 10s on a
+  // loaded machine (an observed source of spurious document.test.ts failures).
+  const timeout = opts.timeout ?? 30_000;
+  const interval = opts.interval ?? 25;
+  const start = Date.now();
+  for (;;) {
+    if (await predicate()) return;
+    if (Date.now() - start > timeout) {
+      throw new Error(`waitFor timed out${opts.label ? `: ${opts.label}` : ""}`);
+    }
+    await new Promise((r) => setTimeout(r, interval));
+  }
 }
 
 /** A random doc guid so tests don't collide in the shared y-sweet server. */
 export function freshGuid(): string {
-	return "test-" + Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
+  return "test-" + Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
 }

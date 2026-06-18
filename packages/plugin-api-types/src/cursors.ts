@@ -14,23 +14,23 @@
  */
 
 export interface AcquireCursorOptions {
-	/** The acquiring plugin's manifest id (same trust model as `sql.open`). */
-	pluginId: string;
-	/** Display name for the cursor; defaults to the plugin id on first acquire. */
-	name?: string;
+  /** The acquiring plugin's manifest id (same trust model as `sql.open`). */
+  pluginId: string;
+  /** Display name for the cursor; defaults to the plugin id on first acquire. */
+  name?: string;
 }
 
 export interface CursorNoteSummary {
-	path: string;
-	guid: string;
-	permalink: string;
+  path: string;
+  guid: string;
+  permalink: string;
 }
 
 export interface CursorNote {
-	path: string;
-	guid: string;
-	content: string;
-	permalink: string;
+  path: string;
+  guid: string;
+  content: string;
+  permalink: string;
 }
 
 /**
@@ -39,46 +39,49 @@ export interface CursorNote {
  * and renewal are handled internally (one transparent re-acquire on 401).
  */
 export interface CursorNotesApi {
-	list(): Promise<CursorNoteSummary[]>;
-	read(path: string): Promise<CursorNote>;
-	create(path: string, content?: string): Promise<CursorNote>;
-	replace(path: string, content: string): Promise<CursorNote>;
-	patch(path: string, edit: { old: string; new: string; replaceAll?: boolean }): Promise<CursorNote>;
-	/**
-	 * Convenience read-then-replace appending `text` on a fresh line. Not
-	 * atomic: a concurrent edit between the read and the write can be lost —
-	 * prefer `patch` with a unique anchor when contention is possible.
-	 */
-	append(path: string, text: string): Promise<CursorNote>;
-	move(path: string, toPath: string): Promise<CursorNote>;
-	delete(path: string): Promise<void>;
+  list(): Promise<CursorNoteSummary[]>;
+  read(path: string): Promise<CursorNote>;
+  create(path: string, content?: string): Promise<CursorNote>;
+  replace(path: string, content: string): Promise<CursorNote>;
+  patch(
+    path: string,
+    edit: { old: string; new: string; replaceAll?: boolean },
+  ): Promise<CursorNote>;
+  /**
+   * Convenience read-then-replace appending `text` on a fresh line. Not
+   * atomic: a concurrent edit between the read and the write can be lost —
+   * prefer `patch` with a unique anchor when contention is possible.
+   */
+  append(path: string, text: string): Promise<CursorNote>;
+  move(path: string, toPath: string): Promise<CursorNote>;
+  delete(path: string): Promise<void>;
 }
 
 export interface RemoteCursorHandle {
-	cursorId: string;
-	appId: string;
-	vaultId: string;
-	name: string;
-	/** Bearer token for REST/MCP/streaming calls. Expires; re-acquire on 401. */
-	token: string;
-	/** Server base URL, e.g. `https://host` (REST routes live under /api). */
-	baseUrl: string;
-	mcpUrl: string;
-	/** WebSocket endpoint for streaming tokens into a note. */
-	streamUrl: string;
-	expiresAt: number;
-	/** Audited, robot-attributed note edits — no token handling needed. */
-	notes: CursorNotesApi;
+  cursorId: string;
+  appId: string;
+  vaultId: string;
+  name: string;
+  /** Bearer token for REST/MCP/streaming calls. Expires; re-acquire on 401. */
+  token: string;
+  /** Server base URL, e.g. `https://host` (REST routes live under /api). */
+  baseUrl: string;
+  mcpUrl: string;
+  /** WebSocket endpoint for streaming tokens into a note. */
+  streamUrl: string;
+  expiresAt: number;
+  /** Audited, robot-attributed note edits — no token handling needed. */
+  notes: CursorNotesApi;
 }
 
 /** The remote cursors API surface (`app.plugins.plugins["realtime"].cursors`). */
 export interface RealtimeCursors {
-	/**
-	 * Get-or-create this plugin's remote cursor for the active vault and return
-	 * a handle with a live bearer token. Tokens are cached per session and
-	 * re-minted when close to expiry; call {@link invalidate} after a 401.
-	 */
-	acquire(opts: AcquireCursorOptions): Promise<RemoteCursorHandle>;
-	/** Drop the cached token for a plugin (e.g. after a 401) so the next acquire re-mints. */
-	invalidate(pluginId: string): void;
+  /**
+   * Get-or-create this plugin's remote cursor for the active vault and return
+   * a handle with a live bearer token. Tokens are cached per session and
+   * re-minted when close to expiry; call {@link invalidate} after a 401.
+   */
+  acquire(opts: AcquireCursorOptions): Promise<RemoteCursorHandle>;
+  /** Drop the cached token for a plugin (e.g. after a 401) so the next acquire re-mints. */
+  invalidate(pluginId: string): void;
 }

@@ -6,96 +6,96 @@ import type RealtimePlugin from "./main";
 import { getClientToken } from "./ysweet";
 
 export abstract class SyncedDoc {
-	readonly path: string;
-	readonly guid: string;
-	readonly serverDocId: string;
-	readonly ydoc: Y.Doc;
-	readonly provider: YSweetProvider;
-	readonly awareness: Awareness;
-	isCreator: boolean;
+  readonly path: string;
+  readonly guid: string;
+  readonly serverDocId: string;
+  readonly ydoc: Y.Doc;
+  readonly provider: YSweetProvider;
+  readonly awareness: Awareness;
+  isCreator: boolean;
 
-	protected readonly plugin: RealtimePlugin;
-	protected destroyed = false;
-	protected readonly persistence: IndexeddbPersistence;
+  protected readonly plugin: RealtimePlugin;
+  protected destroyed = false;
+  protected readonly persistence: IndexeddbPersistence;
 
-	private readyPromise: Promise<void>;
-	private resolveReady!: () => void;
-	private syncedListener: (synced: boolean) => void;
+  private readyPromise: Promise<void>;
+  private resolveReady!: () => void;
+  private syncedListener: (synced: boolean) => void;
 
-	protected constructor(
-		plugin: RealtimePlugin,
-		path: string,
-		guid: string,
-		serverDocId: string,
-		isCreator: boolean,
-	) {
-		this.plugin = plugin;
-		this.path = path;
-		this.guid = guid;
-		this.serverDocId = serverDocId;
-		this.isCreator = isCreator;
-		this.ydoc = new Y.Doc();
+  protected constructor(
+    plugin: RealtimePlugin,
+    path: string,
+    guid: string,
+    serverDocId: string,
+    isCreator: boolean,
+  ) {
+    this.plugin = plugin;
+    this.path = path;
+    this.guid = guid;
+    this.serverDocId = serverDocId;
+    this.isCreator = isCreator;
+    this.ydoc = new Y.Doc();
 
-		this.readyPromise = new Promise((resolve) => {
-			this.resolveReady = resolve;
-		});
+    this.readyPromise = new Promise((resolve) => {
+      this.resolveReady = resolve;
+    });
 
-		this.provider = new YSweetProvider(
-			() => getClientToken(plugin, serverDocId),
-			serverDocId,
-			this.ydoc,
-			{ connect: false, showDebuggerLink: false },
-		);
-		this.awareness = this.provider.awareness;
-		this.persistence = new IndexeddbPersistence(serverDocId, this.ydoc);
+    this.provider = new YSweetProvider(
+      () => getClientToken(plugin, serverDocId),
+      serverDocId,
+      this.ydoc,
+      { connect: false, showDebuggerLink: false },
+    );
+    this.awareness = this.provider.awareness;
+    this.persistence = new IndexeddbPersistence(serverDocId, this.ydoc);
 
-		this.syncedListener = (synced) => {
-			if (synced) void this.finishStartupReconcile();
-		};
-		this.provider.on("synced", this.syncedListener);
+    this.syncedListener = (synced) => {
+      if (synced) void this.finishStartupReconcile();
+    };
+    this.provider.on("synced", this.syncedListener);
 
-		void this.init();
-	}
+    void this.init();
+  }
 
-	whenReady(): Promise<void> {
-		return this.readyPromise;
-	}
+  whenReady(): Promise<void> {
+    return this.readyPromise;
+  }
 
-	ensureConnected(): void {
-		if (this.destroyed) return;
-		const status = this.provider.status;
-		if (status === STATUS_OFFLINE || status === STATUS_ERROR) {
-			void this.provider.connect();
-		}
-	}
+  ensureConnected(): void {
+    if (this.destroyed) return;
+    const status = this.provider.status;
+    if (status === STATUS_OFFLINE || status === STATUS_ERROR) {
+      void this.provider.connect();
+    }
+  }
 
-	protected resolveWhenReady(): void {
-		this.resolveReady();
-	}
+  protected resolveWhenReady(): void {
+    this.resolveReady();
+  }
 
-	protected async init(): Promise<void> {
-		try {
-			await this.persistence.whenSynced;
-			if (!this.destroyed) await this.afterPersistenceSynced();
-		} catch (e) {
-			console.error(`[Realtime] init failed for ${this.path}`, e);
-			this.resolveWhenReady();
-		}
+  protected async init(): Promise<void> {
+    try {
+      await this.persistence.whenSynced;
+      if (!this.destroyed) await this.afterPersistenceSynced();
+    } catch (e) {
+      console.error(`[Realtime] init failed for ${this.path}`, e);
+      this.resolveWhenReady();
+    }
 
-		if (!this.destroyed) void this.provider.connect();
-	}
+    if (!this.destroyed) void this.provider.connect();
+  }
 
-	protected abstract afterPersistenceSynced(): Promise<void> | void;
-	protected abstract finishStartupReconcile(): Promise<void>;
-	protected abstract destroySubclass(): void;
+  protected abstract afterPersistenceSynced(): Promise<void> | void;
+  protected abstract finishStartupReconcile(): Promise<void>;
+  protected abstract destroySubclass(): void;
 
-	destroy(): void {
-		if (this.destroyed) return;
-		this.destroyed = true;
-		this.destroySubclass();
-		this.provider.off("synced", this.syncedListener);
-		this.provider.destroy();
-		void this.persistence.destroy();
-		this.ydoc.destroy();
-	}
+  destroy(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.destroySubclass();
+    this.provider.off("synced", this.syncedListener);
+    this.provider.destroy();
+    void this.persistence.destroy();
+    this.ydoc.destroy();
+  }
 }

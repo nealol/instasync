@@ -2,11 +2,11 @@ import type RealtimePlugin from "./main";
 
 /** Subset of the y-sweet client token needed to connect (see y-sweet SDK). */
 export type ClientToken = {
-	url: string;
-	baseUrl: string;
-	docId: string;
-	token?: string;
-	authorization?: "full" | "read-only";
+  url: string;
+  baseUrl: string;
+  docId: string;
+  token?: string;
+  authorization?: "full" | "read-only";
 };
 
 const TOKEN_RETRY_DELAY_MS = 30_000;
@@ -22,23 +22,23 @@ let tokenAttemptQueue: Promise<void> = Promise.resolve();
  * every later connection for 30s.
  */
 export function resetTokenRetryStateForTests(delayMs = TOKEN_RETRY_DELAY_MS): void {
-	tokenRetryDelayMs = delayMs;
-	nextTokenAttemptAt = 0;
-	tokenAttemptQueue = Promise.resolve();
+  tokenRetryDelayMs = delayMs;
+  nextTokenAttemptAt = 0;
+  tokenAttemptQueue = Promise.resolve();
 }
 
 function delay(ms: number): Promise<void> {
-	return new Promise((resolve) => window.setTimeout(resolve, ms));
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 async function waitForTokenAttemptSlot(): Promise<() => void> {
-	let release!: () => void;
-	const previous = tokenAttemptQueue;
-	tokenAttemptQueue = new Promise((resolve) => {
-		release = resolve;
-	});
-	await previous;
-	return release;
+  let release!: () => void;
+  const previous = tokenAttemptQueue;
+  tokenAttemptQueue = new Promise((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  return release;
 }
 
 /**
@@ -50,26 +50,26 @@ async function waitForTokenAttemptSlot(): Promise<() => void> {
  * for a file); the vault is always the active vault.
  */
 export async function getClientToken(plugin: RealtimePlugin, docId: string): Promise<ClientToken> {
-	const vaultId = plugin.settings.activeVaultId;
-	if (!vaultId) {
-		return new Promise(() => {});
-	}
+  const vaultId = plugin.settings.activeVaultId;
+  if (!vaultId) {
+    return new Promise(() => {});
+  }
 
-	const release = await waitForTokenAttemptSlot();
-	try {
-		const waitMs = nextTokenAttemptAt - Date.now();
-		if (waitMs > 0) await delay(waitMs);
+  const release = await waitForTokenAttemptSlot();
+  try {
+    const waitMs = nextTokenAttemptAt - Date.now();
+    if (waitMs > 0) await delay(waitMs);
 
-		const token = await plugin.auth.docToken(vaultId, docId);
-		nextTokenAttemptAt = 0;
-		if (!token || !token.url) {
-			throw new Error(`Realtime: auth server returned an invalid token for "${docId}".`);
-		}
-		return token;
-	} catch (e) {
-		nextTokenAttemptAt = Date.now() + tokenRetryDelayMs;
-		throw e;
-	} finally {
-		release();
-	}
+    const token = await plugin.auth.docToken(vaultId, docId);
+    nextTokenAttemptAt = 0;
+    if (!token || !token.url) {
+      throw new Error(`Realtime: auth server returned an invalid token for "${docId}".`);
+    }
+    return token;
+  } catch (e) {
+    nextTokenAttemptAt = Date.now() + tokenRetryDelayMs;
+    throw e;
+  } finally {
+    release();
+  }
 }

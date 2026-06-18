@@ -3,11 +3,11 @@
 import type { FileKind } from "./config";
 
 export function kindForPath(relPath: string): FileKind {
-	const lower = relPath.toLowerCase();
-	if (lower.endsWith(".md")) return "note";
-	if (lower.endsWith(".canvas")) return "canvas";
-	if (lower.endsWith(".base")) return "base";
-	return "attachment";
+  const lower = relPath.toLowerCase();
+  if (lower.endsWith(".md")) return "note";
+  if (lower.endsWith(".canvas")) return "canvas";
+  if (lower.endsWith(".base")) return "base";
+  return "attachment";
 }
 
 /**
@@ -16,5 +16,5 @@ export function kindForPath(relPath: string): FileKind {
  * `.obsidian`, editor droppings).
  */
 export function isExcluded(relPath: string): boolean {
-	return relPath.split("/").some((seg) => seg.startsWith("."));
+  return relPath.split("/").some((seg) => seg.startsWith("."));
 }

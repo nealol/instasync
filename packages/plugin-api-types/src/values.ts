@@ -18,13 +18,7 @@
 export type SqlValue = null | number | bigint | string | Uint8Array | boolean;
 
 /** Tagged, JSON-safe encoding of a single `crsql_changes.val`. */
-export type EncodedVal =
-	| null
-	| number
-	| string
-	| boolean
-	| { $blob: string }
-	| { $int: string };
+export type EncodedVal = null | number | string | boolean | { $blob: string } | { $int: string };
 
 /**
  * One row of the `crsql_changes` virtual table, with binary columns base64
@@ -32,47 +26,47 @@ export type EncodedVal =
  * `INSERT INTO crsql_changes` *merges* them.
  */
 export interface ChangeRow {
-	/** Source table name (quoted as `"table"` in SQL — a reserved word). */
-	table: string;
-	/** base64 of the binary-encoded composite primary key (opaque). */
-	pk: string;
-	/** Column id / sentinel. */
-	cid: string;
-	/** Encoded column value. */
-	val: EncodedVal;
-	/** Per-column lamport version. */
-	col_version: number;
-	/** Per-database lamport clock at which this change was made. */
-	db_version: number;
-	/** base64 of the 16-byte originating site id. */
-	site_id: string;
-	/** Causal length (whole-row create/delete resolution). */
-	cl: number;
-	/** Intra-change sequence. */
-	seq: number;
+  /** Source table name (quoted as `"table"` in SQL — a reserved word). */
+  table: string;
+  /** base64 of the binary-encoded composite primary key (opaque). */
+  pk: string;
+  /** Column id / sentinel. */
+  cid: string;
+  /** Encoded column value. */
+  val: EncodedVal;
+  /** Per-column lamport version. */
+  col_version: number;
+  /** Per-database lamport clock at which this change was made. */
+  db_version: number;
+  /** base64 of the 16-byte originating site id. */
+  site_id: string;
+  /** Causal length (whole-row create/delete resolution). */
+  cl: number;
+  /** Intra-change sequence. */
+  seq: number;
 }
 
 /** A published batch of changes, stored as one entry in the per-DB doc array. */
 export interface Batch {
-	/** Unique batch id (ULID-ish, monotonic-ish, collision-resistant). */
-	id: string;
-	/** Hex site id of the device that produced these changes. */
-	siteId: string;
-	/** Exclusive lower bound of `db_version`s covered (cursor before append). */
-	fromDbVersion: number;
-	/** Inclusive upper bound of `db_version`s covered. */
-	toDbVersion: number;
-	/** Schema version the producing client was at. */
-	schemaVersion: number;
-	/** The change rows. */
-	changes: ChangeRow[];
-	/** Creation time (ms epoch). */
-	createdAt: number;
-	/**
-	 * Compatibility tag pinning the cr-sqlite sync format. Clients refuse to
-	 * apply batches whose `format` they do not understand.
-	 */
-	format: string;
+  /** Unique batch id (ULID-ish, monotonic-ish, collision-resistant). */
+  id: string;
+  /** Hex site id of the device that produced these changes. */
+  siteId: string;
+  /** Exclusive lower bound of `db_version`s covered (cursor before append). */
+  fromDbVersion: number;
+  /** Inclusive upper bound of `db_version`s covered. */
+  toDbVersion: number;
+  /** Schema version the producing client was at. */
+  schemaVersion: number;
+  /** The change rows. */
+  changes: ChangeRow[];
+  /** Creation time (ms epoch). */
+  createdAt: number;
+  /**
+   * Compatibility tag pinning the cr-sqlite sync format. Clients refuse to
+   * apply batches whose `format` they do not understand.
+   */
+  format: string;
 }
 
 /** Per-device applied cursor: max db_version seen per origin site id. */
@@ -80,20 +74,20 @@ export type Cursor = Record<string, number>;
 
 /** Lifecycle state surfaced to plugin authors via `onStateChange`. */
 export type DbState =
-	| "loading-wasm"
-	| "restoring"
-	| "bootstrapping"
-	| "syncing"
-	| "live"
-	| "offline"
-	| "needs-migration"
-	| "error";
+  | "loading-wasm"
+  | "restoring"
+  | "bootstrapping"
+  | "syncing"
+  | "live"
+  | "offline"
+  | "needs-migration"
+  | "error";
 
 /** Reason attached to a terminal `error` state. */
 export type DbErrorReason = "deleted" | "diverged" | "wasm" | "signed-out" | "unknown";
 
 /** Payload for `onRemoteChange`. */
 export interface RemoteChange {
-	/** Distinct table names touched by the applied remote batch group. */
-	tables: string[];
+  /** Distinct table names touched by the applied remote batch group. */
+  tables: string[];
 }
