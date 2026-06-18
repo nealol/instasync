@@ -1,8 +1,10 @@
 import type RealtimePlugin from "./main";
-import { StructuredDocument } from "./StructuredDocument";
+import { StructuredDocument, DISK_ORIGIN } from "./StructuredDocument";
 import { CanvasBinding, CANVAS_LOCAL_ORIGIN } from "./editor/CanvasBinding";
-import { parseCanvas, serializeCanvas } from "./structured/canvas";
+import { isStructuredCanvas, parseCanvas, reconcileCanvas, serializeCanvas, type StructuredCanvas } from "./structured/canvas";
 import type { JsonValue } from "./structured/reconcile";
+
+const EMPTY_CANVAS: StructuredCanvas = { nodes: {}, edges: {}, nodeOrder: [], edgeOrder: [] };
 
 export class CanvasDocument extends StructuredDocument {
   private binding: CanvasBinding;
@@ -31,10 +33,12 @@ export class CanvasDocument extends StructuredDocument {
     this.binding.tryBind();
   }
 
-  // Canvas owns the live view via CanvasBinding while it's open, so the base
-  // class must not also write through to disk (that would thrash the view).
+  // Suppress disk write-through only while a live binding is actually patched
+  // onto an open canvas view. If the binding couldn't attach (unsupported
+  // private API, view not yet mounted), the disk write-through stays active so
+  // remote updates still land on disk instead of being silently dropped.
   protected shouldDeferToLiveBinding(): boolean {
-    return true;
+    return this.binding.isActive();
   }
 
   protected parse(text: string): JsonValue {
@@ -43,6 +47,16 @@ export class CanvasDocument extends StructuredDocument {
 
   protected serialize(value: JsonValue): string {
     return serializeCanvas(value);
+  }
+
+  // Use the tombstone-aware canvas reconciler instead of the generic
+  // last-writer-wins map reconcile, so a stale full snapshot from a device
+  // that hasn't applied a remote delete can't resurrect a tombstoned
+  // node/edge. The local clientID is passed so same-device re-add (undo)
+  // clears the tombstone while cross-device stale snapshots are blocked.
+  protected applyValue(value: JsonValue, origin: unknown = DISK_ORIGIN): void {
+    const incoming = isStructuredCanvas(value) ? value : (EMPTY_CANVAS as StructuredCanvas);
+    this.ydoc.transact(() => reconcileCanvas(this.root, incoming, this.ydoc.clientID), origin);
   }
 
   protected onRootChanged(origin?: unknown): void {

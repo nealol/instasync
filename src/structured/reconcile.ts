@@ -61,7 +61,7 @@ function reconcileMap(
   }
 }
 
-function reconcileArray(array: Y.Array<any>, value: JsonValue[], options: ReconcileOptions): void {
+export function reconcileArray(array: Y.Array<any>, value: JsonValue[], options: ReconcileOptions): void {
   let i = 0;
   for (; i < value.length; i++) {
     const current = array.get(i);
@@ -77,7 +77,7 @@ function reconcileArray(array: Y.Array<any>, value: JsonValue[], options: Reconc
   if (array.length > value.length) array.delete(value.length, array.length - value.length);
 }
 
-function reconcileValue(
+export function reconcileValue(
   current: any,
   next: JsonValue,
   key: string | undefined,

@@ -156,6 +156,36 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
         this.vaultSync?.reconnectAll();
         this.vaultSync?.bindOpenCanvases();
         this.vaultSync?.bindOpenBases();
+        // Canvas views may not have their private `canvas` object ready when
+        // active-leaf-change fires (the view mounts asynchronously). A short
+        // delayed retry catches slow-mounting views without a polling loop.
+        window.setTimeout(() => {
+          this.vaultSync?.bindOpenCanvases();
+          this.vaultSync?.bindOpenBases();
+        }, 300);
+      }),
+    );
+
+    // file-open fires when a file becomes active in a leaf — covers views
+    // that mount without an active-leaf transition (hover, pinning, etc.).
+    this.registerEvent(
+      this.app.workspace.on("file-open", () => {
+        this.vaultSync?.bindOpenCanvases();
+        this.vaultSync?.bindOpenBases();
+      }),
+    );
+
+    // layout-change fires on any workspace rearrangement (splits, drag,
+    // pin/unpin). Debounce because it can fire rapidly during interactions.
+    let layoutBindTimer: number | null = null;
+    this.registerEvent(
+      this.app.workspace.on("layout-change", () => {
+        if (layoutBindTimer !== null) window.clearTimeout(layoutBindTimer);
+        layoutBindTimer = window.setTimeout(() => {
+          layoutBindTimer = null;
+          this.vaultSync?.bindOpenCanvases();
+          this.vaultSync?.bindOpenBases();
+        }, 200);
       }),
     );
 

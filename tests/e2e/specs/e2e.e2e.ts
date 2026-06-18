@@ -89,9 +89,17 @@ const canvasNode = (id: string, text: string, x = 0) => ({
   width: 200,
   height: 60,
 });
-/** Serialize a JSON Canvas document from a list of nodes (no edges). */
-const canvasJson = (nodes: ReturnType<typeof canvasNode>[]) =>
-  JSON.stringify({ nodes, edges: [] }, null, 2);
+/** A JSON Canvas edge between two nodes. */
+const canvasEdge = (id: string, fromNode: string, toNode: string) => ({
+  id,
+  fromNode,
+  toNode,
+});
+/** Serialize a JSON Canvas document from nodes and edges. */
+const canvasJson = (
+  nodes: ReturnType<typeof canvasNode>[],
+  edges: ReturnType<typeof canvasEdge>[] = [],
+) => JSON.stringify({ nodes, edges }, null, 2);
 /** A minimal valid `.base` YAML with a single named table view. */
 const baseYaml = (name: string) => `views:\n  - type: table\n    name: ${name}\n`;
 
@@ -524,6 +532,247 @@ describe("Realtime — two isolated Obsidian devices", function () {
           return nodes.some((n) => n?.text === "from-B-remote");
         },
         { timeout: 60 * SECONDS, timeoutMsg: "A's open canvas view never showed B's remote node" },
+      );
+    });
+
+    it("propagates an edge deletion from A's open canvas to B's disk", async function () {
+      // Seed two nodes and an edge on A's open canvas.
+      await editCanvasView(A, "Board.canvas", {
+        nodes: [canvasNode("n1", "hello"), canvasNode("n3", "from-B-remote", 600)],
+        edges: [canvasEdge("e1", "n1", "n3")],
+      });
+      await B.waitUntil(
+        async () => !!(await readNote(B, "Board.canvas"))?.includes('"e1"'),
+        { timeout: 60 * SECONDS, timeoutMsg: "B never received the seeded edge" },
+      );
+
+      // Delete the edge on A's open canvas.
+      await editCanvasView(A, "Board.canvas", {
+        nodes: [canvasNode("n1", "hello"), canvasNode("n3", "from-B-remote", 600)],
+        edges: [],
+      });
+      await B.waitUntil(
+        async () => {
+          const disk = await readNote(B, "Board.canvas");
+          return !!disk && !disk.includes('"e1"');
+        },
+        { timeout: 60 * SECONDS, timeoutMsg: "B's disk still has the deleted edge" },
+      );
+    });
+
+    it("propagates a node deletion from A's open canvas to B's disk", async function () {
+      // Delete n3 on A's open canvas.
+      await editCanvasView(A, "Board.canvas", {
+        nodes: [canvasNode("n1", "hello")],
+        edges: [],
+      });
+      await B.waitUntil(
+        async () => {
+          const disk = await readNote(B, "Board.canvas");
+          return !!disk && !disk.includes("from-B-remote");
+        },
+        { timeout: 60 * SECONDS, timeoutMsg: "B's disk still has the deleted node" },
+      );
+    });
+  });
+
+  describe("canvas deletion propagation to an open view", function () {
+    // Regression suite for the deleted-edge-not-propagating bug: A deletes an
+    // edge/node while B has the same canvas open. The delete must land in B's
+    // *live view* (not just disk), and B's subsequent local edits must not
+    // resurrect the deleted item via a stale full-snapshot capture.
+    before(async function () {
+      const a = await enableCorePlugin(A, "canvas");
+      const b = await enableCorePlugin(B, "canvas");
+      if (!a || !b) this.skip();
+    });
+
+    beforeEach(async function () {
+      await detachLeaves(A, "canvas");
+      await detachLeaves(B, "canvas");
+      await writeNote(
+        A,
+        "DelBoard.canvas",
+        canvasJson(
+          [canvasNode("a1", "alpha", 0), canvasNode("b1", "beta", 300)],
+          [canvasEdge("edge1", "a1", "b1")],
+        ),
+      );
+      await B.waitUntil(
+        async () => !!(await readNote(B, "DelBoard.canvas"))?.includes('"edge1"'),
+        { timeout: 60 * SECONDS, timeoutMsg: "B never received the seeded DelBoard" },
+      );
+    });
+
+    after(async function () {
+      await detachLeaves(A, "canvas");
+      await detachLeaves(B, "canvas");
+      await deleteNote(A, "DelBoard.canvas").catch(() => {});
+    });
+
+    it("lands a remote edge deletion into B's open canvas view", async function () {
+      await openFileInLeaf(B, "DelBoard.canvas");
+      await B.pause(SECONDS); // let the canvas view mount
+      await bindOpenStructured(B);
+
+      // A (not viewing) deletes the edge via disk write.
+      await writeNote(
+        A,
+        "DelBoard.canvas",
+        canvasJson([canvasNode("a1", "alpha", 0), canvasNode("b1", "beta", 300)], []),
+      );
+      await B.waitUntil(
+        async () => {
+          const data = await canvasViewData(B, "DelBoard.canvas");
+          const edges = (data?.edges ?? []) as Array<{ id?: string }>;
+          return !edges.some((e) => e?.id === "edge1");
+        },
+        { timeout: 60 * SECONDS, timeoutMsg: "B's open view still has the deleted edge" },
+      );
+    });
+
+    it("does not resurrect a deleted edge when B makes a local edit on the open canvas", async function () {
+      // B opens the canvas; A deletes the edge; then B edits a node locally.
+      // B's local capture must NOT re-insert the deleted edge.
+      await openFileInLeaf(B, "DelBoard.canvas");
+      await B.pause(SECONDS);
+      await bindOpenStructured(B);
+
+      // A deletes the edge.
+      await writeNote(
+        A,
+        "DelBoard.canvas",
+        canvasJson([canvasNode("a1", "alpha", 0), canvasNode("b1", "beta", 300)], []),
+      );
+      // Wait for B's view to reflect the deletion.
+      await B.waitUntil(
+        async () => {
+          const data = await canvasViewData(B, "DelBoard.canvas");
+          const edges = (data?.edges ?? []) as Array<{ id?: string }>;
+          return !edges.some((e) => e?.id === "edge1");
+        },
+        { timeout: 60 * SECONDS, timeoutMsg: "B's open view never dropped the deleted edge" },
+      );
+
+      // B makes a local edit (moves a node) — its full snapshot must not
+      // resurrect edge1.
+      await editCanvasView(B, "DelBoard.canvas", {
+        nodes: [canvasNode("a1", "alpha", 500), canvasNode("b1", "beta", 300)],
+        edges: [],
+      });
+      await A.waitUntil(
+        async () => {
+          const disk = await readNote(A, "DelBoard.canvas");
+          return !!disk && disk.includes('"a1"') && !disk.includes('"edge1"');
+        },
+        { timeout: 60 * SECONDS, timeoutMsg: "A's disk shows the resurrected edge" },
+      );
+    });
+
+    it("does not resurrect a deleted edge when B captures a stale snapshot that still contains it", async function () {
+      // This is the core tombstone test: B's view has NOT yet applied the
+      // remote delete (e.g. slow binding), so B's captured snapshot still
+      // contains the edge. The tombstone in the CRDT must block re-insertion.
+      await openFileInLeaf(B, "DelBoard.canvas");
+      await B.pause(SECONDS);
+      await bindOpenStructured(B);
+
+      // A deletes the edge.
+      await writeNote(
+        A,
+        "DelBoard.canvas",
+        canvasJson([canvasNode("a1", "alpha", 0), canvasNode("b1", "beta", 300)], []),
+      );
+      // Wait for the CRDT to sync to B (disk converges), but DON'T wait for
+      // B's view — we want to capture the window where B's view is stale.
+      await B.waitUntil(
+        async () => {
+          const disk = await readNote(B, "DelBoard.canvas");
+          return !!disk && !disk.includes('"edge1"');
+        },
+        { timeout: 60 * SECONDS, timeoutMsg: "B's disk never dropped the edge" },
+      );
+
+      // B captures a stale snapshot (simulated by editing the view with the
+      // edge still present — the test helper calls importData then requestSave).
+      // The tombstone must prevent edge1 from re-entering the CRDT.
+      await editCanvasView(B, "DelBoard.canvas", {
+        nodes: [canvasNode("a1", "alpha", 0), canvasNode("b1", "beta", 300)],
+        edges: [canvasEdge("edge1", "a1", "b1")],
+      });
+
+      // Give the sync a moment to propagate, then verify the edge is still
+      // gone on A (not resurrected).
+      await B.pause(2 * SECONDS);
+      const diskA = await readNote(A, "DelBoard.canvas");
+      expect(diskA).toBeTruthy();
+      expect(diskA).not.toContain('"edge1"');
+    });
+
+    it("lands a remote node deletion into B's open canvas view", async function () {
+      await openFileInLeaf(B, "DelBoard.canvas");
+      await B.pause(SECONDS);
+      await bindOpenStructured(B);
+
+      // A deletes node b1.
+      await writeNote(
+        A,
+        "DelBoard.canvas",
+        canvasJson([canvasNode("a1", "alpha", 0)], []),
+      );
+      await B.waitUntil(
+        async () => {
+          const data = await canvasViewData(B, "DelBoard.canvas");
+          const nodes = (data?.nodes ?? []) as Array<{ id?: string }>;
+          return !nodes.some((n) => n?.id === "b1");
+        },
+        { timeout: 60 * SECONDS, timeoutMsg: "B's open view still has the deleted node" },
+      );
+    });
+
+    it("allows same-device undo: A deletes an edge then re-adds it, and the re-add propagates to B", async function () {
+      // Regression for the tombstone-undo interaction: A deletes edge1, then
+      // A re-adds it (simulating undo). Because A created the tombstone, A's
+      // re-add clears it and the edge syncs back to B.
+      await writeNote(
+        A,
+        "DelBoard.canvas",
+        canvasJson(
+          [canvasNode("a1", "alpha", 0), canvasNode("b1", "beta", 300)],
+          [canvasEdge("edge1", "a1", "b1")],
+        ),
+      );
+      await B.waitUntil(
+        async () => !!(await readNote(B, "DelBoard.canvas"))?.includes('"edge1"'),
+        { timeout: 60 * SECONDS, timeoutMsg: "B never received the initial edge" },
+      );
+
+      // A deletes the edge via disk write.
+      await writeNote(
+        A,
+        "DelBoard.canvas",
+        canvasJson([canvasNode("a1", "alpha", 0), canvasNode("b1", "beta", 300)], []),
+      );
+      await B.waitUntil(
+        async () => {
+          const disk = await readNote(B, "DelBoard.canvas");
+          return !!disk && !disk.includes('"edge1"');
+        },
+        { timeout: 60 * SECONDS, timeoutMsg: "B never saw the edge deletion" },
+      );
+
+      // A re-adds the edge (undo). Same device → tombstone clears → edge returns.
+      await writeNote(
+        A,
+        "DelBoard.canvas",
+        canvasJson(
+          [canvasNode("a1", "alpha", 0), canvasNode("b1", "beta", 300)],
+          [canvasEdge("edge1", "a1", "b1")],
+        ),
+      );
+      await B.waitUntil(
+        async () => !!(await readNote(B, "DelBoard.canvas"))?.includes('"edge1"'),
+        { timeout: 60 * SECONDS, timeoutMsg: "B never received the re-added edge (undo blocked by tombstone)" },
       );
     });
   });

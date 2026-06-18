@@ -270,7 +270,7 @@ export async function editCanvasView(b: any, path: string, data: any): Promise<v
           v?.file?.path === p &&
           v.canvas?.importData
         ) {
-          v.canvas.importData(d);
+          v.canvas.importData(d, true);
           v.canvas.requestSave();
           done = true;
         }

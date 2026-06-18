@@ -5,7 +5,7 @@ import { SyncedDoc } from "./SyncedDoc";
 import { ensureParentFolder, getFileByPath, isOpenInWorkspace } from "./vaultHelpers";
 import { reconcileInto, toValue, type JsonValue } from "./structured/reconcile";
 
-const DISK_ORIGIN = Symbol("realtime-structured-disk");
+export const DISK_ORIGIN = Symbol("realtime-structured-disk");
 
 export abstract class StructuredDocument extends SyncedDoc {
   readonly root: Y.Map<any>;
