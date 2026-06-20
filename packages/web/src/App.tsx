@@ -35,7 +35,7 @@ function SharedNote({ shareId }: { shareId: string }) {
         <Markdown shareId={shareId} content={note.content} />
       </article>
       <footer className="footer">
-        Shared with <a href="https://github.com/nszp/instasync">Realtime.md</a> · live updating
+        Shared with <a href="https://github.com/nealol/realtime">Realtime.md</a> · live updating
       </footer>
     </div>
   );
