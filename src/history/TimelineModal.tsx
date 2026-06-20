@@ -1,4 +1,4 @@
-import { App, Modal, Notice } from "obsidian";
+import { App, Modal, Notice, setIcon } from "obsidian";
 import { createRoot, type Root } from "react-dom/client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -48,6 +48,41 @@ class TimelineModal extends Modal {
 
 const PAGE_SIZE = 100;
 
+/** Narrow/mobile breakpoint in pixels. Keep in sync with the @media breakpoint in styles.css. */
+const NARROW_BREAKPOINT_PX = 700;
+
+/**
+ * Exact height of each commit box in the vertical list. Must match the
+ * --realtime-commit-box-height CSS variable defined on .realtime-timeline-modal.
+ */
+const COMMIT_BOX_HEIGHT = 44;
+
+/** True when the viewport is narrow (≤ NARROW_BREAKPOINT_PX) or the Obsidian mobile class is present. */
+function useNarrowOrMobile(): boolean {
+  const [narrow, setNarrow] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return (
+      window.matchMedia(`(max-width: ${NARROW_BREAKPOINT_PX}px)`).matches ||
+      document.body.classList.contains("is-mobile")
+    );
+  });
+
+  useEffect(() => {
+    const mql = window.matchMedia(`(max-width: ${NARROW_BREAKPOINT_PX}px)`);
+    const update = () =>
+      setNarrow(mql.matches || document.body.classList.contains("is-mobile"));
+    update();
+    mql.addEventListener("change", update);
+    window.addEventListener("resize", update);
+    return () => {
+      mql.removeEventListener("change", update);
+      window.removeEventListener("resize", update);
+    };
+  }, []);
+
+  return narrow;
+}
+
 function TimelineView({ plugin, initialHash }: { plugin: RealtimePlugin; initialHash?: string }) {
   const vaultId = plugin.settings.activeVaultId;
   const [commits, setCommits] = useState<HistoryCommit[]>([]);
@@ -56,6 +91,7 @@ function TimelineView({ plugin, initialHash }: { plugin: RealtimePlugin; initial
   const [isAdmin, setIsAdmin] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const loadingRef = useRef(false);
+  const narrow = useNarrowOrMobile();
 
   const loadPage = useCallback(
     async (before?: string) => {
@@ -106,19 +142,26 @@ function TimelineView({ plugin, initialHash }: { plugin: RealtimePlugin; initial
         <h2>Vault history</h2>
         {error && <span className="realtime-history-error">{error}</span>}
       </div>
-      <TimelineStrip
-        commits={commits}
-        selected={selected}
-        onSelect={setSelected}
-        onNearEnd={() => {
-          if (hasMore) void loadPage(commits[commits.length - 1]?.hash);
-        }}
-      />
-      {selected ? (
-        <CommitDetailPane plugin={plugin} vaultId={vaultId} hash={selected} />
-      ) : (
-        <p className="setting-item-description">Select a commit.</p>
-      )}
+      <div className="realtime-timeline-body">
+        <TimelineStrip
+          commits={commits}
+          selected={selected}
+          onSelect={setSelected}
+          onNearEnd={() => {
+            if (hasMore) void loadPage(commits[commits.length - 1]?.hash);
+          }}
+        />
+        {selected ? (
+          <CommitDetailPane
+            plugin={plugin}
+            vaultId={vaultId}
+            hash={selected}
+            narrow={narrow}
+          />
+        ) : (
+          <p className="setting-item-description">Select a commit.</p>
+        )}
+      </div>
       {isAdmin && selected && (
         <RollbackBar
           plugin={plugin}
@@ -142,7 +185,7 @@ function relativeTime(ms: number): string {
   return new Date(ms).toLocaleDateString();
 }
 
-/** Horizontally virtualized strip of commit chips (newest first). */
+/** Vertically virtualized list of commit boxes (newest first). */
 function TimelineStrip({
   commits,
   selected,
@@ -155,11 +198,11 @@ function TimelineStrip({
   onNearEnd: () => void;
 }) {
   const parentRef = useRef<HTMLDivElement | null>(null);
+  const userSelectedRef = useRef(false);
   const virtualizer = useVirtualizer({
     count: commits.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: () => 220,
-    horizontal: true,
+    estimateSize: () => COMMIT_BOX_HEIGHT,
     overscan: 8,
   });
 
@@ -169,12 +212,20 @@ function TimelineStrip({
     if (last && last.index >= commits.length - 10) onNearEnd();
   }, [items, commits.length, onNearEnd]);
 
+  // Scroll the explicitly-selected commit into view (centered). Skip the initial
+  // auto-select so the list doesn't jump on load.
+  useEffect(() => {
+    if (!userSelectedRef.current || !selected) return;
+    const idx = commits.findIndex((c) => c.hash === selected);
+    if (idx >= 0) virtualizer.scrollToIndex(idx, { align: "center" });
+  }, [selected, commits, virtualizer]);
+
   return (
-    <div className="realtime-timeline-strip" ref={parentRef}>
+    <div className="realtime-timeline-list" ref={parentRef}>
       <div
         style={{
-          width: virtualizer.getTotalSize(),
-          height: "100%",
+          height: virtualizer.getTotalSize(),
+          width: "100%",
           position: "relative",
         }}
       >
@@ -192,10 +243,14 @@ function TimelineStrip({
                 position: "absolute",
                 left: 0,
                 top: 0,
-                transform: `translateX(${item.start}px)`,
-                width: item.size - 8,
+                transform: `translateY(${item.start}px)`,
+                height: item.size,
+                width: "100%",
               }}
-              onClick={() => onSelect(commit.hash)}
+              onClick={() => {
+                userSelectedRef.current = true;
+                onSelect(commit.hash);
+              }}
             >
               <div className="realtime-timeline-chip-subject">{commit.subject}</div>
               <div className="realtime-timeline-chip-meta">
@@ -241,16 +296,19 @@ function CommitDetailPane({
   plugin,
   vaultId,
   hash,
+  narrow,
 }: {
   plugin: RealtimePlugin;
   vaultId: string;
   hash: string;
+  narrow: boolean;
 }) {
   const [detail, setDetail] = useState<CommitDetail | null>(null);
   const [allFiles, setAllFiles] = useState<string[] | null>(null);
   const [showAll, setShowAll] = useState(false);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [filesOpen, setFilesOpen] = useState(false);
 
   useEffect(() => {
     setDetail(null);
@@ -281,6 +339,32 @@ function CommitDetailPane({
     })();
   }, [showAll, allFiles, plugin, vaultId, hash]);
 
+  // Reset the drawer when the selected commit changes.
+  useEffect(() => {
+    setFilesOpen(false);
+  }, [hash]);
+
+  // Resize guard: close the drawer when transitioning to desktop.
+  useEffect(() => {
+    if (!narrow) setFilesOpen(false);
+  }, [narrow]);
+
+  // Escape closes the drawer (mobile/narrow only).
+  useEffect(() => {
+    if (!narrow || !filesOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setFilesOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [narrow, filesOpen]);
+
+  // Set only the icon span with Obsidian's icon renderer; React owns the button label.
+  const setFabIconRef = useCallback((el: HTMLSpanElement | null) => {
+    if (!el) return;
+    setIcon(el, "list");
+  }, []);
+
   const changes = detail?.changes ?? [];
   const changedPaths = useMemo(() => changes.map((c) => c.renamedTo ?? c.path), [changes]);
   const gitStatus = useMemo<GitStatusEntry[]>(
@@ -301,9 +385,38 @@ function CommitDetailPane({
   if (error) return <p className="setting-item-description realtime-history-error">{error}</p>;
   if (!detail) return <p className="setting-item-description">Loading…</p>;
 
+  const handleFileSelect = (p: string) => {
+    setSelectedPath(p);
+    if (narrow) setFilesOpen(false);
+  };
+
   return (
     <div className="realtime-timeline-detail">
-      <div className="realtime-timeline-files">
+      {narrow && filesOpen && (
+        <div
+          className="realtime-timeline-backdrop"
+          aria-hidden="true"
+          onClick={() => setFilesOpen(false)}
+        />
+      )}
+      <div
+        className={"realtime-timeline-files" + (narrow ? " is-drawer" : "") + (filesOpen ? " is-open" : "")}
+        id="realtime-timeline-files"
+        role={narrow ? "dialog" : undefined}
+        aria-label={narrow ? "Files in this commit" : undefined}
+      >
+        {narrow && (
+          <div className="realtime-timeline-files-header">
+            <span>Files in this commit</span>
+            <button
+              className="realtime-timeline-files-close"
+              aria-label="Close files panel"
+              onClick={() => setFilesOpen(false)}
+            >
+              ✕
+            </button>
+          </div>
+        )}
         <label className="realtime-timeline-toggle">
           <input
             type="checkbox"
@@ -319,10 +432,22 @@ function CommitDetailPane({
             key={`${hash}:${showAll && allFiles ? "all" : "changed"}`}
             paths={treePaths}
             gitStatus={gitStatus}
-            onSelect={setSelectedPath}
+            onSelect={handleFileSelect}
           />
         )}
       </div>
+      {narrow && (
+        <button
+          className="realtime-timeline-fab"
+          aria-expanded={filesOpen}
+          aria-controls="realtime-timeline-files"
+          aria-label="Show files in this commit"
+          onClick={() => setFilesOpen(true)}
+        >
+          <span ref={setFabIconRef} aria-hidden="true" />
+          <span className="realtime-timeline-fab-label">Show files</span>
+        </button>
+      )}
       <div className="realtime-timeline-diff">
         {selectedPath ? (
           <PathAtCommit
@@ -332,6 +457,8 @@ function CommitDetailPane({
             path={selectedPath}
             oldPath={selectedChange?.renamedTo ? selectedChange.path : selectedPath}
             changed={!!selectedChange}
+            unified={narrow}
+            showUnchangedContents
           />
         ) : (
           <p className="setting-item-description">Select a file.</p>
@@ -348,6 +475,8 @@ function PathAtCommit({
   path,
   oldPath,
   changed,
+  unified,
+  showUnchangedContents,
 }: {
   plugin: RealtimePlugin;
   vaultId: string;
@@ -355,6 +484,8 @@ function PathAtCommit({
   path: string;
   oldPath: string;
   changed: boolean;
+  unified?: boolean;
+  showUnchangedContents?: boolean;
 }) {
   const [files, setFiles] = useState<{ before: FileAtCommit; after: FileAtCommit } | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -396,7 +527,15 @@ function PathAtCommit({
       />
     );
   }
-  return <HistoryFileDiff path={path} before={files.before} after={files.after} />;
+  return (
+    <HistoryFileDiff
+      path={path}
+      before={files.before}
+      after={files.after}
+      unified={unified}
+      showUnchangedContents={showUnchangedContents}
+    />
+  );
 }
 
 // ---------- rollback ----------

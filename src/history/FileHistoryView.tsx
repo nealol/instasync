@@ -1,7 +1,7 @@
 import { ItemView, TFile, WorkspaceLeaf } from "obsidian";
 import { createRoot, type Root } from "react-dom/client";
 import { useCallback, useEffect, useState } from "react";
-import { FileDiff } from "@pierre/diffs/react";
+import { File, FileDiff } from "@pierre/diffs/react";
 import { parseDiffFromFile } from "@pierre/diffs";
 import type RealtimePlugin from "../main";
 import type { HistoryCommit, FileAtCommit } from "./types";
@@ -201,11 +201,13 @@ export function HistoryFileDiff({
   before,
   after,
   unified,
+  showUnchangedContents,
 }: {
   path: string;
   before: FileAtCommit;
   after: FileAtCommit;
   unified?: boolean;
+  showUnchangedContents?: boolean;
 }) {
   if (before.type === "binary" || after.type === "binary") {
     return (
@@ -219,6 +221,29 @@ export function HistoryFileDiff({
   const lang =
     after.type === "text" ? after.lang : before.type === "text" ? before.lang : "markdown";
   if (beforeText === afterText) {
+    if (showUnchangedContents) {
+      if (after.type === "absent") {
+        return <p className="setting-item-description">File not present at this commit.</p>;
+      }
+      return (
+        <>
+          <p className="realtime-history-unchanged-label">
+            No changes to this file in this commit.
+          </p>
+          <div className="realtime-history-diff">
+            <File
+              file={{ name: path, contents: afterText, lang }}
+              disableWorkerPool
+              options={{
+                overflow: "wrap",
+                themeType: "system",
+                disableVirtualizationBuffers: true,
+              }}
+            />
+          </div>
+        </>
+      );
+    }
     return <p className="setting-item-description">No changes to this file in this commit.</p>;
   }
   const fileDiff = parseDiffFromFile(
