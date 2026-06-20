@@ -324,8 +324,8 @@ pub async fn view_events(
 /// Decode a full-state v1 update into its state vector.
 fn state_vector_of(update: &[u8]) -> AppResult<StateVector> {
     let doc = Doc::new();
-    let decoded =
-        Update::decode_v1(update).map_err(|e| AppError::Internal(format!("decode update: {e:?}")))?;
+    let decoded = Update::decode_v1(update)
+        .map_err(|e| AppError::Internal(format!("decode update: {e:?}")))?;
     {
         let mut txn = doc.transact_mut();
         txn.apply_update(decoded);
@@ -338,8 +338,8 @@ fn state_vector_of(update: &[u8]) -> AppResult<StateVector> {
 /// yet covered by `since`, plus the new full state vector.
 fn delta_since(update: &[u8], since: &StateVector) -> AppResult<(Vec<u8>, StateVector)> {
     let doc = Doc::new();
-    let decoded =
-        Update::decode_v1(update).map_err(|e| AppError::Internal(format!("decode update: {e:?}")))?;
+    let decoded = Update::decode_v1(update)
+        .map_err(|e| AppError::Internal(format!("decode update: {e:?}")))?;
     {
         let mut txn = doc.transact_mut();
         txn.apply_update(decoded);
@@ -483,18 +483,12 @@ mod tests {
             file("B/Other.md", "g2"),
             file("Exact.md", "g3"),
         ];
-        assert_eq!(
-            resolve_wikilink_target(&files, "Exact").unwrap().guid,
-            "g3"
-        );
+        assert_eq!(resolve_wikilink_target(&files, "Exact").unwrap().guid, "g3");
         assert_eq!(
             resolve_wikilink_target(&files, "A/Note").unwrap().guid,
             "g1"
         );
-        assert_eq!(
-            resolve_wikilink_target(&files, "other").unwrap().guid,
-            "g2"
-        );
+        assert_eq!(resolve_wikilink_target(&files, "other").unwrap().guid, "g2");
         assert!(resolve_wikilink_target(&files, "Missing").is_none());
     }
 }

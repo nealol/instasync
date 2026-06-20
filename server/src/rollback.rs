@@ -93,9 +93,15 @@ enum PlannedOp {
         /// Bytes recovered from git to re-insert into the blob store.
         blob_bytes: Option<Vec<u8>>,
     },
-    RemoveFile { path: String },
-    RemoveStructured { path: String },
-    RemoveBinary { path: String },
+    RemoveFile {
+        path: String,
+    },
+    RemoveStructured {
+        path: String,
+    },
+    RemoveBinary {
+        path: String,
+    },
 }
 
 struct Plan {
@@ -220,8 +226,8 @@ async fn plan_rollback(state: &AppState, vault_id: &str, hash: &str) -> AppResul
                             crate::structured::canvas_file_to_map(file)
                         }
                         _ => {
-                            let yaml: serde_yaml::Value = serde_yaml::from_slice(&bytes)
-                                .map_err(|e| {
+                            let yaml: serde_yaml::Value =
+                                serde_yaml::from_slice(&bytes).map_err(|e| {
                                     AppError::Internal(format!("parse base {path}: {e}"))
                                 })?;
                             serde_json::to_value(yaml)
@@ -253,20 +259,20 @@ async fn plan_rollback(state: &AppState, vault_id: &str, hash: &str) -> AppResul
                     }
                 }
                 Classified::Binary => {
-                    let (hash, size, blob_bytes, blob_missing) =
-                        match parse_attachment_shim(&bytes) {
-                            Some(shim) => {
-                                let available = blob_exists(state, vault_id, &shim.hash);
-                                (shim.hash, shim.size, None, !available)
-                            }
-                            None => {
-                                let hash = sha256_hex(&bytes);
-                                let size = bytes.len() as u64;
-                                let missing = !blob_exists(state, vault_id, &hash);
-                                let blob_bytes = missing.then(|| bytes.clone());
-                                (hash, size, blob_bytes, false)
-                            }
-                        };
+                    let (hash, size, blob_bytes, blob_missing) = match parse_attachment_shim(&bytes)
+                    {
+                        Some(shim) => {
+                            let available = blob_exists(state, vault_id, &shim.hash);
+                            (shim.hash, shim.size, None, !available)
+                        }
+                        None => {
+                            let hash = sha256_hex(&bytes);
+                            let size = bytes.len() as u64;
+                            let missing = !blob_exists(state, vault_id, &hash);
+                            let blob_bytes = missing.then(|| bytes.clone());
+                            (hash, size, blob_bytes, false)
+                        }
+                    };
                     if blob_missing {
                         // Shim + blob GC'd: unrecoverable. Leave any current
                         // file at this path untouched.
@@ -400,7 +406,10 @@ async fn plan_rollback(state: &AppState, vault_id: &str, hash: &str) -> AppResul
             continue;
         };
         let target_sql = String::from_utf8_lossy(&bytes).to_string();
-        let changed = current_dumps.get(path).map(|s| s != &target_sql).unwrap_or(true);
+        let changed = current_dumps
+            .get(path)
+            .map(|s| s != &target_sql)
+            .unwrap_or(true);
         let (rollbackable, reason) = if !changed {
             (false, Some("already at this state".to_string()))
         } else {

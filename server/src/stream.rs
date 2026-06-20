@@ -41,7 +41,10 @@ use y_sweet_core::sync::{Message as YMsg, SyncMessage, MSG_AWARENESS};
 use yrs::encoding::write::Write;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
-use yrs::{Assoc, Doc, GetString, IndexScope, IndexedSequence, ReadTxn, StickyIndex, Text, Transact, Update};
+use yrs::{
+    Assoc, Doc, GetString, IndexScope, IndexedSequence, ReadTxn, StickyIndex, Text, Transact,
+    Update,
+};
 
 use crate::audit::{self, AuditEntry};
 use crate::error::AppError;
@@ -142,7 +145,9 @@ async fn run_session(
     // 1. The first frame must be `start`, naming the note and anchor.
     let (path, anchor) = match timeout(SETUP_TIMEOUT, next_client_frame(&mut client)).await {
         Ok(Ok(Some(ClientFrame::Start { path, anchor }))) => (path, anchor),
-        Ok(Ok(Some(_))) => return fail(&mut client, "expected_start", "first frame must be start").await,
+        Ok(Ok(Some(_))) => {
+            return fail(&mut client, "expected_start", "first frame must be start").await
+        }
         Ok(Ok(None)) | Ok(Err(_)) => return Ok(()),
         Err(_) => return fail(&mut client, "timeout", "no start frame received").await,
     };
@@ -163,7 +168,8 @@ async fn run_session(
         }
     };
     let mut session = DocSession::new(&principal);
-    if let Err(e) = timeout(SETUP_TIMEOUT, initial_sync(&mut session, &mut upstream)).await
+    if let Err(e) = timeout(SETUP_TIMEOUT, initial_sync(&mut session, &mut upstream))
+        .await
         .map_err(|_| anyhow::anyhow!("initial sync timed out"))
         .and_then(|r| r)
     {
@@ -181,7 +187,11 @@ async fn run_session(
     if let Some(msg) = session.awareness_message() {
         up_tx.send(WsMsg::Binary(msg)).await?;
     }
-    send_json(&mut client, json!({ "type": "started", "guid": file.guid, "position": position })).await?;
+    send_json(
+        &mut client,
+        json!({ "type": "started", "guid": file.guid, "position": position }),
+    )
+    .await?;
 
     // 5. Pump frames until end/disconnect/timeout.
     let (mut cl_tx, mut cl_rx) = client.split();
@@ -272,9 +282,19 @@ async fn run_session(
 
     let mut client = cl_tx.reunite(cl_rx)?;
     if let Some((code, message)) = error {
-        send_json(&mut client, json!({ "type": "error", "code": code, "message": message })).await.ok();
+        send_json(
+            &mut client,
+            json!({ "type": "error", "code": code, "message": message }),
+        )
+        .await
+        .ok();
     }
-    send_json(&mut client, json!({ "type": "done", "auditId": audit_id, "inserted": session.inserted })).await.ok();
+    send_json(
+        &mut client,
+        json!({ "type": "done", "auditId": audit_id, "inserted": session.inserted }),
+    )
+    .await
+    .ok();
     client.close().await.ok();
     Ok(())
 }
@@ -299,7 +319,12 @@ async fn send_json(client: &mut WebSocket, value: JsonValue) -> anyhow::Result<(
 }
 
 async fn fail(client: &mut WebSocket, code: &str, message: &str) -> anyhow::Result<()> {
-    send_json(client, json!({ "type": "error", "code": code, "message": message })).await.ok();
+    send_json(
+        client,
+        json!({ "type": "error", "code": code, "message": message }),
+    )
+    .await
+    .ok();
     client.close().await.ok();
     Ok(())
 }
@@ -329,7 +354,9 @@ async fn flush(
     }
     cl_tx
         .send(AxumMsg::Text(
-            json!({ "type": "ack", "applied": out.applied }).to_string().into(),
+            json!({ "type": "ack", "applied": out.applied })
+                .to_string()
+                .into(),
         ))
         .await?;
     Ok(())
@@ -621,9 +648,9 @@ fn cursor_color(app_id: &str) -> &'static str {
     const PALETTE: [&str; 8] = [
         "#e91e63", "#9c27b0", "#3f51b5", "#2196f3", "#009688", "#4caf50", "#ff9800", "#795548",
     ];
-    let hash: u32 = app_id
-        .bytes()
-        .fold(2166136261u32, |acc, b| (acc ^ b as u32).wrapping_mul(16777619));
+    let hash: u32 = app_id.bytes().fold(2166136261u32, |acc, b| {
+        (acc ^ b as u32).wrapping_mul(16777619)
+    });
     PALETTE[(hash % PALETTE.len() as u32) as usize]
 }
 
@@ -725,7 +752,9 @@ mod tests {
     fn after_anchor_inserts_behind_match() {
         let (mut session, remote) = synced_session("intro\n## Draft\noutro");
         let pos = session
-            .resolve_anchor(&Anchor::After { text: "## Draft".into() })
+            .resolve_anchor(&Anchor::After {
+                text: "## Draft".into(),
+            })
             .unwrap();
         assert_eq!(pos, "intro\n## Draft".len());
         session.pending.push_str("\nstreamed");
@@ -737,7 +766,9 @@ mod tests {
     fn anchor_errors() {
         let (mut session, _remote) = synced_session("hi 🦀 end");
         assert_eq!(
-            session.resolve_anchor(&Anchor::After { text: "missing".into() }),
+            session.resolve_anchor(&Anchor::After {
+                text: "missing".into()
+            }),
             Err("anchor_not_found")
         );
         // Offset inside the 4-byte crab is not a char boundary.
@@ -746,7 +777,10 @@ mod tests {
             Err("offset_not_char_boundary")
         );
         // Past-the-end offsets clamp to append ("hi 🦀 end" is 11 bytes).
-        assert_eq!(session.resolve_anchor(&Anchor::Offset { offset: 999 }), Ok(11));
+        assert_eq!(
+            session.resolve_anchor(&Anchor::Offset { offset: 999 }),
+            Ok(11)
+        );
     }
 
     #[test]
@@ -793,7 +827,10 @@ mod tests {
 
         // Clearing publishes the protocol's "null" state.
         let cleared = session.clear_awareness_message().unwrap();
-        assert!(matches!(YMsg::decode_v1(&cleared).unwrap(), YMsg::Awareness(_)));
+        assert!(matches!(
+            YMsg::decode_v1(&cleared).unwrap(),
+            YMsg::Awareness(_)
+        ));
     }
 
     #[test]

@@ -202,6 +202,91 @@ export class VaultSync {
     return null;
   }
 
+  /**
+   * Wait until a vault item (located by `path` and/or `guid`) is resolvable on
+   * disk as a {@link TFile}, or until `timeoutMs` (default 15s) elapses.
+   *
+   * Re-resolves the path on every check so a guid that the index only merges
+   * after the wait starts is still picked up. Both conditions must hold: the
+   * shared index must map the guid → path (or a path was given), AND the file
+   * must exist on disk (the index entry alone is insufficient — the Document
+   * pipeline writes the file via {@link Document#writeToDisk} asynchronously).
+   * This method never creates documents or triggers sync; it only re-checks.
+   *
+   * Responsive without polling latency: a ~250ms interval is the backstop, and
+   * observers on `files`/`structured` re-check immediately on any
+   * remote merge. Tolerates the IndexedDB-loading startup phase — it does not
+   * depend on `reconnectAll`'s timing, just on the index merge + disk write
+   * landing. Resolves `null` on timeout or if this sync is destroyed mid-wait.
+   */
+  async waitForItem(opts: {
+    guid?: string;
+    path?: string;
+    timeoutMs?: number;
+  }): Promise<TFile | null> {
+    const timeoutMs = opts.timeoutMs ?? 15_000;
+    const deadline = Date.now() + timeoutMs;
+
+    return new Promise<TFile | null>((resolve) => {
+      let settled = false;
+      let attached = false;
+      let timer: ReturnType<typeof setInterval> | null = null;
+      let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const filesObserver = (): void => check();
+      const structuredObserver = (): void => check();
+
+      // Single, idempotent cleanup/exit path. Safe to call from every exit
+      // (immediate success, observer hit, timer tick, timeout, destroy).
+      const finish = (result: TFile | null): void => {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) clearInterval(timer);
+        if (timeoutTimer !== null) clearTimeout(timeoutTimer);
+        // Only unobserve what we actually attached; unobserving a handler that
+        // was never registered logs a yjs console.error.
+        if (attached) {
+          this.files.unobserve(filesObserver);
+          this.structured.unobserve(structuredObserver);
+        }
+        resolve(result);
+      };
+
+      const check = (): void => {
+        if (this.destroyed) {
+          finish(null);
+          return;
+        }
+        // Re-resolve every tick: a guid may map to a path only after the wait
+        // starts (index merge lands mid-wait). An explicit path takes precedence.
+        const path = opts.path?.trim() || (opts.guid ? this.pathForGuid(opts.guid) : null);
+        if (!path) return; // not ready yet — keep waiting (don't stop at "guid unknown")
+        const file = this.plugin.app.vault.getAbstractFileByPath(path);
+        if (file instanceof TFile) finish(file);
+        // Otherwise keep waiting: the index entry alone is insufficient.
+      };
+
+      // Synchronous happy path before wiring up observers/timer (no cleanup to
+      // do if this settles immediately).
+      check();
+      if (settled) return;
+
+      // Re-check immediately on any remote index merge (responsive without
+      // waiting for the next poll tick).
+      this.files.observe(filesObserver);
+      this.structured.observe(structuredObserver);
+      attached = true;
+
+      // Poll backstop covers the disk-write lag, destroy, and any miss the
+      // observers don't see (e.g. the file landing on disk without an index
+      // change because the index already had the entry).
+      timer = setInterval(() => {
+        check();
+      }, 250);
+      timeoutTimer = setTimeout(() => finish(null), Math.max(0, deadline - Date.now()));
+    });
+  }
+
   /** Notify once when a live connection drops; silent while already offline. */
   private notifyDisconnected(): void {
     if (!this.wasConnected) return;

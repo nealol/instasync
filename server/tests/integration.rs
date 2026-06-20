@@ -438,12 +438,18 @@ async fn fake_ysweet_live() -> (String, FakeDocs, AwarenessLog) {
         // Like the real y-sweet: greet with our state vector.
         let sv = doc.transact().state_vector();
         let greeting = YMsg::Sync(SyncMessage::SyncStep1(sv)).encode_v1();
-        if socket.send(FakeWsMsg::Binary(greeting.into())).await.is_err() {
+        if socket
+            .send(FakeWsMsg::Binary(greeting.into()))
+            .await
+            .is_err()
+        {
             return;
         }
 
         while let Some(Ok(msg)) = socket.recv().await {
-            let FakeWsMsg::Binary(data) = msg else { continue };
+            let FakeWsMsg::Binary(data) = msg else {
+                continue;
+            };
             match YMsg::decode_v1(&data) {
                 Ok(YMsg::Sync(SyncMessage::SyncStep1(sv))) => {
                     let diff = doc.transact().encode_state_as_update_v1(&sv);
@@ -989,7 +995,10 @@ async fn login_creates_session_and_me_works() {
     // git_email is self-settable and flows unescaped into the git author line
     // and Co-authored-by trailers, so injection attempts must be rejected.
     let cases = [
-        ("a@b.com>\nSigned-off-by: attacker <a@x>\n", "trailer injection via '>'"),
+        (
+            "a@b.com>\nSigned-off-by: attacker <a@x>\n",
+            "trailer injection via '>'",
+        ),
         ("a@b.com\r\nX: y", "crlf trailer injection"),
         ("alice<@example.com", "angle bracket in local"),
         ("alice @example.com", "whitespace in local part"),
@@ -3746,7 +3755,10 @@ async fn stream_ws_e2e_tokens_caret_audit_and_undo() {
     };
     assert_eq!(acked, 11, "every streamed byte must be acked");
     assert_eq!(done["inserted"], 11);
-    let audit_id = done["auditId"].as_str().expect("session must be audited").to_string();
+    let audit_id = done["auditId"]
+        .as_str()
+        .expect("session must be audited")
+        .to_string();
 
     // The streamed text landed in the doc, visible over plain REST.
     let (status, note) = send(
@@ -4034,7 +4046,14 @@ async fn history_endpoints_browse_commits_changes_trees_and_files() {
     let ys = fake_ysweet_store().await;
     let (app, git_dir, _blobs) = history_test_app(&ys).await;
     let alice = login(&app, "alice").await;
-    let (_, vault) = send(&app, "POST", "/api/vaults", Some(&alice), Some(json!({"name": "V"}))).await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&alice),
+        Some(json!({"name": "V"})),
+    )
+    .await;
     let vault_id = vault["id"].as_str().unwrap().to_string();
     let repo = git_dir.join(&vault_id);
 
@@ -4088,10 +4107,24 @@ async fn history_endpoints_browse_commits_changes_trees_and_files() {
     let (_, page) = send(&app, "GET", &format!("{base}?limit=1"), Some(&alice), None).await;
     assert_eq!(page["commits"].as_array().unwrap().len(), 1);
     assert_eq!(page["hasMore"], true);
-    let (_, page) = send(&app, "GET", &format!("{base}?before={c2}"), Some(&alice), None).await;
+    let (_, page) = send(
+        &app,
+        "GET",
+        &format!("{base}?before={c2}"),
+        Some(&alice),
+        None,
+    )
+    .await;
     assert_eq!(page["commits"][0]["hash"], json!(c1));
     assert_eq!(page["hasMore"], false);
-    let (_, page) = send(&app, "GET", &format!("{base}?before={c1}"), Some(&alice), None).await;
+    let (_, page) = send(
+        &app,
+        "GET",
+        &format!("{base}?before={c1}"),
+        Some(&alice),
+        None,
+    )
+    .await;
     assert_eq!(page["commits"].as_array().unwrap().len(), 0);
 
     // Per-file history (--follow) sees both commits for the note's path.
@@ -4116,11 +4149,25 @@ async fn history_endpoints_browse_commits_changes_trees_and_files() {
     assert_eq!(changes[0]["kind"], "markdown");
 
     // Short (abbreviated) hashes resolve too.
-    let (status, _) = send(&app, "GET", &format!("{base}/{}", &c2[..8]), Some(&alice), None).await;
+    let (status, _) = send(
+        &app,
+        "GET",
+        &format!("{base}/{}", &c2[..8]),
+        Some(&alice),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     // Tree at each commit.
-    let (_, tree) = send(&app, "GET", &format!("{base}/{c1}/tree"), Some(&alice), None).await;
+    let (_, tree) = send(
+        &app,
+        "GET",
+        &format!("{base}/{c1}/tree"),
+        Some(&alice),
+        None,
+    )
+    .await;
     let entries = tree["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["path"], "nötes/hello one.md");
@@ -4128,11 +4175,25 @@ async fn history_endpoints_browse_commits_changes_trees_and_files() {
 
     // File content at both versions, and "absent" before it existed.
     let file_q = format!("path=n%C3%B6tes%2Fhello%20one.md");
-    let (_, f1) = send(&app, "GET", &format!("{base}/{c1}/file?{file_q}"), Some(&alice), None).await;
+    let (_, f1) = send(
+        &app,
+        "GET",
+        &format!("{base}/{c1}/file?{file_q}"),
+        Some(&alice),
+        None,
+    )
+    .await;
     assert_eq!(f1["type"], "text");
     assert_eq!(f1["content"], "# v1\n");
     assert_eq!(f1["lang"], "markdown");
-    let (_, f2) = send(&app, "GET", &format!("{base}/{c2}/file?{file_q}"), Some(&alice), None).await;
+    let (_, f2) = send(
+        &app,
+        "GET",
+        &format!("{base}/{c2}/file?{file_q}"),
+        Some(&alice),
+        None,
+    )
+    .await;
     assert_eq!(f2["content"], "# v2\nmore\n");
     let (_, missing) = send(
         &app,
@@ -4176,7 +4237,14 @@ async fn rollback_restores_notes_requires_admin_and_stamps_trailer() {
     let ys = fake_ysweet_store().await;
     let (app, git_dir, _blobs) = history_test_app(&ys).await;
     let alice = login(&app, "alice").await;
-    let (_, vault) = send(&app, "POST", "/api/vaults", Some(&alice), Some(json!({"name": "V"}))).await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&alice),
+        Some(json!({"name": "V"})),
+    )
+    .await;
     let vault_id = vault["id"].as_str().unwrap().to_string();
     let repo = git_dir.join(&vault_id);
     let base = format!("/api/vaults/{vault_id}/history/commits");
@@ -4270,7 +4338,14 @@ async fn rollback_restores_notes_requires_admin_and_stamps_trailer() {
     assert_eq!(plan["unrecoverableBinaries"].as_array().unwrap().len(), 0);
 
     // Preview is a dry run: nothing changed yet.
-    let (_, a) = send(&app, "GET", &format!("/api/vaults/{vault_id}/notes/a.md"), Some(&alice), None).await;
+    let (_, a) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/notes/a.md"),
+        Some(&alice),
+        None,
+    )
+    .await;
     assert_eq!(a["content"], "alpha v2 — changed\n");
 
     // Execute.
@@ -4285,12 +4360,29 @@ async fn rollback_restores_notes_requires_admin_and_stamps_trailer() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(result["applied"], 1);
     assert_eq!(result["deleted"], 1);
-    let rb_commit = result["commit"].as_str().expect("rollback commit hash").to_string();
+    let rb_commit = result["commit"]
+        .as_str()
+        .expect("rollback commit hash")
+        .to_string();
 
     // Authoritative state is restored: A back at v1, B gone.
-    let (_, a) = send(&app, "GET", &format!("/api/vaults/{vault_id}/notes/a.md"), Some(&alice), None).await;
+    let (_, a) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/notes/a.md"),
+        Some(&alice),
+        None,
+    )
+    .await;
     assert_eq!(a["content"], "alpha v1\n");
-    let (status, _) = send(&app, "GET", &format!("/api/vaults/{vault_id}/notes/b.md"), Some(&alice), None).await;
+    let (status, _) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/notes/b.md"),
+        Some(&alice),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // The rollback commit is HEAD, attributed to alice, with subject + trailer,
@@ -4332,7 +4424,14 @@ async fn rollback_restores_attachment_blob_from_git_after_gc() {
     let ys = fake_ysweet_store().await;
     let (app, git_dir, blob_dir) = history_test_app(&ys).await;
     let alice = login(&app, "alice").await;
-    let (_, vault) = send(&app, "POST", "/api/vaults", Some(&alice), Some(json!({"name": "V"}))).await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&alice),
+        Some(json!({"name": "V"})),
+    )
+    .await;
     let vault_id = vault["id"].as_str().unwrap().to_string();
     let repo = git_dir.join(&vault_id);
     let base = format!("/api/vaults/{vault_id}/history/commits");
@@ -4448,7 +4547,10 @@ async fn public_share_lifecycle_create_view_and_revoke() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let share_id = share["id"].as_str().unwrap().to_string();
-    assert!(share["url"].as_str().unwrap().ends_with(&format!("/view/{share_id}")));
+    assert!(share["url"]
+        .as_str()
+        .unwrap()
+        .ends_with(&format!("/view/{share_id}")));
     let (status, again) = send(
         &app,
         "POST",

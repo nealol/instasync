@@ -87,7 +87,10 @@ pub struct TreeResponse {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum FileAtCommit {
     #[serde(rename_all = "camelCase")]
-    Text { content: String, lang: String },
+    Text {
+        content: String,
+        lang: String,
+    },
     #[serde(rename_all = "camelCase")]
     Binary {
         hash: String,
@@ -198,11 +201,7 @@ pub fn parse_trailers(body: &str) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     for line in body.lines() {
         if let Some((key, value)) = line.split_once(": ") {
-            if key
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-')
-                && !key.is_empty()
-            {
+            if key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && !key.is_empty() {
                 out.entry(key.to_string())
                     .or_insert_with(|| value.to_string());
             }
@@ -700,16 +699,17 @@ mod tests {
         git(&["config", "commit.gpgsign", "false"]);
         std::fs::write(dir.join("nöte one.md"), "hello").unwrap();
         git(&["add", "-A"]);
-        git(&["commit", "-q", "-m", "Add nöte one.md\n\nVault-Id: v1\nPrincipal-Id: u1"]);
+        git(&[
+            "commit",
+            "-q",
+            "-m",
+            "Add nöte one.md\n\nVault-Id: v1\nPrincipal-Id: u1",
+        ]);
         std::fs::rename(dir.join("nöte one.md"), dir.join("nöte two.md")).unwrap();
         git(&["add", "-A"]);
         git(&["commit", "-q", "-m", "Rename"]);
 
-        let log = git(&[
-            "log",
-            "-z",
-            "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%B",
-        ]);
+        let log = git(&["log", "-z", "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%B"]);
         let commits = parse_log_records(&log);
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[1].subject, "Add nöte one.md");

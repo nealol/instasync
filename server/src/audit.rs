@@ -196,8 +196,12 @@ pub async fn undo(
             check_note_unchanged(state, undoer, vault_id, &entry.path, &entry, force).await?;
             notes::delete_note_inner(state, undoer, vault_id, &entry.path).await?;
         }
-        "note_replace" | "note_patch" | "note_replace_body" | "note_frontmatter"
-        | "note_periodic_append" | "stream" => {
+        "note_replace"
+        | "note_patch"
+        | "note_replace_body"
+        | "note_frontmatter"
+        | "note_periodic_append"
+        | "stream" => {
             let before = entry
                 .before_content
                 .clone()

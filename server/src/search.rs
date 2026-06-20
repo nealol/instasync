@@ -5,14 +5,13 @@ use std::time::{Duration, Instant};
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use regex::Regex;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, Statement, Value,
-};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Statement, Value};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::config::Config;
-use crate::entities::{note_search, vaults};
+use crate::entities::{memberships, note_search, vaults};
 use crate::error::{AppError, AppResult};
 use crate::routes::require_member;
 use crate::session::{now_millis, ApiPrincipal};
@@ -45,6 +44,13 @@ pub struct TagCount {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReindexResponse {
+    pub count: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearFtsAndReindexResponse {
+    pub vaults: usize,
     pub count: usize,
 }
 
@@ -146,49 +152,45 @@ pub async fn index_note(
     let links =
         serde_json::to_string(&parsed.links).map_err(|e| AppError::Internal(e.to_string()))?;
     let now = now_millis();
-    let existing = note_search::Entity::find()
-        .filter(note_search::Column::VaultId.eq(vault_id))
-        .filter(note_search::Column::Guid.eq(guid))
-        .one(&state.db)
-        .await?;
-    if let Some(model) = existing {
-        let mut active: note_search::ActiveModel = model.into();
-        active.path = Set(path.to_string());
-        active.title = Set(parsed.title.clone());
-        active.tags = Set(tags.clone());
-        active.links = Set(links);
-        active.updated_at = Set(now);
-        active.update(&state.db).await?;
-    } else {
-        note_search::ActiveModel {
-            id: Set(uuid::Uuid::new_v4().to_string()),
-            vault_id: Set(vault_id.to_string()),
-            guid: Set(guid.to_string()),
-            path: Set(path.to_string()),
-            title: Set(parsed.title.clone()),
-            tags: Set(tags.clone()),
-            links: Set(links),
-            updated_at: Set(now),
-        }
-        .insert(&state.db)
-        .await?;
-    }
     let tag_text = parsed.tags.join(" ");
     let backend = state.db.get_database_backend();
     state
         .db
         .execute(Statement::from_sql_and_values(
             backend,
-            "DELETE FROM note_fts WHERE vault_id = ? AND guid = ?",
-            [Value::from(vault_id), Value::from(guid)],
+            "INSERT INTO note_search(id,vault_id,guid,path,title,tags,links,updated_at) \
+             VALUES (?,?,?,?,?,?,?,?) \
+             ON CONFLICT(vault_id,guid) DO UPDATE SET \
+             path = excluded.path, title = excluded.title, tags = excluded.tags, \
+             links = excluded.links, updated_at = excluded.updated_at",
+            [
+                Value::from(uuid::Uuid::new_v4().to_string()),
+                Value::from(vault_id),
+                Value::from(guid),
+                Value::from(path),
+                Value::from(parsed.title.as_str()),
+                Value::from(tags.as_str()),
+                Value::from(links.as_str()),
+                Value::from(now),
+            ],
+        ))
+        .await?;
+    let fts_rowid = note_fts_rowid(vault_id, guid);
+    state
+        .db
+        .execute(Statement::from_sql_and_values(
+            backend,
+            "DELETE FROM note_fts WHERE rowid = ?",
+            [Value::from(fts_rowid)],
         ))
         .await?;
     state
         .db
         .execute(Statement::from_sql_and_values(
             backend,
-            "INSERT INTO note_fts(vault_id,guid,path,title,tags,body) VALUES (?,?,?,?,?,?)",
+            "INSERT INTO note_fts(rowid,vault_id,guid,path,title,tags,body) VALUES (?,?,?,?,?,?,?)",
             [
+                Value::from(fts_rowid),
                 Value::from(vault_id),
                 Value::from(guid),
                 Value::from(path),
@@ -211,11 +213,22 @@ pub async fn remove_note(state: &AppState, vault_id: &str, guid: &str) -> AppRes
         .db
         .execute(Statement::from_sql_and_values(
             state.db.get_database_backend(),
-            "DELETE FROM note_fts WHERE vault_id = ? AND guid = ?",
-            [Value::from(vault_id), Value::from(guid)],
+            "DELETE FROM note_fts WHERE rowid = ?",
+            [Value::from(note_fts_rowid(vault_id, guid))],
         ))
         .await?;
     Ok(())
+}
+
+fn note_fts_rowid(vault_id: &str, guid: &str) -> i64 {
+    let mut hasher = Sha256::new();
+    hasher.update(vault_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(guid.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    (i64::from_be_bytes(bytes) & i64::MAX).max(1)
 }
 
 pub async fn reindex_vault(state: &AppState, vault_id: &str) -> AppResult<usize> {
@@ -252,6 +265,11 @@ pub async fn reindex_vault(state: &AppState, vault_id: &str) -> AppResult<usize>
         }
     }
     Ok(count)
+}
+
+async fn clear_note_fts(state: &AppState) -> AppResult<()> {
+    state.db.execute_unprepared("DELETE FROM note_fts").await?;
+    Ok(())
 }
 
 pub async fn search_notes_inner(
@@ -423,6 +441,32 @@ pub async fn reindex_inner(
     })
 }
 
+pub async fn clear_fts_and_reindex_inner(
+    state: &AppState,
+    principal: &ApiPrincipal,
+) -> AppResult<ClearFtsAndReindexResponse> {
+    if principal.pinned_vault_id().is_some() {
+        return Err(AppError::Forbidden);
+    }
+
+    let rows = memberships::Entity::find()
+        .filter(memberships::Column::UserId.eq(&principal.user.id))
+        .all(&state.db)
+        .await?;
+
+    clear_note_fts(state).await?;
+
+    let mut count = 0usize;
+    for row in &rows {
+        count += reindex_vault(state, &row.vault_id).await?;
+    }
+
+    Ok(ClearFtsAndReindexResponse {
+        vaults: rows.len(),
+        count,
+    })
+}
+
 pub async fn search_notes(
     State(state): State<AppState>,
     principal: ApiPrincipal,
@@ -458,6 +502,13 @@ pub async fn reindex(
     Path(vault_id): Path<String>,
 ) -> AppResult<Json<ReindexResponse>> {
     Ok(Json(reindex_inner(&state, &principal, &vault_id).await?))
+}
+
+pub async fn clear_fts_and_reindex(
+    State(state): State<AppState>,
+    principal: ApiPrincipal,
+) -> AppResult<Json<ClearFtsAndReindexResponse>> {
+    Ok(Json(clear_fts_and_reindex_inner(&state, &principal).await?))
 }
 
 struct VaultState {

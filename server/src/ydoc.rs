@@ -276,12 +276,29 @@ pub async fn index_rename_structured(
 /// One index-doc mutation in a rollback batch.
 #[derive(Clone, Debug)]
 pub enum IndexOp {
-    SetFile { path: String, guid: String },
-    RemoveFile { path: String },
-    SetBinary { path: String, hash: String, size: i64 },
-    RemoveBinary { path: String },
-    SetStructured { path: String, guid: String, kind: String },
-    RemoveStructured { path: String },
+    SetFile {
+        path: String,
+        guid: String,
+    },
+    RemoveFile {
+        path: String,
+    },
+    SetBinary {
+        path: String,
+        hash: String,
+        size: i64,
+    },
+    RemoveBinary {
+        path: String,
+    },
+    SetStructured {
+        path: String,
+        guid: String,
+        kind: String,
+    },
+    RemoveStructured {
+        path: String,
+    },
 }
 
 /// Build a single update applying every op in one transaction, including the
@@ -362,11 +379,7 @@ pub fn build_index_batch_update(current_update: &[u8], ops: &[IndexOp]) -> AppRe
 
 /// Apply a batch of index ops in one read/write round trip, then mirror the
 /// `vault_files` DB registry the same way the per-op helpers do.
-pub async fn index_apply_batch(
-    state: &AppState,
-    vault_id: &str,
-    ops: &[IndexOp],
-) -> AppResult<()> {
+pub async fn index_apply_batch(state: &AppState, vault_id: &str, ops: &[IndexOp]) -> AppResult<()> {
     if ops.is_empty() {
         return Ok(());
     }

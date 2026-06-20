@@ -36,7 +36,9 @@ pub async fn serve_asset(
     let full = PathBuf::from(&state.config.web_dist_path)
         .join("assets")
         .join(&path);
-    let bytes = tokio::fs::read(&full).await.map_err(|_| AppError::NotFound)?;
+    let bytes = tokio::fs::read(&full)
+        .await
+        .map_err(|_| AppError::NotFound)?;
     Ok((
         [
             (header::CONTENT_TYPE, content_type(&full)),

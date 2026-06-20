@@ -25,11 +25,11 @@ import type {
 type ConnectionStatus = "offline" | "connecting" | "connected" | "error" | "signin";
 
 const STATUS_TEXT: Record<ConnectionStatus, string> = {
-  offline: "Sync: offline",
-  connecting: "Sync: connecting…",
-  connected: "Sync: live",
-  error: "Sync: offline",
-  signin: "Sync: sign in",
+  offline: "Realtime: offline",
+  connecting: "Realtime: connecting…",
+  connected: "Realtime: live",
+  error: "Realtime: offline",
+  signin: "Realtime: sign in",
 };
 
 export default class RealtimePlugin extends Plugin implements RealtimePluginApi {
@@ -327,28 +327,72 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
         return;
       }
 
-      let path = params.path?.trim() || "";
+      const path = params.path?.trim() || "";
       const guid = params.guid?.trim();
-      if (!path && guid) {
-        path = this.vaultSync?.pathForGuid(guid) ?? "";
+      const found = await this.resolvePermalinkTarget(path, guid);
+      if (found === undefined) return;
+      if (found) {
+        await this.app.workspace.getLeaf(false).openFile(found);
+        return;
       }
-      if (!path) {
+      // Fallback notices — preserve current wording, decided by ORIGINAL inputs
+      // (do not mutate `path`; a guid-only miss must stay "not available locally yet").
+      if (guid && !path) {
         new Notice(`${PLUGIN_NAME}: note link is not available locally yet.`);
-        return;
-      }
-
-      const file = this.app.vault.getAbstractFileByPath(path);
-      if (!(file instanceof TFile)) {
+      } else {
         new Notice(`${PLUGIN_NAME}: note not found: ${path}`);
-        return;
       }
-      await this.app.workspace.getLeaf(false).openFile(file);
     } catch (e) {
       console.error(`[${PLUGIN_NAME}] failed to open permalink`, e);
       new Notice(
         `${PLUGIN_NAME}: failed to open link: ${e instanceof Error ? e.message : String(e)}`,
       );
     }
+  }
+
+  /**
+   * Resolve a permalink target to a local {@link TFile}, attempting a one-shot
+   * recovery (start sync / nudge reconnect, then wait up to 15s for the note to
+   * materialize via the index merge + disk write). Returns null on a miss; the
+   * caller decides the fallback notice from the ORIGINAL path/guid inputs.
+   * Returns undefined when it already showed a more specific recovery-blocked
+   * notice and the caller should not show a second fallback notice.
+   */
+  private async resolvePermalinkTarget(
+    path: string,
+    guid: string | undefined,
+  ): Promise<TFile | null | undefined> {
+    // Happy path (no wait): resolve a guid to its current index path, or use
+    // the explicit path directly. `resolvedPath` is a separate var so the
+    // original (possibly empty) `path` is preserved for the caller's fallback
+    // notice wording.
+    const resolvedPath = path || (guid ? this.vaultSync?.pathForGuid(guid) ?? "" : "");
+    if (resolvedPath) {
+      const file = this.app.vault.getAbstractFileByPath(resolvedPath);
+      if (file instanceof TFile) return file;
+    }
+
+    // Miss → recover. Start sync if it isn't running yet (a single awaited
+    // step; maybeStartSync sets this.vaultSync at its tail when preconditions
+    // hold). The 15s below is the item-recovery budget, not a stacked wait.
+    if (!this.vaultSync) {
+      await this.maybeStartSync();
+      if (!this.vaultSync) {
+        // Not enabled / not logged in / no active vault — maybeStartSync already
+        // surfaced the signin/offline status. No polling, no 15s wait.
+        new Notice(`${PLUGIN_NAME}: sign in and enable sync to open this link.`);
+        return undefined;
+      }
+    } else {
+      // Nudge a stalled provider; no-op when already connected (harmless during
+      // IndexedDB load since waitForItem tolerates that startup phase).
+      this.vaultSync.reconnectAll();
+    }
+
+    const notice = new Notice("Realtime: syncing… looking for note", 15_000);
+    const file = await this.vaultSync.waitForItem({ guid, path, timeoutMs: 15_000 });
+    notice.hide();
+    return file;
   }
 
   /**
@@ -556,8 +600,8 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
     // Attachment upload activity takes precedence over the plain "live" label.
     let text = STATUS_TEXT[this.status];
     if (this.status === "connected") {
-      if (this.uploadStatus === "uploading") text = "Sync: uploading";
-      else if (this.uploadStatus === "pending") text = "Sync: pending upload";
+      if (this.uploadStatus === "uploading") text = "Realtime: uploading";
+      else if (this.uploadStatus === "pending") text = "Realtime: pending upload";
     }
     flushSync(() => {
       this.statusRoot?.render(text);

@@ -310,7 +310,10 @@ pub(crate) async fn replace_note_inner(
     // callers the extra y-sweet read.
     let before = if audit::is_cursor(principal) {
         let update = ydoc::read_update(state, &doc_id).await?;
-        Some(ydoc::decode_text(&update, "contents").map_err(|e| AppError::Internal(e.to_string()))?)
+        Some(
+            ydoc::decode_text(&update, "contents")
+                .map_err(|e| AppError::Internal(e.to_string()))?,
+        )
     } else {
         None
     };
@@ -479,7 +482,10 @@ pub(crate) async fn delete_note_inner(
     // undone; human deletes skip the extra read.
     let before = if audit::is_cursor(principal) {
         let update = ydoc::read_update(state, &doc_id(vault_id, &file.guid)).await?;
-        Some(ydoc::decode_text(&update, "contents").map_err(|e| AppError::Internal(e.to_string()))?)
+        Some(
+            ydoc::decode_text(&update, "contents")
+                .map_err(|e| AppError::Internal(e.to_string()))?,
+        )
     } else {
         None
     };

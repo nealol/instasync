@@ -468,8 +468,14 @@ impl GitService {
         }
         let link_only = self.link_only_updates(repo, &changes).await;
 
-        let (author, message) =
-            build_commit_meta(vault_id, &changes, &link_only, contributors, &self.0.config, ov);
+        let (author, message) = build_commit_meta(
+            vault_id,
+            &changes,
+            &link_only,
+            contributors,
+            &self.0.config,
+            ov,
+        );
         // Pin the committer to the Realtime bot via command-scoped (`-c`) config so
         // it never falls back to the server's *global* git identity — regardless of
         // what (if anything) is in global config or whether ensure_repo's local

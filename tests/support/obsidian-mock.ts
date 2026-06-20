@@ -45,6 +45,7 @@ export class Notice {
   constructor(message: string, _timeout?: number) {
     notices.push(message);
   }
+  hide(): void {}
 }
 
 /** Mirrors Obsidian's path normalisation closely enough for our use. */

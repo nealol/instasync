@@ -20,11 +20,11 @@ pub mod routes;
 pub mod search;
 pub mod session;
 pub mod shares;
-pub mod web;
 pub mod state;
 pub mod storage;
 pub mod stream;
 pub mod structured;
+pub mod web;
 pub mod words;
 pub mod ydoc;
 pub mod ysweet;
@@ -271,6 +271,10 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/api/vaults/{id}/tags", get(search::list_tags))
         .route("/api/vaults/{id}/reindex", post(search::reindex))
+        .route(
+            "/api/clearFtsAndReindex",
+            post(search::clear_fts_and_reindex),
+        )
         .route(
             "/api/vaults/{id}/backlinks/{*path}",
             get(search::list_backlinks),

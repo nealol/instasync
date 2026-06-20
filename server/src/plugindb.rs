@@ -665,11 +665,7 @@ impl PluginDbService {
         // Append the batch to the Y.Doc log.
         let doc_id = Self::doc_id(vault, plugin, name);
         let view = self.fetch_doc(&doc_id).await.unwrap_or_default();
-        let schema_version = view
-            .batches
-            .last()
-            .map(|b| b.schema_version)
-            .unwrap_or(1);
+        let schema_version = view.batches.last().map(|b| b.schema_version).unwrap_or(1);
         let format = view
             .batches
             .last()
@@ -1075,11 +1071,7 @@ fn read_table_rows(
 }
 
 /// Make `tx`'s `table` rows equal to `temp`'s, via keyed INSERT/UPDATE/DELETE.
-fn diff_apply_table(
-    tx: &rusqlite::Transaction<'_>,
-    temp: &Connection,
-    table: &str,
-) -> Result<()> {
+fn diff_apply_table(tx: &rusqlite::Transaction<'_>, temp: &Connection, table: &str) -> Result<()> {
     let (cols, pks) = table_columns(temp, table)?;
     if cols.is_empty() || pks.is_empty() {
         return Ok(());
@@ -1792,7 +1784,10 @@ mod tests {
         let replayed = dump_replica(&config, "v2", "p", "n").unwrap().unwrap();
         // Row contents must converge on the dumped state (whole-dump equality
         // would also compare nothing else here since the schema is identical).
-        assert_eq!(replayed, target, "replayed batch must reach the dumped state");
+        assert_eq!(
+            replayed, target,
+            "replayed batch must reach the dumped state"
+        );
     }
 
     #[test]

@@ -5,12 +5,12 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, Tran
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::audit;
 use crate::entities::{
     git_backups, invites, memberships, permissions, remote_cursor_tokens, remote_cursors, users,
     vault_files, vaults,
 };
 use crate::error::{AppError, AppResult};
-use crate::audit;
 use crate::session::{
     bearer_token, hash_token, now_millis, revoke_session, ApiActor, ApiPrincipal, AuthUser,
 };
@@ -154,7 +154,10 @@ fn validate_git_email(value: &str) -> Result<(), AppError> {
     }
     // No control chars, whitespace, or angle brackets: these could close the
     // `<...>` envelope early or start a new trailer line.
-    if value.chars().any(|c| c.is_control() || c.is_whitespace() || c == '<' || c == '>') {
+    if value
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || c == '<' || c == '>')
+    {
         return Err(AppError::BadRequest(
             "git_email contains invalid characters".into(),
         ));
@@ -889,7 +892,10 @@ pub async fn undo_cursor_audit(
         user,
         actor: ApiActor::User,
     };
-    audit::undo(&state, &undoer, &vault_id, &cursor_id, &entry_id, body.force).await?;
+    audit::undo(
+        &state, &undoer, &vault_id, &cursor_id, &entry_id, body.force,
+    )
+    .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 

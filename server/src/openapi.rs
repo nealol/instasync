@@ -44,6 +44,7 @@ use utoipa::{Modify, OpenApi};
         list_tags,
         list_backlinks,
         reindex,
+        clear_fts_and_reindex,
         read_note,
         replace_note,
         patch_note,
@@ -283,6 +284,9 @@ async fn list_backlinks() {}
 
 #[utoipa::path(post, path = "/api/vaults/{id}/reindex", tag = "search", security(("bearerAuth" = [])), params(("id" = String, Path)), responses((status = 200, description = "Reindexed vault")))]
 async fn reindex() {}
+
+#[utoipa::path(post, path = "/api/clearFtsAndReindex", tag = "search", security(("bearerAuth" = [])), responses((status = 200, description = "Cleared note FTS and reindexed all vaults visible to the authenticated user"), (status = 403, description = "Cursor-scoped tokens cannot run global reindex")))]
+async fn clear_fts_and_reindex() {}
 
 #[utoipa::path(get, path = "/api/vaults/{id}/notes/{path}", tag = "notes", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path, description = "Wildcard note path")), responses((status = 200, description = "Note content"), (status = 404, description = "Not found")))]
 async fn read_note() {}
