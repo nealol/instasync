@@ -483,7 +483,8 @@ pub(crate) async fn create_base_inner(
     vault_id: &str,
     body: CreateStructuredBody,
 ) -> AppResult<StructuredResponse> {
-    create_structured(state, principal, vault_id, &body.path, "base", body.value).await
+    let value = base_value_to_json(body.value)?;
+    create_structured(state, principal, vault_id, &body.path, "base", value).await
 }
 
 pub async fn replace_base(
@@ -492,6 +493,7 @@ pub async fn replace_base(
     Path((vault_id, path)): Path<(String, String)>,
     Json(body): Json<JsonValue>,
 ) -> AppResult<Json<StructuredResponse>> {
+    let body = base_value_to_json(body)?;
     Ok(Json(
         write_structured_json(&state, &principal, &vault_id, &path, "base", body).await?,
     ))
@@ -1309,6 +1311,20 @@ fn ensure_order(root: &mut JsonMap<String, JsonValue>, key: &str, id: &str) {
     }
 }
 
+fn base_value_to_json(value: JsonValue) -> AppResult<JsonValue> {
+    let value = if let Some(text) = value.as_str() {
+        serde_yaml::from_str::<JsonValue>(text)
+            .map_err(|e| AppError::BadRequest(format!("invalid base YAML: {e}")))?
+    } else {
+        value
+    };
+    match value {
+        JsonValue::Object(_) => Ok(value),
+        JsonValue::Null => Ok(json!({})),
+        _ => Err(AppError::BadRequest("base value must be an object".into())),
+    }
+}
+
 fn validate_structured_path(path: &str, kind: &str) -> AppResult<()> {
     if path.is_empty() || path.contains('\\') {
         return Err(AppError::BadRequest("invalid structured path".into()));
@@ -1404,6 +1420,21 @@ mod tests {
         .unwrap();
         assert_eq!(root["views"].as_array().unwrap().len(), 1);
         assert_eq!(root["views"][0]["type"], json!("cards"));
+    }
+
+    #[test]
+    fn base_value_parses_yaml_string() {
+        let value = base_value_to_json(json!("views:\n  - name: Main\n    type: table\n"))
+            .unwrap();
+        assert_eq!(value["views"][0]["name"], json!("Main"));
+        assert_eq!(value["views"][0]["type"], json!("table"));
+    }
+
+    #[test]
+    fn base_value_rejects_scalar_to_avoid_empty_roundtrip() {
+        assert!(base_value_to_json(json!("not-a-map")).is_err());
+        assert!(base_value_to_json(json!(["not-a-map"])).is_err());
+        assert_eq!(base_value_to_json(JsonValue::Null).unwrap(), json!({}));
     }
 
     #[test]
