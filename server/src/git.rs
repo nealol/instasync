@@ -257,7 +257,7 @@ impl GitService {
         };
         let _guard = commit_lock.lock().await;
         let committed = self
-            .commit_once(vault_id, &[who.clone()], Some(&ov))
+            .commit_once(vault_id, std::slice::from_ref(who), Some(&ov))
             .await?;
         if !committed {
             return Ok(None);

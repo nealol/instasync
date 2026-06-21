@@ -445,7 +445,9 @@ pub(crate) async fn move_note_inner(
     let content =
         ydoc::decode_text(&update, "contents").map_err(|e| AppError::Internal(e.to_string()))?;
     best_effort_index(state, vault_id, &file.guid, &body.to_path, &content).await;
-    rewrite_backlinks_after_move(state, vault_id, &file.guid, &file.path, &body.to_path).await;
+    rewrite_references_after_move(state, vault_id, Some(&file.guid), &file.path, &body.to_path)
+        .await;
+    rewrite_canvas_file_refs_after_note_move(state, vault_id, &file.path, &body.to_path).await;
     mark_note_write(state, vault_id, principal).await;
     audit::record(
         state,
@@ -527,10 +529,10 @@ pub(crate) async fn best_effort_index(
     }
 }
 
-async fn rewrite_backlinks_after_move(
+pub(crate) async fn rewrite_references_after_move(
     state: &AppState,
     vault_id: &str,
-    moved_guid: &str,
+    moved_guid: Option<&str>,
     old_path: &str,
     new_path: &str,
 ) {
@@ -538,7 +540,7 @@ async fn rewrite_backlinks_after_move(
         Ok(candidates) => {
             let mut count = 0usize;
             for cand in candidates {
-                if cand.guid == moved_guid {
+                if moved_guid.is_some_and(|guid| cand.guid == guid) {
                     continue;
                 }
                 let doc_id = doc_id(vault_id, &cand.guid);
@@ -568,10 +570,88 @@ async fn rewrite_backlinks_after_move(
                 }
             }
             if count > 0 {
-                tracing::info!("rewrote {count} backlinks for note move {old_path} -> {new_path}");
+                tracing::info!("rewrote {count} references for move {old_path} -> {new_path}");
             }
         }
         Err(e) => tracing::warn!("backlink candidate search failed for {old_path}: {e}"),
+    }
+}
+
+pub(crate) async fn rewrite_canvas_file_refs_after_note_move(
+    state: &AppState,
+    vault_id: &str,
+    old_path: &str,
+    new_path: &str,
+) {
+    let update = match ydoc::read_update(state, vault_id).await {
+        Ok(update) => update,
+        Err(e) => {
+            tracing::warn!("canvas reference rewrite index read failed for {old_path}: {e}");
+            return;
+        }
+    };
+    let entries = match ydoc::decode_structured_index(&update) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!("canvas reference rewrite index decode failed for {old_path}: {e}");
+            return;
+        }
+    };
+
+    let mut count = 0usize;
+    for entry in entries.into_iter().filter(|entry| entry.kind == "canvas") {
+        let canvas_doc_id = doc_id(vault_id, &entry.guid);
+        let update = match ydoc::read_update(state, &canvas_doc_id).await {
+            Ok(update) => update,
+            Err(e) => {
+                tracing::warn!("read canvas reference candidate {} failed: {e}", entry.path);
+                continue;
+            }
+        };
+        let mut value = match ydoc::decode_structured(&update) {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(
+                    "decode canvas reference candidate {} failed: {e}",
+                    entry.path
+                );
+                continue;
+            }
+        };
+
+        let Some(nodes) = value.get_mut("nodes").and_then(Value::as_object_mut) else {
+            tracing::warn!(
+                "canvas reference candidate {} has no object nodes map",
+                entry.path
+            );
+            continue;
+        };
+
+        let mut changed = false;
+        for node in nodes.values_mut().filter_map(Value::as_object_mut) {
+            if node.get("type").and_then(Value::as_str) != Some("file") {
+                continue;
+            }
+            let Some(file) = node.get("file").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(next) = crate::search::rewrite_target(file, old_path, new_path) {
+                node.insert("file".into(), Value::String(next));
+                changed = true;
+            }
+        }
+
+        if changed {
+            if let Err(e) = ydoc::set_structured(state, &canvas_doc_id, &value).await {
+                tracing::warn!("rewrite canvas references {} failed: {e}", entry.path);
+                continue;
+            }
+            count += 1;
+        }
+    }
+
+    if count > 0 {
+        tracing::info!("rewrote {count} canvas file refs for note move {old_path} -> {new_path}");
     }
 }
 

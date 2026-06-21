@@ -274,6 +274,9 @@ pub async fn undo(
         }
         "structured_move" => {
             let kind = structured_kind(&entry)?;
+            let update_embeds = entry_details(&entry)["updateEmbeds"]
+                .as_bool()
+                .unwrap_or(false);
             let to_path = entry
                 .to_path
                 .clone()
@@ -285,6 +288,7 @@ pub async fn undo(
                 &to_path,
                 structured::MoveStructuredBody {
                     to_path: entry.path.clone(),
+                    update_embeds,
                 },
                 &kind,
             )
@@ -313,6 +317,9 @@ pub async fn undo(
                 .await;
         }
         "attachment_move" => {
+            let update_embeds = entry_details(&entry)["updateEmbeds"]
+                .as_bool()
+                .unwrap_or(false);
             let to_path = entry
                 .to_path
                 .clone()
@@ -324,7 +331,7 @@ pub async fn undo(
                 &to_path,
                 crate::attachments::MoveAttachmentBody {
                     to_path: entry.path.clone(),
-                    update_embeds: false,
+                    update_embeds,
                 },
             )
             .await?;

@@ -245,6 +245,15 @@ struct MoveArgs {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+struct StructuredMoveArgs {
+    path: String,
+    to_path: String,
+    #[serde(default)]
+    update_embeds: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct PatchArgs {
     path: String,
     old: String,
@@ -701,7 +710,7 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Move or rename a Canvas; writes are CRDT-merged and appear live in open Canvas views",
+        description = "Move or rename a Canvas; updateEmbeds rewrites ![[...]], [[...]], and [](...) references in other notes; writes are CRDT-merged and appear live in open Canvas views",
         annotations(
             title = "Canvas: Move canvas",
             read_only_hint = false,
@@ -712,7 +721,7 @@ impl InstaMcp {
     async fn move_canvas(
         &self,
         context: RequestContext<RoleServer>,
-        Parameters(args): Parameters<MoveArgs>,
+        Parameters(args): Parameters<StructuredMoveArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let c = ctx(&context)?;
         tool_result(
@@ -723,6 +732,7 @@ impl InstaMcp {
                 &args.path,
                 MoveStructuredBody {
                     to_path: args.to_path,
+                    update_embeds: args.update_embeds,
                 },
                 "canvas",
             )
@@ -1128,7 +1138,7 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Move or rename a Base; writes are CRDT-merged and appear live in open Base views",
+        description = "Move or rename a Base; updateEmbeds rewrites ![[...]], [[...]], and [](...) references in other notes; writes are CRDT-merged and appear live in open Base views",
         annotations(
             title = "Base: Move base",
             read_only_hint = false,
@@ -1139,7 +1149,7 @@ impl InstaMcp {
     async fn move_base(
         &self,
         context: RequestContext<RoleServer>,
-        Parameters(args): Parameters<MoveArgs>,
+        Parameters(args): Parameters<StructuredMoveArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let c = ctx(&context)?;
         tool_result(
@@ -1150,6 +1160,7 @@ impl InstaMcp {
                 &args.path,
                 MoveStructuredBody {
                     to_path: args.to_path,
+                    update_embeds: args.update_embeds,
                 },
                 "base",
             )
@@ -1632,7 +1643,7 @@ impl InstaMcp {
     }
 
     #[tool(
-        description = "Move or rename an attachment",
+        description = "Move or rename an attachment; updateEmbeds rewrites ![[...]], [[...]], and [](...) references in other notes",
         annotations(
             title = "Attachment: Move attachment",
             read_only_hint = false,

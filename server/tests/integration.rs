@@ -2976,6 +2976,366 @@ async fn search_tags_backlinks_reindex_and_rename_rewrite() {
     );
 }
 
+#[tokio::test]
+async fn note_move_rewrites_pathed_links_preserving_paths() {
+    let ys = fake_ysweet_store().await;
+    let app = test_app(&ys, &ys).await;
+    let token = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&token),
+        Some(json!({"name": "Notes"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap();
+    let notes_url = format!("/api/vaults/{vault_id}/notes");
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &notes_url,
+        Some(&token),
+        Some(json!({"path": "a.md", "content": "[[dir/Old.md]] [x](dir/Old.md)"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app,
+        "POST",
+        &notes_url,
+        Some(&token),
+        Some(json!({"path": "dir/Old.md", "content": "# Old"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/note-moves/dir/Old.md"),
+        Some(&token),
+        Some(json!({"toPath": "new/New.md"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, a) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/notes/a.md"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(a["content"], "[[new/New.md]] [x](new/New.md)");
+}
+
+#[tokio::test]
+async fn attachment_move_update_embeds_rewrites_opt_in_only() {
+    let ys = fake_ysweet_store().await;
+    let app = test_app(&ys, &ys).await;
+    let token = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&token),
+        Some(json!({"name": "Notes"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap();
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&token),
+        Some(json!({"path": "true.md", "content": "![[img.png]] ![[old/img.png]]"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send_raw(
+        &app,
+        "PUT",
+        &format!("/api/vaults/{vault_id}/attachments/old/img.png"),
+        Some(&token),
+        b"image bytes".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/attachment-moves/old/img.png"),
+        Some(&token),
+        Some(json!({"toPath": "new/img.png", "updateEmbeds": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, note) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/notes/true.md"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(note["content"], "![[img.png]] ![[new/img.png]]");
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&token),
+        Some(json!({"path": "false.md", "content": "![[pic.png]] ![[old2/pic.png]]"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send_raw(
+        &app,
+        "PUT",
+        &format!("/api/vaults/{vault_id}/attachments/old2/pic.png"),
+        Some(&token),
+        b"image bytes".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/attachment-moves/old2/pic.png"),
+        Some(&token),
+        Some(json!({"toPath": "new2/pic.png", "updateEmbeds": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, note) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/notes/false.md"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(note["content"], "![[pic.png]] ![[old2/pic.png]]");
+}
+
+#[tokio::test]
+async fn canvas_move_update_embeds_rewrites_note_references() {
+    let ys = fake_ysweet_store().await;
+    let app = test_app(&ys, &ys).await;
+    let token = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&token),
+        Some(json!({"name": "Notes"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap();
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/canvases"),
+        Some(&token),
+        Some(json!({"path": "Board.canvas", "value": {"nodes": [], "edges": []}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&token),
+        Some(json!({"path": "a.md", "content": "![[Board.canvas]]"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/canvas-moves/Board.canvas"),
+        Some(&token),
+        Some(json!({"toPath": "Archived/Board.canvas", "updateEmbeds": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, note) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/notes/a.md"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(note["content"], "![[Archived/Board.canvas]]");
+}
+
+#[tokio::test]
+async fn note_move_rewrites_canvas_file_refs_and_undo_restores_them() {
+    let ys = fake_ysweet_store().await;
+    let app = test_app(&ys, &ys).await;
+    let session = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&session),
+        Some(json!({"name": "Notes"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap();
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&session),
+        Some(json!({"path": "ref.md", "content": "[[dir/Old.md]]"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&session),
+        Some(json!({"path": "dir/Old.md", "content": "# Old"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/canvases"),
+        Some(&session),
+        Some(json!({
+            "path": "Board.canvas",
+            "value": {
+                "nodes": [
+                    {"id": "file", "type": "file", "file": "dir/Old.md", "x": 1, "y": 2, "width": 3, "height": 4},
+                    {"id": "link", "type": "link", "url": "dir/Old.md", "x": 5, "y": 6, "width": 7, "height": 8}
+                ],
+                "edges": []
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, cursor) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/cursors"),
+        Some(&session),
+        Some(json!({"name": "Mover"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let cursor_id = cursor["id"].as_str().unwrap();
+    let cursor_secret = cursor["secretToken"].as_str().unwrap();
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/note-moves/dir/Old.md"),
+        Some(cursor_secret),
+        Some(json!({"toPath": "new/New.md"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, canvas) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/canvas/Board.canvas"),
+        Some(&session),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let nodes = canvas["value"]["nodes"].as_array().unwrap();
+    let file_node = nodes.iter().find(|node| node["id"] == "file").unwrap();
+    let link_node = nodes.iter().find(|node| node["id"] == "link").unwrap();
+    assert_eq!(file_node["file"], "new/New.md");
+    assert_eq!(file_node["x"], 1);
+    assert_eq!(file_node["y"], 2);
+    assert_eq!(file_node["width"], 3);
+    assert_eq!(file_node["height"], 4);
+    // Canvas link-node URLs are skipped even if path-like.
+    assert_eq!(link_node["url"], "dir/Old.md");
+
+    let (status, note) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/notes/ref.md"),
+        Some(&session),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(note["content"], "[[new/New.md]]");
+
+    let (status, page) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/cursors/{cursor_id}/audit"),
+        Some(&session),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let audit_id = page["entries"][0]["id"].as_str().unwrap();
+    assert_eq!(page["entries"][0]["operation"], "note_move");
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/cursors/{cursor_id}/audit/{audit_id}/undo"),
+        Some(&session),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, canvas) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/canvas/Board.canvas"),
+        Some(&session),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let file_node = canvas["value"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["id"] == "file")
+        .unwrap();
+    assert_eq!(file_node["file"], "dir/Old.md");
+
+    let (status, note) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/notes/ref.md"),
+        Some(&session),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(note["content"], "[[dir/Old.md]]");
+}
+
 // ---------- plugin databases (cr-sqlite) ----------
 //
 // The replica/dump/compaction tests need the cr-sqlite loadable extension and

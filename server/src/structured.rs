@@ -42,6 +42,8 @@ pub struct CreateStructuredBody {
 #[serde(rename_all = "camelCase")]
 pub struct MoveStructuredBody {
     pub to_path: String,
+    #[serde(default)]
+    pub update_embeds: bool,
 }
 
 #[derive(Deserialize)]
@@ -982,6 +984,16 @@ pub(crate) async fn move_structured_inner(
         return Err(AppError::Forbidden);
     }
     ydoc::index_rename_structured(state, vault_id, &entry.path, &body.to_path).await?;
+    if body.update_embeds {
+        crate::notes::rewrite_references_after_move(
+            state,
+            vault_id,
+            None,
+            &entry.path,
+            &body.to_path,
+        )
+        .await;
+    }
     mark_structured_write(state, vault_id, principal).await;
     audit::record(
         state,
@@ -989,7 +1001,7 @@ pub(crate) async fn move_structured_inner(
         vault_id,
         AuditEntry::new("structured_move", &entry.path)
             .to_path(&body.to_path)
-            .details(json!({ "kind": kind })),
+            .details(json!({ "kind": kind, "updateEmbeds": body.update_embeds })),
     )
     .await;
     let mut out = read_structured_json(state, principal, vault_id, &body.to_path, kind).await?;

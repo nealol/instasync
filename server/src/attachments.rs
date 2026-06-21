@@ -322,9 +322,6 @@ pub(crate) async fn move_attachment_inner(
     path: &str,
     body: MoveAttachmentBody,
 ) -> AppResult<AttachmentSummary> {
-    if body.update_embeds {
-        return Err(AppError::BadRequest("update_embeds_not_supported".into()));
-    }
     let meta = require_attachment(state, principal, vault_id, path).await?;
     validate_attachment_path(state, &body.to_path)?;
     if path == body.to_path {
@@ -334,6 +331,10 @@ pub(crate) async fn move_attachment_inner(
         return Err(AppError::Conflict("exists".into()));
     }
     ydoc::index_rename_binary(state, vault_id, path, &body.to_path).await?;
+    if body.update_embeds {
+        crate::notes::rewrite_references_after_move(state, vault_id, None, path, &body.to_path)
+            .await;
+    }
     state
         .git
         .mark_write(
@@ -347,7 +348,11 @@ pub(crate) async fn move_attachment_inner(
         vault_id,
         AuditEntry::new("attachment_move", path)
             .to_path(&body.to_path)
-            .details(serde_json::json!({ "hash": meta.hash, "size": meta.size })),
+            .details(serde_json::json!({
+                "hash": meta.hash,
+                "size": meta.size,
+                "updateEmbeds": body.update_embeds,
+            })),
     )
     .await;
     Ok(AttachmentSummary {

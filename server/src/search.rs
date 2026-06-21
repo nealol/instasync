@@ -97,18 +97,16 @@ pub fn parse_note(content: &str, path: &str) -> ParsedNote {
 }
 
 pub fn rewrite_links(content: &str, old_path: &str, new_path: &str) -> (String, bool) {
-    let old_keys = target_keys(old_path);
-    let new_base = stem(new_path).to_string();
     let wiki = Regex::new(r"(!?\[\[)([^\]|#]+)(#[^\]|]+)?(\|[^\]]*)?(\]\])").unwrap();
     let mut changed = false;
     let out = wiki
         .replace_all(content, |cap: &regex::Captures| {
-            if old_keys.contains(&normalize_key(&cap[2])) {
+            if let Some(target) = rewrite_target(&cap[2], old_path, new_path) {
                 changed = true;
                 format!(
                     "{}{}{}{}{}",
                     &cap[1],
-                    new_base,
+                    target,
                     cap.get(3).map_or("", |m| m.as_str()),
                     cap.get(4).map_or("", |m| m.as_str()),
                     &cap[5]
@@ -119,15 +117,15 @@ pub fn rewrite_links(content: &str, old_path: &str, new_path: &str) -> (String, 
         })
         .to_string();
 
-    let md = Regex::new(r"(\[[^\]]+\]\()([^)#]+\.md)(#[^)]+)?(\))").unwrap();
+    let md = Regex::new(r"(!?\[[^\]]*\]\()([^)#]+)(#[^)]+)?(\))").unwrap();
     let out = md
         .replace_all(&out, |cap: &regex::Captures| {
-            if old_keys.contains(&normalize_key(&cap[2])) {
+            if let Some(target) = rewrite_target(&cap[2], old_path, new_path) {
                 changed = true;
                 format!(
                     "{}{}{}{}",
                     &cap[1],
-                    new_path,
+                    target,
                     cap.get(3).map_or("", |m| m.as_str()),
                     &cap[4]
                 )
@@ -137,6 +135,50 @@ pub fn rewrite_links(content: &str, old_path: &str, new_path: &str) -> (String, 
         })
         .to_string();
     (out, changed)
+}
+
+pub fn rewrite_target(target: &str, old_path: &str, new_path: &str) -> Option<String> {
+    let target = target.trim();
+    if is_url_like(target) || target.starts_with('#') || target.trim().is_empty() {
+        return None;
+    }
+
+    let is_note = old_path.ends_with(".md");
+    let target_has_md = target.ends_with(".md");
+    let target_has_slash = target.contains('/') || target.contains('\\');
+    let normalized_target = normalize_path_for_rewrite(target);
+    let normalized_old = normalize_path_for_rewrite(old_path);
+
+    let replacement = if is_note {
+        if normalized_target.trim_end_matches(".md") == normalized_old.trim_end_matches(".md") {
+            if target_has_md {
+                new_path.to_string()
+            } else {
+                new_path.trim_end_matches(".md").to_string()
+            }
+        } else if !target_has_slash && eq_basename(target, old_path, true) {
+            let new_stem = stem(new_path);
+            if target_has_md {
+                format!("{new_stem}.md")
+            } else {
+                new_stem.to_string()
+            }
+        } else {
+            return None;
+        }
+    } else if normalized_target == normalized_old {
+        new_path.to_string()
+    } else if !target_has_slash && eq_basename(target, old_path, false) {
+        new_path.rsplit('/').next().unwrap_or(new_path).to_string()
+    } else {
+        return None;
+    };
+
+    if replacement == target {
+        None
+    } else {
+        Some(replacement)
+    }
 }
 
 pub async fn index_note(
@@ -634,7 +676,7 @@ async fn reindex_vault_with_startup_retries(state: &AppState, vault_id: &str) ->
     }
     reindex_vault(state, vault_id)
         .await
-        .or_else(|e| Err(last_err.unwrap_or(e)))
+        .map_err(|e| last_err.unwrap_or(e))
 }
 
 fn frontmatter_value(content: &str) -> Option<serde_json::Value> {
@@ -674,6 +716,47 @@ pub fn target_keys(path: &str) -> HashSet<String> {
 
 fn normalize_key(value: &str) -> String {
     value.trim().trim_end_matches(".md").to_ascii_lowercase()
+}
+
+fn normalize_path_for_rewrite(value: &str) -> String {
+    value
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_ascii_lowercase()
+}
+
+fn eq_basename(a: &str, b: &str, is_note: bool) -> bool {
+    let a = a.rsplit(['/', '\\']).next().unwrap_or(a);
+    let b = b.rsplit(['/', '\\']).next().unwrap_or(b);
+    if is_note {
+        a.trim_end_matches(".md")
+            .eq_ignore_ascii_case(b.trim_end_matches(".md"))
+    } else {
+        a.eq_ignore_ascii_case(b)
+    }
+}
+
+fn is_url_like(target: &str) -> bool {
+    if target.starts_with("//") {
+        return true;
+    }
+    let mut chars = target.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    for ch in chars {
+        if ch == ':' {
+            return true;
+        }
+        if !(ch.is_ascii_alphanumeric() || matches!(ch, '+' | '.' | '-')) {
+            return false;
+        }
+    }
+    false
 }
 
 fn stem(path: &str) -> &str {
@@ -733,7 +816,50 @@ mod tests {
         assert!(changed);
         assert_eq!(
             out,
-            "[[New]] [[New#h|Alias]] ![[New]] [txt](new/New.md#h) [[Other]]"
+            "[[New]] [[New#h|Alias]] ![[new/New.md]] [txt](new/New.md#h) [[Other]]"
         );
+    }
+
+    #[test]
+    fn rewrites_note_targets_preserving_path_form() {
+        let content = "[[dir/Old.md]] [[dir/Old]] [[Old.md]] [[Old]]";
+        let (out, changed) = rewrite_links(content, "dir/Old.md", "new/New.md");
+        assert!(changed);
+        assert_eq!(out, "[[new/New.md]] [[new/New]] [[New.md]] [[New]]");
+    }
+
+    #[test]
+    fn rewrites_attachment_embeds_only_when_text_changes() {
+        let (out, changed) = rewrite_links("![[old/img.png]]", "old/img.png", "new/img.png");
+        assert!(changed);
+        assert_eq!(out, "![[new/img.png]]");
+
+        let (out, changed) = rewrite_links("![[img.png]]", "old/img.png", "new/img.png");
+        assert!(!changed);
+        assert_eq!(out, "![[img.png]]");
+    }
+
+    #[test]
+    fn rewrites_markdown_attachment_targets() {
+        let content = "![](old/img.png) [file](old/img.png)";
+        let (out, changed) = rewrite_links(content, "old/img.png", "new/img.png");
+        assert!(changed);
+        assert_eq!(out, "![](new/img.png) [file](new/img.png)");
+    }
+
+    #[test]
+    fn skips_url_like_markdown_targets() {
+        let content = "[ext](https://example.com/x) [rel](//host/path)";
+        let (out, changed) = rewrite_links(content, "x", "y");
+        assert!(!changed);
+        assert_eq!(out, content);
+    }
+
+    #[test]
+    fn preserves_headers_and_aliases() {
+        let content = "[[Old#h|Alias]] [txt](dir/Old.md#h)";
+        let (out, changed) = rewrite_links(content, "dir/Old.md", "new/New.md");
+        assert!(changed);
+        assert_eq!(out, "[[New#h|Alias]] [txt](new/New.md#h)");
     }
 }
