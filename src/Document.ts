@@ -50,8 +50,9 @@ export class Document extends SyncedDoc {
     guid: string,
     serverDocId: string,
     isCreator: boolean,
+    opts: { autoConnect?: boolean } = {},
   ) {
-    super(plugin, path, guid, serverDocId, isCreator);
+    super(plugin, path, guid, serverDocId, isCreator, opts);
     this.ytext = this.ydoc.getText("contents");
 
     // ytext changes (local edits from other peers, or our own editor) flow to

@@ -5,7 +5,7 @@ import type { ChangeSpec } from "@codemirror/state";
 import { EditorView, ViewPlugin, type PluginValue, type ViewUpdate } from "@codemirror/view";
 import type * as Y from "yjs";
 import type { Document } from "../Document";
-import { getDocumentForEditor } from "./context";
+import { ensureDocumentForEditor } from "./context";
 import { ySyncAnnotation } from "./annotations";
 import { applyTextToYText } from "../diff";
 import { dbg, snip } from "../debug";
@@ -26,7 +26,7 @@ class LiveEditPluginValue implements PluginValue {
   /** Attempt to find this file's Document and attach. Retries until sync is ready. */
   private tryBind(): void {
     if (this.destroyed || this.doc) return;
-    const doc = getDocumentForEditor(this.editor);
+    const doc = ensureDocumentForEditor(this.editor);
     if (!doc) {
       if (this.retries++ < 50) {
         window.setTimeout(() => this.tryBind(), 200);

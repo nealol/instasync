@@ -18,3 +18,12 @@ export function getDocumentForEditor(editor: EditorView): Document | null {
   if (!plugin || !plugin.vaultSync) return null;
   return plugin.vaultSync.getDocumentForPath(file.path) ?? null;
 }
+
+export function ensureDocumentForEditor(editor: EditorView): Document | null {
+  const info = editor.state.field(editorInfoField, false);
+  const file = info?.file;
+  if (!file) return null;
+  const plugin = getPlugin(editor);
+  if (!plugin || !plugin.vaultSync) return null;
+  return plugin.vaultSync.ensureDocumentForPath(file.path) ?? null;
+}

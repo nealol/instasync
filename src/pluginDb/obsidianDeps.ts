@@ -15,6 +15,7 @@ import {
 import { IndexeddbPersistence } from "y-indexeddb";
 import type RealtimePlugin from "../main";
 import { getClientToken } from "../ysweet";
+import { connectYSweetProvider } from "../ysweetConnect";
 import { CRSQLITE_WASM_DATA_URL } from "./wasmBinary";
 import type { PluginDbDocHandle } from "./PluginDbSync";
 import type { SyncedPluginDatabaseOptions } from "./SyncedPluginDatabase";
@@ -130,7 +131,7 @@ function makeDocHandle(plugin: RealtimePlugin, docId: string): PluginDbDocHandle
   const whenSynced = persistence.whenSynced
     .catch(() => {})
     .then(() => {
-      void provider.connect();
+      void connectYSweetProvider(provider);
       return firstSyncedOrTimeout(provider, 3000);
     });
 

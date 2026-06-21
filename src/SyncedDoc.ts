@@ -4,6 +4,7 @@ import type { Awareness } from "y-protocols/awareness";
 import { IndexeddbPersistence } from "y-indexeddb";
 import type RealtimePlugin from "./main";
 import { getClientToken } from "./ysweet";
+import { connectYSweetProvider } from "./ysweetConnect";
 
 export abstract class SyncedDoc {
   readonly path: string;
@@ -21,6 +22,7 @@ export abstract class SyncedDoc {
   private readyPromise: Promise<void>;
   private resolveReady!: () => void;
   private syncedListener: (synced: boolean) => void;
+  private autoConnect: boolean;
 
   protected constructor(
     plugin: RealtimePlugin,
@@ -28,12 +30,14 @@ export abstract class SyncedDoc {
     guid: string,
     serverDocId: string,
     isCreator: boolean,
+    opts: { autoConnect?: boolean } = {},
   ) {
     this.plugin = plugin;
     this.path = path;
     this.guid = guid;
     this.serverDocId = serverDocId;
     this.isCreator = isCreator;
+    this.autoConnect = opts.autoConnect ?? true;
     this.ydoc = new Y.Doc();
 
     this.readyPromise = new Promise((resolve) => {
@@ -65,8 +69,12 @@ export abstract class SyncedDoc {
     if (this.destroyed) return;
     const status = this.provider.status;
     if (status === STATUS_OFFLINE || status === STATUS_ERROR) {
-      void this.provider.connect();
+      void connectYSweetProvider(this.provider);
     }
+  }
+
+  connect(): void {
+    this.ensureConnected();
   }
 
   protected resolveWhenReady(): void {
@@ -82,7 +90,7 @@ export abstract class SyncedDoc {
       this.resolveWhenReady();
     }
 
-    if (!this.destroyed) void this.provider.connect();
+    if (!this.destroyed && this.autoConnect) void connectYSweetProvider(this.provider);
   }
 
   protected abstract afterPersistenceSynced(): Promise<void> | void;

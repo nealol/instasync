@@ -8,9 +8,10 @@ import {
   type YSweetStatus,
 } from "@y-sweet/client";
 import { IndexeddbPersistence } from "y-indexeddb";
-import { TFile, TAbstractFile, Notice, type EventRef } from "obsidian";
+import { TFile, TAbstractFile, Notice, Platform, type EventRef } from "obsidian";
 import type RealtimePlugin from "./main";
 import { getClientToken } from "./ysweet";
+import { connectYSweetProvider } from "./ysweetConnect";
 import { Document } from "./Document";
 import { CanvasDocument } from "./CanvasDocument";
 import { BaseDocument } from "./BaseDocument";
@@ -21,6 +22,12 @@ import { matchesAnyGlob, parseGlobs } from "./glob";
 
 type FileKind = "text" | "structured" | "binary" | "ignore";
 type StructuredKind = "canvas" | "base";
+type QueueKind = "text" | StructuredKind;
+interface QueueItem {
+  path: string;
+  guid: string;
+  kind: QueueKind;
+}
 interface StructuredMeta {
   guid: string;
   kind: StructuredKind;
@@ -117,6 +124,12 @@ export class VaultSync {
   private structuredObserver: (event: Y.YMapEvent<StructuredMeta>) => void;
   private statusListener: (status: YSweetStatus) => void;
   private vaultEvents: EventRef[] = [];
+  private docQueue = new Map<string, QueueItem>();
+  private activeDocConnections = 0;
+  private highPriorityDrained = false;
+  private backgroundSyncStarted = false;
+  private prioritizedPaths = new Set<string>();
+  private prioritizedGuids = new Set<string>();
 
   constructor(plugin: RealtimePlugin) {
     this.plugin = plugin;
@@ -178,7 +191,7 @@ export class VaultSync {
     // Capture the persisted (pre-merge) binary baseline before connecting.
     this.binarySync.seedBaseline();
     this.configSync.seedBaseline();
-    void this.indexProvider.connect();
+    void connectYSweetProvider(this.indexProvider);
   }
 
   /** Nudge the index provider and every document to reconnect if stalled. */
@@ -186,10 +199,19 @@ export class VaultSync {
     if (this.destroyed) return;
     const status = this.indexProvider.status;
     if (status === STATUS_OFFLINE || status === STATUS_ERROR) {
-      void this.indexProvider.connect();
+      void connectYSweetProvider(this.indexProvider);
     }
     for (const doc of this.documents.values()) doc.ensureConnected();
     for (const doc of this.structuredDocuments.values()) doc.ensureConnected();
+    this.pumpDocQueue();
+  }
+
+  prioritizeItem(opts: { path?: string; guid?: string }): void {
+    const path = opts.path?.trim() || (opts.guid ? this.pathForGuid(opts.guid) : null);
+    if (opts.guid) this.prioritizedGuids.add(opts.guid);
+    if (!path) return;
+    this.enqueueKnownPath(path, true);
+    this.pumpDocQueue();
   }
 
   pathForGuid(guid: string): string | null {
@@ -300,14 +322,16 @@ export class VaultSync {
     if (this.initialSynced || this.destroyed) return;
     this.initialSynced = true;
 
-    // Connect documents for entries that already exist in the shared index.
+    const priorityPaths = this.startupPriorityPaths();
+
+    // Register entries that already exist in the shared index, but connect lazily.
     for (const [path, guid] of this.files.entries()) {
       this.registerFile(path, guid);
-      this.ensureDocument(path, guid, false);
+      this.enqueueDoc({ path, guid, kind: "text" }, priorityPaths.has(path));
     }
     for (const [path, meta] of this.structured.entries()) {
       this.registerFile(path, meta.guid);
-      this.ensureStructuredDocument(path, meta.guid, meta.kind, false);
+      this.enqueueDoc({ path, guid: meta.guid, kind: meta.kind }, priorityPaths.has(path));
     }
 
     // Add any local text or structured files that aren't tracked yet.
@@ -333,7 +357,10 @@ export class VaultSync {
         } else {
           const meta = this.structured.get(file.path)!;
           this.registerFile(file.path, meta.guid);
-          this.ensureStructuredDocument(file.path, meta.guid, meta.kind, false);
+          this.enqueueDoc(
+            { path: file.path, guid: meta.guid, kind: meta.kind },
+            priorityPaths.has(file.path),
+          );
         }
         continue;
       }
@@ -348,8 +375,17 @@ export class VaultSync {
         this.registerFile(file.path, guid);
       } else {
         this.registerFile(file.path, this.files.get(file.path)!);
-        this.ensureDocument(file.path, this.files.get(file.path)!, false);
+        this.enqueueDoc(
+          { path: file.path, guid: this.files.get(file.path)!, kind: "text" },
+          priorityPaths.has(file.path),
+        );
       }
+    }
+
+    this.pumpDocQueue();
+    if (this.prioritizedPaths.size === 0) {
+      this.highPriorityDrained = true;
+      this.startBackgroundSyncAfterPriorityDrain();
     }
 
     new Notice(
@@ -358,6 +394,74 @@ export class VaultSync {
 
     // Reconcile binary files against the blob store (after the text pass so
     // note sync wins the bandwidth while binaries settle in the background).
+    this.startBackgroundSyncAfterPriorityDrain();
+  }
+
+  private startupPriorityPaths(): Set<string> {
+    const paths = new Set<string>();
+    const add = (file: TFile | null | undefined) => {
+      if (file && (file.extension === "md" || this.structuredKindForExtension(file.extension))) {
+        paths.add(file.path);
+      }
+    };
+    add((this.plugin.app.workspace as any).getActiveFile?.());
+    (this.plugin.app.workspace as any).iterateAllLeaves?.((leaf: any) => add(leaf?.view?.file));
+    const recentPaths = Array.isArray(this.plugin.settings.recentPaths)
+      ? this.plugin.settings.recentPaths
+      : [];
+    for (const path of recentPaths) paths.add(path);
+    return paths;
+  }
+
+  private enqueueKnownPath(path: string, front = false): void {
+    const guid = this.files.get(path);
+    if (guid) this.enqueueDoc({ path, guid, kind: "text" }, front);
+    const meta = this.structured.get(path);
+    if (meta) this.enqueueDoc({ path, guid: meta.guid, kind: meta.kind }, front);
+  }
+
+  private enqueueDoc(item: QueueItem, front = false): void {
+    if (this.destroyed) return;
+    if (item.kind === "text" && this.documents.has(item.path)) return;
+    if (item.kind !== "text" && this.structuredDocuments.has(item.path)) return;
+    if (front) this.prioritizedPaths.add(item.path);
+    if (front) {
+      this.docQueue.delete(item.path);
+      this.docQueue = new Map([[item.path, item], ...this.docQueue]);
+    } else if (!this.docQueue.has(item.path)) {
+      this.docQueue.set(item.path, item);
+    }
+  }
+
+  private pumpDocQueue(): void {
+    if (this.destroyed) return;
+    const concurrency = Platform?.isMobile ? 1 : 2;
+    while (this.activeDocConnections < concurrency && this.docQueue.size > 0) {
+      const [path, item] = this.docQueue.entries().next().value as [string, QueueItem];
+      this.docQueue.delete(path);
+      const doc =
+        item.kind === "text"
+          ? this.ensureDocument(item.path, item.guid, false, false)
+          : this.ensureStructuredDocument(item.path, item.guid, item.kind, false, false);
+      this.activeDocConnections++;
+      doc.connect();
+      void doc.whenReady().finally(() => {
+        this.activeDocConnections = Math.max(0, this.activeDocConnections - 1);
+        this.prioritizedPaths.delete(item.path);
+        this.prioritizedGuids.delete(item.guid);
+        if (!this.highPriorityDrained && this.prioritizedPaths.size === 0) {
+          this.highPriorityDrained = true;
+          this.startBackgroundSyncAfterPriorityDrain();
+        }
+        this.pumpDocQueue();
+      });
+    }
+  }
+
+  private startBackgroundSyncAfterPriorityDrain(): void {
+    if (!this.initialSynced || this.destroyed || !this.highPriorityDrained) return;
+    if (this.backgroundSyncStarted) return;
+    this.backgroundSyncStarted = true;
     void this.reconcileBinariesAndMigrateStructured();
     if (this.plugin.settings.syncConfigEnabled) {
       this.configSync.start(this.plugin.settings.configIncludeGlobs);
@@ -405,7 +509,11 @@ export class VaultSync {
         const guid = this.files.get(path);
         if (guid) {
           this.registerFile(path, guid);
-          this.ensureDocument(path, guid, false);
+          this.enqueueDoc(
+            { path, guid, kind: "text" },
+            this.prioritizedPaths.has(path) || this.prioritizedGuids.has(guid),
+          );
+          this.pumpDocQueue();
         }
       } else if (change.action === "delete") {
         this.handleRemoteDelete(path);
@@ -420,7 +528,11 @@ export class VaultSync {
         const meta = this.structured.get(path);
         if (meta) {
           this.registerFile(path, meta.guid);
-          this.ensureStructuredDocument(path, meta.guid, meta.kind, false);
+          this.enqueueDoc(
+            { path, guid: meta.guid, kind: meta.kind },
+            this.prioritizedPaths.has(path) || this.prioritizedGuids.has(meta.guid),
+          );
+          this.pumpDocQueue();
         }
       } else if (change.action === "delete") {
         this.handleRemoteDelete(path);
@@ -447,13 +559,18 @@ export class VaultSync {
 
   // --- Document registry -----------------------------------------------------
 
-  private ensureDocument(path: string, guid: string, isCreator: boolean): Document {
+  private ensureDocument(
+    path: string,
+    guid: string,
+    isCreator: boolean,
+    autoConnect = true,
+  ): Document {
     const existing = this.documents.get(path);
     if (existing && existing.guid === guid) return existing;
     if (existing) this.removeDocument(path);
 
     const serverDocId = `${this.plugin.settings.activeVaultId}__${guid}`;
-    const doc = new Document(this.plugin, path, guid, serverDocId, isCreator);
+    const doc = new Document(this.plugin, path, guid, serverDocId, isCreator, { autoConnect });
     this.documents.set(path, doc);
     this.plugin.applyAwarenessTo(doc);
     return doc;
@@ -477,6 +594,7 @@ export class VaultSync {
     guid: string,
     kind: StructuredKind,
     isCreator: boolean,
+    autoConnect = true,
   ): StructuredDocument {
     const existing = this.structuredDocuments.get(path);
     if (existing && existing.guid === guid) return existing;
@@ -485,8 +603,8 @@ export class VaultSync {
     const serverDocId = `${this.plugin.settings.activeVaultId}__${guid}`;
     const doc =
       kind === "canvas"
-        ? new CanvasDocument(this.plugin, path, guid, serverDocId, isCreator)
-        : new BaseDocument(this.plugin, path, guid, serverDocId, isCreator);
+        ? new CanvasDocument(this.plugin, path, guid, serverDocId, isCreator, { autoConnect })
+        : new BaseDocument(this.plugin, path, guid, serverDocId, isCreator, { autoConnect });
     this.structuredDocuments.set(path, doc);
     this.plugin.applyAwarenessTo(doc);
     return doc;
@@ -517,6 +635,16 @@ export class VaultSync {
 
   getDocumentForPath(path: string): Document | undefined {
     return this.documents.get(path);
+  }
+
+  ensureDocumentForPath(path: string): Document | undefined {
+    const guid = this.files.get(path);
+    if (!guid) return this.documents.get(path);
+    const doc = this.ensureDocument(path, guid, false, false);
+    this.prioritizedPaths.add(path);
+    this.prioritizedGuids.add(guid);
+    doc.connect();
+    return doc;
   }
 
   allDocuments(): Array<Document | StructuredDocument> {

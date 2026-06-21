@@ -73,6 +73,8 @@ export interface RealtimeSettings {
   configIncludeGlobs: string[];
   /** Hidden advanced setting for verbose diagnostic logging. */
   diagnosticLogging: boolean;
+  /** Recently opened syncable note/structured paths, newest first. */
+  recentPaths: string[];
 }
 
 export function defaultSettings(): RealtimeSettings {
@@ -97,6 +99,7 @@ export function defaultSettings(): RealtimeSettings {
     syncConfigEnabled: false,
     configIncludeGlobs: [],
     diagnosticLogging: false,
+    recentPaths: [],
   };
 }
 

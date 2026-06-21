@@ -154,6 +154,8 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
     this.registerEvent(
       this.app.workspace.on("active-leaf-change", () => {
         this.vaultSync?.reconnectAll();
+        const file = this.app.workspace.getActiveFile();
+        if (file) this.vaultSync?.prioritizeItem({ path: file.path });
         this.vaultSync?.bindOpenCanvases();
         this.vaultSync?.bindOpenBases();
         // Canvas views may not have their private `canvas` object ready when
@@ -170,6 +172,9 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
     // that mount without an active-leaf transition (hover, pinning, etc.).
     this.registerEvent(
       this.app.workspace.on("file-open", () => {
+        const file = this.app.workspace.getActiveFile();
+        if (file) void this.recordRecentPath(file.path);
+        if (file) this.vaultSync?.prioritizeItem({ path: file.path });
         this.vaultSync?.bindOpenCanvases();
         this.vaultSync?.bindOpenBases();
       }),
@@ -388,6 +393,8 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
       // IndexedDB load since waitForItem tolerates that startup phase).
       this.vaultSync.reconnectAll();
     }
+
+    this.vaultSync.prioritizeItem({ guid, path });
 
     const notice = new Notice("Realtime: syncing… looking for note", 15_000);
     const file = await this.vaultSync.waitForItem({ guid, path, timeoutMs: 15_000 });
@@ -630,6 +637,13 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
   applyDiagnosticLoggingSetting(): void {
     setDiagnosticLoggingEnabled(!!this.settings.diagnosticLogging);
   }
+
+  private async recordRecentPath(path: string): Promise<void> {
+    if (!path.endsWith(".md") && !path.endsWith(".canvas") && !path.endsWith(".base")) return;
+    const recent = [path, ...this.settings.recentPaths.filter((p) => p !== path)].slice(0, 25);
+    this.settings.recentPaths = recent;
+    await this.saveSettings();
+  }
 }
 
 /**
@@ -699,6 +713,9 @@ function sanitizeSettings(raw: unknown): RealtimeSettings {
     : [];
   settings.diagnosticLogging =
     typeof data.diagnosticLogging === "boolean" ? data.diagnosticLogging : false;
+  settings.recentPaths = Array.isArray(data.recentPaths)
+    ? data.recentPaths.filter((path): path is string => typeof path === "string").slice(0, 25)
+    : [];
 
   return settings;
 }

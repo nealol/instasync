@@ -23,8 +23,9 @@ export abstract class StructuredDocument extends SyncedDoc {
     guid: string,
     serverDocId: string,
     isCreator: boolean,
+    opts: { autoConnect?: boolean } = {},
   ) {
-    super(plugin, path, guid, serverDocId, isCreator);
+    super(plugin, path, guid, serverDocId, isCreator, opts);
     this.root = this.ydoc.getMap("root");
     this.rootObserver = (_events, txn) => this.onRootChanged(txn?.origin);
     this.root.observeDeep(this.rootObserver);

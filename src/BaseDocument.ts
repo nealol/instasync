@@ -13,8 +13,9 @@ export class BaseDocument extends StructuredDocument {
     guid: string,
     serverDocId: string,
     isCreator: boolean,
+    opts: { autoConnect?: boolean } = {},
   ) {
-    super(plugin, path, guid, serverDocId, isCreator);
+    super(plugin, path, guid, serverDocId, isCreator, opts);
     this.binding = new BaseBinding(plugin, this);
     this.binding.tryBind();
   }
