@@ -1,7 +1,13 @@
 import type RealtimePlugin from "./main";
 import { StructuredDocument, DISK_ORIGIN } from "./StructuredDocument";
 import { CanvasBinding, CANVAS_LOCAL_ORIGIN } from "./editor/CanvasBinding";
-import { isStructuredCanvas, parseCanvas, reconcileCanvas, serializeCanvas, type StructuredCanvas } from "./structured/canvas";
+import {
+  isStructuredCanvas,
+  parseCanvas,
+  reconcileCanvas,
+  serializeCanvas,
+  type StructuredCanvas,
+} from "./structured/canvas";
 import type { JsonValue } from "./structured/reconcile";
 
 const EMPTY_CANVAS: StructuredCanvas = { nodes: {}, edges: {}, nodeOrder: [], edgeOrder: [] };

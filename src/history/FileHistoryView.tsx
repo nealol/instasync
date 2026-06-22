@@ -1,11 +1,12 @@
-import { ItemView, TFile, WorkspaceLeaf } from "obsidian";
+import { ItemView, Notice, setIcon, TFile, WorkspaceLeaf } from "obsidian";
 import { createRoot, type Root } from "react-dom/client";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { File, FileDiff } from "@pierre/diffs/react";
 import { parseDiffFromFile } from "@pierre/diffs";
 import type RealtimePlugin from "../main";
+import { PLUGIN_NAME } from "../brand";
 import type { HistoryCommit, FileAtCommit } from "./types";
-import { openTimelineModal } from "./TimelineModal";
+import { openTimelineModal, openRollbackConfirm } from "./TimelineModal";
 
 export const FILE_HISTORY_VIEW_TYPE = "realtime-file-history";
 
@@ -52,6 +53,7 @@ function FileHistoryPanel({ plugin }: { plugin: RealtimePlugin }) {
   const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isAdmin, setIsAdmin] = useState(false);
 
   const vaultId = plugin.settings.activeVaultId;
 
@@ -61,6 +63,30 @@ function FileHistoryPanel({ plugin }: { plugin: RealtimePlugin }) {
     });
     return () => plugin.app.workspace.offref(ref);
   }, [plugin]);
+
+  // Admin state is keyed on vaultId and reruns on vault switch. While a fresh
+  // lookup is in flight after a switch, we keep isAdmin=false so the rollback
+  // button from a previous vault's admin state never leaks through.
+  useEffect(() => {
+    if (!vaultId) {
+      setIsAdmin(false);
+      return;
+    }
+    let cancelled = false;
+    setIsAdmin(false);
+    void (async () => {
+      try {
+        const vaults = await plugin.auth.listVaults();
+        if (cancelled) return;
+        setIsAdmin(vaults.find((v) => v.id === vaultId)?.role === "admin");
+      } catch {
+        if (!cancelled) setIsAdmin(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [plugin, vaultId]);
 
   const load = useCallback(
     async (before?: string) => {
@@ -114,6 +140,8 @@ function FileHistoryPanel({ plugin }: { plugin: RealtimePlugin }) {
             vaultId={vaultId}
             path={path}
             commit={commit}
+            isAdmin={isAdmin}
+            onRolledBack={() => void load()}
           />
         ))}
       </div>
@@ -148,15 +176,26 @@ function CommitRow({
   vaultId,
   path,
   commit,
+  isAdmin,
+  onRolledBack,
 }: {
   plugin: RealtimePlugin;
   vaultId: string;
   path: string;
   commit: HistoryCommit;
+  isAdmin: boolean;
+  onRolledBack: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [files, setFiles] = useState<{ before: FileAtCommit; after: FileAtCommit } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [rollingBack, setRollingBack] = useState(false);
+  const caretRef = useRef<HTMLSpanElement | null>(null);
+
+  // Render the caret via Obsidian's icon renderer so it matches theme styling.
+  useEffect(() => {
+    if (caretRef.current) setIcon(caretRef.current, "right-triangle");
+  }, []);
 
   useEffect(() => {
     if (!expanded || files) return;
@@ -178,19 +217,79 @@ function CommitRow({
     ? `${commit.cursorName} (for ${commit.onBehalfOf ?? commit.authorName})`
     : commit.authorName;
 
+  // The target-era path for single-file rollback. When `pathAtCommit` is
+  // missing (resolver gap), the rollback button is disabled rather than
+  // silently falling back to `path` — a wrong default could delete the
+  // current file for a pre-rename commit.
+  const targetPath = commit.pathAtCommit;
+  const canRollBack = isAdmin && !!targetPath;
+
+  const startFileRollback = async () => {
+    if (!targetPath) return;
+    setRollingBack(true);
+    try {
+      const plan = await plugin.auth.rollbackPreview(vaultId, commit.hash, {
+        path,
+        targetPath,
+      });
+      const confirmed = await openRollbackConfirm(plugin.app, plan, {
+        kind: "file",
+        path,
+        targetPath,
+      });
+      if (!confirmed) return;
+      const result = await plugin.auth.rollbackVault(vaultId, commit.hash, {
+        path,
+        targetPath,
+      });
+      new Notice(
+        `${PLUGIN_NAME}: rolled back ${path} — ${result.applied} updated, ${result.deleted} deleted.`,
+      );
+      onRolledBack();
+    } catch (e) {
+      new Notice(`${PLUGIN_NAME}: rollback failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setRollingBack(false);
+    }
+  };
+
   return (
     <div className="realtime-history-row">
-      <div className="realtime-history-row-head" onClick={() => setExpanded((v) => !v)}>
-        <span className="realtime-history-subject">{commit.subject}</span>
-        <span className="realtime-history-meta">
-          {author} · {relativeTime(commit.timestampMs)} · {commit.shortHash}
+      <div
+        className={"realtime-history-row-head" + (expanded ? " is-expanded" : "")}
+        onClick={() => setExpanded((v) => !v)}
+      >
+        <span className="realtime-history-row-text">
+          <span className="realtime-history-subject">{commit.subject}</span>
+          <span className="realtime-history-meta">
+            {author} · {relativeTime(commit.timestampMs)} · {commit.shortHash}
+          </span>
         </span>
+        <span className="realtime-history-caret" ref={caretRef} aria-hidden="true" />
       </div>
       {expanded && error && (
         <p className="setting-item-description realtime-history-error">{error}</p>
       )}
       {expanded && files && (
-        <HistoryFileDiff path={path} before={files.before} after={files.after} unified />
+        <>
+          <HistoryFileDiff path={path} before={files.before} after={files.after} unified />
+          {isAdmin && (
+            <div className="realtime-history-row-actions">
+              <button
+                className="mod-warning"
+                disabled={!canRollBack || rollingBack}
+                title={
+                  !targetPath
+                    ? "Path at this commit could not be resolved; open the vault timeline to roll back."
+                    : "Roll back this file to its state at this commit"
+                }
+                onClick={() => void startFileRollback()}
+              >
+                {rollingBack ? "Working…" : "Roll back file to this commit"}
+              </button>
+            </div>
+          )}
+        </>
       )}
     </div>
   );

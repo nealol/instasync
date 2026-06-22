@@ -396,7 +396,7 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
     // the explicit path directly. `resolvedPath` is a separate var so the
     // original (possibly empty) `path` is preserved for the caller's fallback
     // notice wording.
-    const resolvedPath = path || (guid ? this.vaultSync?.pathForGuid(guid) ?? "" : "");
+    const resolvedPath = path || (guid ? (this.vaultSync?.pathForGuid(guid) ?? "") : "");
     if (resolvedPath) {
       const file = this.app.vault.getAbstractFileByPath(resolvedPath);
       if (file instanceof TFile) return file;

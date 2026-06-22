@@ -380,6 +380,8 @@ export interface HistoryCommit {
   cursorName?: string;
   onBehalfOf?: string;
   rollbackOf?: string;
+  /** When the list was path-filtered, the followed file's path at this commit. */
+  pathAtCommit?: string;
 }
 
 export interface HistoryCommitListPage {

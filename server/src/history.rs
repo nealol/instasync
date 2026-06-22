@@ -42,6 +42,12 @@ pub struct HistoryCommit {
     pub on_behalf_of: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rollback_of: Option<String>,
+    /// When the list was path-filtered (`?path=`), the path the followed file
+    /// had at this commit (resolves renames). Absent when not path-filtered or
+    /// when the resolver could not determine it — clients must not assume a
+    /// default for rollback targeting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_at_commit: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -191,6 +197,7 @@ pub fn parse_log_records(stdout: &[u8]) -> Vec<HistoryCommit> {
                 cursor_name: trailers.get("Cursor-Name").cloned(),
                 on_behalf_of: trailers.get("On-Behalf-Of").cloned(),
                 rollback_of: trailers.get("Rollback-Of").cloned(),
+                path_at_commit: None,
             })
         })
         .collect()
@@ -318,7 +325,7 @@ pub(crate) async fn resolve_commit(
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn validated_rel_path(path: &str) -> AppResult<String> {
+pub(crate) fn validated_rel_path(path: &str) -> AppResult<String> {
     safe_rel_path(path).map_err(|e| AppError::BadRequest(e.to_string()))?;
     Ok(path.to_string())
 }
@@ -467,7 +474,116 @@ pub async fn list_commits(
     let mut commits = parse_log_records(&out.stdout);
     let has_more = commits.len() as u64 > limit;
     commits.truncate(limit as usize);
+
+    // When path-filtered, resolve the followed file's path at each commit so
+    // clients can target the correct `targetPath` for single-file rollback
+    // across renames. The resolver runs over the full history (no `before`/
+    // `limit`) so the rename-chain state is correct for every commit any
+    // paginated query can return.
+    if let Some(rel) = q.path.as_ref() {
+        let rel = validated_rel_path(rel)?;
+        match resolve_path_at_commit_map(&state, &vault_id, &rel).await {
+            Ok(map) => {
+                for c in commits.iter_mut() {
+                    if let Some(p) = map.get(&c.hash) {
+                        c.path_at_commit = Some(p.clone());
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("path-at-commit resolver for {vault_id}:{rel} failed: {e}");
+                // Leave path_at_commit unset on every commit; clients disable
+                // rollback rather than silently falling back to `rel`.
+            }
+        }
+    }
+
     Ok(Json(CommitListResponse { commits, has_more }))
+}
+
+/// Build `HashMap<fullHash, pathAtCommit>` for a followed file by walking
+/// `git log --follow --name-status -z --format=%H <rel>` HEAD-first.
+///
+/// Records are interleaved: a `%H` header is followed by zero or more
+/// `R<score>\0old\0new\0` (or `M\0path\0`, `A\0path\0`, `D\0path\0`) records
+/// describing the changes that commit made to the followed file. Because we
+/// walk HEAD→older, the file's name *before* a rename commit is the rename's
+/// `old` field; we update `current_name` accordingly so subsequent (older)
+/// commits record the older name.
+async fn resolve_path_at_commit_map(
+    state: &AppState,
+    vault_id: &str,
+    rel: &str,
+) -> AppResult<std::collections::HashMap<String, String>> {
+    let out = state
+        .git
+        .git_output(
+            vault_id,
+            &[
+                "log",
+                "--follow",
+                "--name-status",
+                "-z",
+                "--format=%H",
+                "--",
+                rel,
+            ],
+        )
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    if !out.status.success() {
+        return Ok(Default::default());
+    }
+    Ok(parse_path_at_commit_map(&out.stdout, rel))
+}
+
+/// Pure parser for `git log --follow --name-status -z --format=%H <rel>`.
+/// Walks records HEAD-first; `current_name` starts as `rel` and is updated to
+/// the rename's `old` field when an `Rxx` record is encountered.
+pub fn parse_path_at_commit_map(
+    stdout: &[u8],
+    rel: &str,
+) -> std::collections::HashMap<String, String> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut parts = text.split('\0').peekable();
+    let mut map: std::collections::HashMap<String, String> = Default::default();
+    let mut current_name = rel.to_string();
+    while let Some(header) = parts.next() {
+        let header = header.trim_start_matches('\n');
+        if header.is_empty() {
+            continue;
+        }
+        // A 40-hex commit hash header.
+        if header.len() == 40 && header.chars().all(|c| c.is_ascii_hexdigit()) {
+            map.insert(header.to_string(), current_name.clone());
+            // Consume the trailing name-status records for this commit.
+            while let Some(&next) = parts.peek() {
+                let next_header = next.trim_start_matches('\n');
+                if next_header.len() == 40 && next_header.chars().all(|c| c.is_ascii_hexdigit()) {
+                    break;
+                }
+                let status = parts.next().unwrap();
+                let status = status.trim_start_matches('\n');
+                if status.is_empty() {
+                    break;
+                }
+                let first = status.chars().next().unwrap_or('?');
+                if first == 'R' || first == 'C' {
+                    // Rxx\0old\0new\0 — walking backward, `old` is the name
+                    // before this commit.
+                    let old = parts.next().unwrap_or("").to_string();
+                    let _new = parts.next().unwrap_or("");
+                    if !old.is_empty() {
+                        current_name = old;
+                    }
+                } else {
+                    // M/A/D\0path\0 — name unchanged.
+                    let _path = parts.next().unwrap_or("");
+                }
+            }
+        }
+    }
+    map
 }
 
 /// `GET /api/vaults/{id}/history/commits/{hash}`
@@ -758,5 +874,60 @@ mod tests {
         assert_eq!(c.subject, "Update a.md");
         assert_eq!(c.principal_id.as_deref(), Some("u1"));
         assert!(c.rollback_of.is_none());
+        assert!(c.path_at_commit.is_none());
+    }
+
+    #[test]
+    fn parses_path_at_commit_map_walks_renames() {
+        // HEAD: rename old.md -> new.md ; older: modify old.md ; oldest: add old.md
+        let head = "c".repeat(40);
+        let mid = "b".repeat(40);
+        let root = "a".repeat(40);
+        // git log --follow --name-status -z --format=%H emits, per commit:
+        //   %H \0 \n [status \0 path(s) \0]...
+        // (the --format=%H line ends with \n; -z separates records with \0).
+        // We walk HEAD-first; current_name starts as the followed path "new.md".
+        let out = format!(
+            "{head}\0\nR100\0old.md\0new.md\0{mid}\0\nM\0old.md\0{root}\0\nA\0old.md\0",
+            head = head,
+            mid = mid,
+            root = root,
+        );
+        let map = parse_path_at_commit_map(out.as_bytes(), "new.md");
+        // At HEAD the file is named new.md (the rename happens *in* HEAD, so
+        // before HEAD it was old.md; the recorded name at HEAD is current_name
+        // at the time we see the header, which is new.md).
+        assert_eq!(map.get(&head).map(|s| s.as_str()), Some("new.md"));
+        // After processing HEAD's R100 record, current_name becomes old.md,
+        // so the older commits record old.md.
+        assert_eq!(map.get(&mid).map(|s| s.as_str()), Some("old.md"));
+        assert_eq!(map.get(&root).map(|s| s.as_str()), Some("old.md"));
+    }
+
+    #[test]
+    fn parses_path_at_commit_map_handles_partial_score() {
+        // R087 (partial rename) must be matched by the R prefix.
+        let head = "c".repeat(40);
+        let root = "a".repeat(40);
+        let out = format!("{head}\0\nR087\0old.md\0new.md\0{root}\0\nA\0old.md\0");
+        let map = parse_path_at_commit_map(out.as_bytes(), "new.md");
+        assert_eq!(map.get(&head).map(|s| s.as_str()), Some("new.md"));
+        assert_eq!(map.get(&root).map(|s| s.as_str()), Some("old.md"));
+    }
+
+    #[test]
+    fn parses_path_at_commit_map_handles_newline_prefixed_hashes() {
+        // Real `git log -z --format=%H --name-status` output can prefix the
+        // next commit hash with a newline after the previous record's NUL.
+        let head = "c".repeat(40);
+        let mid = "b".repeat(40);
+        let root = "a".repeat(40);
+        let out = format!(
+            "{head}\0\nR100\0old.md\0new.md\0\n{mid}\0\nM\0old.md\0\n{root}\0\nA\0old.md\0",
+        );
+        let map = parse_path_at_commit_map(out.as_bytes(), "new.md");
+        assert_eq!(map.get(&head).map(|s| s.as_str()), Some("new.md"));
+        assert_eq!(map.get(&mid).map(|s| s.as_str()), Some("old.md"));
+        assert_eq!(map.get(&root).map(|s| s.as_str()), Some("old.md"));
     }
 }

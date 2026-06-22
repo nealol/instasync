@@ -73,7 +73,11 @@ export function serializeCanvas(value: JsonValue): string {
  * `nodeOrder` / `edgeOrder` are reconciled generically (arrays of ids); the
  * tombstone maps are managed here and left untouched by the generic path.
  */
-export function reconcileCanvas(root: Y.Map<any>, incoming: StructuredCanvas, clientID: number): void {
+export function reconcileCanvas(
+  root: Y.Map<any>,
+  incoming: StructuredCanvas,
+  clientID: number,
+): void {
   const nodes = ensureMap(root, "nodes");
   const edges = ensureMap(root, "edges");
   const deletedNodeIds = ensureMap(root, "deletedNodeIds");

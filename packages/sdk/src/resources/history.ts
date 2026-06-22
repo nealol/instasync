@@ -54,16 +54,42 @@ export class HistoryResource {
     return new Uint8Array(await res.arrayBuffer());
   }
 
-  /** Dry-run a rollback to `hash` (admin only). */
-  rollbackPreview(hash: string): Promise<HistoryRollbackPlan> {
-    return this.http.request("POST", this.base(`/${hash}/rollback/preview`), { body: {} });
+  /** Dry-run a rollback to `hash` (admin only). Pass `path` to scope to a single file. */
+  rollbackPreview(
+    hash: string,
+    opts?: { path?: string; targetPath?: string },
+  ): Promise<HistoryRollbackPlan> {
+    if (opts?.targetPath && !opts.path) {
+      throw new Error("targetPath requires path");
+    }
+    const qs = new URLSearchParams();
+    if (opts?.path) qs.set("path", opts.path);
+    if (opts?.targetPath) qs.set("targetPath", opts.targetPath);
+    const suffix = qs.toString();
+    return this.http.request(
+      "POST",
+      this.base(`/${hash}/rollback/preview${suffix ? `?${suffix}` : ""}`),
+      { body: {} },
+    );
   }
 
-  /** Execute a rollback to `hash` (admin only); `pluginDbs` opts databases in. */
+  /** Execute a rollback to `hash` (admin only); `pluginDbs` opts databases in (vault scope only). */
   rollback(
     hash: string,
-    pluginDbs: { plugin: string; name: string }[] = [],
+    opts?: { path?: string; targetPath?: string; pluginDbs?: { plugin: string; name: string }[] },
   ): Promise<HistoryRollbackResult> {
-    return this.http.request("POST", this.base(`/${hash}/rollback`), { body: { pluginDbs } });
+    if (opts?.targetPath && !opts.path) {
+      throw new Error("targetPath requires path");
+    }
+    if (opts?.path && opts.pluginDbs && opts.pluginDbs.length > 0) {
+      throw new Error("pluginDbs cannot be combined with path");
+    }
+    const qs = new URLSearchParams();
+    if (opts?.path) qs.set("path", opts.path);
+    if (opts?.targetPath) qs.set("targetPath", opts.targetPath);
+    const suffix = qs.toString();
+    return this.http.request("POST", this.base(`/${hash}/rollback${suffix ? `?${suffix}` : ""}`), {
+      body: { pluginDbs: opts?.pluginDbs ?? [] },
+    });
   }
 }

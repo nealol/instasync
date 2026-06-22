@@ -1424,8 +1424,7 @@ mod tests {
 
     #[test]
     fn base_value_parses_yaml_string() {
-        let value = base_value_to_json(json!("views:\n  - name: Main\n    type: table\n"))
-            .unwrap();
+        let value = base_value_to_json(json!("views:\n  - name: Main\n    type: table\n")).unwrap();
         assert_eq!(value["views"][0]["name"], json!("Main"));
         assert_eq!(value["views"][0]["type"], json!("table"));
     }

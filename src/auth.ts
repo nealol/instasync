@@ -1037,24 +1037,45 @@ export class AuthClient {
     return res.arrayBuffer;
   }
 
-  /** Dry-run a rollback (admin only). */
-  rollbackPreview(vaultId: string, hash: string): Promise<import("./history/types").RollbackPlan> {
-    return this.api(`/api/vaults/${vaultId}/history/commits/${hash}/rollback/preview`, {
-      method: "POST",
-      body: {},
-    });
+  /** Dry-run a rollback (admin only). Pass `path` to scope to a single file. */
+  rollbackPreview(
+    vaultId: string,
+    hash: string,
+    opts?: { path?: string; targetPath?: string },
+  ): Promise<import("./history/types").RollbackPlan> {
+    if (opts?.targetPath && !opts.path) {
+      throw new Error("targetPath requires path");
+    }
+    const qs = new URLSearchParams();
+    if (opts?.path) qs.set("path", opts.path);
+    if (opts?.targetPath) qs.set("targetPath", opts.targetPath);
+    const suffix = qs.toString();
+    return this.api(
+      `/api/vaults/${vaultId}/history/commits/${hash}/rollback/preview${suffix ? `?${suffix}` : ""}`,
+      { method: "POST", body: {} },
+    );
   }
 
-  /** Execute a rollback (admin only); `pluginDbs` opts databases in. */
+  /** Execute a rollback (admin only); `pluginDbs` opts databases in (vault scope only). */
   rollbackVault(
     vaultId: string,
     hash: string,
-    pluginDbs: { plugin: string; name: string }[] = [],
+    opts?: { path?: string; targetPath?: string; pluginDbs?: { plugin: string; name: string }[] },
   ): Promise<import("./history/types").RollbackResult> {
-    return this.api(`/api/vaults/${vaultId}/history/commits/${hash}/rollback`, {
-      method: "POST",
-      body: { pluginDbs },
-    });
+    if (opts?.targetPath && !opts.path) {
+      throw new Error("targetPath requires path");
+    }
+    if (opts?.path && opts.pluginDbs && opts.pluginDbs.length > 0) {
+      throw new Error("pluginDbs cannot be combined with path");
+    }
+    const qs = new URLSearchParams();
+    if (opts?.path) qs.set("path", opts.path);
+    if (opts?.targetPath) qs.set("targetPath", opts.targetPath);
+    const suffix = qs.toString();
+    return this.api(
+      `/api/vaults/${vaultId}/history/commits/${hash}/rollback${suffix ? `?${suffix}` : ""}`,
+      { method: "POST", body: { pluginDbs: opts?.pluginDbs ?? [] } },
+    );
   }
 }
 

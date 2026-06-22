@@ -69,8 +69,7 @@ function useNarrowOrMobile(): boolean {
 
   useEffect(() => {
     const mql = window.matchMedia(`(max-width: ${NARROW_BREAKPOINT_PX}px)`);
-    const update = () =>
-      setNarrow(mql.matches || document.body.classList.contains("is-mobile"));
+    const update = () => setNarrow(mql.matches || document.body.classList.contains("is-mobile"));
     update();
     mql.addEventListener("change", update);
     window.addEventListener("resize", update);
@@ -88,6 +87,7 @@ function TimelineView({ plugin, initialHash }: { plugin: RealtimePlugin; initial
   const [commits, setCommits] = useState<HistoryCommit[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [selected, setSelected] = useState<string | null>(initialHash ?? null);
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const loadingRef = useRef(false);
@@ -132,6 +132,13 @@ function TimelineView({ plugin, initialHash }: { plugin: RealtimePlugin; initial
     })();
   }, [plugin, vaultId]);
 
+  // Reset the selected path whenever the selected commit changes, before the
+  // new detail arrives. CommitDetailPane propagates the initial path once its
+  // fresh detail fetch lands (with a stale-fetch guard).
+  useEffect(() => {
+    setSelectedPath(null);
+  }, [selected]);
+
   if (!vaultId) {
     return <p className="setting-item-description">Connect to a vault to view its history.</p>;
   }
@@ -157,6 +164,8 @@ function TimelineView({ plugin, initialHash }: { plugin: RealtimePlugin; initial
             vaultId={vaultId}
             hash={selected}
             narrow={narrow}
+            selectedPath={selectedPath}
+            onSelectedPathChange={setSelectedPath}
           />
         ) : (
           <p className="setting-item-description">Select a commit.</p>
@@ -167,6 +176,7 @@ function TimelineView({ plugin, initialHash }: { plugin: RealtimePlugin; initial
           plugin={plugin}
           vaultId={vaultId}
           hash={selected}
+          filePath={selectedPath}
           onDone={() => void loadPage()}
         />
       )}
@@ -297,16 +307,19 @@ function CommitDetailPane({
   vaultId,
   hash,
   narrow,
+  selectedPath,
+  onSelectedPathChange,
 }: {
   plugin: RealtimePlugin;
   vaultId: string;
   hash: string;
   narrow: boolean;
+  selectedPath: string | null;
+  onSelectedPathChange: (path: string | null) => void;
 }) {
   const [detail, setDetail] = useState<CommitDetail | null>(null);
   const [allFiles, setAllFiles] = useState<string[] | null>(null);
   const [showAll, setShowAll] = useState(false);
-  const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [filesOpen, setFilesOpen] = useState(false);
 
@@ -314,18 +327,25 @@ function CommitDetailPane({
     setDetail(null);
     setAllFiles(null);
     setShowAll(false);
-    setSelectedPath(null);
     setError(null);
+    let cancelled = false;
     void (async () => {
       try {
         const d = await plugin.auth.getHistoryCommit(vaultId, hash);
+        if (cancelled) return;
         setDetail(d);
-        setSelectedPath(d.changes[0]?.renamedTo ?? d.changes[0]?.path ?? null);
+        // Stale-fetch guard: only propagate the initial path if this fetch
+        // is still the current one for `hash`.
+        onSelectedPathChange(d.changes[0]?.renamedTo ?? d.changes[0]?.path ?? null);
       } catch (e) {
+        if (cancelled) return;
         setError(e instanceof Error ? e.message : String(e));
       }
     })();
-  }, [plugin, vaultId, hash]);
+    return () => {
+      cancelled = true;
+    };
+  }, [plugin, vaultId, hash, onSelectedPathChange]);
 
   useEffect(() => {
     if (!showAll || allFiles) return;
@@ -386,7 +406,7 @@ function CommitDetailPane({
   if (!detail) return <p className="setting-item-description">Loading…</p>;
 
   const handleFileSelect = (p: string) => {
-    setSelectedPath(p);
+    onSelectedPathChange(p);
     if (narrow) setFilesOpen(false);
   };
 
@@ -400,7 +420,9 @@ function CommitDetailPane({
         />
       )}
       <div
-        className={"realtime-timeline-files" + (narrow ? " is-drawer" : "") + (filesOpen ? " is-open" : "")}
+        className={
+          "realtime-timeline-files" + (narrow ? " is-drawer" : "") + (filesOpen ? " is-open" : "")
+        }
         id="realtime-timeline-files"
         role={narrow ? "dialog" : undefined}
         aria-label={narrow ? "Files in this commit" : undefined}
@@ -540,24 +562,30 @@ function PathAtCommit({
 
 // ---------- rollback ----------
 
+type RollbackScope = { kind: "vault" } | { kind: "file"; path: string; targetPath: string };
+
 function RollbackBar({
   plugin,
   vaultId,
   hash,
+  filePath,
   onDone,
 }: {
   plugin: RealtimePlugin;
   vaultId: string;
   hash: string;
+  /** Currently selected path in the commit detail pane (null while loading). */
+  filePath: string | null;
   onDone: () => void;
 }) {
-  const [busy, setBusy] = useState(false);
+  const [vaultBusy, setVaultBusy] = useState(false);
+  const [fileBusy, setFileBusy] = useState(false);
 
-  const start = async () => {
-    setBusy(true);
+  const startVaultRollback = async () => {
+    setVaultBusy(true);
     try {
       const plan = await plugin.auth.rollbackPreview(vaultId, hash);
-      const confirmed = await openRollbackConfirm(plugin.app, plan);
+      const confirmed = await openRollbackConfirm(plugin.app, plan, { kind: "vault" });
       if (!confirmed) return;
       let pluginDbs: { plugin: string; name: string }[] = [];
       if (plan.pluginDbs.length > 0) {
@@ -565,7 +593,7 @@ function RollbackBar({
         if (picked === null) return;
         pluginDbs = picked;
       }
-      const result = await plugin.auth.rollbackVault(vaultId, hash, pluginDbs);
+      const result = await plugin.auth.rollbackVault(vaultId, hash, { pluginDbs });
       new Notice(
         `${PLUGIN_NAME}: rolled back — ${result.applied} updated, ${result.deleted} deleted` +
           (result.pluginDbsRolledBack ? `, ${result.pluginDbsRolledBack} database(s)` : "") +
@@ -575,37 +603,88 @@ function RollbackBar({
     } catch (e) {
       new Notice(`${PLUGIN_NAME}: rollback failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
-      setBusy(false);
+      setVaultBusy(false);
     }
   };
+
+  const startFileRollback = async () => {
+    if (!filePath) return;
+    setFileBusy(true);
+    try {
+      const plan = await plugin.auth.rollbackPreview(vaultId, hash, {
+        path: filePath,
+        targetPath: filePath,
+      });
+      const confirmed = await openRollbackConfirm(plugin.app, plan, {
+        kind: "file",
+        path: filePath,
+        targetPath: filePath,
+      });
+      if (!confirmed) return;
+      const result = await plugin.auth.rollbackVault(vaultId, hash, {
+        path: filePath,
+        targetPath: filePath,
+      });
+      new Notice(
+        `${PLUGIN_NAME}: rolled back ${filePath} — ${result.applied} updated, ${result.deleted} deleted.`,
+      );
+      onDone();
+    } catch (e) {
+      new Notice(`${PLUGIN_NAME}: rollback failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setFileBusy(false);
+    }
+  };
+
+  const busy = vaultBusy || fileBusy;
 
   return (
     <div className="realtime-timeline-rollback">
       <span className="setting-item-description">
-        Restore the whole vault to this commit. History is preserved — the restore is applied as a
-        new change.
+        Restore the whole vault, or just the selected path, to this commit. History is preserved —
+        the restore is applied as a new change.
       </span>
-      <button className="mod-warning" disabled={busy} onClick={() => void start()}>
-        {busy ? "Working…" : "Roll back vault to this commit"}
-      </button>
+      <div className="realtime-timeline-rollback-buttons">
+        <button
+          className="mod-warning"
+          disabled={!filePath || busy}
+          title={
+            filePath
+              ? "Roll back this path to its state at this commit"
+              : "Select a file to roll back"
+          }
+          onClick={() => void startFileRollback()}
+        >
+          {fileBusy ? "Working…" : "Roll back this path to this commit"}
+        </button>
+        <button className="mod-warning" disabled={busy} onClick={() => void startVaultRollback()}>
+          {vaultBusy ? "Working…" : "Roll back vault to this commit"}
+        </button>
+      </div>
     </div>
   );
 }
 
-function openRollbackConfirm(app: App, plan: RollbackPlan): Promise<boolean> {
+export function openRollbackConfirm(
+  app: App,
+  plan: RollbackPlan,
+  scope: RollbackScope,
+): Promise<boolean> {
   return new Promise((resolve) => {
-    new RollbackConfirmModal(app, plan, resolve).open();
+    new RollbackConfirmModal(app, plan, scope, resolve).open();
   });
 }
 
 class RollbackConfirmModal extends Modal {
   private plan: RollbackPlan;
+  private rollbackScope: RollbackScope;
   private resolve: (ok: boolean) => void;
   private settled = false;
 
-  constructor(app: App, plan: RollbackPlan, resolve: (ok: boolean) => void) {
+  constructor(app: App, plan: RollbackPlan, scope: RollbackScope, resolve: (ok: boolean) => void) {
     super(app);
     this.plan = plan;
+    this.rollbackScope = scope;
     this.resolve = resolve;
   }
 
@@ -619,7 +698,18 @@ class RollbackConfirmModal extends Modal {
   onOpen(): void {
     const { contentEl } = this;
     this.modalEl.addClass("realtime-rollback-confirm");
-    contentEl.createEl("h3", { text: "Roll back vault?" });
+    const scope = this.rollbackScope;
+    const isFile = scope.kind === "file";
+    contentEl.createEl("h3", { text: isFile ? "Roll back file?" : "Roll back vault?" });
+
+    if (scope.kind === "file") {
+      const { path, targetPath } = scope;
+      const subtitle =
+        path === targetPath
+          ? `Restore \`${path}\` to its state at this commit.`
+          : `Restore current \`${path}\` from \`${targetPath}\` at this commit.`;
+      contentEl.createEl("p", { cls: "setting-item-description", text: subtitle });
+    }
 
     const counts = new Map<string, number>();
     for (const c of this.plan.changes) counts.set(c.action, (counts.get(c.action) ?? 0) + 1);
@@ -651,10 +741,25 @@ class RollbackConfirmModal extends Modal {
       }
     }
 
+    // No-op UX: when the plan has no changes, no unrecoverable binaries, and
+    // no rollbackable plugin DBs, disable the destructive confirm button and
+    // surface a clear "already at this state" message.
+    const noop =
+      this.plan.changes.length === 0 &&
+      this.plan.unrecoverableBinaries.length === 0 &&
+      this.plan.pluginDbs.every((db) => !db.rollbackable);
+    if (noop) {
+      contentEl.createEl("p", {
+        cls: "setting-item-description",
+        text: "Already at this state.",
+      });
+    }
+
     const actions = contentEl.createDiv({ cls: "modal-button-container" });
     const cancel = actions.createEl("button", { text: "Cancel" });
     cancel.addEventListener("click", () => this.settle(false));
     const ok = actions.createEl("button", { text: "Roll back", cls: "mod-warning" });
+    ok.disabled = noop;
     ok.addEventListener("click", () => this.settle(true));
   }
 

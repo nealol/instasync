@@ -403,12 +403,44 @@
 .realtime-history-row-head {
 	cursor: pointer;
 	display: flex;
-	flex-direction: column;
-	gap: 2px;
+	flex-direction: row;
+	align-items: flex-start;
+	gap: 6px;
 }
 
 .realtime-history-row-head:hover {
 	background: var(--background-modifier-hover);
+}
+
+.realtime-history-row-text {
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	min-width: 0;
+}
+
+.realtime-history-caret {
+	flex-shrink: 0;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 16px;
+	height: 16px;
+	margin-top: 2px;
+	color: var(--text-muted);
+	transition: transform 0.15s ease;
+	transform: rotate(0deg);
+}
+
+.realtime-history-row-head.is-expanded .realtime-history-caret {
+	transform: rotate(90deg);
+}
+
+.realtime-history-row-actions {
+	margin-top: 6px;
+	display: flex;
+	gap: 6px;
 }
 
 .realtime-history-subject {
@@ -607,6 +639,12 @@
 	justify-content: space-between;
 	gap: 12px;
 	margin-top: 10px;
+}
+
+.realtime-timeline-rollback-buttons {
+	display: flex;
+	gap: 8px;
+	flex-shrink: 0;
 }
 
 .realtime-rollback-warning {

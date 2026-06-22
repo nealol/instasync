@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::Json;
 use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -478,6 +478,42 @@ pub struct PluginDbSelector {
     pub name: String,
 }
 
+/// Optional query params for the rollback endpoints.
+///
+/// - `path`: the current authoritative vault path to mutate. When present,
+///   the rollback is scoped to this single path.
+/// - `targetPath`: the path to read from the target commit's tree. Defaults to
+///   `path` when omitted. Required to differ from `path` for cross-rename
+///   rollback (e.g. `path=new.md&targetPath=old.md`).
+///
+/// If `targetPath` is present and `path` is absent, the request is rejected
+/// with a 400 (`targetPath requires path`).
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackQuery {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default, rename = "targetPath")]
+    pub target_path: Option<String>,
+}
+
+/// Validate the rollback query and return `Some((path, target_path))` when
+/// this is a single-file rollback, or `None` for a full vault rollback.
+fn validate_rollback_query(q: &RollbackQuery) -> AppResult<Option<(String, String)>> {
+    let Some(path) = q.path.as_ref() else {
+        if q.target_path.is_some() {
+            return Err(AppError::BadRequest("targetPath requires path".into()));
+        }
+        return Ok(None);
+    };
+    let path = history::validated_rel_path(path)?;
+    let target_path = match q.target_path.as_ref() {
+        Some(tp) => history::validated_rel_path(tp)?,
+        None => path.clone(),
+    };
+    Ok(Some((path, target_path)))
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RollbackResult {
@@ -496,6 +532,7 @@ async fn execute_rollback(
     vault_id: &str,
     hash: &str,
     selected_dbs: &[PluginDbSelector],
+    single_file: Option<(String, String)>,
 ) -> AppResult<RollbackResult> {
     let lock = {
         let mut locks = rollback_locks().lock().await;
@@ -507,7 +544,12 @@ async fn execute_rollback(
     let _guard = lock.lock().await;
 
     // Recompute fresh — the preview was advisory.
-    let plan = plan_rollback(state, vault_id, hash).await?;
+    let plan = match &single_file {
+        Some((path, target_path)) => {
+            plan_single_file_rollback(state, vault_id, hash, path, target_path).await?
+        }
+        None => plan_rollback(state, vault_id, hash).await?,
+    };
     let full = plan.summary.target_commit.clone();
 
     let mut applied = 0usize;
@@ -643,7 +685,10 @@ async fn execute_rollback(
     // Immediate, awaited commit so a user edit can't coalesce into it.
     let mut commit = None;
     if applied + deleted + plugin_dbs_rolled_back > 0 {
-        let subject = rollback_subject(state, vault_id, &full).await;
+        let subject = match &single_file {
+            Some((path, _)) => rollback_subject_path(state, vault_id, &full, path).await,
+            None => rollback_subject(state, vault_id, &full).await,
+        };
         let ov = CommitOverride {
             subject,
             trailers: vec![("Rollback-Of".to_string(), full.clone())],
@@ -687,6 +732,315 @@ async fn rollback_subject(state: &AppState, vault_id: &str, full: &str) -> Strin
     }
 }
 
+/// `Rollback {path} to {short} ({YYYY-MM-DD HH:MM})` for single-file rollback.
+async fn rollback_subject_path(state: &AppState, vault_id: &str, full: &str, path: &str) -> String {
+    let short: String = full.chars().take(10).collect();
+    let when = state
+        .git
+        .git_output(vault_id, &["log", "-n1", "--format=%at", full])
+        .await
+        .ok()
+        .and_then(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse::<i64>()
+                .ok()
+        })
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string());
+    match when {
+        Some(when) => format!("Rollback {path} to {short} ({when})"),
+        None => format!("Rollback {path} to {short}"),
+    }
+}
+
+// ---------- single-file rollback ----------
+
+/// Plan a single-file rollback: restore `path` (current vault path) to the
+/// content of `target_path` at commit `hash`. `target_path` defaults to
+/// `path` when equal. Plugin DBs are never touched by single-file rollback.
+///
+/// Classification:
+/// - If `path` currently exists, classify by the current index kind. If the
+///   target content's extension-implied kind differs from the current kind,
+///   reject with a 400 — single-file rollback refuses to convert a path's
+///   kind. Users can use full vault rollback for broader state restoration.
+/// - If `path` is currently absent, classify by `target_path`'s extension
+///   (matches full rollback's create-path classification).
+async fn plan_single_file_rollback(
+    state: &AppState,
+    vault_id: &str,
+    hash: &str,
+    path: &str,
+    target_path: &str,
+) -> AppResult<Plan> {
+    let full = history::resolve_commit(state, vault_id, hash).await?;
+
+    // Current authoritative state (Yjs, not HEAD — git lags the debounce).
+    let index_update = ydoc::read_update(state, vault_id).await?;
+    let files: HashMap<String, String> = decode_files_map(&index_update)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .into_iter()
+        .collect();
+    let structured: HashMap<String, (String, String)> = decode_structured_index(&index_update)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .into_iter()
+        .map(|e| (e.path, (e.guid, e.kind)))
+        .collect();
+    let binaries: HashMap<String, (String, u64)> = decode_binaries_entries(&index_update)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .into_iter()
+        .map(|e| (e.path, (e.hash, e.size)))
+        .collect();
+
+    let mut changes = Vec::new();
+    let mut unrecoverable = Vec::new();
+    let mut ops = Vec::new();
+
+    let target_bytes = history::file_bytes_at(state, vault_id, &full, target_path).await?;
+
+    if let Some(bytes) = target_bytes {
+        // Target present: classify by current state first.
+        if let Some(guid) = files.get(path) {
+            // Current path is markdown. Target must be markdown.
+            let target_kind = history::path_kind(target_path);
+            if target_kind != "markdown" {
+                return Err(AppError::BadRequest(format!(
+                    "rollback would change file kind for {path}; use full vault rollback"
+                )));
+            }
+            let content = String::from_utf8_lossy(&bytes).to_string();
+            let doc_id = format!("{vault_id}__{guid}");
+            let update = ydoc::read_update(state, &doc_id).await?;
+            let current =
+                decode_text(&update, "contents").map_err(|e| AppError::Internal(e.to_string()))?;
+            if current != content {
+                changes.push(PlannedChange {
+                    path: path.to_string(),
+                    kind: "markdown".into(),
+                    action: "modify".into(),
+                });
+                ops.push(PlannedOp::SetText {
+                    path: path.to_string(),
+                    guid: Some(guid.clone()),
+                    content,
+                });
+            }
+        } else if let Some((guid, kind)) = structured.get(path) {
+            // Current path is structured. Target must be the same kind.
+            let target_kind = history::path_kind(target_path);
+            if target_kind != kind.as_str() {
+                return Err(AppError::BadRequest(format!(
+                    "rollback would change file kind for {path}; use full vault rollback"
+                )));
+            }
+            let value = match kind.as_str() {
+                "canvas" => {
+                    let file: JsonValue = serde_json::from_slice(&bytes).map_err(|e| {
+                        AppError::Internal(format!("parse canvas {target_path}: {e}"))
+                    })?;
+                    crate::structured::canvas_file_to_map(file)
+                }
+                _ => {
+                    let yaml: serde_yaml::Value = serde_yaml::from_slice(&bytes).map_err(|e| {
+                        AppError::Internal(format!("parse base {target_path}: {e}"))
+                    })?;
+                    serde_json::to_value(yaml).map_err(|e| AppError::Internal(e.to_string()))?
+                }
+            };
+            let doc_id = format!("{vault_id}__{guid}");
+            let update = ydoc::read_update(state, &doc_id).await?;
+            let current =
+                decode_structured(&update).map_err(|e| AppError::Internal(e.to_string()))?;
+            if current != value {
+                changes.push(PlannedChange {
+                    path: path.to_string(),
+                    kind: kind.clone(),
+                    action: "modify".into(),
+                });
+                ops.push(PlannedOp::SetStructured {
+                    path: path.to_string(),
+                    guid: Some(guid.clone()),
+                    kind: kind.clone(),
+                    value,
+                });
+            }
+        } else if let Some((cur_hash, _)) = binaries.get(path) {
+            // Current path is binary. Target must be binary (any non-md/
+            // canvas/base extension is binary by path_kind).
+            let (hash, size, blob_bytes, blob_missing) = match parse_attachment_shim(&bytes) {
+                Some(shim) => {
+                    let available = blob_exists(state, vault_id, &shim.hash);
+                    (shim.hash, shim.size, None, !available)
+                }
+                None => {
+                    let hash = sha256_hex(&bytes);
+                    let size = bytes.len() as u64;
+                    let missing = !blob_exists(state, vault_id, &hash);
+                    let blob_bytes = missing.then(|| bytes.clone());
+                    (hash, size, blob_bytes, false)
+                }
+            };
+            if blob_missing {
+                // Unrecoverable: leave the current file at `path` untouched.
+                unrecoverable.push(UnrecoverableBinary {
+                    path: path.to_string(),
+                    hash,
+                    current_kept: true,
+                });
+            } else if *cur_hash != hash || blob_bytes.is_some() {
+                let action = if blob_bytes.is_some() {
+                    "restoreBlob"
+                } else {
+                    "modify"
+                };
+                changes.push(PlannedChange {
+                    path: path.to_string(),
+                    kind: "binary".into(),
+                    action: action.into(),
+                });
+                ops.push(PlannedOp::SetBinary {
+                    path: path.to_string(),
+                    hash,
+                    size,
+                    blob_bytes,
+                });
+            }
+        } else {
+            // Current path is absent: classify by target_path's extension.
+            let target_kind = history::path_kind(target_path);
+            match target_kind {
+                "markdown" => {
+                    let content = String::from_utf8_lossy(&bytes).to_string();
+                    changes.push(PlannedChange {
+                        path: path.to_string(),
+                        kind: "markdown".into(),
+                        action: "create".into(),
+                    });
+                    ops.push(PlannedOp::SetText {
+                        path: path.to_string(),
+                        guid: None,
+                        content,
+                    });
+                }
+                "canvas" | "base" => {
+                    let value = if target_kind == "canvas" {
+                        let file: JsonValue = serde_json::from_slice(&bytes).map_err(|e| {
+                            AppError::Internal(format!("parse canvas {target_path}: {e}"))
+                        })?;
+                        crate::structured::canvas_file_to_map(file)
+                    } else {
+                        let yaml: serde_yaml::Value =
+                            serde_yaml::from_slice(&bytes).map_err(|e| {
+                                AppError::Internal(format!("parse base {target_path}: {e}"))
+                            })?;
+                        serde_json::to_value(yaml).map_err(|e| AppError::Internal(e.to_string()))?
+                    };
+                    changes.push(PlannedChange {
+                        path: path.to_string(),
+                        kind: target_kind.into(),
+                        action: "create".into(),
+                    });
+                    ops.push(PlannedOp::SetStructured {
+                        path: path.to_string(),
+                        guid: None,
+                        kind: target_kind.into(),
+                        value,
+                    });
+                }
+                _ => {
+                    // Binary create.
+                    let (hash, size, blob_bytes, blob_missing) = match parse_attachment_shim(&bytes)
+                    {
+                        Some(shim) => {
+                            let available = blob_exists(state, vault_id, &shim.hash);
+                            (shim.hash, shim.size, None, !available)
+                        }
+                        None => {
+                            let hash = sha256_hex(&bytes);
+                            let size = bytes.len() as u64;
+                            let missing = !blob_exists(state, vault_id, &hash);
+                            let blob_bytes = missing.then(|| bytes.clone());
+                            (hash, size, blob_bytes, false)
+                        }
+                    };
+                    if blob_missing {
+                        unrecoverable.push(UnrecoverableBinary {
+                            path: path.to_string(),
+                            hash,
+                            current_kept: false,
+                        });
+                    } else {
+                        changes.push(PlannedChange {
+                            path: path.to_string(),
+                            kind: "binary".into(),
+                            action: if blob_bytes.is_some() {
+                                "restoreBlob"
+                            } else {
+                                "create"
+                            }
+                            .into(),
+                        });
+                        ops.push(PlannedOp::SetBinary {
+                            path: path.to_string(),
+                            hash,
+                            size,
+                            blob_bytes,
+                        });
+                    }
+                }
+            }
+        }
+    } else {
+        // Target absent: delete `path` if it currently exists.
+        if files.contains_key(path) {
+            changes.push(PlannedChange {
+                path: path.to_string(),
+                kind: "markdown".into(),
+                action: "delete".into(),
+            });
+            ops.push(PlannedOp::RemoveFile {
+                path: path.to_string(),
+            });
+        } else if structured.contains_key(path) {
+            let kind = structured
+                .get(path)
+                .map(|(_, k)| k.clone())
+                .unwrap_or_default();
+            changes.push(PlannedChange {
+                path: path.to_string(),
+                kind,
+                action: "delete".into(),
+            });
+            ops.push(PlannedOp::RemoveStructured {
+                path: path.to_string(),
+            });
+        } else if binaries.contains_key(path) {
+            changes.push(PlannedChange {
+                path: path.to_string(),
+                kind: "binary".into(),
+                action: "delete".into(),
+            });
+            ops.push(PlannedOp::RemoveBinary {
+                path: path.to_string(),
+            });
+        }
+        // If `path` isn't in any current map, there's nothing to delete — no-op.
+    }
+
+    changes.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(Plan {
+        summary: RollbackPlan {
+            target_commit: full,
+            changes,
+            unrecoverable_binaries: unrecoverable,
+            plugin_dbs: Vec::new(),
+        },
+        ops,
+        plugin_targets: Vec::new(),
+    })
+}
+
 // ---------- handlers ----------
 
 /// `POST /api/vaults/{id}/history/commits/{hash}/rollback/preview`
@@ -694,9 +1048,16 @@ pub async fn rollback_preview(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     AxumPath((vault_id, hash)): AxumPath<(String, String)>,
+    Query(q): Query<RollbackQuery>,
 ) -> AppResult<Json<RollbackPlan>> {
     require_admin(&state, &user.id, &vault_id).await?;
-    let plan = plan_rollback(&state, &vault_id, &hash).await?;
+    let path = validate_rollback_query(&q)?;
+    let plan = match path {
+        Some((path, target_path)) => {
+            plan_single_file_rollback(&state, &vault_id, &hash, &path, &target_path).await?
+        }
+        None => plan_rollback(&state, &vault_id, &hash).await?,
+    };
     Ok(Json(plan.summary))
 }
 
@@ -705,10 +1066,18 @@ pub async fn rollback(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     AxumPath((vault_id, hash)): AxumPath<(String, String)>,
+    Query(q): Query<RollbackQuery>,
     body: Option<Json<RollbackBody>>,
 ) -> AppResult<Json<RollbackResult>> {
     require_admin(&state, &user.id, &vault_id).await?;
     let body = body.map(|Json(b)| b).unwrap_or_default();
+    let path = validate_rollback_query(&q)?;
+    // Single-file rollback never touches plugin DBs.
+    if path.is_some() && !body.plugin_dbs.is_empty() {
+        return Err(AppError::BadRequest(
+            "pluginDbs cannot be combined with path".into(),
+        ));
+    }
     let principal = Principal {
         user_id: user.id.clone(),
         display_name: user.display_name.clone(),
@@ -717,6 +1086,7 @@ pub async fn rollback(
         actor: PrincipalActor::User,
         expires_at_ms: now_millis() + 24 * 60 * 60 * 1000,
     };
-    let result = execute_rollback(&state, &principal, &vault_id, &hash, &body.plugin_dbs).await?;
+    let result =
+        execute_rollback(&state, &principal, &vault_id, &hash, &body.plugin_dbs, path).await?;
     Ok(Json(result))
 }

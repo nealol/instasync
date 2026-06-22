@@ -576,10 +576,10 @@ describe("Realtime — two isolated Obsidian devices", function () {
         nodes: [canvasNode("n1", "hello"), canvasNode("n3", "from-B-remote", 600)],
         edges: [canvasEdge("e1", "n1", "n3")],
       });
-      await B.waitUntil(
-        async () => !!(await readNote(B, "Board.canvas"))?.includes('"e1"'),
-        { timeout: 60 * SECONDS, timeoutMsg: "B never received the seeded edge" },
-      );
+      await B.waitUntil(async () => !!(await readNote(B, "Board.canvas"))?.includes('"e1"'), {
+        timeout: 60 * SECONDS,
+        timeoutMsg: "B never received the seeded edge",
+      });
 
       // Delete the edge on A's open canvas.
       await editCanvasView(A, "Board.canvas", {
@@ -633,10 +633,10 @@ describe("Realtime — two isolated Obsidian devices", function () {
           [canvasEdge("edge1", "a1", "b1")],
         ),
       );
-      await B.waitUntil(
-        async () => !!(await readNote(B, "DelBoard.canvas"))?.includes('"edge1"'),
-        { timeout: 60 * SECONDS, timeoutMsg: "B never received the seeded DelBoard" },
-      );
+      await B.waitUntil(async () => !!(await readNote(B, "DelBoard.canvas"))?.includes('"edge1"'), {
+        timeout: 60 * SECONDS,
+        timeoutMsg: "B never received the seeded DelBoard",
+      });
     });
 
     after(async function () {
@@ -750,11 +750,7 @@ describe("Realtime — two isolated Obsidian devices", function () {
       await bindOpenStructured(B);
 
       // A deletes node b1.
-      await writeNote(
-        A,
-        "DelBoard.canvas",
-        canvasJson([canvasNode("a1", "alpha", 0)], []),
-      );
+      await writeNote(A, "DelBoard.canvas", canvasJson([canvasNode("a1", "alpha", 0)], []));
       await B.waitUntil(
         async () => {
           const data = await canvasViewData(B, "DelBoard.canvas");
@@ -777,10 +773,10 @@ describe("Realtime — two isolated Obsidian devices", function () {
           [canvasEdge("edge1", "a1", "b1")],
         ),
       );
-      await B.waitUntil(
-        async () => !!(await readNote(B, "DelBoard.canvas"))?.includes('"edge1"'),
-        { timeout: 60 * SECONDS, timeoutMsg: "B never received the initial edge" },
-      );
+      await B.waitUntil(async () => !!(await readNote(B, "DelBoard.canvas"))?.includes('"edge1"'), {
+        timeout: 60 * SECONDS,
+        timeoutMsg: "B never received the initial edge",
+      });
 
       // A deletes the edge via disk write.
       await writeNote(
@@ -805,10 +801,10 @@ describe("Realtime — two isolated Obsidian devices", function () {
           [canvasEdge("edge1", "a1", "b1")],
         ),
       );
-      await B.waitUntil(
-        async () => !!(await readNote(B, "DelBoard.canvas"))?.includes('"edge1"'),
-        { timeout: 60 * SECONDS, timeoutMsg: "B never received the re-added edge (undo blocked by tombstone)" },
-      );
+      await B.waitUntil(async () => !!(await readNote(B, "DelBoard.canvas"))?.includes('"edge1"'), {
+        timeout: 60 * SECONDS,
+        timeoutMsg: "B never received the re-added edge (undo blocked by tombstone)",
+      });
     });
   });
 

@@ -72,22 +72,35 @@ export function registerHistoryCommands(program: Command): void {
     .command("rollback <hash>")
     .description("roll the vault back to a commit (previews first; admin only)")
     .option("--yes", "apply without an interactive confirmation")
-    .action(async (hash: string, opts: { yes?: boolean }) => {
+    .option("--path <p>", "scope the rollback to a single current vault path")
+    .option("--target-path <p>", "path to read from the target commit (defaults to --path)")
+    .action(async (hash: string, opts: { yes?: boolean; path?: string; targetPath?: string }) => {
       const ctx = ctxFrom(program);
       const { vault } = userVault(ctx);
-      const plan = await vault.history.rollbackPreview(hash);
+      if (opts.targetPath && !opts.path) {
+        throw new Error("--target-path requires --path");
+      }
+      const plan = await vault.history.rollbackPreview(hash, {
+        path: opts.path,
+        targetPath: opts.targetPath,
+      });
       out(ctx, plan, () => {
         printTable(plan.changes.map((c) => [c.action, c.path]));
         for (const b of plan.unrecoverableBinaries) {
           process.stderr.write(`unrecoverable binary: ${b.path} (${b.hash})\n`);
         }
       });
-      const proceed = opts.yes || (await confirm(`Roll back to ${plan.targetCommit}?`, false));
+      const target = opts.path ?? "vault";
+      const proceed =
+        opts.yes || (await confirm(`Roll back ${target} to ${plan.targetCommit}?`, false));
       if (!proceed) {
         process.stderr.write("aborted\n");
         return;
       }
-      const result = await vault.history.rollback(hash);
+      const result = await vault.history.rollback(hash, {
+        path: opts.path,
+        targetPath: opts.targetPath,
+      });
       out(ctx, result, () => {
         process.stdout.write(
           `rolled back: ${result.applied} applied, ${result.deleted} deleted, ${result.blobsRestored} blob(s) restored\n`,

@@ -127,8 +127,6 @@ impl AppState {
         let now = now_millis();
         // Opportunistic eviction: drop expired entries on every read path too.
         map.retain(|_, p| p.expires_at_ms > now);
-        map.get(token)
-            .filter(|p| p.expires_at_ms > now)
-            .cloned()
+        map.get(token).filter(|p| p.expires_at_ms > now).cloned()
     }
 }

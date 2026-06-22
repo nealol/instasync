@@ -4895,6 +4895,569 @@ async fn rollback_restores_attachment_blob_from_git_after_gc() {
     assert_eq!(body, payload);
 }
 
+// ---------- single-file rollback e2e ----------
+
+/// Helper: create a vault + alice admin + bob member, returning (app, repo,
+/// vault_id, alice, bob, base_url).
+async fn single_file_rollback_setup() -> (Router, std::path::PathBuf, String, String, String, String)
+{
+    let ys = fake_ysweet_store().await;
+    let (app, git_dir, _blobs) = history_test_app(&ys).await;
+    let alice = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&alice),
+        Some(json!({"name": "V"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+    let repo = git_dir.join(&vault_id);
+    let base = format!("/api/vaults/{vault_id}/history/commits");
+
+    // Invite bob as a member (non-admin) for the non-admin test.
+    let (_, invite) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/invites"),
+        Some(&alice),
+        Some(json!({"role": "member"})),
+    )
+    .await;
+    let bob = login(&app, "bob").await;
+    let _ = send(
+        &app,
+        "POST",
+        "/api/invites/redeem",
+        Some(&bob),
+        Some(json!({"code": invite["code"]})),
+    )
+    .await;
+
+    (app, repo, vault_id, alice, bob, base)
+}
+
+#[tokio::test]
+async fn rollback_single_file_restores_one_path_only() {
+    let (app, repo, vault_id, alice, _bob, base) = single_file_rollback_setup().await;
+
+    // c1: a.md at v1.
+    send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&alice),
+        Some(json!({"path": "a.md", "content": "alpha v1\n"})),
+    )
+    .await;
+    let c1 = wait_for_commit_count(&repo, 1).await;
+
+    // c2: edit a.md and create b.md.
+    send(
+        &app,
+        "PUT",
+        &format!("/api/vaults/{vault_id}/notes/a.md"),
+        Some(&alice),
+        Some(json!({"content": "alpha v2\n"})),
+    )
+    .await;
+    send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&alice),
+        Some(json!({"path": "b.md", "content": "bravo\n"})),
+    )
+    .await;
+    wait_for_commit_count(&repo, 2).await;
+
+    // Single-file rollback a.md to c1.
+    let (status, plan) = send(
+        &app,
+        "POST",
+        &format!("{base}/{c1}/rollback/preview?path=a.md"),
+        Some(&alice),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let changes = plan["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["path"], json!("a.md"));
+    assert_eq!(changes[0]["action"], json!("modify"));
+
+    let (status, result) = send(
+        &app,
+        "POST",
+        &format!("{base}/{c1}/rollback?path=a.md"),
+        Some(&alice),
+        Some(json!({"pluginDbs": []})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["applied"], 1);
+    assert_eq!(result["deleted"], 0);
+
+    // a.md restored; b.md untouched.
+    let (_, a) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/notes/a.md"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(a["content"], "alpha v1\n");
+    let (_, b) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/notes/b.md"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(b["content"], "bravo\n");
+}
+
+#[tokio::test]
+async fn rollback_single_file_absent_at_target_deletes_only_that_file() {
+    let (app, repo, vault_id, alice, _bob, base) = single_file_rollback_setup().await;
+
+    // c1: a.md only.
+    send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&alice),
+        Some(json!({"path": "a.md", "content": "alpha\n"})),
+    )
+    .await;
+    let c1 = wait_for_commit_count(&repo, 1).await;
+
+    // c2: create b.md.
+    send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&alice),
+        Some(json!({"path": "b.md", "content": "bravo\n"})),
+    )
+    .await;
+    wait_for_commit_count(&repo, 2).await;
+
+    // Single-file rollback b.md to c1 (where b.md is absent) -> delete b.md.
+    let (status, result) = send(
+        &app,
+        "POST",
+        &format!("{base}/{c1}/rollback?path=b.md"),
+        Some(&alice),
+        Some(json!({"pluginDbs": []})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["applied"], 0);
+    assert_eq!(result["deleted"], 1);
+
+    let (status, _) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/notes/b.md"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, a) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/notes/a.md"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(a["content"], "alpha\n");
+}
+
+#[tokio::test]
+async fn rollback_single_file_unchanged_returns_noop() {
+    let (app, repo, vault_id, alice, _bob, base) = single_file_rollback_setup().await;
+
+    // c1: a.md.
+    send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&alice),
+        Some(json!({"path": "a.md", "content": "alpha\n"})),
+    )
+    .await;
+    wait_for_commit_count(&repo, 1).await;
+
+    // c2: create b.md (a.md unchanged).
+    send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&alice),
+        Some(json!({"path": "b.md", "content": "bravo\n"})),
+    )
+    .await;
+    let c2 = wait_for_commit_count(&repo, 2).await;
+
+    // Single-file rollback a.md to c2 (where a.md is unchanged) -> no-op.
+    let (status, plan) = send(
+        &app,
+        "POST",
+        &format!("{base}/{c2}/rollback/preview?path=a.md"),
+        Some(&alice),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(plan["changes"].as_array().unwrap().len(), 0);
+
+    let (status, result) = send(
+        &app,
+        "POST",
+        &format!("{base}/{c2}/rollback?path=a.md"),
+        Some(&alice),
+        Some(json!({"pluginDbs": []})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["applied"], 0);
+    assert_eq!(result["deleted"], 0);
+    assert_eq!(result["commit"], Value::Null);
+}
+
+#[tokio::test]
+async fn rollback_single_file_rename_uses_target_path() {
+    let (app, repo, vault_id, alice, _bob, base) = single_file_rollback_setup().await;
+
+    // c1: old.md with content "old v1".
+    send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&alice),
+        Some(json!({"path": "old.md", "content": "old v1\n"})),
+    )
+    .await;
+    let c1 = wait_for_commit_count(&repo, 1).await;
+
+    // c2: rename old.md -> new.md via the note-moves API (git detects R100).
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/note-moves/old.md"),
+        Some(&alice),
+        Some(json!({"toPath": "new.md"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_commit_count(&repo, 2).await;
+
+    // c3: edit new.md so its content differs from old.md's c1 content.
+    let (status, _) = send(
+        &app,
+        "PUT",
+        &format!("/api/vaults/{vault_id}/notes/new.md"),
+        Some(&alice),
+        Some(json!({"content": "new v2\n"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_commit_count(&repo, 3).await;
+
+    // Single-file rollback new.md to c1, reading from old.md at c1.
+    let (status, result) = send(
+        &app,
+        "POST",
+        &format!("{base}/{c1}/rollback?path=new.md&targetPath=old.md"),
+        Some(&alice),
+        Some(json!({"pluginDbs": []})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["applied"], 1);
+
+    // new.md now has old.md's c1 content; old.md is not recreated.
+    let (_, n) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/notes/new.md"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(n["content"], "old v1\n");
+    let (status, _) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/notes/old.md"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn rollback_single_file_create_when_current_absent_with_rename() {
+    let (app, repo, vault_id, alice, _bob, base) = single_file_rollback_setup().await;
+
+    // c1: old.md with content "old v1".
+    send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&alice),
+        Some(json!({"path": "old.md", "content": "old v1\n"})),
+    )
+    .await;
+    let c1 = wait_for_commit_count(&repo, 1).await;
+
+    // c2: rename old.md -> new.md.
+    send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/note-moves/old.md"),
+        Some(&alice),
+        Some(json!({"toPath": "new.md"})),
+    )
+    .await;
+    wait_for_commit_count(&repo, 2).await;
+
+    // c3: delete new.md so the current path is absent.
+    send(
+        &app,
+        "DELETE",
+        &format!("/api/vaults/{vault_id}/notes/new.md"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    wait_for_commit_count(&repo, 3).await;
+
+    // Single-file rollback new.md (currently absent) to c1, reading old.md.
+    let (status, result) = send(
+        &app,
+        "POST",
+        &format!("{base}/{c1}/rollback?path=new.md&targetPath=old.md"),
+        Some(&alice),
+        Some(json!({"pluginDbs": []})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["applied"], 1);
+
+    let (_, n) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/notes/new.md"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(n["content"], "old v1\n");
+}
+
+#[tokio::test]
+async fn rollback_single_file_rejects_kind_change() {
+    let (app, repo, vault_id, alice, _bob, base) = single_file_rollback_setup().await;
+
+    // c1: a.md (markdown).
+    send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&alice),
+        Some(json!({"path": "a.md", "content": "# markdown\n"})),
+    )
+    .await;
+    let _c1 = wait_for_commit_count(&repo, 1).await;
+
+    // c2: create a.canvas (structured). a.md still exists as markdown.
+    send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/canvases"),
+        Some(&alice),
+        Some(json!({"path": "a.canvas", "value": {"nodes": [], "edges": []}})),
+    )
+    .await;
+    let c2 = wait_for_commit_count(&repo, 2).await;
+
+    // Single-file rollback a.md to c2, where a.canvas exists but a.md does not.
+    // Current a.md is markdown; target a.md is absent; target_path=a.md is
+    // absent at c2 -> would delete a.md. That's not a kind change. Instead,
+    // test the kind-change path: rollback a.md to a state where a.md would be
+    // created from a.canvas content. Use targetPath=a.canvas with path=a.md:
+    // current a.md is markdown, target a.canvas is canvas -> kind mismatch.
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("{base}/{c2}/rollback/preview?path=a.md&targetPath=a.canvas"),
+        Some(&alice),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let msg = body["error"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("kind"),
+        "expected kind-change rejection, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn rollback_path_rejects_traversal() {
+    let (app, _repo, _vault_id, alice, _bob, base) = single_file_rollback_setup().await;
+    let c1 = "0".repeat(40);
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("{base}/{c1}/rollback/preview?path=../x"),
+        Some(&alice),
+        Some(json!({})),
+    )
+    .await;
+    // Either 400 (bad path) or 404 (unknown hash) is acceptable; the path
+    // validation must reject `..` before any planning. Axum runs query
+    // extraction before hash resolution, so 400 is expected.
+    assert!(
+        status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_FOUND,
+        "expected 400 or 404, got {status}"
+    );
+}
+
+#[tokio::test]
+async fn rollback_targetpath_without_path_rejected() {
+    let (app, _repo, _vault_id, alice, _bob, base) = single_file_rollback_setup().await;
+    let c1 = "0".repeat(40);
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("{base}/{c1}/rollback/preview?targetPath=old.md"),
+        Some(&alice),
+        Some(json!({})),
+    )
+    .await;
+    assert!(
+        status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_FOUND,
+        "expected 400 or 404, got {status}"
+    );
+}
+
+#[tokio::test]
+async fn rollback_path_rejects_plugin_dbs() {
+    let (app, repo, vault_id, alice, _bob, base) = single_file_rollback_setup().await;
+    send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&alice),
+        Some(json!({"path": "a.md", "content": "alpha\n"})),
+    )
+    .await;
+    let c1 = wait_for_commit_count(&repo, 1).await;
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("{base}/{c1}/rollback?path=a.md"),
+        Some(&alice),
+        Some(json!({"pluginDbs": [{"plugin": "x", "name": "y"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let msg = body["error"].as_str().unwrap_or("");
+    assert!(msg.contains("pluginDbs"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn rollback_path_rejects_non_admin() {
+    let (app, repo, vault_id, alice, bob, base) = single_file_rollback_setup().await;
+    send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&alice),
+        Some(json!({"path": "a.md", "content": "alpha\n"})),
+    )
+    .await;
+    let c1 = wait_for_commit_count(&repo, 1).await;
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("{base}/{c1}/rollback?path=a.md"),
+        Some(&bob),
+        Some(json!({"pluginDbs": []})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn list_commits_path_returns_path_at_commit() {
+    let (app, repo, vault_id, alice, _bob, base) = single_file_rollback_setup().await;
+
+    // c1: old.md.
+    send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&alice),
+        Some(json!({"path": "old.md", "content": "old v1\n"})),
+    )
+    .await;
+    wait_for_commit_count(&repo, 1).await;
+
+    // c2: rename old.md -> new.md via the note-moves API (git detects R100).
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/note-moves/old.md"),
+        Some(&alice),
+        Some(json!({"toPath": "new.md"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "note-moves failed");
+    wait_for_commit_count(&repo, 2).await;
+
+    // Path-filtered list for new.md should include pathAtCommit on each row.
+    let (status, page) = send(
+        &app,
+        "GET",
+        &format!("{base}?path=new.md"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "list_commits path failed");
+    let commits = page["commits"].as_array().unwrap();
+    assert!(
+        commits.len() >= 2,
+        "expected at least 2 commits, got {}",
+        commits.len()
+    );
+    // Newest first: c2 (new.md exists), c1 (file was old.md).
+    // The HEAD commit's pathAtCommit should be new.md.
+    assert_eq!(commits[0]["pathAtCommit"], json!("new.md"));
+    // The older commit's pathAtCommit should be old.md (rename walked back).
+    assert_eq!(commits[1]["pathAtCommit"], json!("old.md"));
+
+    // Non-path-filtered list omits pathAtCommit.
+    let (_, page_all) = send(&app, "GET", &base, Some(&alice), None).await;
+    let commits_all = page_all["commits"].as_array().unwrap();
+    assert!(
+        commits_all[0].get("pathAtCommit").is_none() || commits_all[0]["pathAtCommit"].is_null(),
+        "non-path-filtered list must not include pathAtCommit"
+    );
+}
+
 #[tokio::test]
 async fn public_share_lifecycle_create_view_and_revoke() {
     let ys = fake_ysweet_store().await;

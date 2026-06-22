@@ -20,8 +20,7 @@ function makeFixture(): VaultSync & { onDisk: Set<string> } {
   sync["plugin"] = {
     app: {
       vault: {
-        getAbstractFileByPath: (p: string): TFile | null =>
-          onDisk.has(p) ? new TFile(p) : null,
+        getAbstractFileByPath: (p: string): TFile | null => (onDisk.has(p) ? new TFile(p) : null),
       },
     },
   } as any;

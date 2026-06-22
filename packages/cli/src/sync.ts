@@ -11,7 +11,14 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { VaultHandle } from "@realtime-md/sdk";
-import { CliError, writeRtmd, type FileKind, type RtmdConfig, type SyncFileState, type Workspace } from "./config";
+import {
+  CliError,
+  writeRtmd,
+  type FileKind,
+  type RtmdConfig,
+  type SyncFileState,
+  type Workspace,
+} from "./config";
 import { isExcluded, kindForPath } from "./kinds";
 
 export function hashBytes(bytes: Uint8Array): string {
