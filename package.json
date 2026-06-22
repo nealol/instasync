@@ -19,7 +19,7 @@
     "test:sdk": "vitest run --project sdk-unit",
     "test:sdk:e2e": "vitest run --project sdk-e2e",
     "test:server": "cargo test --manifest-path server/Cargo.toml",
-    "test:all": "bun run typecheck && bun run test:unit && bun run test:server",
+    "test:all": "bun run typecheck && bun run test:unit && bun run test:sdk:e2e && bun run test:server",
     "test:watch": "vitest",
     "pretest:e2e": "bun run build",
     "test:e2e": "wdio run tests/e2e/wdio.conf.mts",
@@ -36,7 +36,7 @@
   "devDependencies": {
     "@codemirror/state": "^6.6.0",
     "@codemirror/view": "^6.43.0",
-    "@types/node": "^16.11.6",
+    "@types/node": "^20.11.0",
     "@types/react": "^19.2.16",
     "@types/react-dom": "^19.2.3",
     "@types/ws": "^8.18.1",

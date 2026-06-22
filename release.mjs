@@ -68,6 +68,11 @@ if (!existsSync("main.js")) {
   process.exit(1);
 }
 
+if (!existsSync("styles.css") || statSync("styles.css").size === 0) {
+  console.error("styles.css is missing or empty — it is a hand-maintained release asset. Aborting.");
+  process.exit(1);
+}
+
 // 4. GitHub release
 // crsqlite.wasm backs the synced-SQLite plugin API; ship it so clients can fetch
 // it by version when it is not already cached in the plugin directory.

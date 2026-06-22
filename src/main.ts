@@ -7,6 +7,7 @@ import type { UploadStatus } from "./BinarySync";
 import { matchesAnyGlob, parseGlobs } from "./glob";
 import type { SyncedDoc } from "./SyncedDoc";
 import { AuthClient, AuthError, normalizeServerUrl } from "./auth";
+import { CompatibilityError } from "./caps";
 import { PLUGIN_NAME } from "./brand";
 import { liveEdit } from "./editor/LiveEdit";
 import { yRemoteSelections, yRemoteSelectionsTheme } from "./editor/RemoteSelections";
@@ -36,6 +37,17 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
   settings!: RealtimeSettings;
   auth!: AuthClient;
   vaultSync: VaultSync | null = null;
+  /**
+   * Last compatibility-gating failure from `Auth.serverInfoChecked`, or `null`
+   * when the last check passed (or the server was lenient/old). Non-persisted:
+   * updated by auth on every server-info fetch, read by the settings banner.
+   * Not saved to settings — it reflects the live server, not user config.
+   */
+  lastCompatibilityError: {
+    reason: "server-incompatible" | "client-too-old";
+    detail: string;
+    serverVersion?: string;
+  } | null = null;
   /** Synced-SQLite API for third-party plugins (see src/pluginDb, docs/plugin-sql). */
   sqlApi!: RealtimeSqlAPI;
   /** Public handle: `app.plugins.plugins["realtime"].sql` — typed by @realtime-md/plugin-api-types. */
@@ -247,9 +259,22 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
       return;
     }
     // Resolve this server's stable id and migrate any legacy token into the
-    // per-server SecretStorage key. Best-effort: tolerate offline startups,
-    // where the legacy key keeps working until we can reach the server.
-    await this.auth.ensureServerId().catch(() => {});
+    // per-server SecretStorage key. Best-effort for network/offline errors
+    // (tolerate offline startups, where the legacy key keeps working until we
+    // can reach the server), but hard-block on compatibility failures: a cap
+    // mismatch means continuing would corrupt state or hit immediate API
+    // errors, so do not proceed to me()/startSync().
+    try {
+      await this.auth.ensureServerId();
+    } catch (e) {
+      if (e instanceof CompatibilityError) {
+        // lastCompatibilityError is already set by serverInfoChecked; surface
+        // it as the sync status and stop. Do not fall through to me().
+        this.setStatus("offline");
+        return;
+      }
+      // Other errors (network/offline) are tolerated as before.
+    }
     // Validate the session; a 401 clears it. Other (network) errors are
     // tolerated so we can still start and let the providers retry.
     try {

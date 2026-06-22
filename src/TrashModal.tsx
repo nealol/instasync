@@ -105,10 +105,14 @@ function TrashRow({ plugin, entry }: { plugin: RealtimePlugin; entry: TrashEntry
     void (async () => {
       setBusy(true);
       try {
-        await plugin.vaultSync?.restoreTrashEntry(entry.id, path);
+        if (!plugin.vaultSync) {
+          new Notice(`${PLUGIN_NAME}: sync is not running.`);
+          return;
+        }
+        await plugin.vaultSync.restoreTrashEntry(entry.id, path);
         new Notice(`${PLUGIN_NAME}: restored "${path?.trim() || entry.path}".`);
       } catch (e) {
-        new Notice(`${PLUGIN_NAME}: ${(e as Error).message}`);
+        new Notice(`${PLUGIN_NAME}: ${e instanceof Error ? e.message : String(e)}`);
       } finally {
         setBusy(false);
       }
@@ -119,10 +123,14 @@ function TrashRow({ plugin, entry }: { plugin: RealtimePlugin; entry: TrashEntry
       if (!confirm(`Permanently delete "${entry.path}"? This cannot be undone.`)) return;
       setBusy(true);
       try {
-        await plugin.vaultSync?.permanentlyDeleteTrashEntry(entry.id);
+        if (!plugin.vaultSync) {
+          new Notice(`${PLUGIN_NAME}: sync is not running.`);
+          return;
+        }
+        await plugin.vaultSync.permanentlyDeleteTrashEntry(entry.id);
         new Notice(`${PLUGIN_NAME}: permanently deleted "${entry.path}".`);
       } catch (e) {
-        new Notice(`${PLUGIN_NAME}: ${(e as Error).message}`);
+        new Notice(`${PLUGIN_NAME}: ${e instanceof Error ? e.message : String(e)}`);
       } finally {
         setBusy(false);
       }

@@ -249,7 +249,13 @@ export class ConfigSync {
     for (const part of parts) {
       current = current ? `${current}/${part}` : part;
       if (!(await this.plugin.app.vault.adapter.exists(current))) {
-        await this.plugin.app.vault.adapter.mkdir(current);
+        try {
+          await this.plugin.app.vault.adapter.mkdir(current);
+        } catch (e) {
+          // Folder may have been created concurrently; tolerate that case only.
+          const msg = e instanceof Error ? e.message : String(e);
+          if (!/already exist/i.test(msg)) throw e;
+        }
       }
     }
   }

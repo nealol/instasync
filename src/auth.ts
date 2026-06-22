@@ -1,6 +1,7 @@
 import { requestUrl } from "obsidian";
 import type RealtimePlugin from "./main";
 import type { ClientToken } from "./ysweet";
+import { checkServerCaps, CompatibilityError } from "./caps";
 
 /** Identity returned by `GET /api/me`. */
 export interface MeResponse {
@@ -19,6 +20,12 @@ export interface KnownSession extends MeResponse {
 /** Server identity returned by the public `GET /api/server-info`. */
 export interface ServerInfoResponse {
   serverId: string;
+  /** Server release semver (operator-facing; not used for gating). Optional for old servers. */
+  version?: string;
+  /** Named capability versions per surface. Optional for old servers (pre-caps rollout). */
+  caps?: Record<string, string>;
+  /** Cap names the client must understand. Optional; empty in v1. */
+  requiredCaps?: string[];
 }
 
 export interface VaultInfo {
@@ -233,9 +240,39 @@ export class AuthClient {
 
   // --- server identity -------------------------------------------------------
 
-  /** Fetch a server's stable id (public endpoint; no session required). */
-  serverInfo(baseUrl: string): Promise<ServerInfoResponse> {
+  /**
+   * Fetch a server's stable id, release version, and advertised caps (public
+   * endpoint; no session required). Raw fetch with no compatibility check —
+   * kept private so all callers go through {@link serverInfoChecked} and cannot
+   * bypass cap gating.
+   */
+  private async rawServerInfo(baseUrl: string): Promise<ServerInfoResponse> {
     return this.apiAt<ServerInfoResponse>(normalizeServerUrl(baseUrl), "/api/server-info");
+  }
+
+  /**
+   * Fetch `/api/server-info` and enforce capability compatibility. On a cap
+   * mismatch, sets `plugin.lastCompatibilityError` and throws
+   * {@link CompatibilityError}. On success or old-server leniency
+   * (`caps == null`), clears `plugin.lastCompatibilityError` and returns the
+   * full response so callers can read `serverId` as before.
+   *
+   * Network/offline errors propagate as normal exceptions (not
+   * `CompatibilityError`); callers tolerate them as today.
+   */
+  async serverInfoChecked(baseUrl: string): Promise<ServerInfoResponse> {
+    const info = await this.rawServerInfo(baseUrl);
+    const result = checkServerCaps(info.caps, info.requiredCaps);
+    if (result.ok) {
+      this.plugin.lastCompatibilityError = null;
+      return info;
+    }
+    this.plugin.lastCompatibilityError = {
+      reason: result.reason,
+      detail: result.detail,
+      serverVersion: info.version,
+    };
+    throw new CompatibilityError(result.reason, result.detail, info.version);
   }
 
   /**
@@ -245,8 +282,23 @@ export class AuthClient {
    * (e.g. offline), in which case the legacy key keeps working.
    */
   async ensureServerId(): Promise<string> {
-    if (this.plugin.settings.authServerId) return this.plugin.settings.authServerId;
-    const { serverId } = await this.serverInfo(this.baseUrl);
+    const existing = this.plugin.settings.authServerId;
+    if (existing) {
+      try {
+        const { serverId } = await this.serverInfoChecked(this.baseUrl);
+        if (serverId !== existing) {
+          this.plugin.settings.authServerId = serverId;
+          await this.plugin.saveSettings();
+        }
+        return serverId;
+      } catch (e) {
+        // Existing installs should still start while offline, but a cap failure
+        // means the server explicitly advertised an incompatible protocol.
+        if (e instanceof CompatibilityError) throw e;
+        return existing;
+      }
+    }
+    const { serverId } = await this.serverInfoChecked(this.baseUrl);
     this.plugin.settings.authServerId = serverId;
     await this.migrateLegacyToken();
     await this.plugin.saveSettings();
@@ -329,7 +381,7 @@ export class AuthClient {
 
   /** Fetch and store the server's stable id for the given (already-set) server. */
   private async resolveServerId(baseUrl: string): Promise<void> {
-    const { serverId } = await this.serverInfo(baseUrl);
+    const { serverId } = await this.serverInfoChecked(baseUrl);
     this.plugin.settings.authServerId = serverId;
   }
 
@@ -410,7 +462,7 @@ export class AuthClient {
 
   async validSessionsForServer(baseUrl: string): Promise<KnownSession[]> {
     const normalized = normalizeServerUrl(baseUrl);
-    const { serverId } = await this.serverInfo(normalized);
+    const { serverId } = await this.serverInfoChecked(normalized);
     let sessions = this.knownSessions().filter((session) => {
       return (
         session.serverUrl === normalized &&
@@ -460,6 +512,10 @@ export class AuthClient {
   async useKnownSession(session: KnownSession): Promise<MeResponse> {
     const token = this.plugin.app.secretStorage.getSecret(session.tokenKey);
     if (!token) throw new AuthError("Saved session not found. Please sign in again.");
+    // Verify compatibility before trusting the saved session's server. A
+    // server upgrade that broke a cap should not let an old session silently
+    // proceed against an incompatible server.
+    await this.serverInfoChecked(session.serverUrl);
     this.plugin.settings.authServerUrl = session.serverUrl;
     this.plugin.settings.authServerId = session.serverId;
     const me = await this.apiAt<MeResponse>(session.serverUrl, "/api/me", token);
@@ -467,8 +523,11 @@ export class AuthClient {
     return me;
   }
 
-  authenticateAt(baseUrl: string): Promise<{ token: string; me: MeResponse }> {
+  async authenticateAt(baseUrl: string): Promise<{ token: string; me: MeResponse }> {
     const normalized = normalizeServerUrl(baseUrl);
+    // Verify compatibility before opening the SSO browser flow — a cap
+    // mismatch should hard-block before the user is sent to the browser.
+    await this.serverInfoChecked(normalized);
     // Record which server this SSO attempt targets. Pointing it at a different
     // server cancels any earlier in-flight login (see beginSetupFor). Must run
     // before we install the new resolver below so we don't cancel ourselves.

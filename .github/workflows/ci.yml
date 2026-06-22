@@ -29,10 +29,6 @@ jobs:
       - run: bun run build
       - run: bun run test:unit
 
-  # SDK unit tests are hermetic (mocked fetch + local WebSocket; no spawned
-  # servers), so they can run in CI even while the plugin job is disabled.
-  # The SDK e2e suite (`bun run test:sdk:e2e`) spawns the Rust server +
-  # y-sweet like the plugin suite and stays local-only for the same reason.
   sdk:
     runs-on: ubuntu-latest
     steps:
@@ -45,6 +41,7 @@ jobs:
       - run: bun run typecheck
       - run: cd packages/sdk && bun run typecheck && bun run build
       - run: bun run test:sdk
+      - run: bunx vitest run --project cli-unit --project web-unit
 
   server:
     runs-on: ubuntu-latest

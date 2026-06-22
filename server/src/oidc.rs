@@ -119,6 +119,7 @@ pub async fn callback(
     State(state): State<AppState>,
     Query(params): Query<CallbackParams>,
 ) -> AppResult<Response> {
+    prune_oidc_flows(&state).await;
     let csrf_state = params
         .state
         .clone()

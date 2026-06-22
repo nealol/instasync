@@ -1,6 +1,7 @@
 pub mod attachments;
 pub mod audit;
 pub mod blobs;
+pub mod caps;
 pub mod config;
 pub mod db;
 pub mod dmux;

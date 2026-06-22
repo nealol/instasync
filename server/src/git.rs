@@ -50,7 +50,9 @@ use crate::ydoc::{
 type Contributor = Principal;
 
 /// First line of the text shim committed in place of an oversized attachment.
-pub(crate) const ATTACHMENT_SHIM_VERSION: &str = "https://realtime.md/attachment-shim/v1";
+/// Source of truth lives in `caps::ATTACHMENT_SHIM`; re-exported here so the
+/// shim writer and the advertised cap value cannot drift.
+pub(crate) use crate::caps::ATTACHMENT_SHIM as ATTACHMENT_SHIM_VERSION;
 
 /// One entry of the working tree to materialize.
 enum TreeContent {

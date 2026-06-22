@@ -30,16 +30,23 @@ export async function ensureParentFolder(app: App, path: string): Promise<void> 
 /** True if the file at `path` is open in any workspace leaf (or is active). */
 export function isOpenInWorkspace(app: App, path: string): boolean {
   const workspace = app.workspace as any;
-  if (workspace?.getActiveFile?.()?.path === path) return true;
+  if (typeof workspace?.getActiveFile === "function" && workspace.getActiveFile()?.path === path) {
+    return true;
+  }
 
   let found = false;
-  workspace?.iterateAllLeaves?.((leaf: any) => {
-    if (leaf?.view?.file?.path === path) found = true;
-  });
+  if (typeof workspace?.iterateAllLeaves === "function") {
+    workspace.iterateAllLeaves((leaf: any) => {
+      if (leaf?.view?.file?.path === path) found = true;
+    });
+  }
   if (found) return true;
 
-  const leaves = workspace?.getLeavesOfType?.("markdown") ?? [];
-  return leaves.some((leaf: any) => leaf?.view?.file?.path === path);
+  if (typeof workspace?.getLeavesOfType === "function") {
+    const leaves = workspace.getLeavesOfType("markdown") ?? [];
+    return leaves.some((leaf: any) => leaf?.view?.file?.path === path);
+  }
+  return false;
 }
 
 /** Resolve a vault-relative path to a {@link TFile}, or null if absent / a folder. */

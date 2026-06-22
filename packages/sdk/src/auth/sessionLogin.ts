@@ -37,10 +37,12 @@ export async function loginViaBrowser(opts: BrowserLoginOptions): Promise<string
     const token = params.get("token");
     if (!token) {
       throw new Error(
-        "login redirect returned no token. If the server rejected the redirect " +
-          "('login redirect is not allowed'), add the loopback origin " +
-          `(${loopback.origin}) to the server's ALLOWED_LOGIN_REDIRECTS, ` +
-          "or use a pasted token with `new RealtimeClient({ baseUrl, token })`.",
+        "login redirect returned no token. The server may have rejected the " +
+          "loopback redirect. Two options:\n" +
+          `1. Add the loopback origin (${loopback.origin}) to the server's ` +
+          "ALLOWED_LOGIN_REDIRECTS environment variable and retry.\n" +
+          `2. Visit ${baseUrl}/auth/login in a browser, copy the token shown, ` +
+          "and use it directly: `new RealtimeClient({ baseUrl, token })`.",
       );
     }
     return token;

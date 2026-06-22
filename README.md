@@ -99,8 +99,8 @@ and `/api/doc-token`.
 
 1. Install via [BRAT](https://github.com/TfTHacker/obsidian42-brat): add `nealol/realtime` as a beta plugin, or build manually:
    ```bash
-   npm install
-   npm run build
+   bun install
+   bun run build
    ```
    Then copy `main.js`, `manifest.json`, and `styles.css` into
    `<your-vault>/.obsidian/plugins/realtime/`.
@@ -119,6 +119,15 @@ cr-sqlite database that replicates to every device in the vault — offline-firs
 last-writer-wins per column, with snapshots, a server-side replica, deterministic
 git dumps, and trash-bin deletion. See the full guide:
 **[docs/plugin-sql/](docs/plugin-sql/README.md)**.
+
+## Compatibility & versioning
+
+The plugin and server release on independent cadences. Compatibility is gated
+by **named capability versions** advertised on `GET /api/server-info`, not by
+either side's semver. The plugin hard-blocks on a cap mismatch and never
+nudges about newer server versions unless compatibility is actually broken.
+See **[docs/versioning.md](docs/versioning.md)** for the cap names, bump
+rules, gating behavior, and rollout notes.
 
 ```ts
 const realtime = (this.app as any).plugins.plugins["realtime"];
@@ -140,8 +149,11 @@ await db.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, [crypto.randomUUID(
 ## Development
 
 ```bash
-npm run dev        # esbuild watch -> main.js
-npm run typecheck  # tsc -noEmit
+bun install        # install dependencies
+bun run dev        # esbuild watch -> main.js
+bun run typecheck  # tsc -noEmit
+bun run test       # vitest (plugin + sdk unit tests)
+bun run test:all   # typecheck + all unit tests + Rust server tests
 ```
 
 ## Caveats (prototype)

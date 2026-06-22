@@ -671,7 +671,7 @@ impl PluginDbService {
             .last()
             .map(|b| b.format.clone())
             .filter(|f| !f.is_empty())
-            .unwrap_or_else(|| "crsqlite-1".to_string());
+            .unwrap_or_else(|| crate::caps::PLUGIN_DB_SYNC.to_string());
         let from = rows.iter().map(|r| r.db_version).min().unwrap_or(post) - 1;
         let batch = serde_json::json!({
             "id": uuid::Uuid::new_v4().to_string(),
@@ -1800,7 +1800,7 @@ mod tests {
             to_db_version: 3,
             schema_version: 1,
             changes: vec![sample_change("AAA", 1), sample_change("AAA", 3)],
-            format: "crsqlite-1".into(),
+            format: crate::caps::PLUGIN_DB_SYNC.into(),
         };
         let view = DocView {
             batches: vec![batch],

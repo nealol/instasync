@@ -1061,6 +1061,30 @@ async fn server_info_returns_stable_id_without_auth() {
     // Stable across calls on the same server.
     let (_, again) = send(&app, "GET", "/api/server-info", None, None).await;
     assert_eq!(again["serverId"].as_str(), Some(id));
+
+    // Release version is advertised (operator-facing; not used for gating).
+    let version = info["version"].as_str().expect("version string");
+    assert!(!version.is_empty());
+
+    // Named capability versions are advertised for client-side gating.
+    let caps = info["caps"].as_object().expect("caps object");
+    assert_eq!(caps["restApi"].as_str(), Some("1"));
+    assert_eq!(caps["oauth"].as_str(), Some("1"));
+    assert_eq!(caps["pluginDbSync"].as_str(), Some("crsqlite-1"));
+    assert_eq!(
+        caps["attachmentShim"].as_str(),
+        Some("https://realtime.md/attachment-shim/v1")
+    );
+
+    // v1 advertises no required caps (all four are mandatory and known by the
+    // v1 client; the field exists for future optional caps).
+    assert!(
+        info["requiredCaps"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(false),
+        "requiredCaps should be an empty array in v1"
+    );
 }
 
 #[tokio::test]

@@ -57,12 +57,18 @@ export function useSharedNote(shareId: string): SharedNoteState {
 
       source = new EventSource(`/api/view/${encodeURIComponent(shareId)}/events`);
       source.addEventListener("update", (event) => {
-        const data = JSON.parse((event as MessageEvent).data) as { update: string };
-        Y.applyUpdate(doc, b64ToBytes(data.update));
+        if (cancelled) return;
+        try {
+          const data = JSON.parse((event as MessageEvent).data) as { update: string };
+          Y.applyUpdate(doc, b64ToBytes(data.update));
+        } catch (e) {
+          console.error("Failed to apply shared-note update event", e);
+        }
       });
       source.addEventListener("revoked", () => {
+        if (cancelled) return;
         source?.close();
-        if (!cancelled) setState({ status: "revoked", title });
+        setState({ status: "revoked", title });
       });
     })().catch(() => {
       if (!cancelled) setState({ status: "not-found" });

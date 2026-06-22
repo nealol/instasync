@@ -52,7 +52,7 @@ async function waitForTokenAttemptSlot(): Promise<() => void> {
 export async function getClientToken(plugin: RealtimePlugin, docId: string): Promise<ClientToken> {
   const vaultId = plugin.settings.activeVaultId;
   if (!vaultId) {
-    return new Promise(() => {});
+    throw new Error("Realtime: no active vault; sign in and set up a vault before syncing.");
   }
 
   const release = await waitForTokenAttemptSlot();

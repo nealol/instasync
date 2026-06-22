@@ -4,8 +4,11 @@ use axum::Json;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
+use utoipa::ToSchema;
 
 use crate::audit;
+use crate::caps;
 use crate::entities::{
     git_backups, invites, memberships, permissions, remote_cursor_tokens, remote_cursors, users,
     vault_files, vaults,
@@ -41,10 +44,20 @@ pub struct UpdateMeBody {
     pub git_email: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerInfoResponse {
     pub server_id: String,
+    /// Server release semver (from `Cargo.toml`). Human/operator-facing only;
+    /// not used for compatibility gating — clients gate on `caps`.
+    pub version: String,
+    /// Named capability versions for each compatibility surface. Clients
+    /// intersect these against their own accepted values; see `caps` module.
+    pub caps: BTreeMap<String, String>,
+    /// Cap names the client must understand to use this server. Empty in v1;
+    /// exists so future optional caps can be added without hard-blocking old
+    /// clients that don't know the name.
+    pub required_caps: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -96,10 +109,22 @@ pub(crate) async fn require_admin(
 // ---------- auth / session ----------
 
 /// Public: advertise this server's stable id so clients can scope cached
-/// session tokens per server. No authentication required.
+/// session tokens per server, plus release version and named capability
+/// versions for client-side compatibility gating. No authentication required.
 pub async fn server_info(State(state): State<AppState>) -> Json<ServerInfoResponse> {
+    let caps = caps::caps()
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect::<BTreeMap<_, _>>();
     Json(ServerInfoResponse {
         server_id: state.server_id.clone(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        caps,
+        // v1: all four caps are mandatory and known by the v1 client, so none
+        // need to be flagged here. Future optional caps can be added to `caps`
+        // without listing them here, then moved here once all deployed clients
+        // understand the name.
+        required_caps: Vec::new(),
     })
 }
 
@@ -1220,9 +1245,14 @@ pub(crate) async fn authorize_doc(
     let path = if doc_id == vault_id {
         String::new()
     } else {
-        let guid = doc_id
-            .strip_prefix(&format!("{vault_id}__"))
-            .unwrap_or_default();
+        let prefix = format!("{vault_id}__");
+        let guid = doc_id.strip_prefix(&prefix).unwrap_or_else(|| {
+            // Defensive: callers should validate the doc_id namespace before
+            // reaching here. A malformed id is treated as vault-level access
+            // rather than panicking, but logged for investigation.
+            tracing::warn!("authorize_doc: doc_id {doc_id} missing vault prefix {prefix}");
+            ""
+        });
         vault_files::Entity::find()
             .filter(vault_files::Column::VaultId.eq(vault_id))
             .filter(vault_files::Column::Guid.eq(guid))
@@ -1247,6 +1277,9 @@ pub(crate) async fn authorize_path(
         .await?;
 
     // Most specific match wins: longer prefix first, user-specific over everyone.
+    // NOTE: path matching is case-sensitive, consistent with how Obsidian and the
+    // sync layer store paths. Clients on case-insensitive filesystems (macOS,
+    // Windows) normalize to the stored casing before sending, so this is safe.
     let mut best: Option<(i64, String)> = None;
     for r in rows {
         let principal_ok = match &r.principal_user_id {
