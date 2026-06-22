@@ -21,8 +21,9 @@ This repository is Bun-first for JavaScript/TypeScript tasks.
 - Run the default JS test suite with `bun run test`.
 - Run all configured unit suites with `bun run test:unit`.
 - Run SDK tests with `bun run test:sdk`; run SDK e2e tests with `bun run test:sdk:e2e`.
+- Run plugin e2e tests with `bun run test:e2e` (requires built artifacts from `bun run build`).
 - Run Rust server tests with `bun run test:server` or `cargo test --manifest-path server/Cargo.toml`.
-- Run the full local validation path with `bun run test:all`.
+- Run the full local validation path with `bun run test:all` (includes typecheck, all unit suites, SDK e2e, and Rust server tests).
 
 Prefer targeted test commands while iterating, then run the broadest relevant suite before handing work back.
 

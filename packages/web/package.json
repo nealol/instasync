@@ -7,7 +7,8 @@
 	"scripts": {
 		"dev": "vite",
 		"build": "tsc -noEmit && vite build",
-		"preview": "vite preview"
+		"preview": "vite preview",
+		"test": "vitest run --project web-unit --config ../../vitest.config.ts"
 	},
 	"dependencies": {
 		"katex": "^0.16.21",

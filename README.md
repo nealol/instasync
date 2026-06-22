@@ -99,8 +99,8 @@ and `/api/doc-token`.
 
 1. Install via [BRAT](https://github.com/TfTHacker/obsidian42-brat): add `nealol/realtime` as a beta plugin, or build manually:
    ```bash
-   npm install
-   npm run build
+   bun install
+   bun run build
    ```
    Then copy `main.js`, `manifest.json`, and `styles.css` into
    `<your-vault>/.obsidian/plugins/realtime/`.
@@ -140,8 +140,11 @@ await db.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, [crypto.randomUUID(
 ## Development
 
 ```bash
-npm run dev        # esbuild watch -> main.js
-npm run typecheck  # tsc -noEmit
+bun install        # install dependencies
+bun run dev        # esbuild watch -> main.js
+bun run typecheck  # tsc -noEmit
+bun run test       # vitest (plugin + sdk unit tests)
+bun run test:all   # typecheck + all unit tests + Rust server tests
 ```
 
 ## Caveats (prototype)

@@ -45,6 +45,9 @@ jobs:
       - run: bun run typecheck
       - run: cd packages/sdk && bun run typecheck && bun run build
       - run: bun run test:sdk
+      # CLI and web unit tests are hermetic (no spawned servers), so they can
+      # run alongside the SDK unit tests in CI.
+      - run: bunx vitest run --project cli-unit --project web-unit
 
   server:
     runs-on: ubuntu-latest
