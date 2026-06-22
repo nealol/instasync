@@ -223,6 +223,14 @@ pub(crate) async fn create_note_inner(
     require_member(state, &principal.user.id, vault_id).await?;
     validate_note_path(&body.path)?;
 
+    // The `vault_files` table is a mirror of the authoritative y-sweet index
+    // doc and drifts when clients delete files through the index CRDT without
+    // calling the server delete API (the common path — see
+    // `reconcile_vault_files`). Reconcile before the existence guard so a
+    // client-deleted path isn't rejected as "already exists" by a stale orphan
+    // row; `list_notes` does the same. `file_by_path` alone would see the
+    // orphan and diverge from `list_notes`, which filters it out.
+    reconcile_vault_files(state, vault_id).await?;
     if file_by_path(state, vault_id, &body.path).await?.is_some() {
         return Err(AppError::Conflict("note already exists".into()));
     }

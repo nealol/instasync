@@ -3058,6 +3058,88 @@ async fn note_move_rewrites_pathed_links_preserving_paths() {
 }
 
 #[tokio::test]
+async fn create_note_after_client_side_delete_succeeds() {
+    // Reproduces the create/list divergence: a client deletes a file by removing
+    // it from the index doc CRDT (the common path — clients never call the
+    // server delete API), leaving an orphan `vault_files` row. `list_notes`
+    // reconciles and drops the ghost; `create_note` must do the same instead of
+    // rejecting the path as "already exists" on the stale row.
+    use yrs::updates::decoder::Decode;
+    use yrs::{Map, ReadTxn, Transact};
+
+    let (ys, docs) = fake_ysweet_store_with_docs().await;
+    let app = test_app(&ys, &ys).await;
+    let token = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&token),
+        Some(json!({"name": "V"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+    let notes_url = format!("/api/vaults/{vault_id}/notes");
+
+    // Create the note, then simulate a client-side delete: remove the path from
+    // the index doc CRDT directly, leaving the `vault_files` row orphaned.
+    let (status, created) = send(
+        &app,
+        "POST",
+        &notes_url,
+        Some(&token),
+        Some(json!({"path": "ghost.md", "content": "boo"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let first_guid = created["guid"].as_str().unwrap().to_string();
+
+    {
+        let raw = docs.lock().await.get(&vault_id).cloned().unwrap();
+        let doc = yrs::Doc::new();
+        let files = doc.get_or_insert_map("files");
+        let mut txn = doc.transact_mut();
+        txn.apply_update(yrs::Update::decode_v1(&raw).unwrap());
+        files.remove(&mut txn, "ghost.md");
+        drop(txn);
+        let new_update = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        docs.lock().await.insert(vault_id.clone(), new_update.to_vec());
+    }
+
+    // create_note must agree with list_notes and accept the freed path. Test it
+    // BEFORE any list call — list_notes reconciles and would prune the orphan
+    // row as a side effect, masking the create-guard divergence.
+    let (status, recreated) = send(
+        &app,
+        "POST",
+        &notes_url,
+        Some(&token),
+        Some(json!({"path": "ghost.md", "content": "boo 2"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "recreate should succeed, got {recreated}");
+    assert_ne!(
+        recreated["guid"].as_str().unwrap(),
+        first_guid,
+        "recreate must mint a new guid, not resurrect the deleted one"
+    );
+
+    // list_notes reconciles against the index doc and must not show the ghost
+    // (the recreated note is a different guid, so the old one stays gone).
+    let (status, list) = send(&app, "GET", &notes_url, Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let paths: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths.iter().filter(|p| **p == "ghost.md").count(), 1);
+}
+
+#[tokio::test]
 async fn attachment_move_update_embeds_rewrites_opt_in_only() {
     let ys = fake_ysweet_store().await;
     let app = test_app(&ys, &ys).await;
