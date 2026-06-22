@@ -151,7 +151,7 @@ export class VaultSync {
       () => getClientToken(plugin, vaultId),
       vaultId,
       this.indexDoc,
-      { connect: false, showDebuggerLink: false, ...muxProviderOptions(plugin) },
+      { connect: false, showDebuggerLink: false, ...muxProviderOptions() },
     );
     this.indexPersistence = new IndexeddbPersistence(vaultId, this.indexDoc);
 

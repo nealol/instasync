@@ -1,14 +1,12 @@
 import type { YSweetProviderParams } from "@y-sweet/client";
-import type RealtimePlugin from "../main";
 import { MuxWebSocket } from "./mux";
 
 /**
- * Extra `YSweetProvider` options that route the provider's socket through the
- * shared single-socket multiplexer when {@link RealtimeSettings.singleSocketSync}
- * is enabled. Returns `{}` otherwise so the provider opens its own WebSocket.
+ * `YSweetProvider` options that route every provider's socket through the shared
+ * single-socket multiplexer (`/dmux`) instead of opening one WebSocket per
+ * document. See `src/sync/mux.ts`.
  */
-export function muxProviderOptions(plugin: RealtimePlugin): Partial<YSweetProviderParams> {
-  if (!plugin.settings.singleSocketSync) return {};
+export function muxProviderOptions(): Partial<YSweetProviderParams> {
   return {
     WebSocketPolyfill: MuxWebSocket as unknown as YSweetProviderParams["WebSocketPolyfill"],
   };

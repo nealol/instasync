@@ -115,7 +115,7 @@ function makeDocHandle(plugin: RealtimePlugin, docId: string): PluginDbDocHandle
   const provider = new YSweetProvider(() => getClientToken(plugin, docId), docId, doc, {
     connect: false,
     showDebuggerLink: false,
-    ...muxProviderOptions(plugin),
+    ...muxProviderOptions(),
   });
   const persistence = new IndexeddbPersistence(docId, doc);
 

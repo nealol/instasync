@@ -73,11 +73,6 @@ export interface RealtimeSettings {
   configIncludeGlobs: string[];
   /** Hidden advanced setting for verbose diagnostic logging. */
   diagnosticLogging: boolean;
-  /**
-   * Experimental: route every Yjs document over a single multiplexed WebSocket
-   * (`/dmux`) instead of one socket per document. See `src/sync/mux.ts`.
-   */
-  singleSocketSync: boolean;
   /** Recently opened syncable note/structured paths, newest first. */
   recentPaths: string[];
 }
@@ -104,7 +99,6 @@ export function defaultSettings(): RealtimeSettings {
     syncConfigEnabled: false,
     configIncludeGlobs: [],
     diagnosticLogging: false,
-    singleSocketSync: false,
     recentPaths: [],
   };
 }
@@ -1916,23 +1910,6 @@ function AdvancedSettings({
     <details className="realtime-advanced">
       <summary>Advanced settings</summary>
       <ConfigSyncSection plugin={plugin} />
-      <SettingRow
-        name="Single-socket sync (experimental)"
-        desc="Route every document over one multiplexed WebSocket instead of one per file. Requires a server that serves the /dmux endpoint. Reconnects sync after toggling."
-        control={
-          <Toggle
-            value={plugin.settings.singleSocketSync}
-            onChange={(value) =>
-              void runNotice(undefined, async () => {
-                plugin.settings.singleSocketSync = value;
-                await plugin.saveSettings();
-                await plugin.reloadSync();
-                refresh();
-              })
-            }
-          />
-        }
-      />
       <SettingRow
         name="Diagnostic logging"
         desc="Write verbose Realtime diagnostics to the developer console. Keep this off unless troubleshooting."

@@ -49,7 +49,7 @@ export abstract class SyncedDoc {
       () => getClientToken(plugin, serverDocId),
       serverDocId,
       this.ydoc,
-      { connect: false, showDebuggerLink: false, ...muxProviderOptions(plugin) },
+      { connect: false, showDebuggerLink: false, ...muxProviderOptions() },
     );
     this.awareness = this.provider.awareness;
     this.persistence = new IndexeddbPersistence(serverDocId, this.ydoc);

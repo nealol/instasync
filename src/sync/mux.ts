@@ -25,11 +25,20 @@ import * as decoding from "lib0/decoding";
  *   OPEN_ERR = [3][channelId]                            server -> client
  *   DATA     = [4][channelId][raw yjs bytes …]           both directions
  *   CLOSE    = [5][channelId]                            both directions
+ *   PING     = [6][0]                                    client -> server
+ *   PONG     = [7][0]                                    server -> client
  *
  * `pathAndQuery` is the per-doc URL the provider would otherwise have connected
  * to (`/d/{docId}/ws/{docId}?token=…`); the server forwards it verbatim to the
  * internal y-sweet, so it keeps minting/validating per-doc tokens exactly as
  * before.
+ *
+ * PING/PONG are a mux-level heartbeat on the shared socket (channel 0). The
+ * provider has its own per-channel heartbeat, but it can only close the
+ * *virtual* socket; a silently-dead real socket (mobile sleep, NAT timeout)
+ * keeps `readyState === OPEN`, so every reconnect would re-attach to a dead
+ * socket. This heartbeat detects that and tears the real socket down so every
+ * channel's provider reconnects and rebuilds it.
  */
 
 const FRAME_OPEN = 1;
@@ -37,6 +46,19 @@ const FRAME_OPEN_OK = 2;
 const FRAME_OPEN_ERR = 3;
 const FRAME_DATA = 4;
 const FRAME_CLOSE = 5;
+const FRAME_PING = 6;
+const FRAME_PONG = 7;
+
+/** Channel id reserved for control frames that are not tied to a channel. */
+const CONTROL_CHANNEL = 0;
+
+/** Send a PING this often while the real socket is open. */
+const HEARTBEAT_INTERVAL_MS = 5_000;
+/** Tear the socket down if no PONG (or any frame) arrives within this window. */
+const HEARTBEAT_TIMEOUT_MS = 12_000;
+
+/** Close code reported to providers when the shared socket drops. */
+const CLOSE_CODE_TRANSPORT = 1006;
 
 const WS_CONNECTING = 0;
 const WS_OPEN = 1;
@@ -66,12 +88,28 @@ export function encodeClose(channelId: number): Uint8Array {
   return encoding.toUint8Array(enc);
 }
 
+export function encodePing(): Uint8Array {
+  const enc = encoding.createEncoder();
+  encoding.writeVarUint(enc, FRAME_PING);
+  encoding.writeVarUint(enc, CONTROL_CHANNEL);
+  return encoding.toUint8Array(enc);
+}
+
+export function encodePong(): Uint8Array {
+  const enc = encoding.createEncoder();
+  encoding.writeVarUint(enc, FRAME_PONG);
+  encoding.writeVarUint(enc, CONTROL_CHANNEL);
+  return encoding.toUint8Array(enc);
+}
+
 export type DecodedFrame =
   | { type: "open"; channelId: number; pathAndQuery: string }
   | { type: "open_ok"; channelId: number }
   | { type: "open_err"; channelId: number }
   | { type: "data"; channelId: number; payload: Uint8Array }
   | { type: "close"; channelId: number }
+  | { type: "ping" }
+  | { type: "pong" }
   | null;
 
 export function decodeFrame(buf: Uint8Array): DecodedFrame {
@@ -90,6 +128,10 @@ export function decodeFrame(buf: Uint8Array): DecodedFrame {
         return { type: "data", channelId, payload: decoding.readTailAsUint8Array(dec) };
       case FRAME_CLOSE:
         return { type: "close", channelId };
+      case FRAME_PING:
+        return { type: "ping" };
+      case FRAME_PONG:
+        return { type: "pong" };
       default:
         return null;
     }
@@ -122,6 +164,9 @@ class MuxConnection {
   /** OPEN frames awaiting a live socket: channelId -> pathAndQuery. */
   private readonly pendingOpens = new Map<number, string>();
   private nextChannelId = 1;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  /** Timestamp of the last frame received on the real socket. */
+  private lastActivity = 0;
 
   constructor(private readonly url: string) {}
 
@@ -158,6 +203,10 @@ class MuxConnection {
     if (this.ws && this.ws.readyState === WS_OPEN) {
       this.ws.send(encodeClose(channelId));
     }
+    // Nothing left to carry: drop the idle real socket instead of leaking it.
+    if (this.channels.size === 0 && this.pendingOpens.size === 0) {
+      this.teardown();
+    }
   }
 
   private ensureSocket(): void {
@@ -167,7 +216,11 @@ class MuxConnection {
     const ws = new webSocketCtor(this.url);
     ws.binaryType = "arraybuffer";
     this.ws = ws;
-    ws.onopen = () => this.flushOpens();
+    ws.onopen = () => {
+      this.lastActivity = Date.now();
+      this.startHeartbeat();
+      this.flushOpens();
+    };
     ws.onmessage = (event: MessageEvent) => this.receive(new Uint8Array(event.data as ArrayBuffer));
     ws.onclose = () => this.handleDown();
     ws.onerror = () => this.handleDown();
@@ -182,50 +235,105 @@ class MuxConnection {
   }
 
   private receive(buf: Uint8Array): void {
+    this.lastActivity = Date.now();
     const frame = decodeFrame(buf);
     if (!frame) return;
-    const channel = this.channels.get(frame.channelId);
     switch (frame.type) {
+      case "pong":
+      case "ping":
+        // Liveness only; `lastActivity` is already refreshed above.
+        break;
       case "data":
-        channel?.deliverData(frame.payload);
+        this.channels.get(frame.channelId)?.deliverData(frame.payload);
         break;
       case "open_ok":
-        channel?.deliverOpen();
+        this.channels.get(frame.channelId)?.deliverOpen();
         break;
-      case "open_err":
+      case "open_err": {
+        const channel = this.channels.get(frame.channelId);
         this.channels.delete(frame.channelId);
         channel?.deliverError();
-        channel?.deliverClose();
+        channel?.deliverClose(CLOSE_CODE_TRANSPORT);
         break;
-      case "close":
+      }
+      case "close": {
+        const channel = this.channels.get(frame.channelId);
         this.channels.delete(frame.channelId);
-        channel?.deliverClose();
+        channel?.deliverClose(CLOSE_CODE_TRANSPORT);
         break;
+      }
       default:
         break;
+    }
+  }
+
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => this.heartbeatTick(), HEARTBEAT_INTERVAL_MS);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer !== null) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  /** Periodically ping the real socket; if it goes silent past the timeout,
+   * treat it as dead even when no `close` event ever fired (mobile/NAT). */
+  private heartbeatTick(): void {
+    if (!this.ws || this.ws.readyState !== WS_OPEN) return;
+    if (Date.now() - this.lastActivity > HEARTBEAT_TIMEOUT_MS) {
+      this.handleDown();
+      return;
+    }
+    try {
+      this.ws.send(encodePing());
+    } catch {
+      this.handleDown();
     }
   }
 
   /** Real socket dropped: fail every channel so each provider reconnects (which
    * recreates a channel and reopens the shared socket). */
   private handleDown(): void {
+    this.stopHeartbeat();
     const channels = [...this.channels.values()];
     this.channels.clear();
     this.pendingOpens.clear();
+    const ws = this.ws;
     this.ws = null;
+    if (ws) {
+      ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+      try {
+        ws.close();
+      } catch {
+        /* ignore */
+      }
+    }
     for (const channel of channels) {
       channel.deliverError();
-      channel.deliverClose();
+      channel.deliverClose(CLOSE_CODE_TRANSPORT);
+    }
+  }
+
+  /** Close the idle real socket without failing channels (there are none). */
+  private teardown(): void {
+    this.stopHeartbeat();
+    const ws = this.ws;
+    this.ws = null;
+    if (ws) {
+      ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+      try {
+        ws.close();
+      } catch {
+        /* ignore */
+      }
     }
   }
 
   destroyForTests(): void {
-    try {
-      this.ws?.close();
-    } catch {
-      /* ignore */
-    }
-    this.ws = null;
+    this.teardown();
     this.channels.clear();
     this.pendingOpens.clear();
   }
@@ -299,9 +407,10 @@ export class MuxWebSocket {
     this.onerror?.({});
   }
 
-  deliverClose(): void {
+  deliverClose(code: number = CLOSE_CODE_TRANSPORT): void {
     if (this.readyState === WS_CLOSED) return;
     this.readyState = WS_CLOSED;
-    this.onclose?.({});
+    // The provider ignores the code today, but carry it for parity/diagnostics.
+    this.onclose?.({ code, reason: "", wasClean: false });
   }
 }

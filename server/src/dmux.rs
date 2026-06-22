@@ -20,6 +20,7 @@
 //!   CLOSE    = [5][channel]                            both directions
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::{
@@ -33,6 +34,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as WsMsg};
 
@@ -46,20 +48,40 @@ const FRAME_OPEN_OK: u64 = 2;
 const FRAME_OPEN_ERR: u64 = 3;
 const FRAME_DATA: u64 = 4;
 const FRAME_CLOSE: u64 = 5;
+const FRAME_PING: u64 = 6;
+const FRAME_PONG: u64 = 7;
+
+/// Channel id reserved for connection-level control frames (PING/PONG).
+const CONTROL_CHANNEL: u64 = 0;
 
 /// Outbound queue depth per direction; bounds memory if one side stalls.
 const CHANNEL_CAPACITY: usize = 256;
 
+/// Process-wide count of live upstream y-sweet sockets across every `/dmux`
+/// connection — the fan-out metric the eval called for. Logged on each change.
+static UPSTREAM_SOCKETS: AtomicU64 = AtomicU64::new(0);
+
+/// RAII gauge: one live upstream y-sweet socket for as long as it is held.
+struct UpstreamGuard;
+
+impl UpstreamGuard {
+    fn new() -> Self {
+        let n = UPSTREAM_SOCKETS.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::debug!(upstream_sockets = n, "dmux: upstream socket opened");
+        Self
+    }
+}
+
+impl Drop for UpstreamGuard {
+    fn drop(&mut self) {
+        let n = UPSTREAM_SOCKETS.fetch_sub(1, Ordering::Relaxed) - 1;
+        tracing::debug!(upstream_sockets = n, "dmux: upstream socket closed");
+    }
+}
+
 /// Accept the multiplexed sync socket.
 pub async fn dmux(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| handle(socket, state))
-}
-
-/// One open channel: a sender into its upstream pump plus the resolved
-/// attribution (used to mark content writes for git/search/plugin-db).
-struct ChannelHandle {
-    up_tx: mpsc::Sender<Vec<u8>>,
-    attribution: Option<Arc<Attribution>>,
 }
 
 async fn handle(client: WebSocket, state: AppState) {
@@ -76,7 +98,8 @@ async fn handle(client: WebSocket, state: AppState) {
         }
     });
 
-    let mut channels: HashMap<u64, ChannelHandle> = HashMap::new();
+    // channel id -> sender into that channel's upstream pump.
+    let mut channels: HashMap<u64, mpsc::Sender<Vec<u8>>> = HashMap::new();
 
     while let Some(msg) = cl_stream.next().await {
         let Ok(msg) = msg else { break };
@@ -89,23 +112,43 @@ async fn handle(client: WebSocket, state: AppState) {
                 channel,
                 path_and_query,
             }) => {
-                start_channel(&state, channel, path_and_query, &out_tx, &mut channels).await;
+                // Register the channel synchronously, then dial upstream in a
+                // spawned task. Dialing here would block the whole multiplexed
+                // socket (head-of-line) — a slow/hung upstream would freeze every
+                // other channel — so the read loop must never await the dial.
+                let (up_tx, up_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
+                channels.insert(channel, up_tx);
+                let state = state.clone();
+                let out = out_tx.clone();
+                tokio::spawn(async move {
+                    open_and_pump(state, channel, path_and_query, up_rx, out).await;
+                });
             }
             Some(Frame::Data { channel, payload }) => {
-                if let Some(handle) = channels.get(&channel) {
-                    if let Some(attr) = &handle.attribution {
-                        if is_content_write(payload) {
-                            attr.mark_content_write().await;
+                if let Some(up_tx) = channels.get(&channel) {
+                    match up_tx.try_send(payload.to_vec()) {
+                        Ok(()) => {}
+                        // Upstream is backed up. Silently dropping a Yjs update
+                        // would diverge the doc (the provider thinks it sent it
+                        // and won't resend until reconnect), so instead reset the
+                        // channel: the provider reconnects and does a full resync.
+                        Err(TrySendError::Full(_)) => {
+                            channels.remove(&channel);
+                            let _ = out_tx.try_send(encode_simple(FRAME_CLOSE, channel));
+                            tracing::warn!(channel, "dmux: upstream backpressure; reset channel");
+                        }
+                        Err(TrySendError::Closed(_)) => {
+                            channels.remove(&channel);
                         }
                     }
-                    // Drop on a full/closed channel rather than blocking the
-                    // whole socket; the provider re-syncs on reconnect.
-                    let _ = handle.up_tx.try_send(payload.to_vec());
                 }
             }
             Some(Frame::Close { channel }) => {
-                // Dropping the handle ends that channel's upstream pump.
+                // Dropping the sender ends that channel's upstream pump.
                 channels.remove(&channel);
+            }
+            Some(Frame::Ping) => {
+                let _ = out_tx.try_send(encode_simple(FRAME_PONG, CONTROL_CHANNEL));
             }
             None => {}
         }
@@ -117,15 +160,16 @@ async fn handle(client: WebSocket, state: AppState) {
     let _ = writer.await;
 }
 
-/// Dial the upstream y-sweet for one channel and spawn its bidirectional pump.
-async fn start_channel(
-    state: &AppState,
+/// Resolve attribution, dial the upstream y-sweet, then pump frames for one
+/// channel. Runs in its own task so the client read loop never blocks on a dial.
+async fn open_and_pump(
+    state: AppState,
     channel: u64,
     path_and_query: String,
-    out_tx: &mpsc::Sender<Vec<u8>>,
-    channels: &mut HashMap<u64, ChannelHandle>,
+    up_rx: mpsc::Receiver<Vec<u8>>,
+    out_tx: mpsc::Sender<Vec<u8>>,
 ) {
-    let authority = match upstream_authority(state) {
+    let authority = match upstream_authority(&state) {
         Ok(a) => a,
         Err(e) => {
             tracing::warn!("dmux: invalid y-sweet upstream: {e}");
@@ -136,7 +180,7 @@ async fn start_channel(
 
     // Attribute writes exactly as the /d proxy does, from the path+query token.
     let attribution = match path_and_query.parse::<Uri>() {
-        Ok(uri) => resolve_attribution(state, &uri).await.map(Arc::new),
+        Ok(uri) => resolve_attribution(&state, &uri).await.map(Arc::new),
         Err(_) => None,
     };
 
@@ -149,16 +193,17 @@ async fn start_channel(
             return;
         }
     };
+    let _guard = UpstreamGuard::new();
 
-    let _ = out_tx.send(encode_simple(FRAME_OPEN_OK, channel)).await;
+    if out_tx
+        .send(encode_simple(FRAME_OPEN_OK, channel))
+        .await
+        .is_err()
+    {
+        return;
+    }
 
-    let (up_tx, up_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
-    let out_for_pump = out_tx.clone();
-    tokio::spawn(async move {
-        pump_channel(channel, upstream, up_rx, out_for_pump).await;
-    });
-
-    channels.insert(channel, ChannelHandle { up_tx, attribution });
+    pump_channel(channel, upstream, up_rx, out_tx, attribution).await;
 }
 
 type Upstream = tokio_tungstenite::WebSocketStream<TcpStream>;
@@ -188,6 +233,7 @@ async fn pump_channel(
     upstream: Upstream,
     mut up_rx: mpsc::Receiver<Vec<u8>>,
     out_tx: mpsc::Sender<Vec<u8>>,
+    attribution: Option<Arc<Attribution>>,
 ) {
     let (mut up_sink, mut up_stream) = upstream.split();
     loop {
@@ -195,6 +241,14 @@ async fn pump_channel(
             from_client = up_rx.recv() => {
                 match from_client {
                     Some(bytes) => {
+                        // Tap content writes for git/search/plugin-db, exactly as
+                        // the /d proxy does — here rather than in the read loop so
+                        // attribution never blocks other channels.
+                        if let Some(attr) = &attribution {
+                            if is_content_write(&bytes) {
+                                attr.mark_content_write().await;
+                            }
+                        }
                         if up_sink.send(WsMsg::Binary(bytes)).await.is_err() {
                             break;
                         }
@@ -236,6 +290,7 @@ enum Frame<'a> {
     Close {
         channel: u64,
     },
+    Ping,
 }
 
 fn parse_frame(buf: &[u8]) -> Option<Frame<'_>> {
@@ -259,6 +314,7 @@ fn parse_frame(buf: &[u8]) -> Option<Frame<'_>> {
             payload: rest,
         }),
         t if t == FRAME_CLOSE => Some(Frame::Close { channel }),
+        t if t == FRAME_PING => Some(Frame::Ping),
         _ => None,
     }
 }
@@ -345,6 +401,12 @@ mod tests {
             parse_frame(&close),
             Some(Frame::Close { channel: 4 })
         ));
+    }
+
+    #[test]
+    fn parses_ping() {
+        let ping = encode_simple(FRAME_PING, CONTROL_CHANNEL);
+        assert!(matches!(parse_frame(&ping), Some(Frame::Ping)));
     }
 
     #[test]

@@ -17,6 +17,7 @@ import {
   setPluginEnabled,
   installNetworkShim,
   setNetworkOffline,
+  liveSocketUrls,
   statusText,
   signInDevice,
   createVaultFromLocal,
@@ -243,6 +244,40 @@ describe("Realtime — two isolated Obsidian devices", function () {
         async () => (await readNote(A, "Paused.md")) === "written while A is paused",
         { timeout: 60 * SECONDS, timeoutMsg: "A did not catch up after unpausing" },
       );
+    });
+  });
+
+  describe("single-socket multiplexing", function () {
+    // The point of Option A: no matter how many documents are open, the client
+    // holds exactly one real WebSocket (to `/dmux`) for all of them. Device A's
+    // sockets are tracked by the shim installed in `before`.
+    it("carries every open document over a single /dmux socket", async function () {
+      // Open several distinct docs at once (index + plugin DB are already live),
+      // so multiple Yjs providers are active simultaneously.
+      await writeNote(A, "Mux1.md", "one");
+      await writeNote(A, "Mux2.md", "two");
+      await writeNote(A, "Mux3.md", "three");
+      await openNoteInEditor(A, "Mux1.md");
+      await openNoteInEditor(A, "Mux2.md");
+      await openNoteInEditor(A, "Mux3.md");
+
+      let urls: string[] = [];
+      await A.waitUntil(
+        async () => {
+          urls = await liveSocketUrls(A);
+          return urls.filter((u) => u.includes("/dmux")).length === 1;
+        },
+        {
+          timeout: 60 * SECONDS,
+          timeoutMsg: () => `expected exactly one /dmux socket, saw ${JSON.stringify(urls)}`,
+        },
+      );
+
+      // And the docs really synced through that one socket to device B.
+      await B.waitUntil(async () => (await readNote(B, "Mux1.md")) === "one", {
+        timeout: 60 * SECONDS,
+        timeoutMsg: "B never received Mux1.md over the mux",
+      });
     });
   });
 
