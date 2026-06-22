@@ -127,19 +127,23 @@ function FileHistoryPanel({ plugin }: { plugin: RealtimePlugin }) {
     <div className="realtime-history-panel">
       <div className="realtime-history-header">
         <h4>{path}</h4>
+        <button className="mod-cta" onClick={() => openTimelineModal(plugin)}>
+          Vault History
+        </button>
       </div>
       {error && <p className="setting-item-description realtime-history-error">{error}</p>}
       {!error && commits.length === 0 && !loading && (
         <p className="setting-item-description">No history for this file yet.</p>
       )}
       <div className="realtime-history-list">
-        {commits.map((commit) => (
+        {commits.map((commit, index) => (
           <CommitRow
             key={commit.hash}
             plugin={plugin}
             vaultId={vaultId}
             path={path}
             commit={commit}
+            isMostRecent={index === 0}
             isAdmin={isAdmin}
             onRolledBack={() => void load()}
           />
@@ -150,11 +154,6 @@ function FileHistoryPanel({ plugin }: { plugin: RealtimePlugin }) {
           {loading ? "Loading…" : "Load more"}
         </button>
       )}
-      <div className="realtime-history-footer">
-        <button className="mod-cta" onClick={() => openTimelineModal(plugin)}>
-          Open vault timeline
-        </button>
-      </div>
     </div>
   );
 }
@@ -176,6 +175,7 @@ function CommitRow({
   vaultId,
   path,
   commit,
+  isMostRecent,
   isAdmin,
   onRolledBack,
 }: {
@@ -183,6 +183,7 @@ function CommitRow({
   vaultId: string;
   path: string;
   commit: HistoryCommit;
+  isMostRecent: boolean;
   isAdmin: boolean;
   onRolledBack: () => void;
 }) {
@@ -273,7 +274,7 @@ function CommitRow({
       {expanded && files && (
         <>
           <HistoryFileDiff path={path} before={files.before} after={files.after} unified />
-          {isAdmin && (
+          {isAdmin && !isMostRecent && (
             <div className="realtime-history-row-actions">
               <button
                 className="mod-warning"
@@ -285,7 +286,7 @@ function CommitRow({
                 }
                 onClick={() => void startFileRollback()}
               >
-                {rollingBack ? "Working…" : "Roll back file to this commit"}
+                {rollingBack ? "Working…" : "Rollback to this"}
               </button>
             </div>
           )}

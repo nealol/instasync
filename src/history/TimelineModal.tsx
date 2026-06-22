@@ -655,10 +655,10 @@ function RollbackBar({
           }
           onClick={() => void startFileRollback()}
         >
-          {fileBusy ? "Working…" : "Roll back this path to this commit"}
+          {fileBusy ? "Working…" : "Rollback this file"}
         </button>
         <button className="mod-warning" disabled={busy} onClick={() => void startVaultRollback()}>
-          {vaultBusy ? "Working…" : "Roll back vault to this commit"}
+          {vaultBusy ? "Working…" : "Rollback whole vault"}
         </button>
       </div>
     </div>

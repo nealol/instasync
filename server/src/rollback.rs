@@ -686,8 +686,8 @@ async fn execute_rollback(
     let mut commit = None;
     if applied + deleted + plugin_dbs_rolled_back > 0 {
         let subject = match &single_file {
-            Some((path, _)) => rollback_subject_path(state, vault_id, &full, path).await,
-            None => rollback_subject(state, vault_id, &full).await,
+            Some((path, _)) => rollback_subject_path(&full, path),
+            None => rollback_subject(&full),
         };
         let ov = CommitOverride {
             subject,
@@ -710,48 +710,16 @@ async fn execute_rollback(
     })
 }
 
-/// `Rollback to {short} ({YYYY-MM-DD HH:MM})` from the target's author date.
-async fn rollback_subject(state: &AppState, vault_id: &str, full: &str) -> String {
+/// `Rollback to {short}` where `short` is the target commit prefix.
+fn rollback_subject(full: &str) -> String {
     let short: String = full.chars().take(10).collect();
-    let when = state
-        .git
-        .git_output(vault_id, &["log", "-n1", "--format=%at", full])
-        .await
-        .ok()
-        .and_then(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .trim()
-                .parse::<i64>()
-                .ok()
-        })
-        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
-        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string());
-    match when {
-        Some(when) => format!("Rollback to {short} ({when})"),
-        None => format!("Rollback to {short}"),
-    }
+    format!("Rollback to {short}")
 }
 
-/// `Rollback {path} to {short} ({YYYY-MM-DD HH:MM})` for single-file rollback.
-async fn rollback_subject_path(state: &AppState, vault_id: &str, full: &str, path: &str) -> String {
+/// `Rollback {path} to {short}` for single-file rollback.
+fn rollback_subject_path(full: &str, path: &str) -> String {
     let short: String = full.chars().take(10).collect();
-    let when = state
-        .git
-        .git_output(vault_id, &["log", "-n1", "--format=%at", full])
-        .await
-        .ok()
-        .and_then(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .trim()
-                .parse::<i64>()
-                .ok()
-        })
-        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
-        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string());
-    match when {
-        Some(when) => format!("Rollback {path} to {short} ({when})"),
-        None => format!("Rollback {path} to {short}"),
-    }
+    format!("Rollback {path} to {short}")
 }
 
 // ---------- single-file rollback ----------

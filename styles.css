@@ -381,7 +381,16 @@
 	overflow-y: auto;
 }
 
+.realtime-history-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+}
+
 .realtime-history-header h4 {
+	flex: 1;
+	min-width: 0;
 	margin: 8px 0;
 	word-break: break-all;
 }
@@ -404,7 +413,7 @@
 	cursor: pointer;
 	display: flex;
 	flex-direction: row;
-	align-items: flex-start;
+	align-items: center;
 	gap: 6px;
 }
 
@@ -427,7 +436,7 @@
 	justify-content: center;
 	width: 16px;
 	height: 16px;
-	margin-top: 2px;
+	margin-right: 4px;
 	color: var(--text-muted);
 	transition: transform 0.15s ease;
 	transform: rotate(0deg);
@@ -441,6 +450,7 @@
 	margin-top: 6px;
 	display: flex;
 	gap: 6px;
+	justify-content: center;
 }
 
 .realtime-history-subject {
@@ -464,10 +474,6 @@
 	font-size: var(--font-ui-smaller);
 	color: var(--text-muted);
 	margin: 0 0 6px;
-}
-
-.realtime-history-footer {
-	margin: 10px 0;
 }
 
 /* ---------- git history: timeline modal ---------- */
