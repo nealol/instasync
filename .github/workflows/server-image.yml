@@ -2,14 +2,7 @@ name: Server image
 
 on:
   push:
-    branches: [master]
     tags: ["*.*.*"]
-    paths:
-      - "server/**"
-      - "packages/web/**"
-      - "package.json"
-      - "bun.lock"
-      - ".github/workflows/server-image.yml"
   pull_request:
     paths:
       - "server/**"
@@ -49,12 +42,11 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=ref,event=branch
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
 
       - name: Build and push
         uses: docker/build-push-action@v6

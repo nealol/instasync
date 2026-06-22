@@ -1,0 +1,107 @@
+name: Server release
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "server/Cargo.toml"
+
+concurrency:
+  group: server-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/realtime-server
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect server version bump
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          current=$(awk -F '"' '/^version = / { print $2; exit }' server/Cargo.toml)
+          if [[ ! "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "server/Cargo.toml version must be x.y.z, got: $current" >&2
+            exit 1
+          fi
+
+          previous=""
+          if [[ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
+            previous=$(git show "${{ github.event.before }}:server/Cargo.toml" \
+              | awk -F '"' '/^version = / { print $2; exit }')
+          fi
+
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+          echo "major_minor=${current%.*}" >> "$GITHUB_OUTPUT"
+
+          if [[ "$current" == "$previous" ]]; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "server version unchanged ($current); skipping image publish"
+            exit 0
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$current" >/dev/null 2>&1; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "tag $current already exists; skipping image publish"
+            exit 0
+          fi
+
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<EOF"
+            echo "${{ env.IMAGE }}:$current"
+            echo "${{ env.IMAGE }}:${current%.*}"
+            echo "${{ env.IMAGE }}:latest"
+            echo "${{ env.IMAGE }}:sha-${GITHUB_SHA::7}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        if: steps.version.outputs.should_release == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.version.outputs.should_release == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        if: steps.version.outputs.should_release == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./server/Dockerfile
+          push: true
+          tags: ${{ steps.version.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.current }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Push server version tag
+        if: steps.version.outputs.should_release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.version.outputs.current }}"
+          git push origin "${{ steps.version.outputs.current }}"
