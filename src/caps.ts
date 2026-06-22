@@ -30,7 +30,7 @@ export type CapName = (typeof CAP_NAMES)[number];
  * values here (e.g. `restApi: ["1", "2"]`).
  */
 export const REQUIRED_CAPS: Record<CapName, string[]> = {
-  restApi: ["1"],
+  restApi: ["2"],
   oauth: ["1"],
   pluginDbSync: [SYNC_FORMAT],
   attachmentShim: ["https://realtime.md/attachment-shim/v1"],

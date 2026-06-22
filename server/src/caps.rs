@@ -11,8 +11,11 @@
 //! exists so future optional caps can be added without hard-blocking old
 //! clients). See `AGENTS.md` "Compatibility & versioning" for the full rules.
 
-/// REST API surface (`/api/*` request/response shapes).
-pub const REST_API: &str = "1";
+/// REST API surface (`/api/*` request/response shapes), plus the sync transport
+/// the plugin now requires: every Yjs document is multiplexed over a single
+/// `/dmux` WebSocket, so a client on this cap will not connect to a server that
+/// lacks that route.
+pub const REST_API: &str = "2";
 
 /// OAuth 2.1 server metadata + token endpoint shape, as consumed by the
 /// Obsidian plugin's own OAuth flow. External MCP clients consume the OAuth
