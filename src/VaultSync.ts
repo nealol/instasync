@@ -12,6 +12,7 @@ import { TFile, TAbstractFile, Notice, Platform, type EventRef } from "obsidian"
 import type RealtimePlugin from "./main";
 import { getClientToken } from "./ysweet";
 import { connectYSweetProvider } from "./ysweetConnect";
+import { muxProviderOptions } from "./sync/wsPolyfill";
 import { Document } from "./Document";
 import { CanvasDocument } from "./CanvasDocument";
 import { BaseDocument } from "./BaseDocument";
@@ -150,7 +151,7 @@ export class VaultSync {
       () => getClientToken(plugin, vaultId),
       vaultId,
       this.indexDoc,
-      { connect: false, showDebuggerLink: false },
+      { connect: false, showDebuggerLink: false, ...muxProviderOptions() },
     );
     this.indexPersistence = new IndexeddbPersistence(vaultId, this.indexDoc);
 

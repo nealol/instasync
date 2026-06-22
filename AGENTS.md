@@ -66,7 +66,7 @@ The server and client release on independent cadences; a single server serves ma
 ### Client gating (`src/caps.ts`)
 
 `checkServerCaps(caps, requiredCaps)` enforces:
-- `caps` is `null`/`undefined`/not an object → proceed (old server in the rollout window before servers advertised caps).
+- `caps` is `null`/`undefined`/not an object → block `"server-incompatible"` (this plugin requires caps to prove `/dmux` support).
 - `caps` is an object but lacks a mandatory cap → block `"server-incompatible"`.
 - cap value not in `REQUIRED_CAPS[name]` → block `"server-incompatible"` (direction cannot be inferred from opaque strings; never reported as "too old/new").
 - cap name in server's `requiredCaps` but unknown to client → block `"client-too-old"`.
@@ -79,4 +79,3 @@ The server and client release on independent cadences; a single server serves ma
 - **Only the Obsidian plugin enforces caps.** The SDK and CLI mirror the optional `version`/`caps`/`requiredCaps` fields on `ServerInfoResponse` (`packages/sdk/src/types.ts`) so consumers can self-gate, but they do not block on mismatches themselves.
 - **Future `requiredCaps` cannot protect pre-v1 clients** that lack the checker — they proceed until a real API mismatch. This is inherent and acceptable; the mechanism is forward-looking.
 - **External MCP clients** (Cursor, etc.) consume the OAuth server metadata document, not `/api/server-info`. The `oauth` cap gates the plugin's own OAuth flow only. If external-client gating is needed, surface the cap value in the OAuth server metadata as a follow-up.
-

@@ -20,9 +20,9 @@ export interface KnownSession extends MeResponse {
 /** Server identity returned by the public `GET /api/server-info`. */
 export interface ServerInfoResponse {
   serverId: string;
-  /** Server release semver (operator-facing; not used for gating). Optional for old servers. */
+  /** Server release semver (operator-facing; not used for gating). */
   version?: string;
-  /** Named capability versions per surface. Optional for old servers (pre-caps rollout). */
+  /** Named capability versions per surface. Required by this plugin for compatibility gating. */
   caps?: Record<string, string>;
   /** Cap names the client must understand. Optional; empty in v1. */
   requiredCaps?: string[];
@@ -252,10 +252,9 @@ export class AuthClient {
 
   /**
    * Fetch `/api/server-info` and enforce capability compatibility. On a cap
-   * mismatch, sets `plugin.lastCompatibilityError` and throws
-   * {@link CompatibilityError}. On success or old-server leniency
-   * (`caps == null`), clears `plugin.lastCompatibilityError` and returns the
-   * full response so callers can read `serverId` as before.
+   * mismatch or missing caps, sets `plugin.lastCompatibilityError` and throws
+   * {@link CompatibilityError}. On success, clears `plugin.lastCompatibilityError`
+   * and returns the full response so callers can read `serverId` as before.
    *
    * Network/offline errors propagate as normal exceptions (not
    * `CompatibilityError`); callers tolerate them as today.

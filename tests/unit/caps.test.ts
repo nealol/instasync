@@ -9,22 +9,46 @@ const OK_CAPS = {
 };
 
 describe("checkServerCaps", () => {
-  it("proceeds when caps is undefined (old server, rollout window)", () => {
-    expect(checkServerCaps(undefined)).toEqual({ ok: true });
-    expect(checkServerCaps(undefined, [])).toEqual({ ok: true });
+  it("fails when caps is undefined", () => {
+    expect(checkServerCaps(undefined)).toEqual({
+      ok: false,
+      reason: "server-incompatible",
+      detail: "server did not advertise compatibility caps",
+    });
+    expect(checkServerCaps(undefined, [])).toEqual({
+      ok: false,
+      reason: "server-incompatible",
+      detail: "server did not advertise compatibility caps",
+    });
   });
 
-  it("proceeds when caps is null", () => {
-    expect(checkServerCaps(null)).toEqual({ ok: true });
+  it("fails when caps is null", () => {
+    expect(checkServerCaps(null)).toEqual({
+      ok: false,
+      reason: "server-incompatible",
+      detail: "server did not advertise compatibility caps",
+    });
   });
 
-  it("proceeds when caps is a non-object (treat as missing)", () => {
-    expect(checkServerCaps("oops")).toEqual({ ok: true });
-    expect(checkServerCaps(42)).toEqual({ ok: true });
+  it("fails when caps is a non-object", () => {
+    expect(checkServerCaps("oops")).toEqual({
+      ok: false,
+      reason: "server-incompatible",
+      detail: "server did not advertise compatibility caps",
+    });
+    expect(checkServerCaps(42)).toEqual({
+      ok: false,
+      reason: "server-incompatible",
+      detail: "server did not advertise compatibility caps",
+    });
   });
 
-  it("proceeds when caps is an array (treat as missing, not a map)", () => {
-    expect(checkServerCaps([])).toEqual({ ok: true });
+  it("fails when caps is an array", () => {
+    expect(checkServerCaps([])).toEqual({
+      ok: false,
+      reason: "server-incompatible",
+      detail: "server did not advertise compatibility caps",
+    });
   });
 
   it("succeeds when all known caps match accepted values", () => {

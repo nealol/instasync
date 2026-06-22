@@ -1068,7 +1068,7 @@ async fn server_info_returns_stable_id_without_auth() {
 
     // Named capability versions are advertised for client-side gating.
     let caps = info["caps"].as_object().expect("caps object");
-    assert_eq!(caps["restApi"].as_str(), Some("1"));
+    assert_eq!(caps["restApi"].as_str(), Some("2"));
     assert_eq!(caps["oauth"].as_str(), Some("1"));
     assert_eq!(caps["pluginDbSync"].as_str(), Some("crsqlite-1"));
     assert_eq!(

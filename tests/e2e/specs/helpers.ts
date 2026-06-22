@@ -418,6 +418,21 @@ export async function setNetworkOffline(b: any, offline: boolean): Promise<void>
   }, offline);
 }
 
+/**
+ * URLs of the device's currently-OPEN WebSockets, read from the shim's live set
+ * (requires installNetworkShim). Used to assert the single-socket mux invariant:
+ * however many documents are open, exactly one socket should target `/dmux`.
+ */
+export async function liveSocketUrls(b: any): Promise<string[]> {
+  return b.executeObsidian(() => {
+    const w = window as any;
+    const set: Set<WebSocket> = w.__wsSet ?? new Set();
+    const urls: string[] = [];
+    for (const s of set) if (s.readyState === s.OPEN) urls.push(String((s as any).url));
+    return urls;
+  });
+}
+
 /** Reads the Realtime status-bar text from the renderer. */
 export async function statusText(b: any): Promise<string> {
   return b.executeObsidian(() => {

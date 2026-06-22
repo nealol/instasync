@@ -122,6 +122,12 @@ export async function startAuthServer(opts: {
   port?: number;
   ysweetUrl: string;
   authKey: string;
+  /**
+   * Public origin baked into minted tokens. Defaults to `ysweetUrl` (clients
+   * talk to y-sweet directly). Set this to the auth server's own URL to route
+   * clients through its `/d` proxy and `/dmux` multiplexer, as in production.
+   */
+  ysweetPublicUrl?: string;
   /** When provided, sets `YSWEET_STORE` so the server can report y-sweet store usage. */
   ysweetStoreDir?: string;
   /** When provided, enables git audit commits into this directory (one repo per vault). */
@@ -149,7 +155,7 @@ export async function startAuthServer(opts: {
       BIND_ADDR: `127.0.0.1:${port}`,
       PUBLIC_BASE_URL: url,
       YSWEET_URL: opts.ysweetUrl,
-      YSWEET_PUBLIC_URL: opts.ysweetUrl,
+      YSWEET_PUBLIC_URL: opts.ysweetPublicUrl ?? opts.ysweetUrl,
       YSWEET_AUTH_KEY: opts.authKey,
       ...(opts.ysweetStoreDir ? { YSWEET_STORE: opts.ysweetStoreDir } : {}),
       ...(opts.gitDataDir
@@ -231,12 +237,18 @@ export async function startAuthHarness(
 ): Promise<AuthHarness> {
   const authKey = await genAuthKey();
   const ysweet = await startYSweetServer(undefined, authKey);
+  // Bake the auth server's own URL into tokens so clients connect through its
+  // `/d` proxy and `/dmux` multiplexer — the production topology, and the only
+  // one where the always-on single-socket mux (`{host}/dmux`) has a route.
+  const port = await freePort();
+  const authUrl = `http://127.0.0.1:${port}`;
   const server = await startAuthServer({
+    port,
     ysweetUrl: ysweet.url,
+    ysweetPublicUrl: authUrl,
     authKey,
     allowedLoginRedirects: opts.allowedLoginRedirects,
   });
-  const authUrl = server.url;
 
   return {
     authUrl,
