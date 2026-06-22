@@ -838,7 +838,7 @@ fn validate_attachment_components(path: &str) -> AppResult<()> {
 
 fn reject_html_upload(content_type: Option<&str>, bytes: &[u8]) -> AppResult<()> {
     if content_type.is_some_and(|value| value.to_ascii_lowercase().contains("text/html"))
-        || std::str::from_utf8(&bytes[..bytes.len().min(256)])
+        || std::str::from_utf8(&bytes[..bytes.len().min(4096)])
             .ok()
             .is_some_and(|text| text.to_ascii_lowercase().contains("<html"))
     {

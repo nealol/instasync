@@ -1220,9 +1220,14 @@ pub(crate) async fn authorize_doc(
     let path = if doc_id == vault_id {
         String::new()
     } else {
-        let guid = doc_id
-            .strip_prefix(&format!("{vault_id}__"))
-            .unwrap_or_default();
+        let prefix = format!("{vault_id}__");
+        let guid = doc_id.strip_prefix(&prefix).unwrap_or_else(|| {
+            // Defensive: callers should validate the doc_id namespace before
+            // reaching here. A malformed id is treated as vault-level access
+            // rather than panicking, but logged for investigation.
+            tracing::warn!("authorize_doc: doc_id {doc_id} missing vault prefix {prefix}");
+            ""
+        });
         vault_files::Entity::find()
             .filter(vault_files::Column::VaultId.eq(vault_id))
             .filter(vault_files::Column::Guid.eq(guid))
@@ -1247,6 +1252,9 @@ pub(crate) async fn authorize_path(
         .await?;
 
     // Most specific match wins: longer prefix first, user-specific over everyone.
+    // NOTE: path matching is case-sensitive, consistent with how Obsidian and the
+    // sync layer store paths. Clients on case-insensitive filesystems (macOS,
+    // Windows) normalize to the stored casing before sending, so this is safe.
     let mut best: Option<(i64, String)> = None;
     for r in rows {
         let principal_ok = match &r.principal_user_id {

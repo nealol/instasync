@@ -186,6 +186,7 @@ pub async fn finish_authorize(
     oauth_flow_key: String,
     user: users::Model,
 ) -> AppResult<Response> {
+    prune_oauth_flows(&state).await;
     let flow = state
         .oauth_flows
         .lock()
@@ -239,6 +240,7 @@ pub async fn token(
     State(state): State<AppState>,
     Form(body): Form<TokenRequest>,
 ) -> AppResult<Json<TokenResponse>> {
+    prune_oauth_flows(&state).await;
     match body.grant_type.as_str() {
         "authorization_code" => exchange_code(&state, body).await.map(Json),
         "refresh_token" => refresh(&state, body).await.map(Json),
@@ -261,6 +263,9 @@ async fn exchange_code(state: &AppState, body: TokenRequest) -> AppResult<TokenR
         .one(&state.db)
         .await?
         .ok_or(AppError::Unauthorized)?;
+    // Delete the authorization code before validation: this enforces one-time
+    // use even if validation fails (e.g. wrong redirect_uri), preventing replay
+    // attempts. The client must request a new code on any failure.
     oauth_codes::Entity::delete_by_id(hash_token(&code))
         .exec(&state.db)
         .await?;

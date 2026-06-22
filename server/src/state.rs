@@ -120,10 +120,15 @@ impl AppState {
     }
 
     /// Resolve a connection token to its (unexpired) principal, if known.
+    /// Lazily evicts expired entries on read so the map cannot grow unbounded
+    /// from tokens that are minted but never looked up again.
     pub async fn principal_for_token(&self, token: &str) -> Option<Principal> {
-        let map = self.principals.lock().await;
+        let mut map = self.principals.lock().await;
+        let now = now_millis();
+        // Opportunistic eviction: drop expired entries on every read path too.
+        map.retain(|_, p| p.expires_at_ms > now);
         map.get(token)
-            .filter(|p| p.expires_at_ms > now_millis())
+            .filter(|p| p.expires_at_ms > now)
             .cloned()
     }
 }
