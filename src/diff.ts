@@ -6,9 +6,10 @@ import type * as Y from "yjs";
  * single delete+insert. This keeps deltas small and avoids clobbering the whole
  * document (which would disrupt other editors' relative cursor positions).
  *
- * Must be called inside a `ydoc.transact(..., origin)`.
+ * Must be called inside a `ydoc.transact(..., origin)` — the caller owns the
+ * transaction so the origin is consistent and operation ordering is predictable.
  */
-export function applyTextToYText(ytext: Y.Text, newText: string, transactOrigin: unknown): void {
+export function applyTextToYText(ytext: Y.Text, newText: string): void {
   const oldText = ytext.toString();
   if (oldText === newText) return;
 
@@ -33,8 +34,6 @@ export function applyTextToYText(ytext: Y.Text, newText: string, transactOrigin:
   const deleteCount = endOld - start;
   const insert = newText.slice(start, endNew);
 
-  ytext.doc?.transact(() => {
-    if (deleteCount > 0) ytext.delete(start, deleteCount);
-    if (insert.length > 0) ytext.insert(start, insert);
-  }, transactOrigin);
+  if (deleteCount > 0) ytext.delete(start, deleteCount);
+  if (insert.length > 0) ytext.insert(start, insert);
 }

@@ -203,7 +203,7 @@ function SetupView({
                   await plugin.onLoggedIn();
                   setStep("choose");
                 } catch (e) {
-                  setError((e as Error).message);
+                  setError((e instanceof Error ? e.message : String(e)));
                 } finally {
                   setBusy(false);
                 }
@@ -240,7 +240,7 @@ function SetupView({
                       await plugin.onLoggedIn();
                       setStep("choose");
                     } catch (e) {
-                      setError((e as Error).message);
+                      setError((e instanceof Error ? e.message : String(e)));
                     } finally {
                       setBusy(false);
                     }
@@ -1083,7 +1083,7 @@ function useStorageUsage(plugin: RealtimePlugin, vaultId: string) {
         const result = await plugin.auth.getStorageUsage(vaultId);
         if (!cancelled) setUsage(result);
       } catch (e) {
-        if (!cancelled) setError(`Could not load storage usage: ${(e as Error).message}`);
+        if (!cancelled) setError(`Could not load storage usage: ${(e instanceof Error ? e.message : String(e))}`);
       }
     })();
     return () => {
@@ -1289,7 +1289,7 @@ function CursorAuditView({
       );
       setHasMore(page.hasMore);
     } catch (e) {
-      setError(`Could not load audit log: ${(e as Error).message}`);
+      setError(`Could not load audit log: ${(e instanceof Error ? e.message : String(e))}`);
     }
   };
   useEffect(() => {
@@ -1363,7 +1363,7 @@ function AuditEntryRow({
       try {
         await plugin.auth.undoCursorAudit(vault.id, cursor.id, entry.id);
       } catch (e) {
-        const message = (e as Error).message;
+        const message = (e instanceof Error ? e.message : String(e));
         if (message === "changed_since") {
           if (
             !confirm(
@@ -1579,7 +1579,7 @@ function useGitBackup(plugin: RealtimePlugin, vaultId: string) {
         const result = await plugin.auth.getGitBackup(vaultId);
         if (!cancelled) setConfig(result);
       } catch (e) {
-        if (!cancelled) setError(`Could not load backup settings: ${(e as Error).message}`);
+        if (!cancelled) setError(`Could not load backup settings: ${(e instanceof Error ? e.message : String(e))}`);
       }
     })();
     return () => {
@@ -2030,7 +2030,7 @@ function ServerMigrationView({
                 close();
                 refresh();
               } catch (e) {
-                setError((e as Error).message);
+                setError((e instanceof Error ? e.message : String(e)));
               } finally {
                 setBusy(false);
               }
@@ -2057,7 +2057,7 @@ function useVaults(plugin: RealtimePlugin) {
         const listed = await plugin.auth.listVaults();
         if (!cancelled) setVaults(listed);
       } catch (e) {
-        if (!cancelled) setError(`Could not load vaults: ${(e as Error).message}`);
+        if (!cancelled) setError(`Could not load vaults: ${(e instanceof Error ? e.message : String(e))}`);
       }
     })();
     return () => {
@@ -2081,7 +2081,7 @@ function useMembers(plugin: RealtimePlugin, vaultId: string) {
         const listed = await plugin.auth.listMembers(vaultId);
         if (!cancelled) setMembers(listed);
       } catch (e) {
-        if (!cancelled) setError(`Could not load members: ${(e as Error).message}`);
+        if (!cancelled) setError(`Could not load members: ${(e instanceof Error ? e.message : String(e))}`);
       }
     })();
     return () => {
@@ -2105,7 +2105,7 @@ function useRemoteCursors(plugin: RealtimePlugin, vaultId: string) {
         const listed = await plugin.auth.listCursors(vaultId);
         if (!cancelled) setCursors(listed);
       } catch (e) {
-        if (!cancelled) setError(`Could not load remote cursors: ${(e as Error).message}`);
+        if (!cancelled) setError(`Could not load remote cursors: ${(e instanceof Error ? e.message : String(e))}`);
       }
     })();
     return () => {
@@ -2171,7 +2171,7 @@ async function runNotice(
     setBusy?.(true);
     await fn();
   } catch (e) {
-    new Notice(`${PLUGIN_NAME}: ${(e as Error).message}`);
+    new Notice(`${PLUGIN_NAME}: ${(e instanceof Error ? e.message : String(e))}`);
   } finally {
     setBusy?.(false);
   }

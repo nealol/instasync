@@ -134,7 +134,9 @@ class LiveEditPluginValue implements PluginValue {
       "->editor",
       snip(target),
     );
-    applyTextToYText(this.ytext, target, this);
+    this.ytext.doc?.transact(() => {
+      applyTextToYText(this.ytext!, target);
+    }, this);
   }
 
   destroy(): void {

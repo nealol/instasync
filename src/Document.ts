@@ -158,7 +158,7 @@ export class Document extends SyncedDoc {
 
   private applyText(text: string): void {
     this.ydoc.transact(() => {
-      applyTextToYText(this.ytext, text, DISK_ORIGIN);
+      applyTextToYText(this.ytext, text);
     }, DISK_ORIGIN);
   }
 
@@ -212,7 +212,7 @@ export class Document extends SyncedDoc {
       snip(this.content),
     );
     this.ydoc.transact(() => {
-      applyTextToYText(this.ytext, disk, DISK_ORIGIN);
+      applyTextToYText(this.ytext, disk);
     }, DISK_ORIGIN);
   }
 
