@@ -82,7 +82,7 @@ implementing these rules:
 
 | Server response | Result |
 |---|---|
-| `caps` is `null` / `undefined` / not an object | **proceed** (old server in the rollout window before servers advertised caps) |
+| `caps` is `null` / `undefined` / not an object | **block** — `"server-incompatible"` |
 | `caps` is an object but missing a mandatory cap (`restApi`, `oauth`, `pluginDbSync`, `attachmentShim`) | **block** — `"server-incompatible"` |
 | cap value not in `REQUIRED_CAPS[name]` | **block** — `"server-incompatible"` |
 | cap name in server's `requiredCaps` but unknown to client | **block** — `"client-too-old"` |
@@ -144,19 +144,12 @@ External MCP clients consume the OAuth 2.1 server metadata document at
 gating becomes necessary, surface the cap value in the OAuth server metadata
 document as a follow-up.
 
-## Rollout window
-
-Until all deployed servers advertise `caps`, the plugin is lenient on
-`caps == null` (treats it as an old server and proceeds). The gate becomes
-enforceable once servers update. This is acceptable since the goal is
-forward-looking enforcement, not retroactive.
-
 ## Testing
 
 - **Server**: `server/tests/integration.rs` —
   `server_info_returns_stable_id_without_auth` asserts `version`, all four
   `caps` values, and empty `requiredCaps`.
-- **Client**: `tests/unit/caps.test.ts` — 15 unit tests covering every
+- **Client**: `tests/unit/caps.test.ts` — unit tests covering every
   branch of `checkServerCaps` (undefined/null/non-object/array caps, exact
   match, missing mandatory cap, unsupported value, non-string value, unknown
   cap ignored vs. in `requiredCaps`, non-string/non-array `requiredCaps`,

@@ -100,57 +100,72 @@ async fn handle(client: WebSocket, state: AppState) {
 
     // channel id -> sender into that channel's upstream pump.
     let mut channels: HashMap<u64, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    // Upstream tasks notify this loop when their channel has ended, so terminal
+    // paths such as OPEN_ERR or upstream close do not leave stale senders behind.
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<u64>();
 
-    while let Some(msg) = cl_stream.next().await {
-        let Ok(msg) = msg else { break };
-        let AxumMsg::Binary(buf) = msg else {
-            // Text/ping/pong/close: ping/pong are handled by axum; ignore the rest.
-            continue;
-        };
-        match parse_frame(&buf) {
-            Some(Frame::Open {
-                channel,
-                path_and_query,
-            }) => {
-                // Register the channel synchronously, then dial upstream in a
-                // spawned task. Dialing here would block the whole multiplexed
-                // socket (head-of-line) — a slow/hung upstream would freeze every
-                // other channel — so the read loop must never await the dial.
-                let (up_tx, up_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
-                channels.insert(channel, up_tx);
-                let state = state.clone();
-                let out = out_tx.clone();
-                tokio::spawn(async move {
-                    open_and_pump(state, channel, path_and_query, up_rx, out).await;
-                });
-            }
-            Some(Frame::Data { channel, payload }) => {
-                if let Some(up_tx) = channels.get(&channel) {
-                    match up_tx.try_send(payload.to_vec()) {
-                        Ok(()) => {}
-                        // Upstream is backed up. Silently dropping a Yjs update
-                        // would diverge the doc (the provider thinks it sent it
-                        // and won't resend until reconnect), so instead reset the
-                        // channel: the provider reconnects and does a full resync.
-                        Err(TrySendError::Full(_)) => {
-                            channels.remove(&channel);
-                            let _ = out_tx.try_send(encode_simple(FRAME_CLOSE, channel));
-                            tracing::warn!(channel, "dmux: upstream backpressure; reset channel");
-                        }
-                        Err(TrySendError::Closed(_)) => {
-                            channels.remove(&channel);
+    loop {
+        tokio::select! {
+            msg = cl_stream.next() => {
+                let Some(msg) = msg else { break };
+                let Ok(msg) = msg else { break };
+                let AxumMsg::Binary(buf) = msg else {
+                    // Text/ping/pong/close: ping/pong are handled by axum; ignore the rest.
+                    continue;
+                };
+                match parse_frame(&buf) {
+                    Some(Frame::Open {
+                        channel,
+                        path_and_query,
+                    }) => {
+                        // Register the channel synchronously, then dial upstream in a
+                        // spawned task. Dialing here would block the whole multiplexed
+                        // socket (head-of-line) — a slow/hung upstream would freeze every
+                        // other channel — so the read loop must never await the dial.
+                        let (up_tx, up_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
+                        channels.insert(channel, up_tx);
+                        let state = state.clone();
+                        let out = out_tx.clone();
+                        let done = done_tx.clone();
+                        tokio::spawn(async move {
+                            open_and_pump(state, channel, path_and_query, up_rx, out).await;
+                            let _ = done.send(channel);
+                        });
+                    }
+                    Some(Frame::Data { channel, payload }) => {
+                        if let Some(up_tx) = channels.get(&channel) {
+                            match up_tx.try_send(payload.to_vec()) {
+                                Ok(()) => {}
+                                // Upstream is backed up. Silently dropping a Yjs update
+                                // would diverge the doc (the provider thinks it sent it
+                                // and won't resend until reconnect), so instead reset the
+                                // channel: the provider reconnects and does a full resync.
+                                Err(TrySendError::Full(_)) => {
+                                    channels.remove(&channel);
+                                    let _ = out_tx.try_send(encode_simple(FRAME_CLOSE, channel));
+                                    tracing::warn!(channel, "dmux: upstream backpressure; reset channel");
+                                }
+                                Err(TrySendError::Closed(_)) => {
+                                    channels.remove(&channel);
+                                }
+                            }
                         }
                     }
+                    Some(Frame::Close { channel }) => {
+                        // Dropping the sender ends that channel's upstream pump.
+                        channels.remove(&channel);
+                    }
+                    Some(Frame::Ping) => {
+                        let _ = out_tx.try_send(encode_simple(FRAME_PONG, CONTROL_CHANNEL));
+                    }
+                    None => {}
                 }
             }
-            Some(Frame::Close { channel }) => {
-                // Dropping the sender ends that channel's upstream pump.
-                channels.remove(&channel);
+            done = done_rx.recv() => {
+                if let Some(channel) = done {
+                    channels.remove(&channel);
+                }
             }
-            Some(Frame::Ping) => {
-                let _ = out_tx.try_send(encode_simple(FRAME_PONG, CONTROL_CHANNEL));
-            }
-            None => {}
         }
     }
 

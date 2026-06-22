@@ -47,9 +47,10 @@ export type CompatibilityResult =
  * Check a server's advertised `caps`/`requiredCaps` against the client's
  * accepted values. Pure function — does not know the server's release version.
  *
- * Leniency rules:
- *  - `caps` is `null`/`undefined`/not an object → proceed (old server in the
- *    rollout window before servers advertised caps).
+ * Rules:
+ *  - `caps` is `null`/`undefined`/not an object → block. This client requires
+ *    the caps-advertised `/dmux` transport and cannot safely talk to older
+ *    servers that do not advertise caps.
  *  - `caps` is an object but lacks a mandatory cap → block
  *    `"server-incompatible"`.
  *  - cap value not in `REQUIRED_CAPS[name]` → block `"server-incompatible"`.
@@ -59,9 +60,14 @@ export type CompatibilityResult =
  *    additive surfaces).
  */
 export function checkServerCaps(caps: unknown, requiredCaps?: unknown): CompatibilityResult {
-  // Old server (pre-caps rollout): lenient.
+  // This client always uses /dmux, so a server that does not advertise caps is
+  // too old to prove it supports the required sync transport.
   if (caps === null || caps === undefined || typeof caps !== "object" || Array.isArray(caps)) {
-    return { ok: true };
+    return {
+      ok: false,
+      reason: "server-incompatible",
+      detail: "server did not advertise compatibility caps",
+    };
   }
   const capsMap = caps as Record<string, unknown>;
 
