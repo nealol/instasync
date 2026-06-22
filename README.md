@@ -120,6 +120,15 @@ last-writer-wins per column, with snapshots, a server-side replica, deterministi
 git dumps, and trash-bin deletion. See the full guide:
 **[docs/plugin-sql/](docs/plugin-sql/README.md)**.
 
+## Compatibility & versioning
+
+The plugin and server release on independent cadences. Compatibility is gated
+by **named capability versions** advertised on `GET /api/server-info`, not by
+either side's semver. The plugin hard-blocks on a cap mismatch and never
+nudges about newer server versions unless compatibility is actually broken.
+See **[docs/versioning.md](docs/versioning.md)** for the cap names, bump
+rules, gating behavior, and rollout notes.
+
 ```ts
 const realtime = (this.app as any).plugins.plugins["realtime"];
 await realtime.sql.whenAvailable();

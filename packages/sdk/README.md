@@ -57,6 +57,16 @@ A cursor secret token (from cursor creation) works too: `new CursorClient({ base
 
 Non-2xx responses throw `ApiError` (`status`, `message`); 401 → `AuthError`, 404 → `NotFoundError`. Token providers can refresh once on 401 before the error surfaces.
 
+## Compatibility & versioning
+
+`serverInfo()` returns `{ serverId, version?, caps?, requiredCaps? }`. The
+optional `caps` map carries named capability versions per surface
+(`restApi`, `oauth`, `pluginDbSync`, `attachmentShim`). The SDK mirrors these
+fields so consumers can self-gate, but **does not enforce caps itself** —
+only the Obsidian plugin does. See
+**[../../docs/versioning.md](../../docs/versioning.md)** for the cap names,
+bump rules, and gating behavior.
+
 ## Coverage
 
 Vaults · invites · members · remote cursors + audit log (list/undo) · notes (CRUD, patch, move, permalinks, frontmatter, periodic) · attachments + content-addressed blobs · canvases (nodes/edges) · bases (views/filters/formulas/properties) · search/tags/backlinks · storage + blob GC · git backup config · plugin-db replication · y-sweet doc tokens · OAuth 2.1 (discovery, dynamic registration, PKCE, refresh) · streaming WebSocket API.

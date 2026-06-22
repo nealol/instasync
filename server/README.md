@@ -151,6 +151,16 @@ Swagger UI is served at `/docs`, with the OpenAPI JSON at `/openapi.json`. The s
 covers consumer-facing REST/auth/OAuth/upload/permalink routes and intentionally
 excludes `/mcp`, `/d/*`, raw blob storage, and `/api/doc-token`.
 
+## Compatibility & versioning
+
+`GET /api/server-info` advertises the server's release `version` (semver,
+operator-facing only) and a `caps` map of named capability versions per
+compatibility surface (`restApi`, `oauth`, `pluginDbSync`, `attachmentShim`).
+Clients gate on `caps`, not on `version`. Cap constants live in
+`src/caps.rs`; bump a cap's value only on a wire-incompatible change to that
+surface. See **[../docs/versioning.md](../docs/versioning.md)** for the full
+rules, the client gating behavior, and rollout notes.
+
 ## Mock OIDC (tests/dev)
 
 With `OIDC_MODE=mock`, `/auth/login` short-circuits the IdP round-trip and issues

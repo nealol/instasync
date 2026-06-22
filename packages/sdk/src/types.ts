@@ -18,6 +18,12 @@ export interface MeResponse {
 /** Server identity returned by the public `GET /api/server-info`. */
 export interface ServerInfoResponse {
   serverId: string;
+  /** Server release semver (operator-facing; not used for gating). Optional for old servers. */
+  version?: string;
+  /** Named capability versions per surface. Optional for old servers. SDK/CLI consumers can self-gate; only the Obsidian plugin enforces caps. */
+  caps?: Record<string, string>;
+  /** Cap names the client must understand. Optional; empty in v1. */
+  requiredCaps?: string[];
 }
 
 // ---------- vaults, invites, members ----------

@@ -219,7 +219,7 @@ async fn oauth_authorize() {}
 #[utoipa::path(post, path = "/oauth/token", tag = "oauth", request_body(content = String, content_type = "application/x-www-form-urlencoded"), responses((status = 200, description = "Access and refresh token response"), (status = 400, description = "Invalid token request"), (status = 401, description = "Invalid grant or client")))]
 async fn oauth_token() {}
 
-#[utoipa::path(get, path = "/api/server-info", tag = "auth", responses((status = 200, description = "Stable server id for per-server token scoping")))]
+#[utoipa::path(get, path = "/api/server-info", tag = "auth", responses((status = 200, description = "Stable server id, release version, and named capability versions for client-side compatibility gating", body = crate::routes::ServerInfoResponse)))]
 async fn server_info() {}
 
 #[utoipa::path(get, path = "/api/me", tag = "auth", security(("bearerAuth" = [])), responses((status = 200, description = "Current user"), (status = 401, description = "Unauthorized")))]

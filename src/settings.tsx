@@ -146,6 +146,42 @@ function SettingsView({
   );
 }
 
+/**
+ * Banner shown when the last server-info compatibility check failed. Never
+ * rendered when compatible — per project policy, the plugin does not nudge
+ * about newer server versions unless compatibility is actually broken.
+ *
+ * Reads `plugin.lastCompatibilityError`, which is updated by `Auth.serverInfoChecked`
+ * on every server-info fetch. Non-persisted: reflects the live server, not config.
+ */
+function CompatibilityBanner({ plugin }: { plugin: RealtimePlugin }) {
+  const err = plugin.lastCompatibilityError;
+  if (!err) return null;
+  const isClientTooOld = err.reason === "client-too-old";
+  const title = isClientTooOld ? "Plugin update required" : "Server incompatible";
+  const versionLine = err.serverVersion ? ` (server version ${err.serverVersion})` : "";
+  return (
+    <div className="realtime-warning-box" style={{ marginBottom: "16px" }}>
+      <strong>{title}</strong>
+      <p>
+        {isClientTooOld
+          ? `This server requires a newer version of the ${PLUGIN_NAME} plugin.`
+          : `This server is incompatible with this version of the ${PLUGIN_NAME} plugin.`}
+        {versionLine}
+      </p>
+      <div className="setting-item-description">{err.detail}</div>
+      {isClientTooOld ? (
+        <div className="setting-item-description">Update the plugin via BRAT and reload.</div>
+      ) : (
+        <div className="setting-item-description">
+          Point the plugin at a compatible server, or ask the server operator to upgrade/downgrade
+          to a matching release.
+        </div>
+      )}
+    </div>
+  );
+}
+
 type SetupStep = "server" | "choose" | "create" | "existing" | "invite";
 
 function SetupView({
@@ -190,6 +226,7 @@ function SetupView({
     <div className="realtime-setup-wrap">
       <div className="realtime-setup-card">
         <h2>Set up {PLUGIN_NAME}</h2>
+        <CompatibilityBanner plugin={plugin} />
         {step === "server" ? (
           <form
             style={{ marginTop: "-4px" }}
@@ -502,6 +539,7 @@ function FullSettings({
   return (
     <>
       {/*<h2>Realtime</h2>*/}
+      <CompatibilityBanner plugin={plugin} />
       <AccountSection plugin={plugin} refresh={refresh} />
       <EnableSyncSection plugin={plugin} refresh={refresh} />
       <StructuredSyncSection plugin={plugin} refresh={refresh} />
