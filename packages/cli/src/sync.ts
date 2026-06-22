@@ -11,13 +11,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { VaultHandle } from "@realtime-md/sdk";
-import {
-  writeRtmd,
-  type FileKind,
-  type RtmdConfig,
-  type SyncFileState,
-  type Workspace,
-} from "./config";
+import { CliError, writeRtmd, type FileKind, type RtmdConfig, type SyncFileState, type Workspace } from "./config";
 import { isExcluded, kindForPath } from "./kinds";
 
 export function hashBytes(bytes: Uint8Array): string {
@@ -36,7 +30,10 @@ export function hashText(text: string): string {
 export function normalizeStructured(text: string): string {
   try {
     return JSON.stringify(JSON.parse(text));
-  } catch {
+  } catch (e) {
+    // Return the original text so the hash differs from the server's normalized
+    // form, which surfaces the corrupted file as a real diff rather than
+    // silently matching. The upload path will report a clear error.
     return text;
   }
 }
@@ -295,7 +292,14 @@ async function uploadLocal(
     }
     case "canvas":
     case "base": {
-      const value: unknown = JSON.parse(Buffer.from(bytes).toString("utf8"));
+      let value: unknown;
+      try {
+        value = JSON.parse(Buffer.from(bytes).toString("utf8"));
+      } catch (e) {
+        throw new CliError(
+          `${relPath}: invalid JSON (${e instanceof Error ? e.message : String(e)})`,
+        );
+      }
       const resource = kind === "canvas" ? vault.canvases : vault.bases;
       const res = exists
         ? await resource.replace(relPath, value)

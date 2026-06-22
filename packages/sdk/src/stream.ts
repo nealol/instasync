@@ -2,7 +2,9 @@ import type { StreamAnchor, StreamResult } from "./types";
 
 /** Server limit: max UTF-8 bytes inserted per streaming session. */
 export const MAX_STREAM_BYTES = 2 * 1024 * 1024;
-/** Backpressure: pause `write()` while this many bytes are unacknowledged. */
+/** Backpressure: pause `write()` while this many bytes are unacknowledged.
+ * 256KB balances responsiveness with throughput — small enough that the stream
+ * stays interactive, large enough to avoid stalling on per-frame ack latency. */
 const HIGH_WATER_BYTES = 256 * 1024;
 
 /** The subset of the WebSocket API the stream client needs (browser/Node/ws). */
@@ -115,32 +117,39 @@ export class NoteStream {
     url.searchParams.set("token", opts.token);
     const ws = new WS(url.toString());
 
-    const started = await new Promise<ServerFrame>((resolve, reject) => {
-      ws.addEventListener("open", () => {
-        ws.send(
-          JSON.stringify({
-            type: "start",
-            path: opts.path,
-            anchor: opts.anchor ?? { mode: "append" },
-          }),
-        );
+    let started: ServerFrame;
+    try {
+      started = await new Promise<ServerFrame>((resolve, reject) => {
+        ws.addEventListener("open", () => {
+          ws.send(
+            JSON.stringify({
+              type: "start",
+              path: opts.path,
+              anchor: opts.anchor ?? { mode: "append" },
+            }),
+          );
+        });
+        ws.addEventListener("message", (event: { data: unknown }) => {
+          const frame = parseFrame(event.data);
+          if (!frame) return;
+          if (frame.type === "started") resolve(frame);
+          else if (frame.type === "error")
+            reject(new StreamError(frame.code ?? "error", frame.message ?? "stream error"));
+        });
+        ws.addEventListener("error", () => reject(new Error("WebSocket connection failed")));
+        ws.addEventListener("close", (event: { code?: number; reason?: string }) => {
+          reject(
+            new Error(
+              `WebSocket closed before start: ${event.code ?? ""} ${event.reason ?? ""}`.trim(),
+            ),
+          );
+        });
       });
-      ws.addEventListener("message", (event: { data: unknown }) => {
-        const frame = parseFrame(event.data);
-        if (!frame) return;
-        if (frame.type === "started") resolve(frame);
-        else if (frame.type === "error")
-          reject(new StreamError(frame.code ?? "error", frame.message ?? "stream error"));
-      });
-      ws.addEventListener("error", () => reject(new Error("WebSocket connection failed")));
-      ws.addEventListener("close", (event: { code?: number; reason?: string }) => {
-        reject(
-          new Error(
-            `WebSocket closed before start: ${event.code ?? ""} ${event.reason ?? ""}`.trim(),
-          ),
-        );
-      });
-    });
+    } catch (e) {
+      // Clean up the WebSocket if the start handshake failed.
+      ws.close();
+      throw e;
+    }
 
     const stream = new NoteStream(ws, started.guid ?? "", started.position ?? 0);
     stream.listen();

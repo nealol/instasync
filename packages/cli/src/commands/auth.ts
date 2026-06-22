@@ -64,7 +64,11 @@ export function registerAuthCommands(program: Command): void {
       if (auth.mode === "user") {
         await requireUserClient(ws)
           .logout()
-          .catch(() => {});
+          .catch((err) => {
+            process.stderr.write(
+              `warning: logout failed (${err instanceof Error ? err.message : String(err)})\n`,
+            );
+          });
       } else {
         process.stderr.write(
           "removing the remote-cursor token from this folder; the cursor itself still exists " +

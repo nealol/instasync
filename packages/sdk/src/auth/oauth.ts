@@ -206,7 +206,13 @@ export class OAuthTokenProvider implements TokenProvider {
         });
         this.tokens = fresh;
         this.expiresAt = Date.now() + fresh.expiresIn * 1000;
-        this.onTokens?.(fresh);
+        // Isolate user callback errors so a throwing onTokens doesn't fail the
+        // refresh — the tokens were already refreshed successfully.
+        try {
+          this.onTokens?.(fresh);
+        } catch (e) {
+          console.error("Token callback error:", e);
+        }
         return fresh.accessToken;
       } finally {
         this.refreshing = null;

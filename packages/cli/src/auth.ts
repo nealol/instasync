@@ -82,7 +82,11 @@ export async function settleFolderAuth(
       const created = await session.client.vault(vault.id).cursors.create(name);
       // Cursor tokens are independent of user sessions, so the temporary
       // session can be invalidated immediately.
-      await session.client.logout().catch(() => {});
+      await session.client.logout().catch((err) => {
+        process.stderr.write(
+          `warning: logout failed (${err instanceof Error ? err.message : String(err)})\n`,
+        );
+      });
       process.stderr.write(
         `Created remote cursor "${created.name}"; this folder now acts as that cursor.\n`,
       );
