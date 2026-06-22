@@ -105,7 +105,9 @@ export async function restoreSnapshot(db: DB, snap: Snapshot): Promise<void> {
     await applyChanges(tx as unknown as DB, snap.changes);
   });
 
-  // Verify: every change we put in must be readable back (no silent drops).
+  // Row-count sanity check: every change we put in must be readable back (no
+  // silent drops). This does not verify row content — only that the count is at
+  // least as large as what we applied (other sites may have added changes too).
   const after = await readAllChanges(db);
   if (after.length < snap.changes.length) {
     throw new Error(

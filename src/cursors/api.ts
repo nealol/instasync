@@ -54,7 +54,9 @@ export class RealtimeCursorsAPI implements RealtimeCursors {
    */
   async acquire(opts: AcquireCursorOptions): Promise<RemoteCursorHandle> {
     if (!isValidId(opts.pluginId)) {
-      throw new Error(`pluginId must match [A-Za-z0-9_-]{1,80} without "__": ${opts.pluginId}`);
+      throw new Error(
+        `pluginId must be 1-80 chars of [A-Za-z0-9_-] and must not contain "__": ${opts.pluginId}`,
+      );
     }
     this.requireAvailable();
     const vaultId = this.plugin.settings.activeVaultId;
