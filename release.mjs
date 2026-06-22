@@ -14,7 +14,7 @@
 // Requires the `gh` CLI to be installed and authenticated.
 
 import { execFileSync } from "child_process";
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, statSync } from "fs";
 
 const args = process.argv.slice(2);
 const version = args.find((a) => !a.startsWith("--"));
