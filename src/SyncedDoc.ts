@@ -5,6 +5,7 @@ import { IndexeddbPersistence } from "y-indexeddb";
 import type RealtimePlugin from "./main";
 import { getClientToken } from "./ysweet";
 import { connectYSweetProvider } from "./ysweetConnect";
+import { muxProviderOptions } from "./sync/wsPolyfill";
 
 export abstract class SyncedDoc {
   readonly path: string;
@@ -48,7 +49,7 @@ export abstract class SyncedDoc {
       () => getClientToken(plugin, serverDocId),
       serverDocId,
       this.ydoc,
-      { connect: false, showDebuggerLink: false },
+      { connect: false, showDebuggerLink: false, ...muxProviderOptions(plugin) },
     );
     this.awareness = this.provider.awareness;
     this.persistence = new IndexeddbPersistence(serverDocId, this.ydoc);

@@ -16,6 +16,7 @@ import { IndexeddbPersistence } from "y-indexeddb";
 import type RealtimePlugin from "../main";
 import { getClientToken } from "../ysweet";
 import { connectYSweetProvider } from "../ysweetConnect";
+import { muxProviderOptions } from "../sync/wsPolyfill";
 import { CRSQLITE_WASM_DATA_URL } from "./wasmBinary";
 import type { PluginDbDocHandle } from "./PluginDbSync";
 import type { SyncedPluginDatabaseOptions } from "./SyncedPluginDatabase";
@@ -114,6 +115,7 @@ function makeDocHandle(plugin: RealtimePlugin, docId: string): PluginDbDocHandle
   const provider = new YSweetProvider(() => getClientToken(plugin, docId), docId, doc, {
     connect: false,
     showDebuggerLink: false,
+    ...muxProviderOptions(plugin),
   });
   const persistence = new IndexeddbPersistence(docId, doc);
 

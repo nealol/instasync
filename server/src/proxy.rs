@@ -27,7 +27,7 @@ use url::Url;
 use crate::state::{AppState, Principal};
 
 /// Everything the proxy needs to attribute a write on this connection to a user.
-struct Attribution {
+pub(crate) struct Attribution {
     vault_id: String,
     principal: Principal,
     state: AppState,
@@ -35,6 +35,27 @@ struct Attribution {
     /// content writes also arm the plugin-db replication debounce (a safety net
     /// for clients whose explicit `/touch` call is lost — e.g. dropped offline).
     plugin_db: Option<(String, String)>,
+}
+
+impl Attribution {
+    /// Record a content write against git/search (and the plugin-db debounce, if
+    /// this connection syncs a plugin database). Mirrors the tap in `relay_ws`.
+    pub(crate) async fn mark_content_write(&self) {
+        self.state
+            .git
+            .mark_write(&self.vault_id, &self.principal)
+            .await;
+        self.state
+            .search
+            .mark_write(self.state.clone(), &self.vault_id, &self.principal)
+            .await;
+        if let Some((plugin, name)) = &self.plugin_db {
+            self.state
+                .plugindb
+                .mark_write(&self.vault_id, plugin, name)
+                .await;
+        }
+    }
 }
 
 /// Hop-by-hop headers must not be forwarded across the proxy.
@@ -51,7 +72,7 @@ const HOP_BY_HOP: &[&str] = &[
 ];
 
 /// `host[:port]` of the internal y-sweet, derived from the configured URL.
-fn upstream_authority(state: &AppState) -> anyhow::Result<String> {
+pub(crate) fn upstream_authority(state: &AppState) -> anyhow::Result<String> {
     let url = Url::parse(&state.config.ysweet_url)?;
     let host = url
         .host_str()
@@ -174,7 +195,10 @@ async fn proxy_http(
 /// Resolve the `(vault, principal)` for a sync WebSocket from its docId path and
 /// `?token=` query, returning `None` if the token is unknown/expired (e.g. a
 /// read-only viewer whose writes we simply won't attribute).
-async fn resolve_attribution(state: &AppState, uri: &axum::http::Uri) -> Option<Attribution> {
+pub(crate) async fn resolve_attribution(
+    state: &AppState,
+    uri: &axum::http::Uri,
+) -> Option<Attribution> {
     // Path is `/d/{docId}/{docId}`; the first segment after `/d/` is the docId.
     let doc_id = uri.path().strip_prefix("/d/")?.split('/').next()?;
     if doc_id.is_empty() {
@@ -197,7 +221,7 @@ async fn resolve_attribution(state: &AppState, uri: &axum::http::Uri) -> Option<
 }
 
 /// Read one unsigned LEB128 varint (lib0 encoding), returning it and the rest.
-fn read_varint(buf: &[u8]) -> Option<(u64, &[u8])> {
+pub(crate) fn read_varint(buf: &[u8]) -> Option<(u64, &[u8])> {
     let mut result: u64 = 0;
     let mut shift = 0;
     for (i, &byte) in buf.iter().enumerate() {
@@ -216,7 +240,7 @@ fn read_varint(buf: &[u8]) -> Option<(u64, &[u8])> {
 /// True if a client→server binary frame carries document content: a Yjs sync
 /// message (type 0) of sub-type SyncStep2 (1) or Update (2). Awareness (cursor)
 /// traffic and SyncStep1 (read requests) are deliberately ignored.
-fn is_content_write(data: &[u8]) -> bool {
+pub(crate) fn is_content_write(data: &[u8]) -> bool {
     let Some((msg_type, rest)) = read_varint(data) else {
         return false;
     };
@@ -255,20 +279,7 @@ async fn relay_ws(
             let msg = msg?;
             if let (Some(attr), AxumMsg::Binary(bytes)) = (&attribution, &msg) {
                 if is_content_write(bytes) {
-                    attr.state
-                        .git
-                        .mark_write(&attr.vault_id, &attr.principal)
-                        .await;
-                    attr.state
-                        .search
-                        .mark_write(attr.state.clone(), &attr.vault_id, &attr.principal)
-                        .await;
-                    if let Some((plugin, name)) = &attr.plugin_db {
-                        attr.state
-                            .plugindb
-                            .mark_write(&attr.vault_id, plugin, name)
-                            .await;
-                    }
+                    attr.mark_content_write().await;
                 }
             }
             if let Some(out) = axum_to_tungstenite(msg) {
