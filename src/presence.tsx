@@ -255,7 +255,6 @@ export function PresenceAvatarStack({ entries }: { entries: PresenceEntry[] }): 
           key: entry.clientId,
           className: "realtime-presence-avatar-wrap",
           style: { "--realtime-presence-color": entry.color } as CSSProperties,
-          title: `${entry.isLocal ? "You: " : ""}${entry.name}`,
           "aria-label": `${entry.isLocal ? "You: " : ""}${entry.name}`,
         },
         entry.avatarUrl
