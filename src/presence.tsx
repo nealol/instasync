@@ -25,9 +25,88 @@ export interface PresenceEntry {
   isLocal: boolean;
 }
 
+/**
+ * Shared cursor position published in canvas-world (graph) coordinates so it
+ * stays consistent across devices with different viewport sizes, pan, or zoom.
+ * `space` versions the coordinate system: `"canvas"` is world coords from
+ * Obsidian's `Canvas.posFromDom`; a missing/other value is ignored as stale
+ * screen-space data from an older plugin version.
+ */
 export interface CanvasCursorState {
   x: number;
   y: number;
+  space: "canvas";
+}
+
+// ---------- canvas viewport adapter ----------
+
+/**
+ * Minimal view of Obsidian's internal Canvas instance exposing the viewport
+ * transform we need. Grounded in the Obsidian desktop build:
+ * - `posFromDom({x,y}) = { x: canvas.x + x/scale, y: canvas.y + y/scale }`
+ *   where `{x,y}` are DOM pixels relative to the canvas center (canvasRect.cx/cy).
+ * - `domFromPos({x,y}) = { x: (x - canvas.x)*scale, y: (y - canvas.y)*scale }`.
+ * - `scale` is the authoritative pixel scale (`2 ** zoom`), kept in sync via
+ *   `setScale`; `zoom` itself is log2 and must not be used as a pixel multiplier.
+ * `canvas.x/y` are the world coords at the viewport CENTER (not top-left),
+ * because `domPosFromEvt` is relative to `canvasRect.cx/cy`.
+ */
+export interface CanvasViewport {
+  x: number;
+  y: number;
+  scale: number;
+  canvasRect: { cx: number; cy: number; left: number; top: number; width: number; height: number };
+  posFromDom: (p: { x: number; y: number }) => { x: number; y: number };
+  domFromPos: (p: { x: number; y: number }) => { x: number; y: number };
+}
+
+/**
+ * Extract a {@link CanvasViewport} from a live Obsidian Canvas instance, if it
+ * has the private viewport properties we rely on. Returns `null` when the shape
+ * is unsupported (old/changed Obsidian), so callers can fall back gracefully.
+ */
+export function readCanvasViewport(canvas: unknown): CanvasViewport | null {
+  if (!canvas || typeof canvas !== "object") return null;
+  const c = canvas as Record<string, unknown>;
+  const scale = c.scale;
+  const x = c.x;
+  const y = c.y;
+  const rect = c.canvasRect;
+  const posFromDom = c.posFromDom;
+  const domFromPos = c.domFromPos;
+  if (typeof scale !== "number" || !Number.isFinite(scale) || scale <= 0) return null;
+  if (typeof x !== "number" || typeof y !== "number") return null;
+  if (typeof posFromDom !== "function" || typeof domFromPos !== "function") return null;
+  if (!rect || typeof rect !== "object") return null;
+  const r = rect as Record<string, unknown>;
+  if (
+    typeof r.cx !== "number" ||
+    typeof r.cy !== "number" ||
+    typeof r.left !== "number" ||
+    typeof r.top !== "number"
+  )
+    return null;
+  const canvasRect = {
+    cx: r.cx,
+    cy: r.cy,
+    left: r.left,
+    top: r.top,
+    width: typeof r.width === "number" ? r.width : 0,
+    height: typeof r.height === "number" ? r.height : 0,
+  };
+  return {
+    x,
+    y,
+    scale,
+    canvasRect,
+    // Bind to the canvas instance: Obsidian's `posFromDom`/`domFromPos` read
+    // `this.x`, `this.scale`, etc., so an unbound reference would lose `this`
+    // and return NaN. `.call(canvas, p)` is safe under the same `function`
+    // check above; a bound arrow wrapper is equivalent and avoids relying on
+    // the call site.
+    posFromDom: (p) => (posFromDom as Function).call(canvas, p),
+    domFromPos: (p) => (domFromPos as Function).call(canvas, p),
+  };
 }
 
 // ---------- helpers ----------
@@ -123,8 +202,8 @@ export function setCanvasCursor(awareness: Awareness, cursor: CanvasCursorState 
 /**
  * Render a stack of avatar bubbles. Returns `null` for zero entries so the
  * mount point can skip the DOM entirely. Each bubble has a CSS variable
- * `--realtime-presence-color` set to the device's cursor color and an offset
- * border via `::after`.
+ * `--realtime-presence-color` set to the device's cursor color and a centered
+ * border ring via `::after`.
  */
 export function PresenceAvatarStack({ entries }: { entries: PresenceEntry[] }): ReactElement | null {
   if (entries.length === 0) return null;
@@ -201,17 +280,50 @@ export function mountPresenceStack(
 /**
  * Mount a canvas cursor overlay into `host`. Subscribes to awareness changes
  * and renders remote cursor markers for states with `state.canvasCursor` and
- * `state.user`. Publishes local pointer coordinates relative to
- * `host.getBoundingClientRect()` on `pointermove` (throttled with rAF), and
- * clears on `pointerleave`, `window.blur`, and hidden `visibilitychange`.
+ * `state.user`. The shared cursor position is published in canvas-world
+ * (graph) coordinates via {@link readCanvasViewport}, so it stays consistent
+ * across devices with different viewport sizes, pan, or zoom.
+ *
+ * Remote markers are rendered by converting the published world coords back to
+ * DOM pixels with the *local* viewport's `domFromPos`. A rAF viewport watcher
+ * re-renders whenever the local pan/zoom changes — Obsidian exposes no public
+ * viewport-change event, so we poll `canvas.x/y/scale` each frame while remote
+ * markers exist, gated to avoid work when no cursors are shown.
+ *
+ * Publishes on `pointermove` (throttled with rAF), clears on `pointerleave`,
+ * `window.blur`, and hidden `visibilitychange`.
  */
-export function mountCanvasCursorOverlay(host: HTMLElement, awareness: Awareness): () => void {
+export function mountCanvasCursorOverlay(
+  host: HTMLElement,
+  awareness: Awareness,
+  getCanvas: () => unknown,
+): () => void {
   const layer = document.createElement("div");
   layer.className = "realtime-canvas-presence-layer";
   host.appendChild(layer);
   const root = createRoot(layer);
 
-  const render = () => {
+  /** Read the live viewport; null when the canvas private API is unavailable. */
+  const viewport = () => readCanvasViewport(getCanvas());
+
+  /**
+   * Convert a canvas-world cursor position to DOM pixels relative to the
+   * overlay layer (top-left origin). Returns null when the viewport is
+   * unavailable. `domFromPos` yields pixels relative to the canvas center, so
+   * we add the layer-to-center offset (canvasRect.cx - layer.left).
+   */
+  const worldToLayer = (wx: number, wy: number): { x: number; y: number } | null => {
+    const vp = viewport();
+    if (!vp) return null;
+    const d = vp.domFromPos({ x: wx, y: wy });
+    const layerRect = layer.getBoundingClientRect();
+    return {
+      x: d.x + (vp.canvasRect.cx - layerRect.left),
+      y: d.y + (vp.canvasRect.cy - layerRect.top),
+    };
+  };
+
+  const collectMarkers = () => {
     const localId = awareness.doc.clientID;
     const markers: Array<{
       key: number;
@@ -227,15 +339,25 @@ export function mountCanvasCursorOverlay(host: HTMLElement, awareness: Awareness
       const user = state.user as AwarenessUser | undefined;
       if (!user) return;
       const cursor = state.canvasCursor as CanvasCursorState | null | undefined;
-      if (!cursor || typeof cursor.x !== "number" || typeof cursor.y !== "number") return;
+      // Ignore stale screen-space data from older plugin versions: only
+      // canvas-world coordinates (`space: "canvas"`) are usable across devices.
+      if (!cursor || cursor.space !== "canvas") return;
+      if (typeof cursor.x !== "number" || typeof cursor.y !== "number") return;
+      const pos = worldToLayer(cursor.x, cursor.y);
+      if (!pos) return;
       markers.push({
         key: clientId,
         name: user.name ?? "Anonymous",
         color: user.color ?? "#30bced",
-        x: cursor.x,
-        y: cursor.y,
+        x: pos.x,
+        y: pos.y,
       });
     });
+    return markers;
+  };
+
+  const render = () => {
+    const markers = collectMarkers();
     root.render(
       createElement(
         "div",
@@ -264,18 +386,73 @@ export function mountCanvasCursorOverlay(host: HTMLElement, awareness: Awareness
   awareness.on("change", listener);
   render();
 
+  // Viewport watcher: re-render remote markers when the local pan/zoom moves.
+  // Obsidian's Canvas sets `viewportChanged` + `requestFrame` internally but
+  // emits no public event, so we poll on rAF only while remote markers exist.
+  let viewRaf: number | null = null;
+  let viewRunning = false;
+  let lastSig = "";
+  const viewportSignature = () => {
+    const vp = viewport();
+    if (!vp) return "";
+    // Include pan/zoom AND the layer rect + canvasRect center, so cursors
+    // stay positioned across window resize, sidebar toggles, and pane layout
+    // shifts that move the canvas without changing pan/zoom.
+    const lr = layer.getBoundingClientRect();
+    return `${vp.x}|${vp.y}|${vp.scale}|${vp.canvasRect.cx}|${vp.canvasRect.cy}|${lr.left}|${lr.top}|${lr.width}|${lr.height}`;
+  };
+  const hasRemoteMarkers = () => {
+    const localId = awareness.doc.clientID;
+    let found = false;
+    awareness.getStates().forEach((state, id) => {
+      if (found || id === localId) return;
+      if (!state || typeof state !== "object") return;
+      const s = state as Record<string, unknown>;
+      const c = s.canvasCursor as CanvasCursorState | undefined;
+      if (c && c.space === "canvas") found = true;
+    });
+    return found;
+  };
+  const startWatcher = () => {
+    if (viewRunning) return;
+    viewRunning = true;
+    lastSig = viewportSignature();
+    const tick = () => {
+      if (!viewRunning) return;
+      if (!hasRemoteMarkers()) {
+        viewRunning = false;
+        viewRaf = null;
+        return;
+      }
+      const sig = viewportSignature();
+      if (sig !== "" && sig !== lastSig) {
+        lastSig = sig;
+        render();
+      }
+      viewRaf = requestAnimationFrame(tick);
+    };
+    viewRaf = requestAnimationFrame(tick);
+  };
+
   let rafId: number | null = null;
   let pending: { x: number; y: number } | null = null;
 
   const onPointerMove = (event: PointerEvent) => {
-    const rect = host.getBoundingClientRect();
-    pending = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    const vp = viewport();
+    if (!vp) return; // cannot convert to world coords without the viewport
+    // Map the client pointer to DOM pixels relative to the canvas center, then
+    // to canvas-world coords via posFromDom.
+    const domX = event.clientX - vp.canvasRect.cx;
+    const domY = event.clientY - vp.canvasRect.cy;
+    pending = vp.posFromDom({ x: domX, y: domY });
     if (rafId === null) {
       rafId = requestAnimationFrame(() => {
         rafId = null;
         if (pending) {
-          setCanvasCursor(awareness, pending);
+          setCanvasCursor(awareness, { ...pending, space: "canvas" });
           pending = null;
+          // Ensure the remote-viewer loop is running while we have a cursor.
+          startWatcher();
         }
       });
     }
@@ -288,6 +465,7 @@ export function mountCanvasCursorOverlay(host: HTMLElement, awareness: Awareness
     }
     pending = null;
     setCanvasCursor(awareness, null);
+    render();
   };
 
   const onPointerLeave = () => clearCursor();
@@ -301,13 +479,24 @@ export function mountCanvasCursorOverlay(host: HTMLElement, awareness: Awareness
   window.addEventListener("blur", onBlur);
   document.addEventListener("visibilitychange", onVisibilityChange);
 
+  // Start the viewport watcher whenever a remote state appears, so remote
+  // cursors move in lockstep with the local pan/zoom even before we publish.
+  const ensureWatcher = () => {
+    if (hasRemoteMarkers()) startWatcher();
+  };
+  awareness.on("change", ensureWatcher);
+  ensureWatcher();
+
   return () => {
     awareness.off("change", listener);
+    awareness.off("change", ensureWatcher);
     host.removeEventListener("pointermove", onPointerMove);
     host.removeEventListener("pointerleave", onPointerLeave);
     window.removeEventListener("blur", onBlur);
     document.removeEventListener("visibilitychange", onVisibilityChange);
     if (rafId !== null) cancelAnimationFrame(rafId);
+    viewRunning = false;
+    if (viewRaf !== null) cancelAnimationFrame(viewRaf);
     setCanvasCursor(awareness, null);
     root.unmount();
     layer.remove();

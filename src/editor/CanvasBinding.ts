@@ -76,7 +76,11 @@ export class CanvasBinding {
       "canvas",
       "realtime-canvas-presence-stack",
     );
-    const cursorCleanup = mountCanvasCursorOverlay(host, this.doc.awareness);
+    const cursorCleanup = mountCanvasCursorOverlay(
+      host,
+      this.doc.awareness,
+      () => this.canvas,
+    );
     this.presenceCleanup = () => {
       cursorCleanup();
       stackCleanup();

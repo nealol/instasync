@@ -7,6 +7,7 @@ import {
   collectPresenceEntries,
   markViewing,
   setCanvasCursor,
+  readCanvasViewport,
   PresenceAvatarStack,
   initials,
   type PresenceEntry,
@@ -124,17 +125,85 @@ describe("markViewing", () => {
 });
 
 describe("setCanvasCursor", () => {
-  it("writes { x, y } and clears to null without changing state.user", () => {
+  it("writes { x, y, space:'canvas' } and clears to null without changing state.user", () => {
     const aw = makeAwareness();
     set_user(aw, { name: "Local", color: "#ff0000" });
-    setCanvasCursor(aw, { x: 10, y: 20 });
-    expect(aw.getLocalState()?.canvasCursor).toEqual({ x: 10, y: 20 });
+    setCanvasCursor(aw, { x: 10, y: 20, space: "canvas" });
+    expect(aw.getLocalState()?.canvasCursor).toEqual({ x: 10, y: 20, space: "canvas" });
     expect(aw.getLocalState()?.user?.name).toBe("Local");
     setCanvasCursor(aw, null);
     expect(aw.getLocalState()?.canvasCursor ?? null).toBeNull();
     expect(aw.getLocalState()?.user?.name).toBe("Local");
   });
 });
+
+describe("readCanvasViewport", () => {
+  it("returns null for non-canvas objects", () => {
+    expect(readCanvasViewport(null)).toBeNull();
+    expect(readCanvasViewport({})).toBeNull();
+    expect(readCanvasViewport({ scale: 1 })).toBeNull();
+  });
+
+  it("returns null when scale is missing, non-finite, or <= 0", () => {
+    const base = makeCanvasLike();
+    expect(readCanvasViewport({ ...base, scale: 0 })).toBeNull();
+    expect(readCanvasViewport({ ...base, scale: NaN })).toBeNull();
+    expect(readCanvasViewport({ ...base, scale: undefined })).toBeNull();
+  });
+
+  it("returns a viewport exposing posFromDom/domFromPos for a well-shaped canvas", () => {
+    const c = makeCanvasLike();
+    const vp = readCanvasViewport(c);
+    expect(vp).not.toBeNull();
+    // posFromDom: world = center.x + dom/scale
+    expect(vp!.posFromDom({ x: 0, y: 0 })).toEqual({ x: 100, y: 50 });
+    expect(vp!.posFromDom({ x: 50, y: 25 })).toEqual({ x: 150, y: 75 });
+    // domFromPos is the inverse of posFromDom
+    expect(vp!.domFromPos({ x: 150, y: 75 })).toEqual({ x: 50, y: 25 });
+  });
+
+  it("binds posFromDom/domFromPos so `this`-based methods work", () => {
+    // Methods read `this.x/this.scale` like Obsidian's; without binding the
+    // viewport wrappers would lose `this` and return NaN.
+    const c = makeCanvasLikeThis();
+    const vp = readCanvasViewport(c);
+    expect(vp).not.toBeNull();
+    expect(vp!.posFromDom({ x: 50, y: 25 })).toEqual({ x: 150, y: 75 });
+    expect(vp!.domFromPos({ x: 150, y: 75 })).toEqual({ x: 50, y: 25 });
+  });
+});
+
+function makeCanvasLike() {
+  return {
+    x: 100,
+    y: 50,
+    scale: 1,
+    canvasRect: { cx: 400, cy: 300, left: 0, top: 0, width: 800, height: 600 },
+    posFromDom: (p: { x: number; y: number }) => ({
+      x: 100 + p.x / 1,
+      y: 50 + p.y / 1,
+    }),
+    domFromPos: (p: { x: number; y: number }) => ({
+      x: (p.x - 100) * 1,
+      y: (p.y - 50) * 1,
+    }),
+  };
+}
+
+function makeCanvasLikeThis() {
+  return {
+    x: 100,
+    y: 50,
+    scale: 1,
+    canvasRect: { cx: 400, cy: 300, left: 0, top: 0, width: 800, height: 600 },
+    posFromDom: function (this: any, p: { x: number; y: number }) {
+      return { x: this.x + p.x / this.scale, y: this.y + p.y / this.scale };
+    },
+    domFromPos: function (this: any, p: { x: number; y: number }) {
+      return { x: (p.x - this.x) * this.scale, y: (p.y - this.y) * this.scale };
+    },
+  };
+}
 
 describe("PresenceAvatarStack", () => {
   it("renders nothing for zero entries", () => {

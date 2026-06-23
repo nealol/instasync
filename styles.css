@@ -832,8 +832,8 @@
 
 .realtime-presence-stack {
   position: absolute;
-  top: 8px;
-  right: 8px;
+  top: 128px;
+  right: 128px;
   z-index: 50;
   display: flex;
   flex-direction: row-reverse;
@@ -861,7 +861,6 @@
   content: "";
   position: absolute;
   inset: -2px;
-  transform: translate(2px, -2px);
   border: 2px solid var(--realtime-presence-color);
   border-radius: inherit;
   z-index: -1;
