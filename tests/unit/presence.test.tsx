@@ -171,6 +171,42 @@ describe("readCanvasViewport", () => {
     expect(vp!.posFromDom({ x: 50, y: 25 })).toEqual({ x: 150, y: 75 });
     expect(vp!.domFromPos({ x: 150, y: 75 })).toEqual({ x: 50, y: 25 });
   });
+
+  it("prefers the live wrapperEl rect over a stale cached canvasRect", () => {
+    // Regression: mobile layout shifts leave Canvas.canvasRect stale, so the
+    // wrapper-element center must win. The cached cx here is wildly wrong.
+    const c = makeCanvasLikeWithWrapper({
+      wrapperLeft: 10,
+      wrapperTop: 20,
+      wrapperWidth: 200,
+      wrapperHeight: 100,
+    });
+    const vp = readCanvasViewport(c);
+    expect(vp).not.toBeNull();
+    // cx = 10 + clientLeft(0) + width/2 = 110; cy = 20 + 0 + 50 = 70
+    expect(vp!.canvasRect.cx).toBe(110);
+    expect(vp!.canvasRect.cy).toBe(70);
+    expect(vp!.canvasRect.left).toBe(10);
+    expect(vp!.canvasRect.top).toBe(20);
+  });
+
+  it("accounts for clientLeft/clientTop border when deriving the center", () => {
+    const c = makeCanvasLikeWithWrapper({
+      wrapperLeft: 5,
+      wrapperTop: 8,
+      wrapperWidth: 40,
+      wrapperHeight: 20,
+      clientLeft: 2,
+      clientTop: 1,
+    });
+    const vp = readCanvasViewport(c);
+    expect(vp).not.toBeNull();
+    // left = 5 + 2 = 7; cx = 7 + 40/2 = 27; top = 8 + 1 = 9; cy = 9 + 20/2 = 19
+    expect(vp!.canvasRect.left).toBe(7);
+    expect(vp!.canvasRect.cx).toBe(27);
+    expect(vp!.canvasRect.top).toBe(9);
+    expect(vp!.canvasRect.cy).toBe(19);
+  });
 });
 
 function makeCanvasLike() {
@@ -205,6 +241,58 @@ function makeCanvasLikeThis() {
   };
 }
 
+/**
+ * Build a canvas-like object whose `wrapperEl` reports a live rect via a real
+ * detached DOM element positioned with `left/top`/`width/height` styles. Lets
+ * the live-rect path be exercised under jsdom.
+ */
+function makeCanvasLikeWithWrapper(opts: {
+  x?: number;
+  y?: number;
+  scale?: number;
+  wrapperLeft: number;
+  wrapperTop: number;
+  wrapperWidth: number;
+  wrapperHeight: number;
+  clientLeft?: number;
+  clientTop?: number;
+}) {
+  const el = document.createElement("div");
+  Object.defineProperty(el, "clientLeft", { value: opts.clientLeft ?? 0 });
+  Object.defineProperty(el, "clientTop", { value: opts.clientTop ?? 0 });
+  Object.defineProperty(el, "clientWidth", { value: opts.wrapperWidth });
+  Object.defineProperty(el, "clientHeight", { value: opts.wrapperHeight });
+  el.getBoundingClientRect = () =>
+    ({
+      left: opts.wrapperLeft,
+      top: opts.wrapperTop,
+      width: opts.wrapperWidth,
+      height: opts.wrapperHeight,
+      right: opts.wrapperLeft + opts.wrapperWidth,
+      bottom: opts.wrapperTop + opts.wrapperHeight,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    }) as DOMRect;
+  const scale = opts.scale ?? 1;
+  const x = opts.x ?? 100;
+  const y = opts.y ?? 50;
+  return {
+    x,
+    y,
+    scale,
+    wrapperEl: el,
+    // A stale cached canvasRect that disagrees with the live wrapper; the live
+    // path must win so we don't regress on mobile layout shifts.
+    canvasRect: { cx: 40000, cy: 30000, left: 0, top: 0, width: 800, height: 600 },
+    posFromDom: function (this: any, p: { x: number; y: number }) {
+      return { x: this.x + p.x / this.scale, y: this.y + p.y / this.scale };
+    },
+    domFromPos: function (this: any, p: { x: number; y: number }) {
+      return { x: (p.x - this.x) * this.scale, y: (p.y - this.y) * this.scale };
+    },
+  };
+}
 describe("PresenceAvatarStack", () => {
   it("renders nothing for zero entries", () => {
     const container = document.createElement("div");

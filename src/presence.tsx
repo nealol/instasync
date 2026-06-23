@@ -44,26 +44,58 @@ export interface CanvasCursorState {
  * Minimal view of Obsidian's internal Canvas instance exposing the viewport
  * transform we need. Grounded in the Obsidian desktop build:
  * - `posFromDom({x,y}) = { x: canvas.x + x/scale, y: canvas.y + y/scale }`
- *   where `{x,y}` are DOM pixels relative to the canvas center (canvasRect.cx/cy).
+ *   where `{x,y}` are DOM pixels relative to the canvas center.
  * - `domFromPos({x,y}) = { x: (x - canvas.x)*scale, y: (y - canvas.y)*scale }`.
  * - `scale` is the authoritative pixel scale (`2 ** zoom`), kept in sync via
  *   `setScale`; `zoom` itself is log2 and must not be used as a pixel multiplier.
- * `canvas.x/y` are the world coords at the viewport CENTER (not top-left),
- * because `domPosFromEvt` is relative to `canvasRect.cx/cy`.
+ * `x/y` are the world coords at the viewport CENTER (not top-left), because
+ * `domPosFromEvt` is relative to the wrapper element's center.
+ *
+ * `canvasRect` is derived LIVE from the canvas `wrapperEl` (mirroring Obsidian's
+ * `p3()`), NOT from the Canvas instance's cached `canvasRect` field. That field
+ * is only refreshed in `onResize`, so on mobile — where sidebars, toolbars, and
+ * viewport insets shift layout without firing resize — a cached `canvasRect.cx`
+ * drifts from the actual center and produces a constant horizontal cursor
+ * offset. Computing the center fresh on each read keeps the cursor overlay
+ * aligned with where Obsidian actually renders nodes.
  */
 export interface CanvasViewport {
   x: number;
   y: number;
   scale: number;
+  /** Live rect of the canvas wrapper, in client coordinates. */
   canvasRect: { cx: number; cy: number; left: number; top: number; width: number; height: number };
   posFromDom: (p: { x: number; y: number }) => { x: number; y: number };
   domFromPos: (p: { x: number; y: number }) => { x: number; y: number };
 }
 
 /**
+ * Reconstruct `p3(wrapperEl)`: the canvas-writer rect Obsidian's own code uses
+ * for `canvasRect` ({ left, top, width, height, cx, cy }), but read live so we
+ * stay correct after layout shifts that don't fire `onResize`. Returns `null`
+ * when no measurable wrapper element is available.
+ */
+function liveWrapperRect(canvas: Record<string, unknown>): CanvasViewport["canvasRect"] | null {
+  const wrapper = canvas.wrapperEl;
+  if (!wrapper || typeof (wrapper as any).getBoundingClientRect !== "function") return null;
+  const el = wrapper as HTMLElement;
+  const r = el.getBoundingClientRect();
+  // Mirror p3(): account for the client border so cx/cy lands on the content
+  // box center, not the border box.
+  const left = r.left + el.clientLeft;
+  const top = r.top + el.clientTop;
+  const width = el.clientWidth;
+  const height = el.clientHeight;
+  return { left, top, width, height, cx: left + width / 2, cy: top + height / 2 };
+}
+
+/**
  * Extract a {@link CanvasViewport} from a live Obsidian Canvas instance, if it
  * has the private viewport properties we rely on. Returns `null` when the shape
- * is unsupported (old/changed Obsidian), so callers can fall back gracefully.
+ * is unsupported (old/changed Obsidian) so callers can fall back gracefully.
+ *
+ * The center rect is read live from `wrapperEl`; if that is unavailable the
+ * Canvas instance's cached `canvasRect` is used as a best-effort fallback.
  */
 export function readCanvasViewport(canvas: unknown): CanvasViewport | null {
   if (!canvas || typeof canvas !== "object") return null;
@@ -71,12 +103,31 @@ export function readCanvasViewport(canvas: unknown): CanvasViewport | null {
   const scale = c.scale;
   const x = c.x;
   const y = c.y;
-  const rect = c.canvasRect;
   const posFromDom = c.posFromDom;
   const domFromPos = c.domFromPos;
   if (typeof scale !== "number" || !Number.isFinite(scale) || scale <= 0) return null;
   if (typeof x !== "number" || typeof y !== "number") return null;
   if (typeof posFromDom !== "function" || typeof domFromPos !== "function") return null;
+
+  // Prefer the live wrapper rect; fall back to the cached field, validating it.
+  const canvasRect = liveWrapperRect(c) ?? cachedCanvasRect(c.canvasRect);
+  if (!canvasRect) return null;
+
+  return {
+    x,
+    y,
+    scale,
+    canvasRect,
+    // Bind to the canvas instance: Obsidian's `posFromDom`/`domFromPos` read
+    // `this.x`, `this.scale`, etc., so an unbound reference would lose `this`
+    // and return NaN. The wrapper arrow preserves the binding for every call.
+    posFromDom: (p) => (posFromDom as Function).call(canvas, p),
+    domFromPos: (p) => (domFromPos as Function).call(canvas, p),
+  };
+}
+
+/** Validate and adopt the Canvas instance's cached `canvasRect`, if usable. */
+function cachedCanvasRect(rect: unknown): CanvasViewport["canvasRect"] | null {
   if (!rect || typeof rect !== "object") return null;
   const r = rect as Record<string, unknown>;
   if (
@@ -86,26 +137,13 @@ export function readCanvasViewport(canvas: unknown): CanvasViewport | null {
     typeof r.top !== "number"
   )
     return null;
-  const canvasRect = {
+  return {
     cx: r.cx,
     cy: r.cy,
     left: r.left,
     top: r.top,
     width: typeof r.width === "number" ? r.width : 0,
     height: typeof r.height === "number" ? r.height : 0,
-  };
-  return {
-    x,
-    y,
-    scale,
-    canvasRect,
-    // Bind to the canvas instance: Obsidian's `posFromDom`/`domFromPos` read
-    // `this.x`, `this.scale`, etc., so an unbound reference would lose `this`
-    // and return NaN. `.call(canvas, p)` is safe under the same `function`
-    // check above; a bound arrow wrapper is equivalent and avoids relying on
-    // the call site.
-    posFromDom: (p) => (posFromDom as Function).call(canvas, p),
-    domFromPos: (p) => (domFromPos as Function).call(canvas, p),
   };
 }
 
@@ -218,6 +256,7 @@ export function PresenceAvatarStack({ entries }: { entries: PresenceEntry[] }): 
           className: "realtime-presence-avatar-wrap",
           style: { "--realtime-presence-color": entry.color } as CSSProperties,
           title: `${entry.isLocal ? "You: " : ""}${entry.name}`,
+          "aria-label": `${entry.isLocal ? "You: " : ""}${entry.name}`,
         },
         entry.avatarUrl
           ? createElement("img", {
