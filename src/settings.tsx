@@ -14,6 +14,7 @@ import { FileDiff } from "@pierre/diffs/react";
 import { parseDiffFromFile } from "@pierre/diffs";
 import {
   normalizeServerUrl,
+  validateAvatarUrl,
   validateGitEmail,
   type CursorAuditEntry,
   type GitBackupConfig,
@@ -47,6 +48,12 @@ export interface RealtimeSettings {
   userDisplayName: string;
   userEmail: string;
   gitEmail: string;
+  /** OpenID picture URL cached from /api/me; read-only default avatar source. */
+  userPictureUrl: string;
+  /** User-configured avatar URL override from /api/me; empty means use userPictureUrl. */
+  userAvatarUrlOverride: string;
+  /** Effective avatar URL shown in presence: userAvatarUrlOverride || userPictureUrl. */
+  userAvatarUrl: string;
   /** The server vault UUID currently synced into this local vault; "" if none. */
   activeVaultId: string;
   /** This client's display name (shown on remote cursors). */
@@ -87,6 +94,9 @@ export function defaultSettings(): RealtimeSettings {
     userDisplayName: "",
     userEmail: "",
     gitEmail: "",
+    userPictureUrl: "",
+    userAvatarUrlOverride: "",
+    userAvatarUrl: "",
     activeVaultId: "",
     clientName: identity.name,
     clientColor: identity.color,
@@ -551,9 +561,20 @@ function FullSettings({
   );
 }
 
+function initials(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "?";
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+}
+
 function AccountSection({ plugin, refresh }: { plugin: RealtimePlugin; refresh: () => void }) {
   const [gitEmail, setGitEmail] = useState(plugin.settings.gitEmail || "");
   const [emailError, setEmailError] = useState("");
+  const [avatarOverride, setAvatarOverride] = useState(
+    plugin.settings.userAvatarUrlOverride || "",
+  );
+  const [avatarError, setAvatarError] = useState("");
   return (
     <>
       <h3>Account</h3>
@@ -574,6 +595,52 @@ function AccountSection({ plugin, refresh }: { plugin: RealtimePlugin; refresh: 
           </button>
         }
       />
+      {plugin.settings.userAvatarUrl ? (
+        <img
+          className="realtime-account-avatar"
+          src={plugin.settings.userAvatarUrl}
+          alt=""
+        />
+      ) : (
+        <div className="realtime-account-avatar is-fallback">
+          {initials(plugin.settings.userDisplayName || plugin.settings.userEmail)}
+        </div>
+      )}
+      <SettingRow
+        name="Avatar URL"
+        desc="Optional image URL shown to collaborators. Leave blank to use your OpenID profile picture."
+        control={
+          <input
+            className="realtime-modal-input"
+            type="url"
+            value={avatarOverride}
+            onChange={(event) => {
+              setAvatarOverride(event.currentTarget.value);
+              if (avatarError) setAvatarError("");
+            }}
+            onBlur={() => {
+              const trimmed = avatarOverride.trim();
+              if (trimmed === (plugin.settings.userAvatarUrlOverride || "")) {
+                if (avatarError) setAvatarError("");
+                return;
+              }
+              const msg = validateAvatarUrl(trimmed);
+              if (msg) {
+                setAvatarError(msg);
+                return;
+              }
+              setAvatarError("");
+              void runNotice(undefined, async () => {
+                await plugin.auth.updateMe({ avatarUrlOverride: trimmed || null });
+                plugin.updateLocalAwareness();
+                refresh();
+                new Notice(`${PLUGIN_NAME}: Avatar updated.`);
+              });
+            }}
+          />
+        }
+      />
+      {avatarError ? <p className="realtime-error">{avatarError}</p> : null}
       <SettingRow
         name="Git author email"
         desc="Optional email used as the Git author for your edits. Leave blank to use your login email."
@@ -600,7 +667,7 @@ function AccountSection({ plugin, refresh }: { plugin: RealtimePlugin; refresh: 
               }
               setEmailError("");
               void runNotice(undefined, async () => {
-                await plugin.auth.updateMe({ gitEmail: trimmed || undefined });
+                await plugin.auth.updateMe({ gitEmail: trimmed || null });
                 setGitEmail(trimmed);
                 new Notice(`${PLUGIN_NAME}: Git author email updated.`);
               });

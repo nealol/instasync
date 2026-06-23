@@ -33,6 +33,10 @@ pub mod users {
         pub email: String,
         pub git_email: Option<String>,
         pub display_name: String,
+        /// Latest OpenID `picture` claim, refreshed on every login.
+        pub picture_url: Option<String>,
+        /// User-configured avatar override; empty/None falls back to `picture_url`.
+        pub avatar_url_override: Option<String>,
         pub created_at: i64,
     }
 

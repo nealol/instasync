@@ -11,6 +11,7 @@ import { CompatibilityError } from "./caps";
 import { PLUGIN_NAME } from "./brand";
 import { liveEdit } from "./editor/LiveEdit";
 import { yRemoteSelections, yRemoteSelectionsTheme } from "./editor/RemoteSelections";
+import { markdownPresence, markdownPresenceTheme } from "./editor/MarkdownPresence";
 import { setDiagnosticLoggingEnabled } from "./debug";
 import { openTrashModal } from "./TrashModal";
 import { FILE_HISTORY_VIEW_TYPE, FileHistoryView } from "./history/FileHistoryView";
@@ -77,8 +78,14 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
     this.statusBarEl = this.addStatusBarItem();
     this.renderStatus();
 
-    // Editor extensions: live editing + remote cursors.
-    this.registerEditorExtension([liveEdit, yRemoteSelections, yRemoteSelectionsTheme]);
+    // Editor extensions: live editing + remote cursors + presence avatars.
+    this.registerEditorExtension([
+      liveEdit,
+      yRemoteSelections,
+      yRemoteSelectionsTheme,
+      markdownPresence,
+      markdownPresenceTheme,
+    ]);
 
     // Deep link back from the SSO login page: obsidian://realtime-auth?token=…
     this.registerObsidianProtocolHandler("realtime-auth", (params) => {
@@ -601,6 +608,7 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
       name: this.settings.clientName,
       color: this.settings.clientColor,
       colorLight: this.settings.clientColorLight,
+      avatarUrl: this.settings.userAvatarUrl || null,
     });
   }
 
@@ -713,6 +721,9 @@ function sanitizeSettings(raw: unknown): RealtimeSettings {
   settings.userDisplayName = typeof data.userDisplayName === "string" ? data.userDisplayName : "";
   settings.userEmail = typeof data.userEmail === "string" ? data.userEmail : "";
   settings.gitEmail = typeof data.gitEmail === "string" ? data.gitEmail : "";
+  settings.userPictureUrl = sanitizeOptionalHttpUrl(data.userPictureUrl);
+  settings.userAvatarUrlOverride = sanitizeOptionalHttpUrl(data.userAvatarUrlOverride);
+  settings.userAvatarUrl = sanitizeOptionalHttpUrl(data.userAvatarUrl);
   settings.activeVaultId = typeof data.activeVaultId === "string" ? data.activeVaultId.trim() : "";
   settings.clientName =
     typeof data.clientName === "string" && data.clientName.trim()
@@ -757,4 +768,21 @@ function sanitizeUrl(value: unknown, fallback: string): string {
 function sanitizeColor(value: unknown, fallback: string): string {
   if (typeof value !== "string") return fallback;
   return /^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/.test(value) ? value : fallback;
+}
+
+/// Sanitize an optional avatar URL setting: returns `""` for non-strings,
+/// empty values, or invalid http(s) URLs. Mirrors server `validate_avatar_url`.
+function sanitizeOptionalHttpUrl(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (trimmed.length > 2048) return "";
+  if (/[\x00-\x1f\x7f\s]/.test(trimmed)) return "";
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return "";
+  } catch {
+    return "";
+  }
+  return trimmed;
 }

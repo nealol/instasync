@@ -53,6 +53,7 @@ pub struct MockIdentity {
     pub subject: String,
     pub email: String,
     pub name: String,
+    pub picture: Option<String>,
 }
 
 /// Pending OIDC Authorization-Code flow, keyed by `state`.

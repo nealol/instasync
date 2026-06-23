@@ -65,6 +65,24 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
         }
     }
 
+    if let Err(e) = db
+        .execute_unprepared("ALTER TABLE users ADD COLUMN picture_url TEXT")
+        .await
+    {
+        if !e.to_string().contains("duplicate column name") {
+            return Err(e);
+        }
+    }
+
+    if let Err(e) = db
+        .execute_unprepared("ALTER TABLE users ADD COLUMN avatar_url_override TEXT")
+        .await
+    {
+        if !e.to_string().contains("duplicate column name") {
+            return Err(e);
+        }
+    }
+
     let indexes: [IndexCreateStatement; 14] = [
         Index::create()
             .if_not_exists()

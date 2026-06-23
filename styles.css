@@ -827,3 +827,106 @@
 .is-mobile .realtime-history-binary-pane img {
 	max-width: 90vw;
 }
+
+/* ---------- presence: avatar stacks and canvas cursors ---------- */
+
+.realtime-presence-stack {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 50;
+  display: flex;
+  flex-direction: row-reverse;
+  align-items: center;
+  pointer-events: none;
+}
+
+
+.cm-editor {
+  position: relative;
+}
+
+.realtime-presence-avatar-wrap {
+  --realtime-presence-color: #30bced;
+  position: relative;
+  width: 24px;
+  height: 24px;
+  margin-left: -7px;
+  border-radius: 999px;
+  background: var(--background-primary);
+  pointer-events: auto;
+}
+
+.realtime-presence-avatar-wrap::after {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  transform: translate(2px, -2px);
+  border: 2px solid var(--realtime-presence-color);
+  border-radius: inherit;
+  z-index: -1;
+}
+
+.realtime-presence-avatar,
+.realtime-presence-avatar-fallback {
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  display: grid;
+  place-items: center;
+  object-fit: cover;
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  box-shadow: 0 0 0 1px var(--background-modifier-border);
+}
+
+.realtime-account-avatar {
+  width: 40px;
+  height: 40px;
+  border-radius: 999px;
+  object-fit: cover;
+  background: var(--background-secondary);
+}
+
+.realtime-account-avatar.is-fallback {
+  display: grid;
+  place-items: center;
+  font-weight: 600;
+}
+
+.realtime-canvas-presence-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 45;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.realtime-canvas-cursor {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform: translate(var(--realtime-canvas-x), var(--realtime-canvas-y));
+  pointer-events: none;
+}
+
+.realtime-canvas-cursor-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: var(--realtime-presence-color);
+  box-shadow: 0 0 0 2px var(--background-primary);
+}
+
+.realtime-canvas-cursor-label {
+  margin-top: 3px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--realtime-presence-color);
+  color: white;
+  font-size: 11px;
+  white-space: nowrap;
+}

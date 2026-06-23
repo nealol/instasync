@@ -105,6 +105,10 @@ export interface FakePlugin {
     userDisplayName: string;
     userEmail: string;
     userId: string;
+    gitEmail: string;
+    userPictureUrl: string;
+    userAvatarUrlOverride: string;
+    userAvatarUrl: string;
     activeVaultId: string;
     clientName: string;
     clientColor: string;
@@ -149,6 +153,10 @@ export function makeFakePlugin(
       userDisplayName: "",
       userEmail: "",
       userId: "",
+      gitEmail: "",
+      userPictureUrl: "",
+      userAvatarUrlOverride: "",
+      userAvatarUrl: "",
       activeVaultId: opts.activeVaultId,
       clientName: opts.clientName ?? "Test Client",
       clientColor: "#ffffff",

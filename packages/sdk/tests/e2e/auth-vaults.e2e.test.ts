@@ -53,6 +53,25 @@ describe("auth", () => {
     const me = await clientFor(token).me();
     expect(me.displayName).toBe("carol");
   });
+
+  it("returns avatar fields from me() and updateMe()", async () => {
+    const token = await harness.loginUser("dave");
+    const client = clientFor(token);
+    const me = await client.me();
+    expect(me).toHaveProperty("pictureUrl");
+    expect(me).toHaveProperty("avatarUrlOverride");
+    expect(me).toHaveProperty("avatarUrl");
+
+    const updated = await client.updateMe({
+      avatarUrlOverride: "https://cdn.example.com/sdk.png",
+    });
+    expect(updated.avatarUrlOverride).toBe("https://cdn.example.com/sdk.png");
+    expect(updated.avatarUrl).toBe("https://cdn.example.com/sdk.png");
+
+    // Clear the override.
+    const cleared = await client.updateMe({ avatarUrlOverride: null });
+    expect(cleared.avatarUrlOverride).toBeNull();
+  });
 });
 
 describe("vaults, invites, members", () => {

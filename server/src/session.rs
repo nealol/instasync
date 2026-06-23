@@ -25,13 +25,15 @@ fn random_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Upsert a user by (issuer, subject); refreshes email / display name on login.
+/// Upsert a user by (issuer, subject); refreshes email / display name / picture
+/// on login. Preserves `git_email` and `avatar_url_override` across logins.
 pub async fn upsert_user(
     db: &impl ConnectionTrait,
     issuer: &str,
     subject: &str,
     email: &str,
     display_name: &str,
+    picture_url: Option<&str>,
 ) -> Result<users::Model, AppError> {
     let existing = users::Entity::find()
         .filter(users::Column::OidcIssuer.eq(issuer))
@@ -43,6 +45,7 @@ pub async fn upsert_user(
         let mut active: users::ActiveModel = model.into();
         active.email = Set(email.to_string());
         active.display_name = Set(display_name.to_string());
+        active.picture_url = Set(picture_url.map(|p| p.to_string()));
         Ok(active.update(db).await?)
     } else {
         let model = users::ActiveModel {
@@ -52,6 +55,8 @@ pub async fn upsert_user(
             email: Set(email.to_string()),
             git_email: Set(None),
             display_name: Set(display_name.to_string()),
+            picture_url: Set(picture_url.map(|p| p.to_string())),
+            avatar_url_override: Set(None),
             created_at: Set(now_millis()),
         };
         Ok(model.insert(db).await?)

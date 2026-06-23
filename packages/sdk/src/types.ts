@@ -13,6 +13,9 @@ export interface MeResponse {
   email: string;
   gitEmail?: string;
   displayName: string;
+  pictureUrl?: string | null;
+  avatarUrlOverride?: string | null;
+  avatarUrl?: string | null;
 }
 
 /** Server identity returned by the public `GET /api/server-info`. */
@@ -59,6 +62,7 @@ export interface MemberInfo {
   displayName: string;
   role: "admin" | "member";
   owner?: boolean;
+  avatarUrl?: string | null;
 }
 
 // ---------- remote cursors ----------

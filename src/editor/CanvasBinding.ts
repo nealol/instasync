@@ -1,6 +1,7 @@
 import type RealtimePlugin from "../main";
 import type { CanvasDocument } from "../CanvasDocument";
 import { parseCanvas } from "../structured/canvas";
+import { mountCanvasCursorOverlay, mountPresenceStack } from "../presence";
 
 /**
  * Origin tag stamped on the Yjs transaction when we fold a local canvas edit
@@ -18,10 +19,16 @@ interface InternalCanvas {
   requestFrame?: () => void;
 }
 
+interface BoundCanvasView {
+  canvas: InternalCanvas;
+  host: HTMLElement;
+}
+
 export class CanvasBinding {
   private plugin: RealtimePlugin;
   private doc: CanvasDocument;
   private canvas: InternalCanvas | null = null;
+  private presenceCleanup: (() => void) | null = null;
   private originalRequestSave: InternalCanvas["requestSave"] | null = null;
   private applyingRemote = false;
   /**
@@ -44,14 +51,15 @@ export class CanvasBinding {
   }
 
   tryBind(): void {
-    const canvas = this.findOpenCanvas();
+    const found = this.findOpenCanvas();
     // Same live canvas we are already patched onto — nothing to do.
-    if (canvas && canvas === this.canvas) return;
+    if (found && found.canvas === this.canvas) return;
     // The leaf was closed (canvas == null) or reopened as a fresh Canvas
     // instance: drop the stale patch before binding the new one, so live
     // editing survives close/reopen instead of silently dying.
-    if (this.canvas && canvas !== this.canvas) this.unpatch();
-    if (!canvas) return;
+    if (this.canvas && (!found || found.canvas !== this.canvas)) this.unpatch();
+    if (!found) return;
+    const { canvas, host } = found;
     this.canvas = canvas;
     this.originalRequestSave = canvas.requestSave.bind(canvas);
     canvas.requestSave = (...args: unknown[]) => {
@@ -60,6 +68,19 @@ export class CanvasBinding {
       return result;
     };
     this.applyRemote();
+    // Mount presence avatar stack + canvas cursor overlay. Both clean up via
+    // presenceCleanup, which is called in unpatch().
+    const stackCleanup = mountPresenceStack(
+      host,
+      this.doc.awareness,
+      "canvas",
+      "realtime-canvas-presence-stack",
+    );
+    const cursorCleanup = mountCanvasCursorOverlay(host, this.doc.awareness);
+    this.presenceCleanup = () => {
+      cursorCleanup();
+      stackCleanup();
+    };
   }
 
   /** Push the CRDT's current value into the live view and converge disk. */
@@ -101,6 +122,8 @@ export class CanvasBinding {
 
   /** Restore the canvas's original `requestSave` and forget the binding. */
   private unpatch(): void {
+    this.presenceCleanup?.();
+    this.presenceCleanup = null;
     if (this.canvas && this.originalRequestSave) {
       this.canvas.requestSave = this.originalRequestSave;
     }
@@ -126,14 +149,14 @@ export class CanvasBinding {
     }
   }
 
-  private findOpenCanvas(): InternalCanvas | null {
-    let found: InternalCanvas | null = null;
+  private findOpenCanvas(): BoundCanvasView | null {
+    let found: BoundCanvasView | null = null;
     const inspect = (leaf: any) => {
       if (found) return;
       const view = leaf?.view;
       if (view?.getViewType?.() !== "canvas" || view?.file?.path !== this.doc.path) return;
       const canvas = view.canvas;
-      if (isInternalCanvas(canvas)) found = canvas;
+      if (isInternalCanvas(canvas)) found = { canvas, host: view.containerEl };
       else if (!loggedUnsupported) {
         loggedUnsupported = true;
         console.warn(

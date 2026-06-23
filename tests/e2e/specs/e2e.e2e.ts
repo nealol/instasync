@@ -35,6 +35,8 @@ import {
   detachLeaves,
   canvasViewData,
   editCanvasView,
+  canvasPresenceMarkers,
+  dispatchCanvasPointerMove,
   baseViewData,
   editBaseView,
   listTrash,
@@ -608,6 +610,31 @@ describe("Realtime — two isolated Obsidian devices", function () {
         },
         { timeout: 60 * SECONDS, timeoutMsg: "B's disk still has the deleted node" },
       );
+    });
+
+    it("shows another device's cursor in an open canvas", async function () {
+      // Open the canvas on B and bind so presence/cursor overlays mount.
+      await openFileInLeaf(B, "Board.canvas");
+      await B.pause(SECONDS); // let the canvas view mount
+      await bindOpenStructured(B);
+
+      // Dispatch a pointermove on B's canvas host to publish cursor coords.
+      await dispatchCanvasPointerMove(B, "Board.canvas", 120, 80);
+
+      // B signed in as "bob" — its clientName defaults to that display name.
+      const bName = "bob";
+      await A.waitUntil(
+        async () => {
+          const markers = await canvasPresenceMarkers(A, "Board.canvas");
+          return markers.some(
+            (m) => m.name === bName && m.x.trim() !== "" && m.y.trim() !== "",
+          );
+        },
+        { timeout: 60 * SECONDS, timeoutMsg: "A never showed B's canvas cursor marker" },
+      );
+
+      // Clean up B's canvas leaf so it doesn't interfere with later tests.
+      await detachLeaves(B, "canvas");
     });
   });
 

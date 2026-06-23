@@ -222,8 +222,11 @@ async fn oauth_token() {}
 #[utoipa::path(get, path = "/api/server-info", tag = "auth", responses((status = 200, description = "Stable server id, release version, and named capability versions for client-side compatibility gating", body = crate::routes::ServerInfoResponse)))]
 async fn server_info() {}
 
-#[utoipa::path(get, path = "/api/me", tag = "auth", security(("bearerAuth" = [])), responses((status = 200, description = "Current user"), (status = 401, description = "Unauthorized")))]
+#[utoipa::path(get, path = "/api/me", tag = "auth", security(("bearerAuth" = [])), responses((status = 200, description = "Current user profile with avatar fields", body = crate::routes::MeResponse), (status = 401, description = "Unauthorized")))]
 async fn me() {}
+
+#[utoipa::path(patch, path = "/api/me", tag = "auth", security(("bearerAuth" = [])), request_body = crate::routes::UpdateMeBody, responses((status = 200, description = "Updated profile", body = crate::routes::MeResponse), (status = 400, description = "Invalid avatar URL or git email"), (status = 401, description = "Unauthorized")))]
+async fn update_me() {}
 
 #[utoipa::path(post, path = "/api/logout", tag = "auth", security(("bearerAuth" = [])), responses((status = 200, description = "Session revoked"), (status = 401, description = "Unauthorized")))]
 async fn logout() {}

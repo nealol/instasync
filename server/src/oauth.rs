@@ -44,6 +44,7 @@ pub struct AuthorizeParams {
     mock_sub: Option<String>,
     mock_email: Option<String>,
     mock_name: Option<String>,
+    mock_picture: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -168,6 +169,7 @@ pub async fn authorize(
         params.mock_sub,
         params.mock_email,
         params.mock_name,
+        params.mock_picture,
         Some(key),
     )
     .await

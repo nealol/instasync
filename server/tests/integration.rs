@@ -784,14 +784,26 @@ async fn multipart_upload(
 
 /// Drive the mock login flow and return a session token for the given subject.
 async fn login(app: &Router, sub: &str) -> String {
+    login_with_picture(app, sub, None).await
+}
+
+/// Drive the mock login flow with an optional OpenID `picture` URL.
+async fn login_with_picture(app: &Router, sub: &str, picture: Option<&str>) -> String {
+    let mut uri = format!(
+        "/auth/login?redirect=http://app/cb&mock_sub={sub}&mock_name={sub}"
+    );
+    if let Some(pic) = picture {
+        uri.push_str("&mock_picture=");
+        uri.push_str(
+            &url::form_urlencoded::byte_serialize(pic.as_bytes()).collect::<String>(),
+        );
+    }
     let res = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri(format!(
-                    "/auth/login?redirect=http://app/cb&mock_sub={sub}&mock_name={sub}"
-                ))
+                .uri(uri)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -971,11 +983,14 @@ async fn login_creates_session_and_me_works() {
     let ys = fake_ysweet().await;
     let app = test_app(&ys, &ys).await;
 
-    let token = login(&app, "alice").await;
+    let token = login_with_picture(&app, "alice", Some("https://example.com/alice.png")).await;
     let (status, me) = send(&app, "GET", "/api/me", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(me["displayName"], "alice");
     assert_eq!(me["gitEmail"], Value::Null);
+    assert_eq!(me["pictureUrl"], "https://example.com/alice.png");
+    assert_eq!(me["avatarUrl"], "https://example.com/alice.png");
+    assert_eq!(me["avatarUrlOverride"], Value::Null);
 
     let (status, me) = send(
         &app,
@@ -1041,6 +1056,97 @@ async fn login_creates_session_and_me_works() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(me["gitEmail"], Value::Null);
+
+    // --- avatar override ---
+
+    // Set an avatar override; gitEmail is preserved (partial update).
+    let (status, me) = send(
+        &app,
+        "PATCH",
+        "/api/me",
+        Some(&token),
+        Some(json!({ "avatarUrlOverride": "https://cdn.example.com/a.jpg" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(me["avatarUrlOverride"], "https://cdn.example.com/a.jpg");
+    assert_eq!(me["avatarUrl"], "https://cdn.example.com/a.jpg");
+    assert_eq!(me["gitEmail"], Value::Null, "gitEmail should be unchanged");
+
+    // Clear the override; avatarUrl falls back to pictureUrl.
+    let (status, me) = send(
+        &app,
+        "PATCH",
+        "/api/me",
+        Some(&token),
+        Some(json!({ "avatarUrlOverride": null })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(me["avatarUrlOverride"], Value::Null);
+    assert_eq!(me["avatarUrl"], "https://example.com/alice.png");
+
+    // Re-set the override for the invalid-value tests below.
+    let (status, _) = send(
+        &app,
+        "PATCH",
+        "/api/me",
+        Some(&token),
+        Some(json!({ "avatarUrlOverride": "https://cdn.example.com/a.jpg" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Invalid avatar URLs are rejected; the last valid override stays.
+    let invalid_avatars = [
+        "javascript:alert(1)",
+        "ftp://example.com/a.png",
+        "https://exa mple.com/a.png",
+    ];
+    for url in invalid_avatars {
+        let (status, me) = send(
+            &app,
+            "PATCH",
+            "/api/me",
+            Some(&token),
+            Some(json!({ "avatarUrlOverride": url })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "invalid avatar: {url:?}");
+        assert_eq!(me["avatarUrl"], Value::Null, "error body should have no avatarUrl");
+    }
+    // Over-long URL (> 2048 bytes).
+    let long_url = format!("https://example.com/{}", "a".repeat(2040));
+    let (status, me) = send(
+        &app,
+        "PATCH",
+        "/api/me",
+        Some(&token),
+        Some(json!({ "avatarUrlOverride": long_url })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "over-long avatar URL");
+    assert_eq!(me["avatarUrl"], Value::Null);
+
+    // The last valid override is still in place.
+    let (status, me) = send(&app, "GET", "/api/me", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(me["avatarUrlOverride"], "https://cdn.example.com/a.jpg");
+    assert_eq!(me["avatarUrl"], "https://cdn.example.com/a.jpg");
+
+    // Legacy: PATCH with `{}` still clears gitEmail for old clients.
+    let (status, me) = send(
+        &app,
+        "PATCH",
+        "/api/me",
+        Some(&token),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(me["gitEmail"], Value::Null, "legacy {{}} should clear gitEmail");
+    // avatarUrlOverride should be unchanged (not cleared by legacy {{}}).
+    assert_eq!(me["avatarUrlOverride"], "https://cdn.example.com/a.jpg");
 
     // No bearer -> 401.
     let (status, _) = send(&app, "GET", "/api/me", None, None).await;

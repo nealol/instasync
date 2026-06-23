@@ -12,7 +12,7 @@ export default defineConfig({
           name: "plugin",
           environment: "jsdom",
           setupFiles: ["./tests/support/setup.ts"],
-          include: ["tests/unit/**/*.test.ts"],
+          include: ["tests/unit/**/*.test.{ts,tsx}"],
           // Must comfortably exceed waitFor's 30s default (tests/support/util.ts):
           // when they were equal, a single stalled sync round-trip surfaced as an
           // opaque vitest "Test timed out" instead of the labeled waitFor error.

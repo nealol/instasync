@@ -669,6 +669,8 @@ mod tests {
                 email: "a@x".into(),
                 git_email: None,
                 display_name: "Alice".into(),
+                picture_url: None,
+                avatar_url_override: None,
                 created_at: now,
             },
             actor: ApiActor::Cursor(remote_cursors::Model {

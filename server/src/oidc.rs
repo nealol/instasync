@@ -22,6 +22,7 @@ pub struct LoginParams {
     pub mock_sub: Option<String>,
     pub mock_email: Option<String>,
     pub mock_name: Option<String>,
+    pub mock_picture: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,6 +44,7 @@ pub async fn login(
         params.mock_sub,
         params.mock_email,
         params.mock_name,
+        params.mock_picture,
         None,
     )
     .await
@@ -54,6 +56,7 @@ pub(crate) async fn begin_login(
     mock_sub: Option<String>,
     mock_email: Option<String>,
     mock_name: Option<String>,
+    mock_picture: Option<String>,
     oauth_flow_key: Option<String>,
 ) -> AppResult<Response> {
     prune_oidc_flows(&state).await;
@@ -66,6 +69,7 @@ pub(crate) async fn begin_login(
                 subject: mock_sub.unwrap_or_else(|| "mock-user".to_string()),
                 email: mock_email.unwrap_or_else(|| "mock@example.com".to_string()),
                 name: mock_name.unwrap_or_else(|| "Mock User".to_string()),
+                picture: mock_picture,
             };
             state.oidc.lock().await.insert(
                 csrf.secret().clone(),
@@ -135,13 +139,19 @@ pub async fn callback(
         return Err(AppError::BadRequest("unknown or expired state".into()));
     }
 
-    let (issuer, subject, email, name) = if let Some(mock) = flow.mock {
-        (mock.issuer, mock.subject, mock.email, mock.name)
+    let (issuer, subject, email, name, picture) = if let Some(mock) = flow.mock {
+        (
+            mock.issuer,
+            mock.subject,
+            mock.email,
+            mock.name,
+            mock.picture,
+        )
     } else {
         resolve_oidc_identity(&state, &flow, &params).await?
     };
 
-    let user = upsert_user(&state.db, &issuer, &subject, &email, &name).await?;
+    let user = upsert_user(&state.db, &issuer, &subject, &email, &name, picture.as_deref()).await?;
     if let Some(oauth_flow_key) = flow.oauth_flow_key {
         return crate::oauth::finish_authorize(state, oauth_flow_key, user).await;
     }
@@ -207,7 +217,7 @@ async fn resolve_oidc_identity(
     state: &AppState,
     flow: &OidcFlow,
     params: &CallbackParams,
-) -> AppResult<(String, String, String, String)> {
+) -> AppResult<(String, String, String, String, Option<String>)> {
     let code = params
         .code
         .clone()
@@ -244,8 +254,12 @@ async fn resolve_oidc_identity(
         .and_then(|n| n.get(None))
         .map(|n| n.to_string())
         .unwrap_or_else(|| email.clone());
+    let picture = claims
+        .picture()
+        .and_then(|p| p.get(None))
+        .map(|p| p.to_string());
 
-    Ok((issuer, subject, email, name))
+    Ok((issuer, subject, email, name, picture))
 }
 
 /// Run OIDC discovery and gather the pieces needed to build a client. The client

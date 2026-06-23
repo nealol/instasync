@@ -9,6 +9,9 @@ export interface MeResponse {
   email: string;
   gitEmail?: string;
   displayName: string;
+  pictureUrl?: string | null;
+  avatarUrlOverride?: string | null;
+  avatarUrl?: string | null;
 }
 
 export interface KnownSession extends MeResponse {
@@ -42,6 +45,7 @@ export interface MemberInfo {
   displayName: string;
   role: "admin" | "member";
   owner?: boolean;
+  avatarUrl?: string | null;
 }
 
 export interface RemoteCursorInfo {
@@ -175,6 +179,32 @@ export function validateGitEmail(value: string): string | null {
   const domain = trimmed.slice(at + 1);
   if (local === "" || domain === "" || !domain.includes(".")) {
     return "Enter a valid email address.";
+  }
+  return null;
+}
+
+/**
+ * Validate a self-settable avatar URL. Mirrors the server-side
+ * `validate_avatar_url` (server/src/routes.rs): must be a parseable `http` or
+ * `https` URL, at most 2048 bytes, with no ASCII control characters or
+ * whitespace. Returns a human-readable error message, or `null` when the value
+ * is valid — including the empty string, which clears the override (falling
+ * back to the OpenID profile picture).
+ */
+export function validateAvatarUrl(value: string): string | null {
+  const trimmed = value.trim();
+  if (trimmed === "") return null;
+  if (trimmed.length > 2048) return "Avatar URL is too long.";
+  if (/[\x00-\x1f\x7f\s]/.test(trimmed)) {
+    return "Avatar URL must not contain spaces or line breaks.";
+  }
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return "Avatar URL must start with http: or https:.";
+    }
+  } catch {
+    return "Enter a valid http(s) URL.";
   }
   return null;
 }
@@ -391,6 +421,9 @@ export class AuthClient {
     this.plugin.settings.userDisplayName = me.displayName;
     this.plugin.settings.userEmail = me.email;
     this.plugin.settings.gitEmail = me.gitEmail ?? "";
+    this.plugin.settings.userPictureUrl = me.pictureUrl ?? "";
+    this.plugin.settings.userAvatarUrlOverride = me.avatarUrlOverride ?? "";
+    this.plugin.settings.userAvatarUrl = me.avatarUrl ?? "";
     // Default the cursor name to the SSO display name on first login.
     if (!this.plugin.settings.clientName) {
       this.plugin.settings.clientName = me.displayName;
@@ -404,6 +437,9 @@ export class AuthClient {
     this.plugin.settings.userDisplayName = "";
     this.plugin.settings.userEmail = "";
     this.plugin.settings.gitEmail = "";
+    this.plugin.settings.userPictureUrl = "";
+    this.plugin.settings.userAvatarUrlOverride = "";
+    this.plugin.settings.userAvatarUrl = "";
     await this.plugin.saveSettings();
   }
 
@@ -432,9 +468,15 @@ export class AuthClient {
     return this.api<MeResponse>("/api/me");
   }
 
-  async updateMe(body: { gitEmail?: string }): Promise<MeResponse> {
+  async updateMe(body: {
+    gitEmail?: string | null;
+    avatarUrlOverride?: string | null;
+  }): Promise<MeResponse> {
     const me = await this.api<MeResponse>("/api/me", { method: "PATCH", body });
     this.plugin.settings.gitEmail = me.gitEmail ?? "";
+    this.plugin.settings.userPictureUrl = me.pictureUrl ?? "";
+    this.plugin.settings.userAvatarUrlOverride = me.avatarUrlOverride ?? "";
+    this.plugin.settings.userAvatarUrl = me.avatarUrl ?? "";
     await this.plugin.saveSettings();
     return me;
   }
@@ -626,6 +668,9 @@ export class AuthClient {
       email: me.email,
       gitEmail: me.gitEmail,
       displayName: me.displayName,
+      pictureUrl: me.pictureUrl,
+      avatarUrlOverride: me.avatarUrlOverride,
+      avatarUrl: me.avatarUrl,
       tokenKey,
     };
     this.saveKnownSessions([
@@ -644,16 +689,31 @@ export class AuthClient {
       const parsed = raw ? JSON.parse(raw) : [];
       if (!Array.isArray(parsed)) return [];
       return parsed.filter((session): session is KnownSession => {
-        return (
-          !!session &&
-          typeof session === "object" &&
-          typeof session.serverUrl === "string" &&
-          typeof session.serverId === "string" &&
-          typeof session.userId === "string" &&
-          typeof session.email === "string" &&
-          typeof session.displayName === "string" &&
-          typeof session.tokenKey === "string"
-        );
+        if (
+          !session ||
+          typeof session !== "object" ||
+          typeof session.serverUrl !== "string" ||
+          typeof session.serverId !== "string" ||
+          typeof session.userId !== "string" ||
+          typeof session.email !== "string" ||
+          typeof session.displayName !== "string" ||
+          typeof session.tokenKey !== "string"
+        ) {
+          return false;
+        }
+        // Avatar fields are optional on old sessions; when present they must
+        // be a string or null.
+        const pic = session.pictureUrl;
+        const override = session.avatarUrlOverride;
+        const avatar = session.avatarUrl;
+        if (
+          (pic !== undefined && pic !== null && typeof pic !== "string") ||
+          (override !== undefined && override !== null && typeof override !== "string") ||
+          (avatar !== undefined && avatar !== null && typeof avatar !== "string")
+        ) {
+          return false;
+        }
+        return true;
       });
     } catch {
       return [];

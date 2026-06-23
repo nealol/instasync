@@ -282,6 +282,72 @@ export async function editCanvasView(b: any, path: string, data: any): Promise<v
   );
 }
 
+/**
+ * Query the open canvas leaf by path and return remote cursor markers:
+ * each entry has the label text (device name) and the CSS variables
+ * `--realtime-canvas-x` / `--realtime-canvas-y` from the marker element.
+ */
+export async function canvasPresenceMarkers(
+  b: any,
+  path: string,
+): Promise<Array<{ name: string; x: string; y: string }>> {
+  return b.executeObsidian(async ({ app }: any, p: string) => {
+    const results: Array<{ name: string; x: string; y: string }> = [];
+    app.workspace.iterateAllLeaves((leaf: any) => {
+      const v = leaf?.view;
+      if (v?.getViewType?.() === "canvas" && v?.file?.path === p) {
+        const host = v.containerEl as HTMLElement;
+        const markers = host.querySelectorAll<HTMLElement>(".realtime-canvas-cursor");
+        markers.forEach((el) => {
+          const label = el.querySelector(".realtime-canvas-cursor-label");
+          results.push({
+            name: label?.textContent ?? "",
+            x: el.style.getPropertyValue("--realtime-canvas-x"),
+            y: el.style.getPropertyValue("--realtime-canvas-y"),
+          });
+        });
+      }
+    });
+    return results;
+  }, path);
+}
+
+/**
+ * Dispatch a `pointermove` event at the given client coordinates on the open
+ * canvas host for `path`. Used to drive canvas cursor presence in e2e tests.
+ */
+export async function dispatchCanvasPointerMove(
+  b: any,
+  path: string,
+  clientX: number,
+  clientY: number,
+): Promise<void> {
+  await b.executeObsidian(
+    async ({ app }: any, p: string, x: number, y: number) => {
+      let dispatched = false;
+      app.workspace.iterateAllLeaves((leaf: any) => {
+        const v = leaf?.view;
+        if (!dispatched && v?.getViewType?.() === "canvas" && v?.file?.path === p) {
+          const host = v.containerEl as HTMLElement;
+          host.dispatchEvent(
+            new PointerEvent("pointermove", {
+              clientX: x,
+              clientY: y,
+              bubbles: true,
+              cancelable: true,
+            }),
+          );
+          dispatched = true;
+        }
+      });
+      if (!dispatched) throw new Error("no open canvas view for " + p);
+    },
+    path,
+    clientX,
+    clientY,
+  );
+}
+
 /** Read the live base view's serialized data (YAML) for an open base, or null. */
 export async function baseViewData(b: any, path: string): Promise<string | null> {
   return b.executeObsidian(async ({ app }: any, p: string) => {

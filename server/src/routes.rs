@@ -29,19 +29,37 @@ const PRINCIPAL_TTL_MS: i64 = 1000 * 60 * 60 * 24;
 
 // ---------- shared response shapes ----------
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MeResponse {
     pub user_id: String,
     pub email: String,
     pub git_email: Option<String>,
     pub display_name: String,
+    pub picture_url: Option<String>,
+    pub avatar_url_override: Option<String>,
+    pub avatar_url: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateMeBody {
-    pub git_email: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub git_email: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub avatar_url_override: Option<Option<String>>,
+}
+
+/// Custom deserializer that wraps the value in `Some(...)`, so that a field
+/// present as `null` becomes `Some(None)` (clear it) rather than `None` (field
+/// absent, leave unchanged). This distinguishes explicit null from omission in
+/// `Option<Option<T>>` partial-update bodies.
+fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
 }
 
 #[derive(Serialize, ToSchema)]
@@ -129,12 +147,7 @@ pub async fn server_info(State(state): State<AppState>) -> Json<ServerInfoRespon
 }
 
 pub async fn me(AuthUser(user): AuthUser) -> Json<MeResponse> {
-    Json(MeResponse {
-        user_id: user.id,
-        email: user.email,
-        git_email: user.git_email,
-        display_name: user.display_name,
-    })
+    Json(me_response(user))
 }
 
 pub async fn update_me(
@@ -142,27 +155,74 @@ pub async fn update_me(
     AuthUser(user): AuthUser,
     Json(body): Json<UpdateMeBody>,
 ) -> AppResult<Json<MeResponse>> {
-    let git_email = match body.git_email {
-        Some(email) => {
+    let mut active: users::ActiveModel = user.into();
+
+    // Partial-update semantics: a field present as `null` or `""` clears it;
+    // a field present as a non-empty string validates and stores it; a field
+    // absent (None) is left unchanged — unless BOTH are absent, in which case
+    // we preserve the legacy behavior of clearing `git_email` for old clients
+    // that sent `{}` to clear.
+    let legacy_clear_git_email = body.git_email.is_none() && body.avatar_url_override.is_none();
+
+    match body.git_email {
+        Some(Some(email)) => {
             let trimmed = email.trim();
             if trimmed.is_empty() {
-                None
+                active.git_email = Set(None);
             } else {
                 validate_git_email(trimmed)?;
-                Some(trimmed.to_string())
+                active.git_email = Set(Some(trimmed.to_string()));
             }
         }
-        None => None,
-    };
-    let mut active: users::ActiveModel = user.into();
-    active.git_email = Set(git_email);
+        Some(None) => {
+            active.git_email = Set(None);
+        }
+        None if legacy_clear_git_email => {
+            active.git_email = Set(None);
+        }
+        None => {}
+    }
+
+    match body.avatar_url_override {
+        Some(Some(url)) => {
+            let trimmed = url.trim();
+            if trimmed.is_empty() {
+                active.avatar_url_override = Set(None);
+            } else {
+                validate_avatar_url(trimmed)?;
+                active.avatar_url_override = Set(Some(trimmed.to_string()));
+            }
+        }
+        Some(None) => {
+            active.avatar_url_override = Set(None);
+        }
+        None => {}
+    }
+
     let user = active.update(&state.db).await?;
-    Ok(Json(MeResponse {
+    Ok(Json(me_response(user)))
+}
+
+/// Build a `MeResponse` from a user model, computing the effective avatar URL
+/// (override first, then IdP picture).
+fn me_response(user: users::Model) -> MeResponse {
+    let avatar_url = effective_avatar_url(&user);
+    MeResponse {
         user_id: user.id,
         email: user.email,
         git_email: user.git_email,
         display_name: user.display_name,
-    }))
+        picture_url: user.picture_url,
+        avatar_url_override: user.avatar_url_override,
+        avatar_url,
+    }
+}
+
+/// Effective avatar URL: override first, then the OpenID `picture` claim.
+fn effective_avatar_url(user: &users::Model) -> Option<String> {
+    user.avatar_url_override
+        .clone()
+        .or_else(|| user.picture_url.clone())
 }
 
 /// Validate a self-settable git author email before persisting it. The value
@@ -199,6 +259,26 @@ fn validate_git_email(value: &str) -> Result<(), AppError> {
         return Err(AppError::BadRequest(
             "git_email is not a valid email address".into(),
         ));
+    }
+    Ok(())
+}
+
+/// Validate a self-settable avatar URL. Must be a parseable `http` or `https`
+/// URL, at most 2048 bytes, with no ASCII control characters or whitespace.
+fn validate_avatar_url(value: &str) -> Result<(), AppError> {
+    if value.len() > 2048 {
+        return Err(AppError::BadRequest("avatar_url is not a valid http(s) URL".into()));
+    }
+    if value
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return Err(AppError::BadRequest("avatar_url contains invalid characters".into()));
+    }
+    let url = url::Url::parse(value)
+        .map_err(|_| AppError::BadRequest("avatar_url is not a valid http(s) URL".into()))?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(AppError::BadRequest("avatar_url is not a valid http(s) URL".into()));
     }
     Ok(())
 }
@@ -435,6 +515,7 @@ pub struct MemberResponse {
     pub display_name: String,
     pub role: String,
     pub owner: bool,
+    pub avatar_url: Option<String>,
 }
 
 pub async fn list_members(
@@ -461,12 +542,14 @@ pub async fn list_members(
             .await?
         {
             let owner = u.id == vault.created_by;
+            let avatar_url = effective_avatar_url(&u);
             out.push(MemberResponse {
                 user_id: u.id,
                 email: u.email,
                 display_name: u.display_name,
                 role: m.role,
                 owner,
+                avatar_url,
             });
         }
     }
@@ -489,13 +572,14 @@ pub async fn promote_member(
         .one(&state.db)
         .await?
         .ok_or(AppError::NotFound)?;
-
+    let avatar_url = effective_avatar_url(&u);
     Ok(Json(MemberResponse {
         user_id: u.id,
         email: u.email,
         display_name: u.display_name,
         role: updated.role,
         owner: false,
+        avatar_url,
     }))
 }
 

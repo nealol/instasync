@@ -107,6 +107,13 @@ export class RealtimeClient {
     return this.http.request("GET", "/api/me");
   }
 
+  updateMe(body: {
+    gitEmail?: string | null;
+    avatarUrlOverride?: string | null;
+  }): Promise<MeResponse> {
+    return this.http.request("PATCH", "/api/me", { body });
+  }
+
   serverInfo(): Promise<ServerInfoResponse> {
     return this.http.request("GET", "/api/server-info");
   }
