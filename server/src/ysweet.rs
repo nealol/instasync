@@ -150,10 +150,23 @@ pub async fn mint_internal_token_with(
         )));
     }
 
-    let token: Value = res
+    let mut token: Value = res
         .json()
         .await
         .map_err(|e| AppError::Internal(format!("y-sweet auth body: {e}")))?;
+    // y-sweet advertises its configured `--public` URL as `baseUrl`, which in
+    // deployments fronted by this auth server is the *public* HTTPS URL
+    // (`https://host/d/{docId}`). Server-to-y-sweet calls must not loop back
+    // out through the public reverse proxy — that turns a transient proxy
+    // hiccup into a hard failure of git audit, search reindex, and public
+    // share rendering. Rewrite the public authority back to the internal one
+    // (the inverse of `mint_client_token`) so these calls hit y-sweet
+    // directly over the internal network.
+    let internal = authority(&config.ysweet_url)
+        .ok_or_else(|| AppError::Internal("invalid YSWEET_URL".into()))?;
+    let public = authority(&config.ysweet_public_url)
+        .ok_or_else(|| AppError::Internal("invalid YSWEET_PUBLIC_URL".into()))?;
+    rewrite_host(&mut token, "baseUrl", &public, &internal);
     let base_url = token
         .get("baseUrl")
         .and_then(Value::as_str)

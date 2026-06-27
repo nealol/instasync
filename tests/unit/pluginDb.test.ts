@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
 import * as Y from "yjs";
 import { makeEngine, makeRelay, newSnapStore } from "../support/crsqliteHarness";
-import { _resetSqliteForTests } from "../../src/pluginDb/crsqlite";
+import { _resetSqliteForTests, readAllChanges } from "../../src/pluginDb/crsqlite";
+import { MAX_BATCH_ROWS, SYNC_FORMAT } from "../../src/pluginDb/types";
 import { waitFor } from "../support/util";
 
 interface TaskRow {
@@ -189,6 +190,94 @@ describe("SyncedPluginDatabase", () => {
         label: "consumer bootstrapped",
       });
       expect(await titles(consumer)).toEqual(["compacted"]);
+    } finally {
+      await producer.close();
+      await consumer.close();
+    }
+  });
+
+  it("flushes unpublished local edits before rebaseFromServer resets the DB", async () => {
+    const doc = new Y.Doc();
+    const db = makeEngine({ doc, snap: newSnapStore(), bootstrap: async () => [] });
+    try {
+      await db.start();
+      await db.whenLive();
+
+      await db.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["local", "survives-rebase"]);
+      await db.rebaseFromServer();
+
+      await waitFor(async () => (await titles(db)).includes("survives-rebase"), {
+        label: "unpublished local row survived rebase",
+      });
+    } finally {
+      await db.close();
+    }
+  });
+
+  it("replays own-site batches that are newer than the restored snapshot", async () => {
+    const doc = new Y.Doc();
+    const snap = newSnapStore();
+    const first = makeEngine({ doc, snap });
+    const secondSnap = newSnapStore();
+    let second: typeof first | null = null;
+    try {
+      await first.start();
+      await first.whenLive();
+      await first.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["v1", "in-snapshot"]);
+      await new Promise((r) => setTimeout(r, 400));
+      await (first as any).persistSnapshot();
+      const staleSnapshot = snap.text;
+      expect(staleSnapshot).toBeTruthy();
+
+      await first.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["v2", "in-log-only"]);
+      await new Promise((r) => setTimeout(r, 400));
+
+      secondSnap.text = staleSnapshot;
+      second = makeEngine({ doc, snap: secondSnap });
+      await second.start();
+      await second.whenLive();
+
+      await waitFor(async () => (await titles(second!)).includes("in-log-only"), {
+        label: "own newer batch replayed over stale snapshot",
+      });
+      expect(await titles(second)).toEqual(["in-snapshot", "in-log-only"]);
+    } finally {
+      await first.close();
+      await second?.close();
+    }
+  });
+
+  it("does not skip an own-site batch when it is newer than the local published watermark", async () => {
+    const producerDoc = new Y.Doc();
+    const producer = makeEngine({ doc: producerDoc, snap: newSnapStore() });
+    const consumerDoc = new Y.Doc();
+    const consumer = makeEngine({ doc: consumerDoc, snap: newSnapStore() });
+    try {
+      await producer.start();
+      await producer.whenLive();
+      await producer.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["own", "own-newer"]);
+      const changes = await readAllChanges((producer as any).db);
+      expect(changes.length).toBeGreaterThan(0);
+
+      await consumer.start();
+      await consumer.whenLive();
+      const site = (consumer as any).siteHex as string;
+      consumerDoc.getArray("batches").push([
+        {
+          id: "forced-own-newer",
+          siteId: site,
+          fromDbVersion: 0,
+          toDbVersion: changes[changes.length - 1].db_version,
+          schemaVersion: 1,
+          changes: changes.slice(0, MAX_BATCH_ROWS),
+          createdAt: Date.now(),
+          format: SYNC_FORMAT,
+        },
+      ]);
+
+      await waitFor(async () => (await titles(consumer)).includes("own-newer"), {
+        label: "own newer batch applied",
+      });
     } finally {
       await producer.close();
       await consumer.close();

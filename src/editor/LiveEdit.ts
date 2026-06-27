@@ -10,13 +10,13 @@ import { ySyncAnnotation } from "./annotations";
 import { applyTextToYText } from "../diff";
 import { dbg, snip } from "../debug";
 
-class LiveEditPluginValue implements PluginValue {
+export class LiveEditPluginValue implements PluginValue {
   private editor: EditorView;
   private doc: Document | null = null;
   private ytext: Y.Text | null = null;
   private observer: (() => void) | null = null;
   private destroyed = false;
-  private retries = 0;
+  private editorTextAtBind: string | null = null;
 
   constructor(editor: EditorView) {
     this.editor = editor;
@@ -28,13 +28,12 @@ class LiveEditPluginValue implements PluginValue {
     if (this.destroyed || this.doc) return;
     const doc = ensureDocumentForEditor(this.editor);
     if (!doc) {
-      if (this.retries++ < 50) {
-        window.setTimeout(() => this.tryBind(), 200);
-      }
+      window.setTimeout(() => this.tryBind(), 500);
       return;
     }
     this.doc = doc;
     this.ytext = doc.ytext;
+    this.editorTextAtBind = this.editor.state.doc.toString();
     doc.bindEditor();
 
     const observer = () => this.onYTextChanged();
@@ -61,6 +60,16 @@ class LiveEditPluginValue implements PluginValue {
     const shared = this.ytext.toString();
     const current = this.editor.state.doc.toString();
     if (shared === current) return;
+
+    // If the user typed while the document was still loading its local
+    // persistence / first server sync, preserve that active editor state as the
+    // newest local edit instead of applying the now-ready shared text over it.
+    if (this.editorTextAtBind !== null && current !== this.editorTextAtBind) {
+      this.ytext.doc?.transact(() => {
+        applyTextToYText(this.ytext!, current);
+      }, this);
+      return;
+    }
 
     if (shared.length > 0) {
       this.applyTextToEditor(shared);
@@ -115,6 +124,7 @@ class LiveEditPluginValue implements PluginValue {
       return;
     }
     if (!this.ytext || !update.docChanged) return;
+    if (this.doc && !this.doc.isReady()) return;
 
     // Self-healing reconcile: make ytext match the editor's *current* text via a
     // minimal prefix/suffix diff, instead of mapping CodeMirror change offsets
@@ -150,6 +160,7 @@ class LiveEditPluginValue implements PluginValue {
     this.observer = null;
     this.ytext = null;
     this.doc = null;
+    this.editorTextAtBind = null;
     this.editor = null as any;
   }
 }

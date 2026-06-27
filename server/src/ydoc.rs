@@ -33,22 +33,43 @@ pub async fn read_update_with(
         ysweet::mint_internal_token_with(config, http, authenticator, doc_id, Level::ReadOnly)
             .await?;
     let url = format!("{}/as-update", base_url.trim_end_matches('/'));
-    let res = http
-        .get(&url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(format!("GET {url}: {e}")))?;
-    if !res.status().is_success() {
-        return Err(AppError::Internal(format!(
-            "as-update {doc_id} returned {}",
-            res.status()
-        )));
+
+    // Retry transient transport failures (stale pooled keep-alive connections,
+    // momentary loopback/proxy hiccups). A single failed GET must not abort a
+    // git audit commit window or a search reindex for the whole vault.
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err: Option<AppError> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                200u64 * (1u64 << (attempt - 1)),
+            ))
+            .await;
+        }
+        let send_result = http.get(&url).bearer_auth(&token).send().await;
+        let res = match send_result {
+            Ok(res) => res,
+            Err(e) => {
+                last_err = Some(AppError::Internal(format!("GET {url}: {e}")));
+                continue;
+            }
+        };
+        if !res.status().is_success() {
+            // Non-transient: y-sweet returned a real status. Don't retry.
+            return Err(AppError::Internal(format!(
+                "as-update {doc_id} returned {}",
+                res.status()
+            )));
+        }
+        match res.bytes().await {
+            Ok(b) => return Ok(b.to_vec()),
+            Err(e) => {
+                last_err = Some(AppError::Internal(format!("as-update body: {e}")));
+                continue;
+            }
+        }
     }
-    res.bytes()
-        .await
-        .map(|b| b.to_vec())
-        .map_err(|e| AppError::Internal(format!("as-update body: {e}")))
+    Err(last_err.unwrap_or_else(|| AppError::Internal(format!("as-update {doc_id}: exhausted retries"))))
 }
 
 pub async fn write_update(state: &AppState, doc_id: &str, update: Vec<u8>) -> AppResult<()> {

@@ -22,6 +22,7 @@ export abstract class SyncedDoc {
 
   private readyPromise: Promise<void>;
   private resolveReady!: () => void;
+  private ready = false;
   private syncedListener: (synced: boolean) => void;
   private autoConnect: boolean;
 
@@ -66,6 +67,10 @@ export abstract class SyncedDoc {
     return this.readyPromise;
   }
 
+  isReady(): boolean {
+    return this.ready;
+  }
+
   ensureConnected(): void {
     if (this.destroyed) return;
     const status = this.provider.status;
@@ -79,6 +84,7 @@ export abstract class SyncedDoc {
   }
 
   protected resolveWhenReady(): void {
+    this.ready = true;
     this.resolveReady();
   }
 

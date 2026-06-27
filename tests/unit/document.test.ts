@@ -99,6 +99,25 @@ describe("Document sync", () => {
     }
   });
 
+  it("does not write stale startup Y.Text to disk before the disk baseline is captured", async () => {
+    const guid = freshGuid();
+    const { doc, vault } = makeDoc(guid, { file: { path: "note.md", content: "newer disk" } });
+    try {
+      await doc.whenReady();
+      (doc as any).startupBaselineCaptured = false;
+      doc.ydoc.transact(() => {
+        doc.ytext.delete(0, doc.ytext.length);
+        doc.ytext.insert(0, "stale indexeddb");
+      });
+
+      await new Promise((r) => setTimeout(r, 250));
+
+      expect(vault.files.get("note.md")).toBe("newer disk");
+    } finally {
+      doc.destroy();
+    }
+  });
+
   it("pure remote update writes to disk without a conflict copy", async () => {
     const guid = freshGuid();
     // Seed the server from B first.
@@ -152,7 +171,7 @@ describe("Document sync", () => {
     }
   });
 
-  it("does not ingest disk modify events while the note is open", async () => {
+  it("does not ingest disk modify events while a live editor binding owns the note", async () => {
     const guid = freshGuid();
     const { plugin, vault } = makeFakePlugin(harness.authUrl, {
       sessionToken: token,
@@ -168,12 +187,42 @@ describe("Document sync", () => {
       await peer.whenSynced();
       await waitFor(() => peer.getText() === "shared buffer", { label: "seed synced" });
 
+      doc.bindEditor();
       vault.files.set("note.md", "disk save snapshot");
       await doc.onDiskChanged();
       await new Promise((r) => setTimeout(r, 250));
 
       expect(doc.content).toBe("shared buffer");
       expect(peer.getText()).toBe("shared buffer");
+    } finally {
+      doc.unbindEditor();
+      doc.destroy();
+      peer.destroy();
+    }
+  });
+
+  it("ingests disk saves for an open note when no editor binding is attached", async () => {
+    const guid = freshGuid();
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    vault.files.set("note.md", "before");
+    (plugin.app.workspace as any).getLeavesOfType = () => [{ view: { file: { path: "note.md" } } }];
+
+    const doc = new Document(plugin as any, "note.md", guid, docId(guid), true);
+    const peer = new Peer(memberPlugin, docId(guid));
+    try {
+      await doc.whenReady();
+      await peer.whenSynced();
+      await waitFor(() => peer.getText() === "before", { label: "seed synced" });
+
+      vault.files.set("note.md", "saved by unbound open editor");
+      await doc.onDiskChanged();
+
+      await waitFor(() => peer.getText() === "saved by unbound open editor", {
+        label: "unbound open save reached peer",
+      });
     } finally {
       doc.destroy();
       peer.destroy();
@@ -214,6 +263,72 @@ describe("Document sync", () => {
     } finally {
       doc.destroy();
       peer.destroy();
+    }
+  });
+
+  it("does not fold a stale write echo over a newer remote update", async () => {
+    const guid = freshGuid();
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    vault.files.set("note.md", "base");
+    const doc = new Document(plugin as any, "note.md", guid, docId(guid), true);
+    const peer = new Peer(memberPlugin, docId(guid));
+    try {
+      await doc.whenReady();
+      await peer.whenSynced();
+      await waitFor(() => peer.getText() === "base", { label: "seed synced" });
+
+      const writePromise = (doc as any).writeToDisk("base");
+      await doc.onDiskChanged(); // deferred because writeToDisk's echo guard is active
+      peer.setText("base + remote");
+      await writePromise;
+
+      await new Promise((r) => setTimeout(r, 50));
+      expect(doc.content).toBe("base + remote");
+      expect(peer.getText()).toBe("base + remote");
+    } finally {
+      doc.destroy();
+      peer.destroy();
+    }
+  });
+
+  it("re-checks open editor state after the pre-modify disk read", async () => {
+    const guid = freshGuid();
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    vault.files.set("note.md", "old");
+    const doc = new Document(plugin as any, "note.md", guid, docId(guid), true);
+    try {
+      await doc.whenReady();
+      let reads = 0;
+      let modified = false;
+      const originalRead = vault.read.bind(vault);
+      vault.read = async (file) => {
+        reads++;
+        const text = await originalRead(file);
+        if (reads >= 1) {
+          (plugin.app.workspace as any).getLeavesOfType = () => [
+            { view: { file: { path: "note.md" } } },
+          ];
+        }
+        return text;
+      };
+      const originalModify = vault.modify.bind(vault);
+      vault.modify = async (file, text) => {
+        modified = true;
+        await originalModify(file, text);
+      };
+
+      await (doc as any).writeToDisk("new");
+
+      expect(modified).toBe(false);
+      expect(vault.files.get("note.md")).toBe("old");
+    } finally {
+      doc.destroy();
     }
   });
 
@@ -344,6 +459,33 @@ describe("Document sync", () => {
       expect(notices.some((n) => /kept the remote version/i.test(n))).toBe(true);
     } finally {
       a2.destroy();
+      peer.destroy();
+    }
+  });
+
+  it("startup reconcile fast-forwards a same-device partial remote prefix without prompting", async () => {
+    const guid = freshGuid();
+    const peer = new Peer(memberPlugin, docId(guid));
+    await peer.whenSynced();
+    peer.setText("draft");
+
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    vault.files.set("note.md", "draft completed locally");
+    const doc = new Document(plugin as any, "note.md", guid, docId(guid), false);
+    try {
+      await doc.whenReady();
+      await waitFor(() => peer.getText() === "draft completed locally", {
+        label: "local completion published",
+      });
+
+      expect(modalMock.calls).toHaveLength(0);
+      expect(doc.content).toBe("draft completed locally");
+      expect(vault.files.get("note.md")).toBe("draft completed locally");
+    } finally {
+      doc.destroy();
       peer.destroy();
     }
   });

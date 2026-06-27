@@ -483,8 +483,11 @@ export class SyncedPluginDatabase {
     for (const batch of batches) {
       if (this.appliedBatchIds.has(batch.id)) continue;
       if (batch.siteId === this.siteHex) {
-        this.appliedBatchIds.add(batch.id);
-        continue;
+        const published = this.published[batch.siteId] ?? 0;
+        if (batch.toDbVersion <= published) {
+          this.appliedBatchIds.add(batch.id);
+          continue;
+        }
       }
       if (batch.format !== SYNC_FORMAT) {
         // Unknown wire format: refuse rather than corrupt.
@@ -584,6 +587,11 @@ export class SyncedPluginDatabase {
 
   private async doRebase(): Promise<void> {
     this.setState("bootstrapping");
+    if (this.publishTimer) {
+      clearTimeout(this.publishTimer);
+      this.publishTimer = null;
+    }
+    await this.publishNow();
     await this.opts.deleteSnapshot().catch(() => {});
     await this.resetDb();
     await this.runMigrate(0);
@@ -616,8 +624,12 @@ export class SyncedPluginDatabase {
 
   async close(): Promise<void> {
     if (this.closed) return;
+    if (this.publishTimer) {
+      clearTimeout(this.publishTimer);
+      this.publishTimer = null;
+    }
+    await this.publishNow();
     this.closed = true;
-    if (this.publishTimer) clearTimeout(this.publishTimer);
     if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
     this.unobserveBatches?.();
     this.unobserveMeta?.();

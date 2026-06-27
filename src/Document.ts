@@ -40,6 +40,8 @@ export class Document extends SyncedDoc {
   private localChangedAtStartup = false;
   /** Guards the one-time startup merge so reconnects don't re-run it. */
   private startupReconciled = false;
+  /** Suppress write-through while IndexedDB is replaying the startup baseline. */
+  private startupBaselineCaptured = false;
 
   private ytextObserver: () => void;
   private writeTimer: number | null = null;
@@ -102,6 +104,7 @@ export class Document extends SyncedDoc {
     const disk = await this.readFromDisk();
     this.diskAtStartup = disk;
     this.localChangedAtStartup = disk !== null && disk !== baseline;
+    this.startupBaselineCaptured = true;
   }
 
   /**
@@ -127,7 +130,16 @@ export class Document extends SyncedDoc {
       const isConflict =
         this.localChangedAtStartup && localDisk !== null && remoteChanged && remote !== localDisk;
 
-      if (isConflict) {
+      const sameDevicePrefixFastForward =
+        isConflict &&
+        baseline.length === 0 &&
+        localDisk !== null &&
+        localDisk.length > remote.length &&
+        localDisk.startsWith(remote);
+
+      if (sameDevicePrefixFastForward) {
+        this.applyText(localDisk);
+      } else if (isConflict) {
         const choice = await openTextConflictModal(this.plugin, {
           path: this.path,
           localContent: localDisk,
@@ -164,6 +176,7 @@ export class Document extends SyncedDoc {
 
   private onYTextChanged(): void {
     if (this.destroyed) return;
+    if (!this.startupBaselineCaptured) return;
     // Note text-sync activity so the binary upload queue can defer large
     // transfers while notes are actively syncing.
     this.plugin.vaultSync?.noteTextActivity();
@@ -183,20 +196,30 @@ export class Document extends SyncedDoc {
       // opened during the debounce window. Writing through vault.modify onto a
       // now-open file makes Obsidian report an external change and 3-way-merge
       // it into the editor buffer, duplicating text (which is then re-sent).
-      if (this.destroyed || this.hasBoundEditor || this.isOpenInWorkspace()) return;
+      if (
+        this.destroyed ||
+        !this.startupBaselineCaptured ||
+        this.hasBoundEditor ||
+        this.isOpenInWorkspace()
+      )
+        return;
       void this.writeToDisk(this.content);
     }, 100);
   }
 
   /** Called by VaultSync when the local file changed and no editor is bound. */
   async onDiskChanged(): Promise<void> {
-    if (this.destroyed || this.hasBoundEditor || this.isOpenInWorkspace()) return;
+    if (this.destroyed || this.hasBoundEditor) return;
     if (this.writingToDisk) {
       // One of our own writes is in flight, but the change may still be an
       // external edit that landed in the same window — re-check once the echo
       // guard clears (next tick) instead of dropping it. A pure echo of our own
       // write is then absorbed by the `disk === this.content` check below.
-      window.setTimeout(() => void this.onDiskChanged(), 0);
+      const ytextAtDefer = this.content;
+      window.setTimeout(() => {
+        if (this.destroyed || this.content !== ytextAtDefer) return;
+        void this.onDiskChanged();
+      }, 0);
       return;
     }
     const disk = await this.readFromDisk();
@@ -253,6 +276,17 @@ export class Document extends SyncedDoc {
           return;
         }
         if ((await this.plugin.app.vault.read(file)) === text) return;
+        if (this.hasBoundEditor || this.isOpenInWorkspace()) {
+          dbg(
+            "writeToDisk SKIP after read (open/bound)",
+            this.path,
+            "bound",
+            this.boundEditors,
+            "open",
+            this.isOpenInWorkspace(),
+          );
+          return;
+        }
         dbg(
           "%cwriteToDisk MODIFY",
           "color:orange",
