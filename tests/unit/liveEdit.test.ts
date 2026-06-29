@@ -58,4 +58,52 @@ describe("LiveEdit", () => {
     live.destroy();
     ydoc.destroy();
   });
+
+  it("detaches from a destroyed document and rebinds before pushing edits", async () => {
+    const oldYdoc = new Y.Doc();
+    const oldYtext = oldYdoc.getText("contents");
+    oldYtext.insert(0, "old shared");
+    let oldDestroyed = false;
+    const oldDoc = {
+      path: "note.md",
+      ytext: oldYtext,
+      bindEditor: vi.fn(),
+      unbindEditor: vi.fn(),
+      whenReady: () => Promise.resolve(),
+      isReady: () => true,
+      isDestroyed: () => oldDestroyed,
+    };
+    bind.doc = oldDoc;
+
+    const editor = makeEditor("old shared") as any;
+    const live = new LiveEditPluginValue(editor);
+    expect(oldDoc.bindEditor).toHaveBeenCalledTimes(1);
+
+    const newYdoc = new Y.Doc();
+    const newYtext = newYdoc.getText("contents");
+    const newDoc = {
+      path: "note.md",
+      ytext: newYtext,
+      bindEditor: vi.fn(),
+      unbindEditor: vi.fn(),
+      whenReady: () => Promise.resolve(),
+      isReady: () => true,
+      isDestroyed: () => false,
+    };
+
+    oldDestroyed = true;
+    bind.doc = newDoc;
+    editor.setText("new editor text");
+    live.update({ docChanged: true, state: editor.state } as any);
+    await Promise.resolve();
+
+    expect(oldDoc.unbindEditor).toHaveBeenCalledTimes(1);
+    expect(newDoc.bindEditor).toHaveBeenCalledTimes(1);
+    expect(oldYtext.toString()).toBe("old shared");
+    expect(newYtext.toString()).toBe("new editor text");
+
+    live.destroy();
+    oldYdoc.destroy();
+    newYdoc.destroy();
+  });
 });

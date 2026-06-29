@@ -32,6 +32,8 @@ export class Document extends SyncedDoc {
   private boundEditors = 0;
   /** True while we are writing ytext content to disk (to ignore the echo). */
   private writingToDisk = false;
+  /** Text currently being written to disk, used to identify our own echo event. */
+  private writingTextToDisk: string | null = null;
   /** Disk content captured at startup, before remote sync (for conflict checks). */
   private diskAtStartup: string | null = null;
   /** Locally persisted Y.Text content before the first remote sync. */
@@ -99,12 +101,17 @@ export class Document extends SyncedDoc {
    * remote sync tells us whether the remote also changed from the baseline.
    */
   protected async afterPersistenceSynced(): Promise<void> {
-    const baseline = this.content;
-    this.baselineAtStartup = baseline;
-    const disk = await this.readFromDisk();
-    this.diskAtStartup = disk;
-    this.localChangedAtStartup = disk !== null && disk !== baseline;
-    this.startupBaselineCaptured = true;
+    try {
+      const baseline = this.content;
+      this.baselineAtStartup = baseline;
+      const disk = await this.readFromDisk();
+      this.diskAtStartup = disk;
+      this.localChangedAtStartup = disk !== null && disk !== baseline;
+    } finally {
+      // Even if the disk read fails, remote Y.Text updates must still be allowed
+      // to materialize locally after the provider syncs.
+      this.startupBaselineCaptured = true;
+    }
   }
 
   /**
@@ -169,6 +176,7 @@ export class Document extends SyncedDoc {
   }
 
   private applyText(text: string): void {
+    if (this.destroyed) return;
     this.ydoc.transact(() => {
       applyTextToYText(this.ytext, text);
     }, DISK_ORIGIN);
@@ -211,19 +219,24 @@ export class Document extends SyncedDoc {
   async onDiskChanged(): Promise<void> {
     if (this.destroyed || this.hasBoundEditor) return;
     if (this.writingToDisk) {
-      // One of our own writes is in flight, but the change may still be an
-      // external edit that landed in the same window — re-check once the echo
-      // guard clears (next tick) instead of dropping it. A pure echo of our own
-      // write is then absorbed by the `disk === this.content` check below.
-      const ytextAtDefer = this.content;
-      window.setTimeout(() => {
-        if (this.destroyed || this.content !== ytextAtDefer) return;
-        void this.onDiskChanged();
-      }, 0);
+      // Usually this is our own vault.modify echo. If disk already differs from
+      // Y.Text, treat it as a real concurrent disk edit and fold it immediately
+      // so the in-flight stale write can abort before overwriting it.
+      const disk = await this.readFromDisk();
+      if (
+        this.destroyed ||
+        disk === null ||
+        disk === this.writingTextToDisk ||
+        disk === this.content
+      )
+        return;
+      this.plugin.vaultSync?.noteTextActivity();
+      this.applyText(disk);
       return;
     }
     const disk = await this.readFromDisk();
     if (disk === null) return;
+    if (this.destroyed) return;
     if (disk === this.content) return;
     this.plugin.vaultSync?.noteTextActivity();
     dbg(
@@ -234,9 +247,7 @@ export class Document extends SyncedDoc {
       "ytext",
       snip(this.content),
     );
-    this.ydoc.transact(() => {
-      applyTextToYText(this.ytext, disk);
-    }, DISK_ORIGIN);
+    this.applyText(disk);
   }
 
   private getFile(): TFile | null {
@@ -256,6 +267,7 @@ export class Document extends SyncedDoc {
   private async writeToDisk(text: string): Promise<void> {
     if (this.destroyed) return;
     this.writingToDisk = true;
+    this.writingTextToDisk = text;
     try {
       const file = this.getFile();
       if (file) {
@@ -287,6 +299,7 @@ export class Document extends SyncedDoc {
           );
           return;
         }
+        if (this.content !== text) return;
         dbg(
           "%cwriteToDisk MODIFY",
           "color:orange",
@@ -302,6 +315,7 @@ export class Document extends SyncedDoc {
         // Remote-created file that does not exist locally yet.
         const path = normalizePath(this.path);
         await ensureParentFolder(this.plugin.app, path);
+        if (this.content !== text) return;
         await this.plugin.app.vault.create(path, text);
       }
     } catch (e) {
@@ -311,6 +325,7 @@ export class Document extends SyncedDoc {
       // which is dispatched asynchronously, is still treated as our own.
       window.setTimeout(() => {
         this.writingToDisk = false;
+        this.writingTextToDisk = null;
       }, 0);
     }
   }

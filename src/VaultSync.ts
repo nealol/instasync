@@ -432,13 +432,20 @@ export class VaultSync {
 
   private enqueueDoc(item: QueueItem, front = false): void {
     if (this.destroyed) return;
-    if (item.kind === "text" && this.documents.has(item.path)) return;
-    if (item.kind !== "text" && this.structuredDocuments.has(item.path)) return;
+    if (item.kind === "text") {
+      const existing = this.documents.get(item.path);
+      if (existing?.guid === item.guid) return;
+      if (existing) this.removeDocument(item.path);
+    } else {
+      const existing = this.structuredDocuments.get(item.path);
+      if (existing?.guid === item.guid) return;
+      if (existing) this.removeStructuredDocument(item.path);
+    }
     if (front) this.prioritizedPaths.add(item.path);
     if (front) {
       this.docQueue.delete(item.path);
       this.docQueue = new Map([[item.path, item], ...this.docQueue]);
-    } else if (!this.docQueue.has(item.path)) {
+    } else {
       this.docQueue.set(item.path, item);
     }
   }
@@ -846,36 +853,44 @@ export class VaultSync {
     this.bumpPathVersion(oldPath);
     const newPathVersion = this.bumpPathVersion(newPath);
 
-    // Drop tracking of the old path on the text side.
+    // Drop local tracking of the old path; publish the index move atomically
+    // below so peers never observe a transient delete with no replacement path.
     const wasTracked = this.files.has(oldPath);
     const guid = this.files.get(oldPath) ?? this.documents.get(oldPath)?.guid;
     const wasStructuredTracked = this.structured.has(oldPath);
     const oldStructured = this.structured.get(oldPath) ?? this.structuredDocuments.get(oldPath);
     this.removeDocument(oldPath);
     this.removeStructuredDocument(oldPath);
-    if (wasTracked) {
-      this.indexDoc.transact(() => this.files.delete(oldPath));
-    }
-    if (wasStructuredTracked) {
-      this.indexDoc.transact(() => this.structured.delete(oldPath));
-    }
 
     const kind = this.classify(file);
     if (kind === "text") {
       const finalGuid = guid ?? newGuid();
       const doc = this.ensureDocument(newPath, finalGuid, !wasTracked);
       if (!wasTracked) {
+        if (wasStructuredTracked) {
+          this.indexDoc.transact(() => this.structured.delete(oldPath));
+        }
         await doc.whenReady();
         if (this.destroyed) return;
         if (!this.canPublishLocalPath(newPath, newPathVersion, doc)) return;
       }
       this.indexDoc.transact(() => {
+        if (wasTracked) this.files.delete(oldPath);
+        if (wasStructuredTracked) this.structured.delete(oldPath);
         this.files.set(newPath, finalGuid);
       });
       this.registerFile(newPath, finalGuid);
     } else if (kind === "structured") {
       const structuredKind = this.structuredKindForExtension(file.extension);
-      if (!structuredKind) return;
+      if (!structuredKind) {
+        if (wasTracked || wasStructuredTracked) {
+          this.indexDoc.transact(() => {
+            if (wasTracked) this.files.delete(oldPath);
+            if (wasStructuredTracked) this.structured.delete(oldPath);
+          });
+        }
+        return;
+      }
       const finalGuid = oldStructured?.guid ?? newGuid();
       const doc = this.ensureStructuredDocument(
         newPath,
@@ -884,18 +899,35 @@ export class VaultSync {
         !wasStructuredTracked,
       );
       if (!wasStructuredTracked) {
+        if (wasTracked) {
+          this.indexDoc.transact(() => this.files.delete(oldPath));
+        }
         await doc.whenReady();
         if (this.destroyed) return;
         if (!this.canPublishLocalPath(newPath, newPathVersion, doc)) return;
       }
       this.indexDoc.transact(() => {
+        if (wasTracked) this.files.delete(oldPath);
+        if (wasStructuredTracked) this.structured.delete(oldPath);
         this.structured.set(newPath, { guid: finalGuid, kind: structuredKind });
       });
       this.registerFile(newPath, finalGuid);
     } else if (kind === "binary") {
+      if (wasTracked || wasStructuredTracked) {
+        this.indexDoc.transact(() => {
+          if (wasTracked) this.files.delete(oldPath);
+          if (wasStructuredTracked) this.structured.delete(oldPath);
+        });
+      }
       // Reconcile both old (now gone) and new paths on the binary side.
       this.binarySync.onLocalRenamed(file, oldPath);
     } else {
+      if (wasTracked || wasStructuredTracked) {
+        this.indexDoc.transact(() => {
+          if (wasTracked) this.files.delete(oldPath);
+          if (wasStructuredTracked) this.structured.delete(oldPath);
+        });
+      }
       // Renamed to an ignored path: ensure any old binary entry is dropped.
       this.binarySync.onLocalDeleted(oldPath);
     }

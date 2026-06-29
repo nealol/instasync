@@ -27,7 +27,7 @@ export class LiveEditPluginValue implements PluginValue {
   private tryBind(): void {
     if (this.destroyed || this.doc) return;
     const doc = ensureDocumentForEditor(this.editor);
-    if (!doc) {
+    if (!doc || doc.isDestroyed()) {
       window.setTimeout(() => this.tryBind(), 500);
       return;
     }
@@ -81,6 +81,15 @@ export class LiveEditPluginValue implements PluginValue {
     }
   }
 
+  private detachDoc(): void {
+    if (this.observer && this.ytext) this.ytext.unobserve(this.observer);
+    if (this.doc) this.doc.unbindEditor();
+    this.observer = null;
+    this.ytext = null;
+    this.doc = null;
+    this.editorTextAtBind = null;
+  }
+
   /** Apply a remote Yjs change to the editor. */
   private onYTextChanged(): void {
     if (!this.ytext || this.destroyed) return;
@@ -123,6 +132,11 @@ export class LiveEditPluginValue implements PluginValue {
       this.tryBind();
       return;
     }
+    if (this.doc.isDestroyed()) {
+      this.detachDoc();
+      this.tryBind();
+      return;
+    }
     if (!this.ytext || !update.docChanged) return;
     if (this.doc && !this.doc.isReady()) return;
 
@@ -151,16 +165,7 @@ export class LiveEditPluginValue implements PluginValue {
 
   destroy(): void {
     this.destroyed = true;
-    if (this.observer && this.ytext) {
-      this.ytext.unobserve(this.observer);
-    }
-    if (this.doc) {
-      this.doc.unbindEditor();
-    }
-    this.observer = null;
-    this.ytext = null;
-    this.doc = null;
-    this.editorTextAtBind = null;
+    this.detachDoc();
     this.editor = null as any;
   }
 }

@@ -294,6 +294,87 @@ describe("Document sync", () => {
     }
   });
 
+  it("folds a real disk edit that arrives while a write echo is in flight", async () => {
+    const guid = freshGuid();
+    const { doc, vault } = makeDoc(guid, { file: { path: "note.md", content: "base" } });
+    try {
+      await doc.whenReady();
+
+      (doc as any).writingToDisk = true;
+      vault.files.set("note.md", "external edit");
+      await doc.onDiskChanged();
+
+      expect(doc.content).toBe("external edit");
+    } finally {
+      doc.destroy();
+    }
+  });
+
+  it("ignores its own delayed write echo after shared text has moved on", async () => {
+    const guid = freshGuid();
+    const { doc, vault } = makeDoc(guid, { file: { path: "note.md", content: "base" } });
+    try {
+      await doc.whenReady();
+
+      (doc as any).writingToDisk = true;
+      (doc as any).writingTextToDisk = "old echo";
+      (doc as any).applyText("newer shared");
+      vault.files.set("note.md", "old echo");
+      await doc.onDiskChanged();
+
+      expect(doc.content).toBe("newer shared");
+    } finally {
+      doc.destroy();
+    }
+  });
+
+  it("aborts a stale disk write when shared text changes during the pre-modify read", async () => {
+    const guid = freshGuid();
+    const { doc, vault } = makeDoc(guid, { file: { path: "note.md", content: "disk old" } });
+    try {
+      await doc.whenReady();
+      (doc as any).applyText("stale write");
+      if ((doc as any).writeTimer !== null) {
+        window.clearTimeout((doc as any).writeTimer);
+        (doc as any).writeTimer = null;
+      }
+
+      let readStarted = false;
+      let releaseRead!: () => void;
+      const originalRead = vault.read.bind(vault);
+      vault.read = async (file) => {
+        readStarted = true;
+        await new Promise<void>((resolve) => {
+          releaseRead = resolve;
+        });
+        return originalRead(file);
+      };
+
+      const writes: string[] = [];
+      const originalModify = vault.modify.bind(vault);
+      vault.modify = async (file, text) => {
+        writes.push(text);
+        await originalModify(file, text);
+      };
+
+      const writePromise = (doc as any).writeToDisk("stale write");
+      await waitFor(() => readStarted, { label: "write reached pre-modify read" });
+      (doc as any).applyText("newer shared");
+      if ((doc as any).writeTimer !== null) {
+        window.clearTimeout((doc as any).writeTimer);
+        (doc as any).writeTimer = null;
+      }
+      releaseRead();
+      await writePromise;
+
+      expect(writes).not.toContain("stale write");
+      expect(vault.files.get("note.md")).toBe("disk old");
+      expect(doc.content).toBe("newer shared");
+    } finally {
+      doc.destroy();
+    }
+  });
+
   it("re-checks open editor state after the pre-modify disk read", async () => {
     const guid = freshGuid();
     const { plugin, vault } = makeFakePlugin(harness.authUrl, {

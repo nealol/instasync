@@ -10,7 +10,8 @@ export const DISK_ORIGIN = Symbol("realtime-structured-disk");
 export abstract class StructuredDocument extends SyncedDoc {
   readonly root: Y.Map<any>;
   private rootObserver: (events: Array<Y.YEvent<any>>, txn: Y.Transaction) => void;
-  private writingToDisk = false;
+  /** Serialized value currently being written, used to identify our own echo. */
+  private writingTextToDisk: string | null = null;
   private writeTimer: number | null = null;
   private startupReconciled = false;
   private baselineAtStartup = "";
@@ -80,15 +81,18 @@ export abstract class StructuredDocument extends SyncedDoc {
   }
 
   async onDiskChanged(): Promise<void> {
-    if (this.destroyed || this.writingToDisk || this.suppressedWhileOpen()) return;
+    if (this.destroyed || this.suppressedWhileOpen()) return;
     const disk = await this.readParsedFromDisk();
     if (disk === null) return;
-    if (this.serialize(disk) === this.serialize(this.value)) return;
+    if (this.destroyed) return;
+    const serialized = this.serialize(disk);
+    if (serialized === this.writingTextToDisk || serialized === this.serialize(this.value)) return;
     this.plugin.vaultSync?.noteTextActivity();
     this.applyValue(disk, DISK_ORIGIN);
   }
 
   protected applyValue(value: JsonValue, origin: unknown = DISK_ORIGIN): void {
+    if (this.destroyed) return;
     this.ydoc.transact(() => reconcileInto(this.root, value), origin);
   }
 
@@ -130,23 +134,25 @@ export abstract class StructuredDocument extends SyncedDoc {
 
   protected async writeToDisk(text: string): Promise<void> {
     if (this.destroyed) return;
-    this.writingToDisk = true;
+    this.writingTextToDisk = text;
     try {
       const file = this.getFile();
       if (file) {
         if (this.suppressedWhileOpen()) return;
         if ((await this.plugin.app.vault.read(file)) === text) return;
+        if (this.serialize(this.value) !== text) return;
         await this.plugin.app.vault.modify(file, text);
       } else {
         const path = normalizePath(this.path);
         await ensureParentFolder(this.plugin.app, path);
+        if (this.serialize(this.value) !== text) return;
         await this.plugin.app.vault.create(path, text);
       }
     } catch (e) {
       console.error(`[Realtime] structured writeToDisk failed for ${this.path}`, e);
     } finally {
       window.setTimeout(() => {
-        this.writingToDisk = false;
+        this.writingTextToDisk = null;
       }, 0);
     }
   }
