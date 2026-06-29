@@ -131,6 +131,8 @@ export class VaultSync {
   private backgroundSyncStarted = false;
   private prioritizedPaths = new Set<string>();
   private prioritizedGuids = new Set<string>();
+  /** Monotonic per-path version used to abort stale async create/rename work. */
+  private pathVersions = new Map<string, number>();
 
   constructor(plugin: RealtimePlugin) {
     this.plugin = plugin;
@@ -328,11 +330,17 @@ export class VaultSync {
     // Register entries that already exist in the shared index, but connect lazily.
     for (const [path, guid] of this.files.entries()) {
       this.registerFile(path, guid);
-      this.enqueueDoc({ path, guid, kind: "text" }, priorityPaths.has(path));
+      this.enqueueDoc(
+        { path, guid, kind: "text" },
+        priorityPaths.has(path) || !this.localFileExists(path),
+      );
     }
     for (const [path, meta] of this.structured.entries()) {
       this.registerFile(path, meta.guid);
-      this.enqueueDoc({ path, guid: meta.guid, kind: meta.kind }, priorityPaths.has(path));
+      this.enqueueDoc(
+        { path, guid: meta.guid, kind: meta.kind },
+        priorityPaths.has(path) || !this.localFileExists(path),
+      );
     }
 
     // Add any local text or structured files that aren't tracked yet.
@@ -341,44 +349,45 @@ export class VaultSync {
       return kind === "text" || kind === "structured";
     });
     for (const file of syncFiles) {
-      if (isConflictCopy(file.path)) continue;
+      const path = file.path;
+      const pathVersion = this.currentPathVersion(path);
+      if (isConflictCopy(path)) continue;
       const kind = this.classify(file);
       if (kind === "structured") {
         const structuredKind = this.structuredKindForExtension(file.extension);
         if (!structuredKind) continue;
-        if (!this.structured.has(file.path)) {
+        if (!this.structured.has(path)) {
           const guid = newGuid();
-          const doc = this.ensureStructuredDocument(file.path, guid, structuredKind, true);
+          const doc = this.ensureStructuredDocument(path, guid, structuredKind, true);
           await doc.whenReady();
           if (this.destroyed) return;
+          if (!this.canPublishLocalPath(path, pathVersion, doc)) continue;
           this.indexDoc.transact(() => {
-            this.structured.set(file.path, { guid, kind: structuredKind });
+            this.structured.set(path, { guid, kind: structuredKind });
           });
-          this.registerFile(file.path, guid);
+          this.registerFile(path, guid);
         } else {
-          const meta = this.structured.get(file.path)!;
-          this.registerFile(file.path, meta.guid);
-          this.enqueueDoc(
-            { path: file.path, guid: meta.guid, kind: meta.kind },
-            priorityPaths.has(file.path),
-          );
+          const meta = this.structured.get(path)!;
+          this.registerFile(path, meta.guid);
+          this.enqueueDoc({ path, guid: meta.guid, kind: meta.kind }, priorityPaths.has(path));
         }
         continue;
       }
-      if (!this.files.has(file.path)) {
+      if (!this.files.has(path)) {
         const guid = newGuid();
-        const doc = this.ensureDocument(file.path, guid, true);
+        const doc = this.ensureDocument(path, guid, true);
         await doc.whenReady();
         if (this.destroyed) return;
+        if (!this.canPublishLocalPath(path, pathVersion, doc)) continue;
         this.indexDoc.transact(() => {
-          this.files.set(file.path, guid);
+          this.files.set(path, guid);
         });
-        this.registerFile(file.path, guid);
+        this.registerFile(path, guid);
       } else {
-        this.registerFile(file.path, this.files.get(file.path)!);
+        this.registerFile(path, this.files.get(path)!);
         this.enqueueDoc(
-          { path: file.path, guid: this.files.get(file.path)!, kind: "text" },
-          priorityPaths.has(file.path),
+          { path, guid: this.files.get(path)!, kind: "text" },
+          priorityPaths.has(path),
         );
       }
     }
@@ -512,7 +521,9 @@ export class VaultSync {
           this.registerFile(path, guid);
           this.enqueueDoc(
             { path, guid, kind: "text" },
-            this.prioritizedPaths.has(path) || this.prioritizedGuids.has(guid),
+            this.prioritizedPaths.has(path) ||
+              this.prioritizedGuids.has(guid) ||
+              !this.localFileExists(path),
           );
           this.pumpDocQueue();
         }
@@ -531,7 +542,9 @@ export class VaultSync {
           this.registerFile(path, meta.guid);
           this.enqueueDoc(
             { path, guid: meta.guid, kind: meta.kind },
-            this.prioritizedPaths.has(path) || this.prioritizedGuids.has(meta.guid),
+            this.prioritizedPaths.has(path) ||
+              this.prioritizedGuids.has(meta.guid) ||
+              !this.localFileExists(path),
           );
           this.pumpDocQueue();
         }
@@ -652,6 +665,34 @@ export class VaultSync {
     return [...this.documents.values(), ...this.structuredDocuments.values()];
   }
 
+  private currentPathVersion(path: string): number {
+    return this.pathVersions.get(path) ?? 0;
+  }
+
+  private bumpPathVersion(path: string): number {
+    const next = this.currentPathVersion(path) + 1;
+    this.pathVersions.set(path, next);
+    return next;
+  }
+
+  private localFileExists(path: string): boolean {
+    return this.plugin.app.vault.getAbstractFileByPath(path) instanceof TFile;
+  }
+
+  private canPublishLocalPath(
+    path: string,
+    pathVersion: number,
+    doc: Document | StructuredDocument,
+  ): boolean {
+    if (doc.isDestroyed()) return false;
+    if (this.currentPathVersion(path) !== pathVersion) return false;
+    if (!this.localFileExists(path)) return false;
+    if (doc instanceof Document) {
+      return this.documents.get(path) === doc && !this.files.has(path);
+    }
+    return this.structuredDocuments.get(path) === doc && !this.structured.has(path);
+  }
+
   bindOpenCanvases(): void {
     for (const doc of this.structuredDocuments.values()) {
       if (doc instanceof CanvasDocument) doc.tryBindLiveCanvas();
@@ -718,52 +759,57 @@ export class VaultSync {
 
   private async handleLocalCreate(file: TAbstractFile): Promise<void> {
     if (this.destroyed || !this.initialSynced) return;
+    const path = file.path;
+    const pathVersion = this.bumpPathVersion(path);
     const kind = this.classify(file);
     if (kind === "binary") {
-      this.binarySync.onLocalChanged(file.path);
+      this.binarySync.onLocalChanged(path);
       return;
     }
     if (kind === "structured" && file instanceof TFile) {
       const structuredKind = this.structuredKindForExtension(file.extension);
       if (!structuredKind) return;
-      if (this.structured.has(file.path)) {
-        const meta = this.structured.get(file.path)!;
-        this.registerFile(file.path, meta.guid);
-        this.ensureStructuredDocument(file.path, meta.guid, meta.kind, false);
+      if (this.structured.has(path)) {
+        const meta = this.structured.get(path)!;
+        this.registerFile(path, meta.guid);
+        this.ensureStructuredDocument(path, meta.guid, meta.kind, false);
         return;
       }
       const guid = newGuid();
-      const doc = this.ensureStructuredDocument(file.path, guid, structuredKind, true);
+      const doc = this.ensureStructuredDocument(path, guid, structuredKind, true);
       await doc.whenReady();
       if (this.destroyed) return;
+      if (!this.canPublishLocalPath(path, pathVersion, doc)) return;
       this.indexDoc.transact(() => {
-        this.structured.set(file.path, { guid, kind: structuredKind });
+        this.structured.set(path, { guid, kind: structuredKind });
       });
-      this.registerFile(file.path, guid);
+      this.registerFile(path, guid);
       return;
     }
     if (kind !== "text") return;
-    if (this.files.has(file.path)) {
+    if (this.files.has(path)) {
       // Created locally because a remote entry arrived; Document handles it.
-      this.registerFile(file.path, this.files.get(file.path)!);
-      this.ensureDocument(file.path, this.files.get(file.path)!, false);
+      this.registerFile(path, this.files.get(path)!);
+      this.ensureDocument(path, this.files.get(path)!, false);
       return;
     }
     const guid = newGuid();
-    const doc = this.ensureDocument(file.path, guid, true);
+    const doc = this.ensureDocument(path, guid, true);
     await doc.whenReady();
     if (this.destroyed) return;
+    if (!this.canPublishLocalPath(path, pathVersion, doc)) return;
     // Publish the index entry only after the creator's file doc has seeded and
     // synced, so peers do not materialize an empty remote-created note.
     this.indexDoc.transact(() => {
-      this.files.set(file.path, guid);
+      this.files.set(path, guid);
     });
-    this.registerFile(file.path, guid);
+    this.registerFile(path, guid);
   }
 
   private onLocalDelete(file: TAbstractFile): void {
     if (this.destroyed || !this.initialSynced) return;
     const path = file.path;
+    this.bumpPathVersion(path);
     if (this.documents.has(path) || this.files.has(path)) {
       this.removeDocument(path);
       if (this.files.has(path)) {
@@ -791,8 +837,14 @@ export class VaultSync {
   }
 
   private onLocalRename(file: TAbstractFile, oldPath: string): void {
+    void this.handleLocalRename(file, oldPath);
+  }
+
+  private async handleLocalRename(file: TAbstractFile, oldPath: string): Promise<void> {
     if (this.destroyed || !this.initialSynced || !(file instanceof TFile)) return;
     const newPath = file.path;
+    this.bumpPathVersion(oldPath);
+    const newPathVersion = this.bumpPathVersion(newPath);
 
     // Drop tracking of the old path on the text side.
     const wasTracked = this.files.has(oldPath);
@@ -811,20 +863,35 @@ export class VaultSync {
     const kind = this.classify(file);
     if (kind === "text") {
       const finalGuid = guid ?? newGuid();
+      const doc = this.ensureDocument(newPath, finalGuid, !wasTracked);
+      if (!wasTracked) {
+        await doc.whenReady();
+        if (this.destroyed) return;
+        if (!this.canPublishLocalPath(newPath, newPathVersion, doc)) return;
+      }
       this.indexDoc.transact(() => {
         this.files.set(newPath, finalGuid);
       });
       this.registerFile(newPath, finalGuid);
-      this.ensureDocument(newPath, finalGuid, !wasTracked);
     } else if (kind === "structured") {
       const structuredKind = this.structuredKindForExtension(file.extension);
       if (!structuredKind) return;
       const finalGuid = oldStructured?.guid ?? newGuid();
+      const doc = this.ensureStructuredDocument(
+        newPath,
+        finalGuid,
+        structuredKind,
+        !wasStructuredTracked,
+      );
+      if (!wasStructuredTracked) {
+        await doc.whenReady();
+        if (this.destroyed) return;
+        if (!this.canPublishLocalPath(newPath, newPathVersion, doc)) return;
+      }
       this.indexDoc.transact(() => {
         this.structured.set(newPath, { guid: finalGuid, kind: structuredKind });
       });
       this.registerFile(newPath, finalGuid);
-      this.ensureStructuredDocument(newPath, finalGuid, structuredKind, !wasStructuredTracked);
     } else if (kind === "binary") {
       // Reconcile both old (now gone) and new paths on the binary side.
       this.binarySync.onLocalRenamed(file, oldPath);

@@ -43,7 +43,7 @@ export class LiveEditPluginValue implements PluginValue {
     // Reconcile only after initial sync, so we never act on an empty,
     // not-yet-synced shared document.
     void doc.whenReady().then(() => {
-      if (this.destroyed) return;
+      if (this.destroyed || doc.isDestroyed()) return;
       this.reconcileOnAttach();
     });
   }

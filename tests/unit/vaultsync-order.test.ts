@@ -172,4 +172,51 @@ describe("VaultSync publish ordering", () => {
       syncB.destroy();
     }
   });
+
+  it("seeds a newly created text file before publishing a pending-create rename", async () => {
+    const vault = await harness.createVault(aliceToken, "ordering-create-rename");
+    const a = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+      clientName: "A",
+    });
+    const b = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+      clientName: "B",
+    });
+
+    const syncA = new VaultSync(a.plugin as any);
+    const syncB = new VaultSync(b.plugin as any);
+    try {
+      await waitFor(() => notices.filter((n) => /connected, syncing/.test(n)).length >= 2, {
+        timeout: 30_000,
+        label: "both peers finished initial sync",
+      });
+
+      const path = "Renamed.md";
+      const content = "seeded note body";
+      const bWrites = recordWrites(b.vault, path);
+
+      // Keep the creator doc unseeded long enough that publishing the rename
+      // immediately would let the peer materialize an empty note at Renamed.md.
+      delayCreatorRead(a.vault, "Draft.md");
+      delayCreatorRead(a.vault, path);
+      await a.vault.create("Draft.md", content);
+      a.vault.rename("Draft.md", path);
+
+      await waitFor(() => b.vault.files.get(path) === content, {
+        timeout: 30_000,
+        label: "renamed text file reached peer with content",
+      });
+      expect(b.vault.files.has("Draft.md")).toBe(false);
+      expect(bWrites.length).toBeGreaterThan(0);
+      for (const text of bWrites) {
+        expect(text).toBe(content);
+      }
+    } finally {
+      syncA.destroy();
+      syncB.destroy();
+    }
+  });
 });

@@ -40,6 +40,7 @@ describe("LiveEdit", () => {
       unbindEditor: vi.fn(),
       whenReady: () => ready,
       isReady: () => isReady,
+      isDestroyed: () => false,
     };
 
     const editor = makeEditor("remote ready value") as any;

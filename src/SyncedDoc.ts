@@ -71,6 +71,10 @@ export abstract class SyncedDoc {
     return this.ready;
   }
 
+  isDestroyed(): boolean {
+    return this.destroyed;
+  }
+
   ensureConnected(): void {
     if (this.destroyed) return;
     const status = this.provider.status;
@@ -84,6 +88,7 @@ export abstract class SyncedDoc {
   }
 
   protected resolveWhenReady(): void {
+    if (this.ready) return;
     this.ready = true;
     this.resolveReady();
   }
@@ -112,5 +117,6 @@ export abstract class SyncedDoc {
     this.provider.destroy();
     void this.persistence.destroy();
     this.ydoc.destroy();
+    this.resolveWhenReady();
   }
 }
