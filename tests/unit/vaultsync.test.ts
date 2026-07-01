@@ -232,4 +232,18 @@ describe("VaultSync index", () => {
       kind: "text",
     });
   });
+
+  it("ignores malformed structured index entries when resolving paths", () => {
+    const sync = Object.create(VaultSync.prototype) as any;
+    const index = new Y.Doc();
+    sync.files = index.getMap("files");
+    sync.structured = index.getMap("structured");
+    sync.structured.set("Bad.canvas", { kind: "canvas" });
+    sync.structured.set("Good.canvas", { guid: "good-guid", kind: "canvas" });
+
+    expect(sync.pathForGuid("good-guid")).toBe("Good.canvas");
+    expect(sync.pathForGuid("")).toBe(null);
+
+    index.destroy();
+  });
 });

@@ -34,6 +34,16 @@ interface StructuredMeta {
   kind: StructuredKind;
 }
 
+function isStructuredMeta(value: unknown): value is StructuredMeta {
+  if (!value || typeof value !== "object") return false;
+  const meta = value as Partial<StructuredMeta>;
+  return (
+    typeof meta.guid === "string" &&
+    meta.guid.length > 0 &&
+    (meta.kind === "canvas" || meta.kind === "base")
+  );
+}
+
 /**
  * Document kind recorded for a trashed (deleted but recoverable) file.
  * `plugindb` is a third-party plugin's synced-SQLite database (see src/pluginDb).
@@ -222,6 +232,7 @@ export class VaultSync {
       if (value === guid) return path;
     }
     for (const [path, meta] of this.structured.entries()) {
+      if (!isStructuredMeta(meta)) continue;
       if (meta.guid === guid) return path;
     }
     return null;
@@ -336,6 +347,10 @@ export class VaultSync {
       );
     }
     for (const [path, meta] of this.structured.entries()) {
+      if (!isStructuredMeta(meta)) {
+        console.warn(`[Realtime] ignoring malformed structured index entry for ${path}`);
+        continue;
+      }
       this.registerFile(path, meta.guid);
       this.enqueueDoc(
         { path, guid: meta.guid, kind: meta.kind },
@@ -367,7 +382,8 @@ export class VaultSync {
           });
           this.registerFile(path, guid);
         } else {
-          const meta = this.structured.get(path)!;
+          const meta = this.structured.get(path);
+          if (!isStructuredMeta(meta)) continue;
           this.registerFile(path, meta.guid);
           this.enqueueDoc({ path, guid: meta.guid, kind: meta.kind }, priorityPaths.has(path));
         }
@@ -427,7 +443,7 @@ export class VaultSync {
     const guid = this.files.get(path);
     if (guid) this.enqueueDoc({ path, guid, kind: "text" }, front);
     const meta = this.structured.get(path);
-    if (meta) this.enqueueDoc({ path, guid: meta.guid, kind: meta.kind }, front);
+    if (isStructuredMeta(meta)) this.enqueueDoc({ path, guid: meta.guid, kind: meta.kind }, front);
   }
 
   private enqueueDoc(item: QueueItem, front = false): void {
@@ -545,7 +561,7 @@ export class VaultSync {
     event.changes.keys.forEach((change, path) => {
       if (change.action === "add" || change.action === "update") {
         const meta = this.structured.get(path);
-        if (meta) {
+        if (isStructuredMeta(meta)) {
           this.registerFile(path, meta.guid);
           this.enqueueDoc(
             { path, guid: meta.guid, kind: meta.kind },
@@ -777,7 +793,8 @@ export class VaultSync {
       const structuredKind = this.structuredKindForExtension(file.extension);
       if (!structuredKind) return;
       if (this.structured.has(path)) {
-        const meta = this.structured.get(path)!;
+        const meta = this.structured.get(path);
+        if (!isStructuredMeta(meta)) return;
         this.registerFile(path, meta.guid);
         this.ensureStructuredDocument(path, meta.guid, meta.kind, false);
         return;
@@ -831,7 +848,8 @@ export class VaultSync {
     if (this.structuredDocuments.has(path) || this.structured.has(path)) {
       this.removeStructuredDocument(path);
       if (this.structured.has(path)) {
-        const meta = this.structured.get(path)!;
+        const meta = this.structured.get(path);
+        if (!isStructuredMeta(meta)) return;
         this.indexDoc.transact(() => {
           this.recordTrashIn({ path, kind: meta.kind, guid: meta.guid });
           this.structured.delete(path);
@@ -858,7 +876,10 @@ export class VaultSync {
     const wasTracked = this.files.has(oldPath);
     const guid = this.files.get(oldPath) ?? this.documents.get(oldPath)?.guid;
     const wasStructuredTracked = this.structured.has(oldPath);
-    const oldStructured = this.structured.get(oldPath) ?? this.structuredDocuments.get(oldPath);
+    const oldStructuredMeta = this.structured.get(oldPath);
+    const oldStructured = isStructuredMeta(oldStructuredMeta)
+      ? oldStructuredMeta
+      : this.structuredDocuments.get(oldPath);
     this.removeDocument(oldPath);
     this.removeStructuredDocument(oldPath);
 

@@ -90,6 +90,9 @@ export class CanvasBinding {
   /** Push the CRDT's current value into the live view and converge disk. */
   applyRemote(): void {
     if (!this.canvas) return;
+    // Do not import the constructor-time empty Y.Doc into an already-open
+    // canvas. The real value arrives after IndexedDB/server startup reconcile.
+    if (!this.doc.isReady()) return;
     const next = this.doc.canvasData();
     const nextHash = hashCanvasData(next);
     // Skip a pointless re-render (and the scroll/selection churn it brings)
@@ -138,6 +141,10 @@ export class CanvasBinding {
 
   private captureLocal(): void {
     try {
+      // Saves can fire while Obsidian is still mounting/reusing a canvas view.
+      // Before startup reconcile, that snapshot may be stale data from a
+      // previous path; disk startup handling is the source of truth until ready.
+      if (!this.doc.isReady()) return;
       const data = this.canvas?.getData();
       if (!data) return;
       // Ignore the bounce-back from our own importData(): if the view still

@@ -48,6 +48,11 @@ export class CanvasDocument extends StructuredDocument {
     return this.binding.isActive();
   }
 
+  protected async finishStartupReconcile(): Promise<void> {
+    await super.finishStartupReconcile();
+    this.binding.applyRemote();
+  }
+
   protected parse(text: string): JsonValue {
     return parseCanvas(text);
   }
