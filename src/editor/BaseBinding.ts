@@ -34,6 +34,8 @@ export class BaseBinding {
   private doc: BaseDocument;
   private view: InternalBaseView | null = null;
   private originalRequestSave: InternalBaseView["requestSave"] | null = null;
+  /** Our patch function, so unpatch can tell whether we're still the top patch. */
+  private patchedRequestSave: InternalBaseView["requestSave"] | null = null;
   private applyingRemote = false;
 
   constructor(plugin: RealtimePlugin, doc: BaseDocument) {
@@ -56,18 +58,49 @@ export class BaseBinding {
     if (this.view && view !== this.view) this.unpatch();
     if (!view) return;
     this.view = view;
-    this.originalRequestSave = view.requestSave.bind(view);
-    view.requestSave = () => {
-      const result = this.originalRequestSave?.();
+    // Capture the original in the closure (not via the mutable field): a stale
+    // copy of this patch can linger on a view instance that Obsidian reuses
+    // for another file, and it must keep delegating to the save function it
+    // wrapped even after this binding rebinds elsewhere.
+    const original = view.requestSave.bind(view);
+    this.originalRequestSave = original;
+    this.patchedRequestSave = () => {
+      const result = original();
       if (!this.applyingRemote) this.captureLocal();
       return result;
     };
+    view.requestSave = this.patchedRequestSave;
     this.applyRemote();
+  }
+
+  /**
+   * True when the bound view no longer displays this document's file.
+   * Obsidian reuses the same TextFileView when a leaf switches to another
+   * `.base` file, so the binding must re-verify the path at every
+   * capture/apply. Acting through a reused view would read the *other*
+   * file's YAML into this CRDT, or write this CRDT's YAML into the other
+   * file on disk.
+   */
+  private isStaleView(): boolean {
+    return this.view?.file?.path !== this.doc.path;
+  }
+
+  /** Unpatch if the bound view is gone or now shows another file. */
+  unbindIfStale(): void {
+    if (!this.view) return;
+    const found = this.findOpenBase();
+    if (!found || found !== this.view || this.isStaleView()) this.unpatch();
   }
 
   /** Push the CRDT's current value into the live view and persist it. */
   applyRemote(): void {
     if (!this.view) return;
+    // The leaf may have switched this reused view to a different file since we
+    // bound; pushing here would overwrite that file with this doc's content.
+    if (this.isStaleView()) {
+      this.unpatch();
+      return;
+    }
     const next = this.doc.baseData();
     // Avoid a pointless re-render (and the scroll/selection churn it brings)
     // when the view already shows this content.
@@ -91,15 +124,29 @@ export class BaseBinding {
 
   /** Restore the view's original `requestSave` and forget the binding. */
   private unpatch(): void {
+    // Only restore when we're still the top patch. If another binding patched
+    // over us (the view instance is shared across files in a leaf), leave the
+    // chain intact — its closure delegates to the save it captured, and our
+    // capture path is disabled by nulling `view` below.
     if (this.view && this.originalRequestSave) {
-      this.view.requestSave = this.originalRequestSave;
+      if (this.view.requestSave === this.patchedRequestSave) {
+        this.view.requestSave = this.originalRequestSave;
+      }
     }
     this.view = null;
     this.originalRequestSave = null;
+    this.patchedRequestSave = null;
   }
 
   private captureLocal(): void {
     try {
+      // The reused view may now show a different file: its YAML belongs to
+      // that file, not this document. Folding it in would overwrite this
+      // base everywhere with the other base's content.
+      if (this.view && this.isStaleView()) {
+        this.unpatch();
+        return;
+      }
       const data = this.view?.getViewData();
       if (typeof data === "string") this.doc.reconcileFromBaseText(data, BASE_LOCAL_ORIGIN);
     } catch (e) {

@@ -621,7 +621,8 @@ describe("Realtime — two isolated Obsidian devices", function () {
       // Dispatch a pointermove on B's canvas host to publish cursor coords.
       await dispatchCanvasPointerMove(B, "Board.canvas", 120, 80);
 
-      // B signed in as "bob" — its clientName defaults to that display name.
+      // B signed in as "bob" — login adopts the SSO display name as the
+      // cursor name unless the user customized it in settings.
       const bName = "bob";
       await A.waitUntil(
         async () => {

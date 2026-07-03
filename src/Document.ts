@@ -301,6 +301,9 @@ export class Document extends SyncedDoc {
           return;
         }
         if ((await this.plugin.app.vault.read(file)) === text) return;
+        // Re-check destroyed after the await: a doc replaced mid-write (rename,
+        // guid change) must not clobber the file its successor now owns.
+        if (this.destroyed) return;
         if (this.hasBoundEditor || this.isOpenInWorkspace()) {
           dbg(
             "writeToDisk SKIP after read (open/bound)",
@@ -328,7 +331,7 @@ export class Document extends SyncedDoc {
         // Remote-created file that does not exist locally yet.
         const path = normalizePath(this.path);
         await ensureParentFolder(this.plugin.app, path);
-        if (this.content !== text) return;
+        if (this.destroyed || this.content !== text) return;
         await this.plugin.app.vault.create(path, text);
       }
     } catch (e) {

@@ -34,6 +34,11 @@ export class BaseDocument extends StructuredDocument {
     this.binding.tryBind();
   }
 
+  /** Drop the live binding if its view closed or now shows another file. */
+  unbindStaleBase(): void {
+    this.binding.unbindIfStale();
+  }
+
   // Defer to the live binding only while it's actually patched onto an open
   // Bases view; otherwise the StructuredDocument disk write-through stays active
   // (so bases still sync when the API shape is unrecognized or the file is closed).

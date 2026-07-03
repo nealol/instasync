@@ -22,14 +22,19 @@ interface InternalCanvas {
 interface BoundCanvasView {
   canvas: InternalCanvas;
   host: HTMLElement;
+  view: { file?: { path?: string } | null };
 }
 
 export class CanvasBinding {
   private plugin: RealtimePlugin;
   private doc: CanvasDocument;
   private canvas: InternalCanvas | null = null;
+  /** The Obsidian view the canvas belongs to, kept to re-verify `file.path`. */
+  private view: BoundCanvasView["view"] | null = null;
   private presenceCleanup: (() => void) | null = null;
   private originalRequestSave: InternalCanvas["requestSave"] | null = null;
+  /** Our patch function, so unpatch can tell whether we're still the top patch. */
+  private patchedRequestSave: InternalCanvas["requestSave"] | null = null;
   private applyingRemote = false;
   /**
    * Normalized snapshot of the last data pushed into the view via
@@ -59,14 +64,21 @@ export class CanvasBinding {
     // editing survives close/reopen instead of silently dying.
     if (this.canvas && (!found || found.canvas !== this.canvas)) this.unpatch();
     if (!found) return;
-    const { canvas, host } = found;
+    const { canvas, host, view } = found;
     this.canvas = canvas;
-    this.originalRequestSave = canvas.requestSave.bind(canvas);
-    canvas.requestSave = (...args: unknown[]) => {
-      const result = this.originalRequestSave?.(...args);
+    this.view = view;
+    // Capture the original in the closure (not via the mutable field): a stale
+    // copy of this patch can linger on a canvas instance that Obsidian reuses
+    // for another file, and it must keep delegating to the save function it
+    // wrapped even after this binding rebinds elsewhere.
+    const original = canvas.requestSave.bind(canvas);
+    this.originalRequestSave = original;
+    this.patchedRequestSave = (...args: unknown[]) => {
+      const result = original(...args);
       if (!this.applyingRemote) this.captureLocal();
       return result;
     };
+    canvas.requestSave = this.patchedRequestSave;
     this.applyRemote();
     // Mount presence avatar stack + canvas cursor overlay. Both clean up via
     // presenceCleanup, which is called in unpatch().
@@ -87,9 +99,34 @@ export class CanvasBinding {
     };
   }
 
+  /**
+   * True when the bound view no longer displays this document's file.
+   * Obsidian reuses the same view — and the same Canvas instance — when a
+   * leaf switches to a different canvas file, so the binding must re-verify
+   * the path at every capture/import. Acting through a reused view would
+   * read the *other* file's content into this CRDT, or write this CRDT's
+   * content into the other file on disk.
+   */
+  private isStaleView(): boolean {
+    return this.view?.file?.path !== this.doc.path;
+  }
+
+  /** Unpatch if the bound canvas is gone or its view now shows another file. */
+  unbindIfStale(): void {
+    if (!this.canvas) return;
+    const found = this.findOpenCanvas();
+    if (!found || found.canvas !== this.canvas || this.isStaleView()) this.unpatch();
+  }
+
   /** Push the CRDT's current value into the live view and converge disk. */
   applyRemote(): void {
     if (!this.canvas) return;
+    // The leaf may have switched this reused view to a different file since we
+    // bound; importing here would overwrite that file with this doc's content.
+    if (this.isStaleView()) {
+      this.unpatch();
+      return;
+    }
     // Do not import the constructor-time empty Y.Doc into an already-open
     // canvas. The real value arrives after IndexedDB/server startup reconcile.
     if (!this.doc.isReady()) return;
@@ -131,16 +168,31 @@ export class CanvasBinding {
   private unpatch(): void {
     this.presenceCleanup?.();
     this.presenceCleanup = null;
+    // Only restore when we're still the top patch. If another binding patched
+    // over us (the canvas instance is shared across files in a leaf), leave
+    // the chain intact — its closure delegates to the save it captured, and
+    // our capture path is disabled by nulling `canvas`/`view` below.
     if (this.canvas && this.originalRequestSave) {
-      this.canvas.requestSave = this.originalRequestSave;
+      if (this.canvas.requestSave === this.patchedRequestSave) {
+        this.canvas.requestSave = this.originalRequestSave;
+      }
     }
     this.canvas = null;
+    this.view = null;
     this.originalRequestSave = null;
+    this.patchedRequestSave = null;
     this.lastImportedHash = null;
   }
 
   private captureLocal(): void {
     try {
+      // The reused view may now show a different file: its data belongs to
+      // that file, not this document. Folding it in would overwrite this
+      // canvas everywhere with the other canvas's content.
+      if (this.canvas && this.isStaleView()) {
+        this.unpatch();
+        return;
+      }
       // Saves can fire while Obsidian is still mounting/reusing a canvas view.
       // Before startup reconcile, that snapshot may be stale data from a
       // previous path; disk startup handling is the source of truth until ready.
@@ -167,7 +219,7 @@ export class CanvasBinding {
       const view = leaf?.view;
       if (view?.getViewType?.() !== "canvas" || view?.file?.path !== this.doc.path) return;
       const canvas = view.canvas;
-      if (isInternalCanvas(canvas)) found = { canvas, host: view.containerEl };
+      if (isInternalCanvas(canvas)) found = { canvas, host: view.containerEl, view };
       else if (!loggedUnsupported) {
         loggedUnsupported = true;
         console.warn(

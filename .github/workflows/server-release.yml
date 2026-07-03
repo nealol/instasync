@@ -105,3 +105,10 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag "${{ steps.version.outputs.current }}"
           git push origin "${{ steps.version.outputs.current }}"
+      - name: Trigger image bump on lannix
+        run: |
+          curl -fsSL -X POST \
+           -H "Authorization: token ${{ secrets.LANNIX_BUMP_TOKEN }}" \
+           -H "Content-Type: application/json" \
+           -d '{"ref":"main","inputs":{"image":"ghcr.io/nealol/realtime-server"}}' \
+           https://git.szpunar.cloud/api/v1/repos/LAN/lannix/actions/workflows/bump-images.yml/dispatches

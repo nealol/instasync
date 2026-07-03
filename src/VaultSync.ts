@@ -717,13 +717,23 @@ export class VaultSync {
     return this.structuredDocuments.get(path) === doc && !this.structured.has(path);
   }
 
+  // Two passes: unbind every stale binding before binding new ones. Obsidian
+  // reuses view/canvas instances across files in a leaf, so binding a new doc
+  // while a stale sibling is still patched would wrap the stale patch and the
+  // later unbind could clobber the fresh one.
   bindOpenCanvases(): void {
+    for (const doc of this.structuredDocuments.values()) {
+      if (doc instanceof CanvasDocument) doc.unbindStaleCanvas();
+    }
     for (const doc of this.structuredDocuments.values()) {
       if (doc instanceof CanvasDocument) doc.tryBindLiveCanvas();
     }
   }
 
   bindOpenBases(): void {
+    for (const doc of this.structuredDocuments.values()) {
+      if (doc instanceof BaseDocument) doc.unbindStaleBase();
+    }
     for (const doc of this.structuredDocuments.values()) {
       if (doc instanceof BaseDocument) doc.tryBindLiveBase();
     }

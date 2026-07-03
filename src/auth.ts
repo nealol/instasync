@@ -424,11 +424,15 @@ export class AuthClient {
     this.plugin.settings.userPictureUrl = me.pictureUrl ?? "";
     this.plugin.settings.userAvatarUrlOverride = me.avatarUrlOverride ?? "";
     this.plugin.settings.userAvatarUrl = me.avatarUrl ?? "";
-    // Default the cursor name to the SSO display name on first login.
-    if (!this.plugin.settings.clientName) {
+    // Default the cursor name to the SSO display name. defaultSettings()
+    // pre-fills a random two-word placeholder, so a falsy check alone would
+    // never adopt the account name; replace the name unless the user has
+    // explicitly customized it in settings.
+    if (me.displayName && !this.plugin.settings.clientNameCustomized) {
       this.plugin.settings.clientName = me.displayName;
     }
     await this.plugin.saveSettings();
+    this.plugin.updateLocalAwareness();
   }
 
   private async clearSession(): Promise<void> {

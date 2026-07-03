@@ -140,11 +140,15 @@ export abstract class StructuredDocument extends SyncedDoc {
       if (file) {
         if (this.suppressedWhileOpen()) return;
         if ((await this.plugin.app.vault.read(file)) === text) return;
+        // Re-check destroyed after the await: a doc replaced mid-write (rename,
+        // guid change) must not clobber the file its successor now owns.
+        if (this.destroyed || this.suppressedWhileOpen()) return;
         if (this.serialize(this.value) !== text) return;
         await this.plugin.app.vault.modify(file, text);
       } else {
         const path = normalizePath(this.path);
         await ensureParentFolder(this.plugin.app, path);
+        if (this.destroyed) return;
         if (this.serialize(this.value) !== text) return;
         await this.plugin.app.vault.create(path, text);
       }

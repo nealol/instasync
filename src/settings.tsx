@@ -63,6 +63,12 @@ export interface RealtimeSettings {
   activeVaultId: string;
   /** This client's display name (shown on remote cursors). */
   clientName: string;
+  /**
+   * True once the user has explicitly edited/randomized the display name.
+   * Until then the name is a placeholder (the auto-generated two-word
+   * identity), and login replaces it with the account's SSO display name.
+   */
+  clientNameCustomized: boolean;
   /** This client's cursor color. */
   clientColor: string;
   clientColorLight: string;
@@ -107,6 +113,7 @@ export function defaultSettings(): RealtimeSettings {
     userAvatarUrl: "",
     activeVaultId: "",
     clientName: identity.name,
+    clientNameCustomized: false,
     clientColor: identity.color,
     clientColorLight: identity.colorLight,
     enabled: true,
@@ -869,6 +876,7 @@ function DeviceSection({ plugin }: { plugin: RealtimePlugin }) {
     setName(value);
     void runNotice(undefined, async () => {
       plugin.settings.clientName = value;
+      plugin.settings.clientNameCustomized = true;
       await plugin.saveSettings();
       plugin.updateLocalAwareness();
     });

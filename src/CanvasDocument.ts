@@ -40,6 +40,11 @@ export class CanvasDocument extends StructuredDocument {
     this.binding.tryBind();
   }
 
+  /** Drop the live binding if its view closed or now shows another file. */
+  unbindStaleCanvas(): void {
+    this.binding.unbindIfStale();
+  }
+
   // Suppress disk write-through only while a live binding is actually patched
   // onto an open canvas view. If the binding couldn't attach (unsupported
   // private API, view not yet mounted), the disk write-through stays active so

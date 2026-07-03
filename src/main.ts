@@ -730,6 +730,8 @@ function sanitizeSettings(raw: unknown): RealtimeSettings {
     typeof data.clientName === "string" && data.clientName.trim()
       ? data.clientName.trim()
       : defaults.clientName;
+  settings.clientNameCustomized =
+    typeof data.clientNameCustomized === "boolean" ? data.clientNameCustomized : false;
   settings.clientColor = sanitizeColor(data.clientColor, defaults.clientColor);
   settings.clientColorLight = sanitizeColor(data.clientColorLight, defaults.clientColorLight);
   settings.enabled = typeof data.enabled === "boolean" ? data.enabled : defaults.enabled;
