@@ -42,7 +42,8 @@ use crate::session::now_millis;
 use crate::state::{Principal, PrincipalActor};
 use crate::structured::canvas_to_file_json;
 use crate::ydoc::{
-    decode_binaries_entries, decode_files_map, decode_structured, decode_structured_index,
+    decode_binaries_entries, decode_config_entries, decode_files_map, decode_structured,
+    decode_structured_index,
     decode_text,
 };
 
@@ -341,10 +342,13 @@ impl GitService {
             }
         }
 
-        // 2a. Binary attachments from the `binaries` map. Small ones are
-        // committed verbatim from the blob store; larger ones as a text shim
-        // pointing at the authenticated blob download endpoint.
-        for entry in decode_binaries_entries(&index_update)? {
+        // 2a. Binary attachments from the `binaries` map, plus synced config
+        // folder files from the `configFiles` map (same blob-store shape).
+        // Small ones are committed verbatim from the blob store; larger ones
+        // as a text shim pointing at the authenticated blob download endpoint.
+        let mut blob_entries = decode_binaries_entries(&index_update)?;
+        blob_entries.extend(decode_config_entries(&index_update)?);
+        for entry in blob_entries {
             let rel = match safe_rel_path(&entry.path) {
                 Ok(rel) => rel,
                 Err(e) => {
@@ -1198,6 +1202,36 @@ mod tests {
                 size: 123,
             }]
         );
+    }
+
+    #[test]
+    fn decode_config_entries_reads_config_files_map() {
+        use crate::ydoc::BinaryEntry;
+        let hash = "b".repeat(64);
+        let doc = Doc::new();
+        let map = doc.get_or_insert_map("configFiles");
+        {
+            let mut txn = doc.transact_mut();
+            map.insert(
+                &mut txn,
+                ".obsidian/app.json".to_string(),
+                binary_meta_any(&hash, 42),
+            );
+        }
+        let update = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        let got = decode_config_entries(&update).unwrap();
+        assert_eq!(
+            got,
+            vec![BinaryEntry {
+                path: ".obsidian/app.json".into(),
+                hash,
+                size: 42,
+            }]
+        );
+        // Config paths survive the git path safety check (dotfolder ≠ dot component).
+        assert!(safe_rel_path(".obsidian/app.json").is_ok());
     }
 
     #[test]

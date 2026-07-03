@@ -27,6 +27,11 @@ import {
 import { PLUGIN_NAME } from "./brand";
 import { generateClientIdentity } from "./names";
 import { openTrashModal } from "./TrashModal";
+import {
+  CONFIG_CATEGORIES,
+  defaultConfigSyncCategories,
+  type ConfigSyncCategories,
+} from "./configCategories";
 
 export interface RealtimeSettings {
   /** Base URL of the Realtime auth server, e.g. http://127.0.0.1:8081 */
@@ -74,10 +79,13 @@ export interface RealtimeSettings {
    * files to exclude from sync, e.g. `*.tmp, .obsidian/**`. Empty syncs all.
    */
   binaryExcludeGlobs: string;
-  /** Whether this device syncs whitelisted files under `.obsidian`. */
+  /** Whether this device syncs its active Obsidian config folder. Per-device. */
   syncConfigEnabled: boolean;
-  /** Globs matched relative to `.obsidian`, e.g. `snippets/*.css`. */
-  configIncludeGlobs: string[];
+  /**
+   * Per-device vault configuration sync toggles, mirroring Obsidian Sync's
+   * category list (main settings, appearance, hotkeys, plugin lists, ...).
+   */
+  configSyncCategories: ConfigSyncCategories;
   /** Hidden advanced setting for verbose diagnostic logging. */
   diagnosticLogging: boolean;
   /** Recently opened syncable note/structured paths, newest first. */
@@ -107,7 +115,7 @@ export function defaultSettings(): RealtimeSettings {
     syncBases: true,
     binaryExcludeGlobs: "",
     syncConfigEnabled: false,
-    configIncludeGlobs: [],
+    configSyncCategories: defaultConfigSyncCategories(),
     diagnosticLogging: false,
     recentPaths: [],
   };
@@ -1910,29 +1918,20 @@ function GitBackupSection({ plugin, vault }: { plugin: RealtimePlugin; vault: Va
   );
 }
 
-/** A glob row with a stable id so React keys survive add/remove reordering. */
-interface GlobRow {
-  id: number;
-  value: string;
-}
-
-let nextGlobRowId = 1;
-
 /**
- * Self-contained `.obsidian` sync controls. Uses local state for the enabled
- * flag and the glob rows so toggling never re-renders (and scroll-resets) the
- * whole settings page. Rows use plain React buttons — not imperatively-mounted
- * Obsidian components — so React fully owns the dynamic list and reconciliation
- * can't hit a stale `removeChild`.
+ * Vault configuration sync controls, modeled on Obsidian Sync's settings
+ * panel: a master toggle plus one toggle per configuration category. All
+ * toggles are per-device (as in Obsidian Sync) and live in local state so
+ * flipping one never re-renders (and scroll-resets) the whole settings page.
  */
 function ConfigSyncSection({ plugin }: { plugin: RealtimePlugin }) {
   const [enabled, setEnabled] = useState(plugin.settings.syncConfigEnabled);
-  const [rows, setRows] = useState<GlobRow[]>(() =>
-    plugin.settings.configIncludeGlobs.map((value) => ({ id: nextGlobRowId++, value })),
-  );
+  const [categories, setCategories] = useState<ConfigSyncCategories>(() => ({
+    ...plugin.settings.configSyncCategories,
+  }));
+  const configDir = plugin.app.vault.configDir;
 
-  const persist = async (next: GlobRow[]) => {
-    plugin.settings.configIncludeGlobs = next.map((row) => row.value.trim()).filter(Boolean);
+  const persist = async () => {
     await plugin.saveSettings();
     await plugin.reloadSync();
   };
@@ -1940,8 +1939,8 @@ function ConfigSyncSection({ plugin }: { plugin: RealtimePlugin }) {
   return (
     <>
       <SettingRow
-        name="Sync `.obsidian` files"
-        desc="Opt in per device. Matched files under your Obsidian config folder sync as binary attachments. Expect slight issues. Must be configured per-device. "
+        name="Vault configuration sync"
+        desc={`Sync this device's active config folder (${configDir}) between devices using the same folder name, like Obsidian Sync's settings profiles. Configure per device. The Realtime plugin's own folder is always excluded.`}
         control={
           <Toggle
             value={enabled}
@@ -1949,57 +1948,36 @@ function ConfigSyncSection({ plugin }: { plugin: RealtimePlugin }) {
               void runNotice(undefined, async () => {
                 setEnabled(value);
                 plugin.settings.syncConfigEnabled = value;
-                await plugin.saveSettings();
-                await plugin.reloadSync();
+                await persist();
               })
             }
           />
         }
       />
-      {enabled ? (
-        <SettingRow
-          name="Config include globs"
-          desc="Matched relative to your config folder, e.g. snippets/*.css or hotkeys.json. Uses picomatch. The Realtime plugin folder and all node_modules folders are hard excluded."
-          control={
-            <div className="realtime-choice-list">
-              {rows.map((row) => (
-                <div className="realtime-actions" key={row.id}>
-                  <input
-                    className="realtime-modal-input"
-                    type="text"
-                    value={row.value}
-                    placeholder="snippets/*.css"
-                    onChange={(event) => {
-                      const value = event.currentTarget.value;
-                      setRows((current) =>
-                        current.map((r) => (r.id === row.id ? { ...r, value } : r)),
-                      );
-                    }}
-                    onBlur={() => void persist(rows)}
-                  />
-                  <button
-                    className="mod-warning"
-                    onClick={() => {
-                      const next = rows.filter((r) => r.id !== row.id);
-                      setRows(next);
-                      void persist(next);
-                    }}
-                  >
-                    Remove
-                  </button>
-                </div>
-              ))}
-              <button
-                onClick={() =>
-                  setRows((current) => [...current, { id: nextGlobRowId++, value: "" }])
-                }
-              >
-                Add glob
-              </button>
-            </div>
-          }
-        />
-      ) : null}
+      {enabled
+        ? CONFIG_CATEGORIES.map((category) => (
+            <SettingRow
+              key={category.id}
+              name={category.name}
+              desc={category.desc}
+              control={
+                <Toggle
+                  value={categories[category.id]}
+                  onChange={(value) =>
+                    void runNotice(undefined, async () => {
+                      setCategories((current) => ({ ...current, [category.id]: value }));
+                      plugin.settings.configSyncCategories = {
+                        ...plugin.settings.configSyncCategories,
+                        [category.id]: value,
+                      };
+                      await persist();
+                    })
+                  }
+                />
+              }
+            />
+          ))
+        : null}
     </>
   );
 }

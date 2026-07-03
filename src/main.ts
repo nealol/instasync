@@ -2,6 +2,7 @@ import { Menu, MenuItem, Notice, Plugin, TFile } from "obsidian";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { RealtimeSettings, RealtimeSettingTab, defaultSettings } from "./settings";
+import { sanitizeConfigSyncCategories } from "./configCategories";
 import { VaultSync, isConflictCopy } from "./VaultSync";
 import type { UploadStatus } from "./BinarySync";
 import { matchesAnyGlob, parseGlobs } from "./glob";
@@ -741,12 +742,9 @@ function sanitizeSettings(raw: unknown): RealtimeSettings {
     typeof data.binaryExcludeGlobs === "string" ? data.binaryExcludeGlobs : "";
   settings.syncConfigEnabled =
     typeof data.syncConfigEnabled === "boolean" ? data.syncConfigEnabled : false;
-  settings.configIncludeGlobs = Array.isArray(data.configIncludeGlobs)
-    ? data.configIncludeGlobs
-        .filter((glob): glob is string => typeof glob === "string")
-        .map((glob) => glob.trim())
-        .filter(Boolean)
-    : [];
+  // Legacy `configIncludeGlobs` (pre-category config sync) is intentionally
+  // dropped; category toggles start from their Obsidian-Sync-like defaults.
+  settings.configSyncCategories = sanitizeConfigSyncCategories(data.configSyncCategories);
   settings.diagnosticLogging =
     typeof data.diagnosticLogging === "boolean" ? data.diagnosticLogging : false;
   settings.recentPaths = Array.isArray(data.recentPaths)

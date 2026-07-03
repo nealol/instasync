@@ -20,13 +20,3 @@ export function matchesAnyGlob(path: string, globs: string[]): boolean {
   return matched;
 }
 
-/**
- * True if a path under the Obsidian config dir matches any per-device config
- * include glob. Globs are matched relative to `configDir` (e.g. `.obsidian`),
- * so the leading `${configDir}/` is stripped before matching.
- */
-export function matchesConfigGlobs(path: string, configDir: string, globs: string[]): boolean {
-  const prefix = `${configDir}/`;
-  if (!path.startsWith(prefix)) return false;
-  return matchesAnyGlob(path.slice(prefix.length), globs);
-}

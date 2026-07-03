@@ -927,8 +927,20 @@ pub struct BinaryEntry {
 /// Decode the vault index doc's `binaries` map into typed entries, skipping
 /// any entry whose metadata is malformed (missing/mistyped hash or size).
 pub fn decode_binaries_entries(update: &[u8]) -> Result<Vec<BinaryEntry>> {
+    decode_hash_entries(update, "binaries")
+}
+
+/// Decode the vault index doc's `configFiles` map (Obsidian config folder
+/// files synced via the blob store) into typed entries, skipping any entry
+/// whose metadata is malformed. Same shape as `binaries` entries.
+pub fn decode_config_entries(update: &[u8]) -> Result<Vec<BinaryEntry>> {
+    decode_hash_entries(update, "configFiles")
+}
+
+/// Decode a `path -> { hash, size, ... }` index map into typed entries.
+fn decode_hash_entries(update: &[u8], map_name: &str) -> Result<Vec<BinaryEntry>> {
     let mut out = Vec::new();
-    for (path, value) in decode_binaries_map(update)? {
+    for (path, value) in decode_any_map(update, map_name)? {
         let Any::Map(meta) = value else { continue };
         let Some(Any::String(hash)) = meta.get("hash") else {
             continue;
@@ -949,13 +961,18 @@ pub fn decode_binaries_entries(update: &[u8]) -> Result<Vec<BinaryEntry>> {
 
 /// Decode the vault index doc's `binaries` map (path -> JSON metadata) from a full-state update.
 pub fn decode_binaries_map(update: &[u8]) -> Result<Vec<(String, Any)>> {
+    decode_any_map(update, "binaries")
+}
+
+/// Decode an index-doc map (path -> JSON metadata) from a full-state update.
+fn decode_any_map(update: &[u8], map_name: &str) -> Result<Vec<(String, Any)>> {
     let doc = Doc::new();
     let update = Update::decode_v1(update).map_err(|e| anyhow!("decode index: {e:?}"))?;
     {
         let mut txn = doc.transact_mut();
         txn.apply_update(update);
     }
-    let map = doc.get_or_insert_map("binaries");
+    let map = doc.get_or_insert_map(map_name);
     let txn = doc.transact();
     let mut out = Vec::new();
     if let Any::Map(entries) = map.to_json(&txn) {

@@ -3,7 +3,7 @@
 //! Surfaces the storage a vault occupies on the server, split into three
 //! buckets for the plugin's "Storage Management" panel:
 //!  - **current** binary attachments — blobs referenced by the live `binaries`
-//!    index map;
+//!    or `configFiles` index maps;
 //!  - **previous** binary attachments — orphaned blobs no longer referenced by
 //!    the live map (older versions and the content behind trashed/deleted files);
 //!  - **plain vault** — the internal y-sweet document store for this vault
@@ -67,18 +67,25 @@ fn vault_blob_dir(state: &AppState, vault_id: &str) -> PathBuf {
     p
 }
 
-/// Hashes referenced by the live `binaries` index map (the "current" set).
+/// Hashes referenced by the live `binaries` and `configFiles` index maps (the
+/// "current" set). Config-folder files share the attachment blob store, so
+/// they must count as live or GC would delete them out from under peers.
 async fn live_blob_hashes(state: &AppState, vault_id: &str) -> AppResult<HashSet<String>> {
     let current = ydoc::read_update(state, vault_id).await?;
+    let mut hashes = HashSet::new();
     let entries = ydoc::decode_binaries_map(&current)
         .map_err(|e| crate::error::AppError::Internal(e.to_string()))?;
-    let mut hashes = HashSet::new();
     for (_path, value) in entries {
         if let yrs::Any::Map(meta) = value {
             if let Some(yrs::Any::String(hash)) = meta.get("hash") {
                 hashes.insert(hash.to_string());
             }
         }
+    }
+    let config_entries = ydoc::decode_config_entries(&current)
+        .map_err(|e| crate::error::AppError::Internal(e.to_string()))?;
+    for entry in config_entries {
+        hashes.insert(entry.hash);
     }
     Ok(hashes)
 }

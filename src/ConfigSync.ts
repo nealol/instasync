@@ -1,7 +1,12 @@
 import * as Y from "yjs";
+import { Notice } from "obsidian";
 import type RealtimePlugin from "./main";
 import { sha256Hex } from "./hash";
-import { matchesConfigGlobs } from "./glob";
+import {
+  categoryForVaultPath,
+  categoryRequiresReload,
+  type ConfigCategoryId,
+} from "./configCategories";
 import { dbg } from "./debug";
 
 export interface ConfigMeta {
@@ -10,12 +15,31 @@ export interface ConfigMeta {
   mtime: number;
 }
 
-export type ConfigReconcileAction = "none" | "upload" | "download" | "deleteLocal";
+export type ConfigReconcileAction =
+  | "none"
+  | "upload"
+  | "download"
+  | "deleteLocal"
+  | "deleteRemote"
+  | "merge";
 
+/**
+ * Three-way reconcile decision, mirroring Obsidian Sync's documented behavior
+ * for settings files: deletes propagate within a profile, and a true conflict
+ * on a JSON settings file merges the objects with local keys applied on top
+ * of remote keys (`canMerge`); non-JSON conflicts fall back to newest-wins.
+ *
+ * `initialPull` guards the delete-propagation branch during the first pass
+ * after start(): baselines are seeded from the shared map before any local
+ * download has happened, so "local missing + baseline matches remote" would
+ * otherwise publish a bogus remote delete from a device that simply never
+ * pulled the file (or just enabled its category).
+ */
 export function decideConfigReconcile(
   local: ConfigMeta | null,
   remote: ConfigMeta | null,
   base: string | null,
+  opts: { initialPull?: boolean; canMerge?: boolean } = {},
 ): ConfigReconcileAction {
   const localHash = local?.hash ?? null;
   const remoteHash = remote?.hash ?? null;
@@ -28,32 +52,70 @@ export function decideConfigReconcile(
     return "upload";
   }
 
-  if (!local && remote) return "download";
+  if (!local && remote) {
+    if (base === remote.hash && !opts.initialPull) return "deleteRemote";
+    return "download";
+  }
 
   if (local && remote) {
+    // Fresh device (no baseline): the profile's remote settings win, so a
+    // newly joining device never clobbers the profile with its local defaults.
     if (base === null) return "download";
     if (base === remote.hash) return "upload";
     if (base === local.hash) return "download";
+    if (opts.canMerge) return "merge";
     return local.mtime >= remote.mtime ? "upload" : "download";
   }
 
   return "none";
 }
 
+/**
+ * Shallow-merge two JSON settings documents the way Obsidian Sync documents
+ * it: "JSON objects are merged; local keys are applied on top of remote
+ * keys". Returns `null` when either side is not a plain JSON object, in
+ * which case the caller falls back to newest-wins.
+ */
+export function mergeJsonSettings(remoteText: string, localText: string): string | null {
+  let remote: unknown;
+  let local: unknown;
+  try {
+    remote = JSON.parse(remoteText);
+    local = JSON.parse(localText);
+  } catch {
+    return null;
+  }
+  if (!isPlainObject(remote) || !isPlainObject(local)) return null;
+  return JSON.stringify({ ...remote, ...local }, null, 2);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 const POLL_MS = 15_000;
 const RETRY_MS = 2_000;
+const RELOAD_NOTICE_DEBOUNCE_MS = 2_000;
 
 export class ConfigSync {
   private plugin: RealtimePlugin;
   private indexDoc: Y.Doc;
   private configFiles: Y.Map<ConfigMeta>;
-  private globs: string[] = [];
+  private enabledCategories = new Set<ConfigCategoryId>();
   private lastSyncedHash = new Map<string, string>();
   private chains = new Map<string, Promise<void>>();
   private writing = new Set<string>();
   private pollTimer: number | null = null;
   private started = false;
   private destroyed = false;
+  /**
+   * True while the reconcile pass triggered by start() runs. Baselines seeded
+   * from the shared map don't prove this device ever downloaded the file, so
+   * delete propagation is suppressed until the initial pull completes
+   * (mirrors BinarySync's `pullingMissingRemote`).
+   */
+  private initialPull = false;
+  private reloadNoticeTimer: number | null = null;
   private observer: (event: Y.YMapEvent<ConfigMeta>) => void;
   private focusHandler = () => void this.reconcileAll();
 
@@ -86,17 +148,26 @@ export class ConfigSync {
     dbg("ConfigSync seedBaseline", this.lastSyncedHash.size, "entries");
   }
 
-  start(globs: string[]): void {
+  start(categories: Set<ConfigCategoryId>): void {
     if (this.destroyed) return;
-    this.globs = globs.map((glob) => glob.trim()).filter(Boolean);
+    this.enabledCategories = new Set(categories);
     if (this.started) {
-      void this.reconcileAll();
+      void this.runInitialPull();
       return;
     }
     this.started = true;
     window.addEventListener("focus", this.focusHandler);
-    void this.reconcileAll();
+    void this.runInitialPull();
     this.schedulePoll();
+  }
+
+  private async runInitialPull(): Promise<void> {
+    this.initialPull = true;
+    try {
+      await this.reconcileAll();
+    } finally {
+      this.initialPull = false;
+    }
   }
 
   async reconcileAll(): Promise<void> {
@@ -120,7 +191,7 @@ export class ConfigSync {
   }
 
   private reconcile(path: string): Promise<void> {
-    if (this.isHardExcluded(path) || !this.matchesGlobs(path)) return Promise.resolve();
+    if (this.syncableCategory(path) === null) return Promise.resolve();
     if (this.writing.has(path)) return Promise.resolve();
     const prev = this.chains.get(path) ?? Promise.resolve();
     const next = prev
@@ -142,7 +213,10 @@ export class ConfigSync {
     const remote = this.configFiles.get(path) ?? null;
     const base = this.lastSyncedHash.get(path) ?? null;
 
-    const action = decideConfigReconcile(local, remote, base);
+    const action = decideConfigReconcile(local, remote, base, {
+      initialPull: this.initialPull,
+      canMerge: path.endsWith(".json"),
+    });
     if (action === "none") {
       if (remote?.hash) this.lastSyncedHash.set(path, remote.hash);
       else this.lastSyncedHash.delete(path);
@@ -151,12 +225,14 @@ export class ConfigSync {
     if (action === "upload" && local) await this.upload(path, local);
     else if (action === "download" && remote) await this.download(path, remote);
     else if (action === "deleteLocal") await this.deleteLocal(path);
+    else if (action === "deleteRemote") this.publishDelete(path);
+    else if (action === "merge" && local && remote) await this.mergeConflict(path, local, remote);
   }
 
   private async localConfigPaths(): Promise<string[]> {
     const paths: string[] = [];
     await this.walk(this.configRoot, paths);
-    return paths.filter((path) => !this.isHardExcluded(path) && this.matchesGlobs(path));
+    return paths.filter((path) => this.syncableCategory(path) !== null);
   }
 
   private async walk(folder: string, paths: string[]): Promise<void> {
@@ -191,10 +267,18 @@ export class ConfigSync {
 
   private async upload(path: string, meta: ConfigMeta): Promise<void> {
     const bytes = await this.plugin.app.vault.adapter.readBinary(path);
+    await this.uploadBytes(path, bytes, meta);
+  }
+
+  private async uploadBytes(
+    path: string,
+    bytes: ArrayBuffer,
+    meta: ConfigMeta | null,
+  ): Promise<void> {
     const hash = await sha256Hex(bytes);
     if (this.destroyed) return;
     const finalMeta =
-      hash === meta.hash ? meta : { hash, size: bytes.byteLength, mtime: Date.now() };
+      meta && hash === meta.hash ? meta : { hash, size: bytes.byteLength, mtime: Date.now() };
     if (!(await this.plugin.auth.blobExists(this.vaultId, finalMeta.hash))) {
       await this.plugin.auth.putBlob(this.vaultId, finalMeta.hash, bytes);
     }
@@ -220,10 +304,55 @@ export class ConfigSync {
       await this.ensureParentFolders(path);
       await this.plugin.app.vault.adapter.writeBinary(path, bytes);
       this.lastSyncedHash.set(path, meta.hash);
+      this.noteDownloaded(path);
       dbg("config downloaded", path, meta.hash, bytes.byteLength);
     } finally {
       window.setTimeout(() => this.writing.delete(path), 0);
     }
+  }
+
+  /**
+   * Both sides changed the same JSON settings file since the shared baseline.
+   * Mirror Obsidian Sync: merge the objects with local keys on top of remote
+   * keys, write the merged result locally, and publish it. Falls back to
+   * newest-wins when either side isn't a plain JSON object.
+   */
+  private async mergeConflict(path: string, local: ConfigMeta, remote: ConfigMeta): Promise<void> {
+    let remoteBytes: ArrayBuffer;
+    try {
+      remoteBytes = await this.plugin.auth.getBlob(this.vaultId, remote.hash);
+    } catch (e) {
+      if (this.destroyed) return;
+      console.error(`[Realtime] config blob download failed for ${path}`, e);
+      window.setTimeout(() => void this.reconcile(path), RETRY_MS);
+      return;
+    }
+    const localBytes = await this.plugin.app.vault.adapter.readBinary(path);
+    if (this.destroyed) return;
+
+    const decoder = new TextDecoder();
+    const merged = mergeJsonSettings(decoder.decode(remoteBytes), decoder.decode(localBytes));
+    if (merged === null) {
+      // Not mergeable JSON → newest modified version wins.
+      if (local.mtime >= remote.mtime) await this.uploadBytes(path, localBytes, local);
+      else await this.download(path, remote);
+      return;
+    }
+
+    const mergedBytes = new TextEncoder().encode(merged);
+    const buffer = mergedBytes.buffer.slice(
+      mergedBytes.byteOffset,
+      mergedBytes.byteOffset + mergedBytes.byteLength,
+    ) as ArrayBuffer;
+    this.writing.add(path);
+    try {
+      await this.plugin.app.vault.adapter.writeBinary(path, buffer);
+    } finally {
+      window.setTimeout(() => this.writing.delete(path), 0);
+    }
+    if (this.destroyed) return;
+    await this.uploadBytes(path, buffer, null);
+    dbg("config merged", path);
   }
 
   private async deleteLocal(path: string): Promise<void> {
@@ -233,6 +362,7 @@ export class ConfigSync {
         await this.plugin.app.vault.adapter.remove(path);
       }
       this.lastSyncedHash.delete(path);
+      this.noteDownloaded(path);
     } finally {
       window.setTimeout(() => this.writing.delete(path), 0);
     }
@@ -241,6 +371,7 @@ export class ConfigSync {
   private publishDelete(path: string): void {
     this.indexDoc.transact(() => this.configFiles.delete(path));
     this.lastSyncedHash.delete(path);
+    dbg("config delete published", path);
   }
 
   private async ensureParentFolders(path: string): Promise<void> {
@@ -260,6 +391,22 @@ export class ConfigSync {
     }
   }
 
+  /**
+   * After remote changes land in categories Obsidian can't hot-reload, show
+   * one debounced notice suggesting a reload (mirrors Obsidian Sync's
+   * documented "restart after settings download" guidance).
+   */
+  private noteDownloaded(path: string): void {
+    const category = this.syncableCategory(path);
+    if (!category || !categoryRequiresReload(category)) return;
+    if (this.reloadNoticeTimer !== null) window.clearTimeout(this.reloadNoticeTimer);
+    this.reloadNoticeTimer = window.setTimeout(() => {
+      this.reloadNoticeTimer = null;
+      if (this.destroyed) return;
+      new Notice("Realtime: synced Obsidian settings changed. Reload Obsidian to apply them.");
+    }, RELOAD_NOTICE_DEBOUNCE_MS);
+  }
+
   private schedulePoll(): void {
     if (this.destroyed || this.pollTimer !== null) return;
     this.pollTimer = window.setTimeout(() => {
@@ -268,8 +415,16 @@ export class ConfigSync {
     }, POLL_MS);
   }
 
-  private matchesGlobs(path: string): boolean {
-    return matchesConfigGlobs(path, this.configRoot, this.globs);
+  /**
+   * The enabled sync category a path belongs to, or `null` when the path is
+   * hard-excluded, outside this device's config folder (other profiles are
+   * other devices' business), unclassifiable, or in a disabled category.
+   */
+  private syncableCategory(path: string): ConfigCategoryId | null {
+    if (this.isHardExcluded(path)) return null;
+    const category = categoryForVaultPath(path, this.configRoot);
+    if (category === null || !this.enabledCategories.has(category)) return null;
+    return category;
   }
 
   private isHardExcluded(path: string): boolean {
@@ -286,6 +441,10 @@ export class ConfigSync {
     if (this.pollTimer !== null) {
       window.clearTimeout(this.pollTimer);
       this.pollTimer = null;
+    }
+    if (this.reloadNoticeTimer !== null) {
+      window.clearTimeout(this.reloadNoticeTimer);
+      this.reloadNoticeTimer = null;
     }
     this.chains.clear();
   }

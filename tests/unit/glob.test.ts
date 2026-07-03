@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseGlobs, matchesAnyGlob, matchesConfigGlobs } from "../../src/glob";
+import { parseGlobs, matchesAnyGlob } from "../../src/glob";
 
 describe("glob", () => {
   it("parses comma-separated lists, trimming and dropping empties", () => {
@@ -34,49 +34,5 @@ describe("glob", () => {
     expect(matchesAnyGlob("snippets/a.css", ["**/*", "!snippets/**"])).toBe(false);
     expect(matchesAnyGlob("hotkeys.json", ["**/*", "!snippets/**"])).toBe(true);
     expect(matchesAnyGlob("snippets/a.css", ["!snippets/**", "snippets/*.css"])).toBe(true);
-  });
-});
-
-describe("matchesConfigGlobs", () => {
-  it("matches globs relative to the config dir", () => {
-    expect(matchesConfigGlobs(".obsidian/snippets/a.css", ".obsidian", ["snippets/*.css"])).toBe(
-      true,
-    );
-    expect(matchesConfigGlobs(".obsidian/hotkeys.json", ".obsidian", ["hotkeys.json"])).toBe(true);
-    expect(matchesConfigGlobs(".obsidian/snippets/a.css", ".obsidian", ["*.css"])).toBe(false);
-  });
-
-  it("matches ** across nested config segments", () => {
-    expect(matchesConfigGlobs(".obsidian/snippets/sub/a.css", ".obsidian", ["snippets/**"])).toBe(
-      true,
-    );
-  });
-
-  it("honors a custom config dir", () => {
-    expect(
-      matchesConfigGlobs(".obsidian-custom/snippets/a.css", ".obsidian-custom", ["snippets/*.css"]),
-    ).toBe(true);
-    // A path under the default dir must not match when a custom dir is configured.
-    expect(
-      matchesConfigGlobs(".obsidian/snippets/a.css", ".obsidian-custom", ["snippets/*.css"]),
-    ).toBe(false);
-  });
-
-  it("returns false for paths outside the config dir", () => {
-    expect(matchesConfigGlobs("notes/a.md", ".obsidian", ["**"])).toBe(false);
-    expect(matchesConfigGlobs(".obsidianX/a.css", ".obsidian", ["*.css"])).toBe(false);
-  });
-
-  it("returns false when no globs are given", () => {
-    expect(matchesConfigGlobs(".obsidian/hotkeys.json", ".obsidian", [])).toBe(false);
-  });
-
-  it("supports negative include globs", () => {
-    expect(
-      matchesConfigGlobs(".obsidian/hotkeys.json", ".obsidian", ["**/*", "!workspace.json"]),
-    ).toBe(true);
-    expect(
-      matchesConfigGlobs(".obsidian/workspace.json", ".obsidian", ["**/*", "!workspace.json"]),
-    ).toBe(false);
   });
 });

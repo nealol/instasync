@@ -122,6 +122,93 @@ export async function docTokenStatus(b: any, vaultId: string): Promise<string> {
   }, vaultId);
 }
 
+// --- Config-folder sync (Tier-3) -------------------------------------------
+//
+// The redesigned `.obsidian` config sync classifies every path under the
+// active config folder into a category and reconciles it through a shared
+// `configFiles` Y.Map + the blob store. Config files are NOT TFiles, so these
+// helpers read/write them through `app.vault.adapter` with paths relative to
+// `app.vault.configDir` (resolved inside the renderer, so the tests don't
+// hard-code `.obsidian`).
+
+/**
+ * Enable config sync on a device with ONLY the given categories on (everything
+ * else off, so the two instances' real generated app.json/appearance.json/
+ * workspace files can't fight each other). Persists + reloads sync so the new
+ * settings take effect.
+ */
+export async function enableConfigSync(b: any, categories: string[]): Promise<void> {
+  await b.executeObsidian(async ({ app }: any, cats: string[]) => {
+    const p = (app as any).plugins.plugins.realtime;
+    p.settings.syncConfigEnabled = true;
+    const all = p.settings.configSyncCategories as Record<string, boolean>;
+    for (const key of Object.keys(all)) all[key] = cats.includes(key);
+    for (const key of cats) all[key] = true; // tolerate unknown/new ids
+    await p.saveSettings();
+    await p.reloadSync();
+  }, categories);
+}
+
+/** Resolve a config-relative path and write text to it, creating parent dirs. */
+export async function writeConfigFile(b: any, rel: string, content: string): Promise<void> {
+  await b.executeObsidian(
+    async ({ app }: any, r: string, c: string) => {
+      const full = app.vault.configDir + "/" + r;
+      const parts = full.split("/").slice(0, -1);
+      let cur = "";
+      for (const part of parts) {
+        cur = cur ? cur + "/" + part : part;
+        if (!(await app.vault.adapter.exists(cur))) await app.vault.adapter.mkdir(cur);
+      }
+      await app.vault.adapter.write(full, c);
+    },
+    rel,
+    content,
+  );
+}
+
+/** Read a config-relative file's text, or null if it doesn't exist. */
+export async function readConfigFile(b: any, rel: string): Promise<string | null> {
+  return b.executeObsidian(async ({ app }: any, r: string) => {
+    const full = app.vault.configDir + "/" + r;
+    return (await app.vault.adapter.exists(full)) ? await app.vault.adapter.read(full) : null;
+  }, rel);
+}
+
+/** True if a config-relative file exists on disk. */
+export async function configFileExists(b: any, rel: string): Promise<boolean> {
+  return b.executeObsidian(async ({ app }: any, r: string) => {
+    return app.vault.adapter.exists(app.vault.configDir + "/" + r);
+  }, rel);
+}
+
+/** Remove a config-relative file (adapter.remove — the local-delete path). */
+export async function removeConfigFile(b: any, rel: string): Promise<void> {
+  await b.executeObsidian(async ({ app }: any, r: string) => {
+    const full = app.vault.configDir + "/" + r;
+    if (await app.vault.adapter.exists(full)) await app.vault.adapter.remove(full);
+  }, rel);
+}
+
+/**
+ * Deterministically kick ConfigSync's reconcile pass. Dotfolder files emit no
+ * vault events, so *local* changes are only noticed on poll/focus; ConfigSync
+ * listens for window "focus", so dispatching it forces an immediate pass
+ * instead of waiting for the 15s poll.
+ */
+export async function triggerConfigReconcile(b: any): Promise<void> {
+  await b.executeObsidian(() => window.dispatchEvent(new Event("focus")));
+}
+
+/** True if the shared configFiles Y.Map holds an entry for the config-relative path. */
+export async function configMapHas(b: any, rel: string): Promise<boolean> {
+  return b.executeObsidian(async ({ app }: any, r: string) => {
+    const doc = (app as any).plugins.plugins.realtime?.vaultSync?.indexDoc;
+    if (!doc) return false;
+    return doc.getMap("configFiles").has(app.vault.configDir + "/" + r);
+  }, rel);
+}
+
 // --- Live editing (real CM6 editor) ----------------------------------------
 //
 // The plain vault.modify/read helpers never open a file in an editor, so they
@@ -503,7 +590,7 @@ export async function liveSocketUrls(b: any): Promise<string[]> {
 export async function statusText(b: any): Promise<string> {
   return b.executeObsidian(() => {
     const el = Array.from(document.querySelectorAll(".status-bar-item")).find((e) =>
-      (e.textContent ?? "").includes("Sync:"),
+      (e.textContent ?? "").includes("Realtime:"),
     );
     return el?.textContent ?? "";
   });

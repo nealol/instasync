@@ -19,6 +19,7 @@ import { BaseDocument } from "./BaseDocument";
 import type { StructuredDocument } from "./StructuredDocument";
 import { BinarySync } from "./BinarySync";
 import { ConfigSync } from "./ConfigSync";
+import { enabledConfigCategories } from "./configCategories";
 import { matchesAnyGlob, parseGlobs } from "./glob";
 
 type FileKind = "text" | "structured" | "binary" | "ignore";
@@ -497,7 +498,7 @@ export class VaultSync {
     this.backgroundSyncStarted = true;
     void this.reconcileBinariesAndMigrateStructured();
     if (this.plugin.settings.syncConfigEnabled) {
-      this.configSync.start(this.plugin.settings.configIncludeGlobs);
+      this.configSync.start(enabledConfigCategories(this.plugin.settings.configSyncCategories));
     }
   }
 
