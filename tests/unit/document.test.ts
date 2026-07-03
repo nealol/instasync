@@ -571,6 +571,85 @@ describe("Document sync", () => {
     }
   });
 
+  it("creator startup: treats an empty first remote as unseeded, not a conflict", async () => {
+    const guid = freshGuid();
+    const peer = new Peer(memberPlugin, docId(guid));
+
+    const a1 = makeDoc(guid, { file: { path: "note.md", content: "base" } });
+    await a1.doc.whenReady();
+    await peer.whenSynced();
+    await waitFor(() => peer.getText() === "base", { label: "baseline synced" });
+    await new Promise((r) => setTimeout(r, 250));
+    a1.doc.destroy();
+
+    peer.setText("");
+    a1.vault.files.set("note.md", "new local note body");
+
+    const { plugin } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+      clientName: "Brave Otter",
+    });
+    (plugin.app.vault as FakeVault).files = a1.vault.files;
+    const a2 = new Document(plugin as any, "note.md", guid, docId(guid), true);
+    try {
+      await a2.whenReady();
+      await waitFor(() => peer.getText() === "new local note body", {
+        timeout: 15_000,
+        label: "creator local content reseeded empty remote",
+      });
+
+      expect(a2.content).toBe("new local note body");
+      expect(modalMock.calls).toHaveLength(0);
+      expect(conflictFiles(plugin.app.vault as FakeVault)).toHaveLength(0);
+    } finally {
+      a2.destroy();
+      peer.destroy();
+    }
+  });
+
+  it("non-creator startup: still prompts when the remote intentionally became empty", async () => {
+    const guid = freshGuid();
+    const peer = new Peer(memberPlugin, docId(guid));
+
+    const a1 = makeDoc(guid, { file: { path: "note.md", content: "base" } });
+    await a1.doc.whenReady();
+    await peer.whenSynced();
+    await waitFor(() => peer.getText() === "base", { label: "baseline synced" });
+    await new Promise((r) => setTimeout(r, 250));
+    a1.doc.destroy();
+
+    peer.setText("");
+    a1.vault.files.set("note.md", "base LOCAL side");
+
+    const { plugin } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+      clientName: "Brave Otter",
+    });
+    (plugin.app.vault as FakeVault).files = a1.vault.files;
+    const a2 = new Document(plugin as any, "note.md", guid, docId(guid), false);
+    try {
+      await a2.whenReady();
+      await waitFor(() => peer.getText() === "base LOCAL side", {
+        timeout: 15_000,
+        label: "local conflict choice synced over empty remote",
+      });
+
+      expect(modalMock.calls).toEqual([
+        {
+          path: "note.md",
+          localContent: "base LOCAL side",
+          remoteContent: "",
+        },
+      ]);
+      expect(a2.content).toBe("base LOCAL side");
+    } finally {
+      a2.destroy();
+      peer.destroy();
+    }
+  });
+
   it("restart durability: offline edits persist across a restart via IndexedDB", async () => {
     const guid = freshGuid();
     const a1 = makeDoc(guid, { file: { path: "note.md", content: "" } });

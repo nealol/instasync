@@ -10,6 +10,30 @@ import { ySyncAnnotation } from "./annotations";
 import { applyTextToYText } from "../diff";
 import { dbg, snip } from "../debug";
 
+/**
+ * Decide whether a local editor change may be materialized into the shared
+ * Y.Text. The dangerous case is turning a *pre-existing* editor buffer into
+ * brand-new Yjs operations on an *empty* shared doc before our first server
+ * sync: on clients whose local persistence was evicted (common on mobile) the
+ * shared doc loads empty even though the server already holds this content, so
+ * seeding it here duplicates the whole note once the server's operations
+ * arrive. We therefore hold pushes back only while a sync that could deliver
+ * that content is actually expected (provider online, not yet synced, and not
+ * the doc's creator). Offline edits and post-sync edits always flow through:
+ * no duplicate can arrive offline, and after the first sync `applyTextToYText`
+ * produces a minimal, non-duplicating diff against the server's content.
+ */
+export function shouldPushEditorToShared(state: {
+  sharedEmpty: boolean;
+  isCreator: boolean;
+  hasSyncedOnce: boolean;
+  providerOnline: boolean;
+}): boolean {
+  const { sharedEmpty, isCreator, hasSyncedOnce, providerOnline } = state;
+  if (sharedEmpty && !isCreator && !hasSyncedOnce && providerOnline) return false;
+  return true;
+}
+
 export class LiveEditPluginValue implements PluginValue {
   private editor: EditorView;
   private doc: Document | null = null;
@@ -65,6 +89,12 @@ export class LiveEditPluginValue implements PluginValue {
     // persistence / first server sync, preserve that active editor state as the
     // newest local edit instead of applying the now-ready shared text over it.
     if (this.editorTextAtBind !== null && current !== this.editorTextAtBind) {
+      // ...unless a server sync that could deliver this content is still pending
+      // (see {@link shouldPushEditorToShared}); seeding it now would duplicate.
+      if (!this.mayPushToShared()) {
+        dbg("reconcile push DEFERRED (pre-sync empty shared)", this.doc?.path, snip(current));
+        return;
+      }
       this.ytext.doc?.transact(() => {
         applyTextToYText(this.ytext!, current);
       }, this);
@@ -73,12 +103,29 @@ export class LiveEditPluginValue implements PluginValue {
 
     if (shared.length > 0) {
       this.applyTextToEditor(shared);
-    } else if (current.length > 0) {
+    } else if (current.length > 0 && this.mayPushToShared()) {
+      // Seed the empty shared doc from the editor, unless a server sync that
+      // could already hold this content is still pending (see
+      // {@link shouldPushEditorToShared}) — seeding then would duplicate.
       const ytext = this.ytext;
       ytext.doc?.transact(() => {
-        ytext.insert(0, current);
+        applyTextToYText(ytext, current);
       }, this);
     }
+  }
+
+  /**
+   * Whether the current editor buffer may be pushed into the shared Y.Text.
+   * Guards against the mobile-reopen duplication (see {@link shouldPushEditorToShared}).
+   */
+  private mayPushToShared(): boolean {
+    if (!this.doc || !this.ytext) return false;
+    return shouldPushEditorToShared({
+      sharedEmpty: this.ytext.length === 0,
+      isCreator: this.doc.isCreator,
+      hasSyncedOnce: this.doc.hasSyncedOnce,
+      providerOnline: this.doc.isProviderOnline,
+    });
   }
 
   private detachDoc(): void {
@@ -150,6 +197,14 @@ export class LiveEditPluginValue implements PluginValue {
     // is also why it needs no annotation filter.
     const target = update.state.doc.toString();
     if (this.ytext.toString() === target) return;
+
+    // Hardening against the mobile-reopen duplication: never seed a pre-existing
+    // buffer into an empty, not-yet-synced shared doc (the server may already
+    // hold this content). See {@link shouldPushEditorToShared}.
+    if (!this.mayPushToShared()) {
+      dbg("local push DEFERRED (pre-sync empty shared)", this.doc.path, "->editor", snip(target));
+      return;
+    }
     dbg(
       "local push",
       this.doc?.path,

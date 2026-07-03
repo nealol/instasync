@@ -693,13 +693,16 @@ pub fn generate_ssh_keypair() -> Result<(String, String)> {
 
 /// Write an SSH private key with owner-only permissions (ssh refuses 0644 keys).
 async fn write_private_key(path: &Path, key: &str) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     tokio::fs::write(path, key)
         .await
         .with_context(|| format!("write ssh key {}", path.display()))?;
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .await
-        .with_context(|| format!("chmod ssh key {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .with_context(|| format!("chmod ssh key {}", path.display()))?;
+    }
     Ok(())
 }
 

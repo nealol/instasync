@@ -25,6 +25,8 @@ export abstract class SyncedDoc {
   private ready = false;
   private syncedListener: (synced: boolean) => void;
   private autoConnect: boolean;
+  /** True once the provider has reported a successful server sync at least once. */
+  private syncedOnce = false;
 
   protected constructor(
     plugin: RealtimePlugin,
@@ -56,7 +58,10 @@ export abstract class SyncedDoc {
     this.persistence = new IndexeddbPersistence(serverDocId, this.ydoc);
 
     this.syncedListener = (synced) => {
-      if (synced) void this.finishStartupReconcile();
+      if (synced) {
+        this.syncedOnce = true;
+        void this.finishStartupReconcile();
+      }
     };
     this.provider.on("synced", this.syncedListener);
 
@@ -69,6 +74,21 @@ export abstract class SyncedDoc {
 
   isReady(): boolean {
     return this.ready;
+  }
+
+  /** True once the first successful server sync has been observed. */
+  get hasSyncedOnce(): boolean {
+    return this.syncedOnce;
+  }
+
+  /**
+   * True while the provider is online (or trying to be) — i.e. a server sync is
+   * expected that could deliver content we don't yet have locally. When offline
+   * or errored, no sync can arrive, so local content must be persisted as-is.
+   */
+  get isProviderOnline(): boolean {
+    const status = this.provider.status;
+    return status !== STATUS_OFFLINE && status !== STATUS_ERROR;
   }
 
   isDestroyed(): boolean {

@@ -133,9 +133,18 @@ export class Document extends SyncedDoc {
       const baseline = this.baselineAtStartup;
       const localDisk = this.diskAtStartup;
       const remoteChanged = remote !== baseline;
+      const creatorHasLocalAgainstEmptyRemote =
+        this.isCreator && localDisk !== null && localDisk.length > 0 && remote.length === 0;
 
+      // Creator docs are the only side allowed to seed a brand-new server doc.
+      // If their first remote is empty, treat it as unseeded instead of asking
+      // the user to resolve a blank-vs-local conflict.
       const isConflict =
-        this.localChangedAtStartup && localDisk !== null && remoteChanged && remote !== localDisk;
+        this.localChangedAtStartup &&
+        localDisk !== null &&
+        remoteChanged &&
+        remote !== localDisk &&
+        !creatorHasLocalAgainstEmptyRemote;
 
       const sameDevicePrefixFastForward =
         isConflict &&
@@ -159,7 +168,11 @@ export class Document extends SyncedDoc {
         } else {
           new Notice(`Realtime: kept the remote version of "${this.path}".`);
         }
-      } else if (this.localChangedAtStartup && localDisk !== null && !remoteChanged) {
+      } else if (
+        this.localChangedAtStartup &&
+        localDisk !== null &&
+        (!remoteChanged || creatorHasLocalAgainstEmptyRemote)
+      ) {
         this.applyText(localDisk);
       }
 
