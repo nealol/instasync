@@ -271,7 +271,7 @@ describe("Realtime — two isolated Obsidian devices", function () {
         },
         {
           timeout: 60 * SECONDS,
-          timeoutMsg: () => `expected exactly one /dmux socket, saw ${JSON.stringify(urls)}`,
+          timeoutMsg: "expected exactly one /dmux socket",
         },
       );
 

@@ -17,6 +17,11 @@ import * as fs from "fs";
 import { fileURLToPath } from "url";
 import { startYSweetServer, genAuthKey, type YSweetServer } from "../support/ysweetServer.js";
 import { startAuthServer, type AuthServer } from "../support/authServer.js";
+import {
+  restoreObsidianProtocolRegistry,
+  snapshotObsidianProtocolRegistry,
+  type ProtocolRegistrySnapshot,
+} from "./protocolRegistry.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "../..");
@@ -25,6 +30,22 @@ const AUTH_PORT = Number(process.env.AUTH_PORT ?? 8081);
 
 let ysweet: YSweetServer | undefined;
 let authServer: AuthServer | undefined;
+let obsidianProtocolSnapshot: ProtocolRegistrySnapshot | undefined;
+let obsidianProtocolRestored = false;
+
+function restoreObsidianProtocolOnce() {
+  if (obsidianProtocolRestored) return;
+  restoreObsidianProtocolRegistry(obsidianProtocolSnapshot);
+  obsidianProtocolRestored = true;
+}
+
+function restoreObsidianProtocolOnExit() {
+  try {
+    restoreObsidianProtocolOnce();
+  } catch (error) {
+    console.warn("Failed to restore Obsidian protocol registry handler", error);
+  }
+}
 
 export const config: WebdriverIO.Config = {
   runner: "local",
@@ -52,6 +73,8 @@ export const config: WebdriverIO.Config = {
   logLevel: "warn",
 
   async onPrepare() {
+    obsidianProtocolSnapshot = snapshotObsidianProtocolRegistry();
+    process.once("exit", restoreObsidianProtocolOnExit);
     const authKey = await genAuthKey();
     const ysweetStoreDir = fs.mkdtempSync(path.join(os.tmpdir(), "realtime-ysweet-store-"));
     // Git audit commits go to a temp dir the spec can inspect (plugin-db git
@@ -78,7 +101,11 @@ export const config: WebdriverIO.Config = {
     });
   },
   async onComplete() {
-    await authServer?.stop();
-    await ysweet?.stop();
+    try {
+      await authServer?.stop();
+      await ysweet?.stop();
+    } finally {
+      restoreObsidianProtocolOnce();
+    }
   },
 };
