@@ -16,8 +16,59 @@
  */
 
 import * as Y from "yjs";
-import type { Batch, Cursor } from "./types";
+import type { Batch, ChangeRow, Cursor } from "./types";
 import { SYNC_FORMAT } from "./types";
+
+/**
+ * Coerce a lib0/Yjs-decoded value back to a JS `number`.
+ *
+ * The server publishes batches and meta values into the Y.Doc via `json_to_any`
+ * (server/src/ydoc.rs), which maps every JSON integer to lib0's `Any::BigInt`.
+ * The client Yjs binding decodes `Any::BigInt` as a JS `BigInt`, so integer
+ * fields arrive here as `bigint` even though the {@link Batch}/{@link ChangeRow}
+ * contracts declare them `number`. `Math.max`, `JSON.stringify` and other
+ * `ToNumber`-based call sites throw on `BigInt`, so every numeric field read from
+ * the Y.Doc is normalized back to `number` at this boundary.
+ */
+function toNum(v: unknown): number {
+  if (typeof v === "bigint") return Number(v);
+  if (typeof v === "number") return v;
+  return 0;
+}
+
+/** Normalize a server-authored batch's integer fields to `number`. */
+function normalizeBatch(b: Batch): Batch {
+  if (!b) return b;
+  const changes = b.changes
+    ? b.changes.map((c) =>
+        c
+          ? {
+              ...c,
+              col_version: toNum(c.col_version),
+              db_version: toNum(c.db_version),
+              cl: toNum(c.cl),
+              seq: toNum(c.seq),
+            }
+          : c,
+      )
+    : b.changes;
+  return {
+    ...b,
+    fromDbVersion: toNum(b.fromDbVersion),
+    toDbVersion: toNum(b.toDbVersion),
+    schemaVersion: toNum(b.schemaVersion),
+    createdAt: toNum(b.createdAt),
+    changes,
+  };
+}
+
+/** Normalize a cursor-like `Record<string, number>` from the Y.Doc. */
+function normalizeCursor(c: Cursor | undefined | null): Cursor {
+  if (!c) return {};
+  const out: Cursor = {};
+  for (const k of Object.keys(c)) out[k] = toNum((c as Record<string, unknown>)[k]);
+  return out;
+}
 
 export interface PluginDbDocHandle {
   doc: Y.Doc;
@@ -68,20 +119,20 @@ export class PluginDbSync {
   // --- batches ---------------------------------------------------------------
 
   listBatches(): Batch[] {
-    return this.batches.toArray();
+    return this.batches.toArray().map(normalizeBatch);
   }
 
   appendBatch(batch: Batch): void {
     this.doc.transact(() => {
       this.batches.push([batch]);
-      const current = (this.meta.get("schemaVersion") as number | undefined) ?? 0;
+      const current = toNum(this.meta.get("schemaVersion"));
       if (batch.schemaVersion > current) this.meta.set("schemaVersion", batch.schemaVersion);
       if (!this.meta.get("format")) this.meta.set("format", SYNC_FORMAT);
     });
   }
 
   observeBatches(cb: (batches: Batch[]) => void): () => void {
-    const observer = () => cb(this.batches.toArray());
+    const observer = () => cb(this.batches.toArray().map(normalizeBatch));
     this.batches.observe(observer);
     return () => this.batches.unobserve(observer);
   }
@@ -90,7 +141,7 @@ export class PluginDbSync {
 
   /** This device's applied-remote cursor (keyed by the device's own site id). */
   getCursor(deviceSiteHex: string): Cursor {
-    return { ...(this.cursors.get(deviceSiteHex) ?? {}) };
+    return normalizeCursor(this.cursors.get(deviceSiteHex));
   }
 
   setCursor(deviceSiteHex: string, cursor: Cursor): void {
@@ -103,14 +154,14 @@ export class PluginDbSync {
   /** Every device's cursor, used by the server's compaction safety check. */
   allCursors(): Record<string, Cursor> {
     const out: Record<string, Cursor> = {};
-    for (const [site, cursor] of this.cursors.entries()) out[site] = { ...cursor };
+    for (const [site, cursor] of this.cursors.entries()) out[site] = normalizeCursor(cursor);
     return out;
   }
 
   // --- meta ------------------------------------------------------------------
 
   getSchemaVersion(): number {
-    return (this.meta.get("schemaVersion") as number | undefined) ?? 0;
+    return toNum(this.meta.get("schemaVersion"));
   }
 
   /** The CRR schema DDL, published so the server can build a replica + git dump. */
@@ -135,12 +186,13 @@ export class PluginDbSync {
   }
 
   getCompactedThrough(): Cursor {
-    return { ...((this.meta.get("compactedThrough") as Cursor | undefined) ?? {}) };
+    return normalizeCursor(this.meta.get("compactedThrough") as Cursor | undefined);
   }
 
   getDeletedAt(): number | null {
     const v = this.meta.get("deletedAt");
-    return typeof v === "number" ? v : null;
+    if (v === null || v === undefined) return null;
+    return toNum(v);
   }
 
   setDeletedAt(ms: number): void {

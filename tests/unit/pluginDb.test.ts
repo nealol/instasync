@@ -283,6 +283,66 @@ describe("SyncedPluginDatabase", () => {
       await consumer.close();
     }
   });
+
+  it("applies a server-authored batch whose integer fields arrive as BigInt", async () => {
+    // The server publishes batches into the Y.Doc via lib0 `Any::BigInt` (see
+    // server/src/ydoc.rs `json_to_any`), which the client Yjs binding decodes as
+    // JS `bigint`. The engine must normalize those back to `number` so call
+    // sites like `Math.max(applied, batch.toDbVersion)` do not throw.
+    const producerDoc = new Y.Doc();
+    const producer = makeEngine({ doc: producerDoc, snap: newSnapStore() });
+    const consumerDoc = new Y.Doc();
+    const consumer = makeEngine({ doc: consumerDoc, snap: newSnapStore() });
+    try {
+      await producer.start();
+      await producer.whenLive();
+      await producer.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["s1", "server-bigint"]);
+      const changes = await readAllChanges((producer as any).db);
+      expect(changes.length).toBeGreaterThan(0);
+      const producerSite = (producer as any).siteHex as string;
+
+      await consumer.start();
+      await consumer.whenLive();
+
+      // Rebuild the batch with every integer field as BigInt, mirroring lib0's
+      // Any::BigInt decoding of a server-published batch.
+      const last = changes[changes.length - 1];
+      const bigintChanges = changes.map((c) => ({
+        ...c,
+        col_version: BigInt(c.col_version),
+        db_version: BigInt(c.db_version),
+        cl: BigInt(c.cl),
+        seq: BigInt(c.seq),
+      }));
+      consumerDoc.getArray("batches").push([
+        {
+          id: "server-bigint-batch",
+          siteId: producerSite,
+          fromDbVersion: BigInt(0),
+          toDbVersion: BigInt(last.db_version),
+          schemaVersion: BigInt(1),
+          changes: bigintChanges,
+          createdAt: BigInt(Date.now()),
+          format: SYNC_FORMAT,
+        },
+      ]);
+
+      await waitFor(async () => (await titles(consumer)).includes("server-bigint"), {
+        label: "bigint batch applied without throwing",
+      });
+      expect(await titles(consumer)).toEqual(["server-bigint"]);
+      // The crash site is `Math.max(applied, batch.toDbVersion)` which runs
+      // AFTER applyChanges succeeds — so the row lands but the cursor never
+      // advances and the batch is retried forever. Assert the cursor moved.
+      await waitFor(
+        () => ((consumer as any).cursor[producerSite] ?? 0) >= last.db_version,
+        { label: "cursor advanced past the bigint batch" },
+      );
+    } finally {
+      await producer.close();
+      await consumer.close();
+    }
+  });
 });
 
 describe("sqlIdentifiers / lint", () => {
