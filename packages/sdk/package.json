@@ -1,6 +1,6 @@
 {
   "name": "@realtime-md/sdk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "TypeScript SDK for the Realtime.md server: user and remote-cursor auth (OAuth 2.1 PKCE), vaults, notes, attachments, canvases, bases, search, and the note-streaming WebSocket API.",
   "type": "module",
   "main": "./dist/index.cjs",
