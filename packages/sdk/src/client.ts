@@ -1,5 +1,5 @@
 import { Http, staticToken, type TokenProvider } from "./http";
-import type { DocTokenResponse, MeResponse, ServerInfoResponse } from "./types";
+import type { DocTokenResponse, MeResponse, PluginDbInfo, ServerInfoResponse } from "./types";
 import { NotesResource, FrontmatterResource, PeriodicNotesResource } from "./resources/notes";
 import {
   VaultsResource,
@@ -72,6 +72,14 @@ export class VaultHandle {
   /** Replication endpoints for one synced plugin database. */
   pluginDb(pluginId: string, name: string): PluginDbResource {
     return new PluginDbResource(this.http, this.vaultId, pluginId, name);
+  }
+  /** List synced plugin databases the server holds a replica for. */
+  async listPluginDbs(): Promise<PluginDbInfo[]> {
+    const res = await this.http.request<{ databases: PluginDbInfo[] }>(
+      "GET",
+      `/api/vaults/${this.vaultId}/plugin-dbs`,
+    );
+    return res.databases;
   }
 
   /** Register a file guid→path mapping in the vault file registry. */

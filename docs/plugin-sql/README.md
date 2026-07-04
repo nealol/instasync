@@ -64,6 +64,20 @@ server replica + git dump (.realtime/plugin-dbs/…)  +  bootstrap endpoint
   returns, it re-bootstraps from the server replica instead of replaying the log.
 - **Trash-bin deletion.** Deleting a database is a *soft delete* — it lands in the
   vault's trash bin and can be restored, or permanently purged.
+- **Access from outside Obsidian.** The server replica also backs server-side
+  SQL access over REST: `GET /api/vaults/{id}/plugin-dbs` lists the databases
+  the server holds a replica for, `POST …/{plugin}/{name}/query` runs a
+  read-only `SELECT` (refreshed against the Y.Doc first), and
+  `POST …/{plugin}/{name}/execute` runs `INSERT`/`UPDATE`/`DELETE`/`REPLACE`
+  statements in one transaction and publishes the resulting changes as a
+  server-authored batch so all devices converge (CRDT last-writer-wins, just
+  like any peer's edit). Schema changes are rejected — the schema is owned by
+  plugin `migrate()` on clients. The same surfaces are exposed as MCP tools
+  (`list_plugin_databases`, `query_plugin_database`, `write_plugin_database`)
+  and through the TypeScript SDK (`VaultHandle.listPluginDbs()`,
+  `PluginDbResource.query()`, `PluginDbResource.execute()`). All of these
+  require the cr-sqlite loadable extension on the server
+  (`config.crsqlite_ext_path`); without it they return a clear error.
 
 ## Limits
 

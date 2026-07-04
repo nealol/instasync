@@ -434,6 +434,36 @@ struct SetValueArgs {
     value: serde_json::Value,
 }
 
+// Schema helper for `Vec<serde_json::Value>` params: schemars renders a bare
+// `Value` as boolean `true`, which Claude Code rejects (see `any_object_schema`).
+fn any_json_array_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": "array" })
+}
+
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PluginDbQueryArgs {
+    plugin: String,
+    name: String,
+    sql: String,
+    #[serde(default)]
+    #[schemars(schema_with = "any_json_array_schema")]
+    params: Vec<serde_json::Value>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PluginDbExecuteArgs {
+    plugin: String,
+    name: String,
+    sql: String,
+    #[serde(default)]
+    #[schemars(schema_with = "any_json_array_schema")]
+    params: Vec<serde_json::Value>,
+}
+
 fn base_view_fields(
     filters: Option<serde_json::Value>,
     order: Option<Vec<serde_json::Value>>,
@@ -479,6 +509,78 @@ impl InstaMcp {
             structured::list_structured_inner(&c.state, &c.principal, &c.vault_id, Some("canvas"))
                 .await,
         )
+    }
+    #[tool(
+        description = "List synced plugin SQLite databases in the cursor vault (server-side replicas)",
+        annotations(
+            title = "Plugin DB: List databases",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn list_plugin_databases(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(crate::plugindb::routes::list_inner(&c.state, &c.principal, &c.vault_id).await)
+    }
+
+    #[tool(
+        description = "Run a read-only SELECT against a synced plugin SQLite database; params bind ?1..?N; returns columns + rows. Cell values use the tagged wire encoding ({$blob}/{$int}) for non-JSON-native values.",
+        annotations(
+            title = "Plugin DB: Query (read-only)",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn query_plugin_database(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<PluginDbQueryArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        tool_result(crate::plugindb::routes::query_inner(
+            &c.state,
+            &c.principal,
+            &c.vault_id,
+            &args.plugin,
+            &args.name,
+            &args.sql,
+            &args.params,
+            args.limit,
+        )
+        .await)
+    }
+
+    #[tool(
+        description = "Run one INSERT/UPDATE/DELETE/REPLACE against a synced plugin SQLite database; the change replicates to all vault devices (CRDT last-writer-wins). Schema changes are not allowed.",
+        annotations(
+            title = "Plugin DB: Execute write",
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn write_plugin_database(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<PluginDbExecuteArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        let stmts = vec![crate::plugindb::ExecuteStatement {
+            sql: args.sql,
+            params: args.params,
+        }];
+        tool_result(crate::plugindb::routes::execute_inner(
+            &c.state,
+            &c.principal,
+            &c.vault_id,
+            &args.plugin,
+            &args.name,
+            &stmts,
+        )
+        .await)
     }
 
     #[tool(
