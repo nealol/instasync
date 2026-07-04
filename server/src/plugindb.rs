@@ -1802,6 +1802,131 @@ fn open_replica(config: &Config, path: &Path) -> Result<(Connection, bool)> {
     Ok((conn, is_new))
 }
 
+/// Apply the published schema DDL to a replica, skipping statements whose
+/// target table already exists. This makes the operation idempotent: a new
+/// replica gets the full schema, and an existing replica picks up only tables
+/// added by a subsequent client migration. The DDL from the client is
+/// `CREATE TABLE name …` plus `SELECT crsql_as_crr('name')` per CRR table
+/// (see `collectSchema` in `src/pluginDb/snapshot.ts`); neither uses
+/// `IF NOT EXISTS`, so a naive re-run would fail with "table already exists".
+fn apply_schema_idempotent(conn: &Connection, schema: &[String]) -> Result<()> {
+    // Collect existing table names once (base tables + crsql sidecars).
+    let existing: std::collections::HashSet<String> = {
+        let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut s = std::collections::HashSet::new();
+        for r in rows {
+            s.insert(r?);
+        }
+        s
+    };
+    for stmt in schema {
+        if let Some(table) = create_table_target(stmt) {
+            // Skip CREATE TABLE for a base table that already exists.
+            if existing.contains(&table) {
+                continue;
+            }
+        }
+        if let Some(table) = crsql_as_crr_target(stmt) {
+            // Skip crsql_as_crr when the clock sidecar already exists (already a CRR).
+            if existing.contains(&format!("{table}__crsql_clock")) {
+                continue;
+            }
+        }
+        conn.execute_batch(stmt)
+            .with_context(|| format!("apply schema stmt: {stmt}"))?;
+    }
+    Ok(())
+}
+
+/// Extract the table name from a `CREATE TABLE [name] …` statement (handling
+/// optional `IF NOT EXISTS`, backtick/quote/bracket identifiers). Returns
+/// `None` for non-CREATE-TABLE statements. The name is extracted from the
+/// original (non-lowercased) text so it matches `sqlite_master` case.
+fn create_table_target(stmt: &str) -> Option<String> {
+    let s = stmt.trim_start();
+    let lower = s.to_ascii_lowercase();
+    let after = lower.strip_prefix("create table")?;
+    // `after` is a lowercased slice parallel to `s`; find the byte offset and
+    // slice the original to preserve identifier case.
+    let offset = s.len() - after.len();
+    let rest_orig = &s[offset..];
+    let rest_lower = &lower[offset..];
+    let rest_lower = rest_lower.trim_start();
+    let skip = rest_lower.len()
+        - rest_lower.strip_prefix("if not exists").map(str::trim_start).unwrap_or(rest_lower).len();
+    let rest_orig = rest_orig[skip..].trim_start();
+    parse_quoted_identifier(rest_orig)
+}
+
+/// Extract the table name from a `SELECT crsql_as_crr('name')` statement.
+fn crsql_as_crr_target(stmt: &str) -> Option<String> {
+    let s = stmt.trim();
+    let lower = s.to_ascii_lowercase();
+    let after = lower.strip_prefix("select crsql_as_crr(")?;
+    let offset = s.len() - after.len();
+    let rest = &s[offset..].trim_start();
+    // The argument is a single-quoted string literal.
+    if let Some(rest) = rest.strip_prefix('\'') {
+        let end = rest.find('\'')?;
+        return Some(rest[..end].to_string());
+    }
+    None
+}
+
+/// Parse a possibly-quoted SQL identifier from the start of `s`.
+fn parse_quoted_identifier(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    match bytes[0] {
+        b'"' | b'`' => {
+            let close = bytes[0];
+            let rest = &s[1..];
+            let end = rest.find(close as char)?;
+            // Handle doubled-quote escape inside quoted identifiers.
+            let mut name = String::new();
+            let mut chars = rest.chars();
+            while let Some(c) = chars.next() {
+                if c == close as char {
+                    if let Some(next) = chars.clone().next() {
+                        if next == close as char {
+                            name.push(close as char);
+                            chars.next();
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                name.push(c);
+            }
+            if name.is_empty() && end == 0 {
+                return None;
+            }
+            // Fallback: simple extraction if the escape-aware loop didn't find the close.
+            if name.is_empty() {
+                return Some(rest[..end].to_string());
+            }
+            Some(name)
+        }
+        b'[' => {
+            let rest = &s[1..];
+            let end = rest.find(']')?;
+            Some(rest[..end].to_string())
+        }
+        c if c.is_ascii_alphabetic() || c == b'_' => {
+            let end = s
+                .char_indices()
+                .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+                .last()
+                .map(|(i, c)| i + c.len_utf8())?;
+            Some(s[..end].to_string())
+        }
+        _ => None,
+    }
+}
+
 fn apply_to_replica(
     config: &Config,
     vault: &str,
@@ -1812,15 +1937,17 @@ fn apply_to_replica(
     mut cursor: Cursor,
 ) -> Result<Cursor> {
     let path = replica_path(config, vault, plugin, name);
-    let (mut conn, is_new) = open_replica(config, &path)?;
+    let (mut conn, _is_new) = open_replica(config, &path)?;
 
-    if is_new {
-        for stmt in schema {
-            // crsql_as_crr is a SELECT; CREATE TABLE is DDL — both run via execute_batch.
-            conn.execute_batch(stmt)
-                .with_context(|| format!("apply schema stmt: {stmt}"))?;
-        }
-    }
+    // Apply schema idempotently on every replicate, not just when the replica
+    // file is new. A client may add a table via migration (bumping
+    // `meta.schemaVersion` and republishing the full DDL including the new
+    // `CREATE TABLE` + `crsql_as_crr`); the server must create that table's
+    // base table and clock sidecar before applying batches that reference it,
+    // or `INSERT INTO crsql_changes` fails with "could not find the schema
+    // information for table X". Each statement is skipped when the table it
+    // targets already exists, so re-applying an unchanged schema is a no-op.
+    apply_schema_idempotent(&conn, schema)?;
 
     let tx = conn.transaction()?;
     {
@@ -2648,6 +2775,68 @@ mod tests {
         assert_eq!(
             replayed, target,
             "replayed batch must reach the dumped state"
+        );
+    }
+
+    #[test]
+    fn apply_to_replica_picks_up_new_table_from_migration() {
+        let Some(config) = ext_config() else {
+            eprintln!("skipping migration test: CRSQLITE_EXT_PATH not set");
+            return;
+        };
+        let path = replica_path(&config, "v", "p", "n");
+        // Seed a replica with one table (simulating a prior replicate that
+        // created the file when only `tasks` existed).
+        {
+            let (conn, _new) = open_replica(&config, &path).unwrap();
+            conn.execute_batch("CREATE TABLE tasks (id PRIMARY KEY NOT NULL, title)")
+                .unwrap();
+            conn.execute_batch("SELECT crsql_as_crr('tasks')").unwrap();
+            conn.execute("INSERT INTO tasks (id, title) VALUES ('a', 'x')", [])
+                .unwrap();
+            conn.execute("SELECT crsql_finalize()", []).ok();
+        }
+        // Now the client migrates, adding `notes`. The published schema DDL
+        // includes both tables + crsql_as_crr calls. A batch arrives with a
+        // change for `notes`. Before the fix this failed with "could not find
+        // the schema information for table notes".
+        let schema = vec![
+            "CREATE TABLE tasks (id PRIMARY KEY NOT NULL, title)".to_string(),
+            "SELECT crsql_as_crr('tasks')".to_string(),
+            "CREATE TABLE notes (id PRIMARY KEY NOT NULL, body)".to_string(),
+            "SELECT crsql_as_crr('notes')".to_string(),
+        ];
+        let batch = Batch {
+            id: "b1".into(),
+            site_id: "AQ==".into(), // site id base64 — bytes_to_b64(&[1])
+            from_db_version: 0,
+            to_db_version: 1,
+            schema_version: 2,
+            changes: vec![ChangeRow {
+                table: "notes".into(),
+                pk: "AQ==".into(),
+                cid: "body".into(),
+                val: JsonValue::String("hello".into()),
+                col_version: 1,
+                db_version: 1,
+                site_id: "AQ==".into(),
+                cl: 1,
+                seq: 0,
+            }],
+            format: crate::caps::PLUGIN_DB_SYNC.into(),
+        };
+        let cursor = HashMap::new();
+        let new_cursor = apply_to_replica(&config, "v", "p", "n", &schema, &[batch], cursor)
+            .expect("replicate with new table must succeed");
+        assert!(new_cursor.contains_key("AQ=="));
+
+        // The replica now has the `notes` table with its clock sidecar, and
+        // the change row is visible via a dump.
+        let dump = dump_replica(&config, "v", "p", "n").unwrap().unwrap();
+        assert!(dump.contains("-- crr: notes"), "dump should list notes as a CRR");
+        assert!(
+            dump.contains("INSERT INTO \"notes\""),
+            "dump should contain the notes row"
         );
     }
 
