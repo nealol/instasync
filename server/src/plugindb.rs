@@ -168,6 +168,16 @@ pub struct ExecuteSqlResult {
     pub db_version: i64,
 }
 
+/// A server-authored batch that committed to the replica but has not yet been
+/// published to the Y.Doc log (see `Inner::pending_publishes`).
+#[derive(Clone, Debug)]
+struct PendingPublish {
+    rows: Vec<ChangeRow>,
+    site_hex: String,
+    site_b64: String,
+    post: i64,
+}
+
 /// Cursor: origin site hex -> highest applied db_version.
 type Cursor = HashMap<String, i64>;
 
@@ -189,6 +199,13 @@ struct Inner {
     /// (execute_sql, rollback_to_dump): fetch->refresh->write->publish->cursor.
     /// Replication (`replicate_once`) and read-only queries do NOT take these.
     write_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Server-authored batches that committed to the replica but failed to
+    /// publish to the Y.Doc (doc write error). Keyed like `write_locks`.
+    /// Retried by `flush_pending_publishes` (called from `replicate_once` and
+    /// before the next `execute_sql`/`rollback_to_dump` publish) so clients
+    /// eventually converge. In-memory only: a restart drops the queue, but the
+    /// replica and git dump retain the data.
+    pending_publishes: tokio::sync::Mutex<HashMap<String, Vec<PendingPublish>>>,
     /// One-time probe result: the configured extension actually loads.
     ext_ok: std::sync::OnceLock<bool>,
 }
@@ -210,6 +227,7 @@ impl PluginDbService {
             authenticator,
             dbs: Mutex::new(HashMap::new()),
             write_locks: tokio::sync::Mutex::new(HashMap::new()),
+            pending_publishes: tokio::sync::Mutex::new(HashMap::new()),
             ext_ok: std::sync::OnceLock::new(),
         }))
     }
@@ -264,13 +282,70 @@ impl PluginDbService {
     /// Get (or insert) the per-DB async write lock. The caller locks the
     /// returned `Arc<Mutex<()>>` for the whole read-apply-write-publish
     /// sequence so concurrent server-authored writes to the same DB serialize.
-    async fn write_lock(&self, vault: &str, plugin: &str, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+    async fn write_lock(
+        &self,
+        vault: &str,
+        plugin: &str,
+        name: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
         let key = Self::key(vault, plugin, name);
         let mut locks = self.0.write_locks.lock().await;
         locks
             .entry(key)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// Retry any queued server-authored batches whose Y.Doc publish previously
+    /// failed. MUST be called with the per-DB write lock held. Batches are
+    /// retried in commit order; on the first failure the remainder are
+    /// re-queued and the error is returned (a later replication pass retries).
+    async fn flush_pending_locked(&self, vault: &str, plugin: &str, name: &str) -> Result<()> {
+        let key = Self::key(vault, plugin, name);
+        let pending = {
+            let mut map = self.0.pending_publishes.lock().await;
+            match map.remove(&key) {
+                Some(p) if !p.is_empty() => p,
+                _ => return Ok(()),
+            }
+        };
+        for (i, p) in pending.iter().enumerate() {
+            if let Err(e) = self
+                .publish_own_batch(
+                    vault,
+                    plugin,
+                    name,
+                    p.rows.clone(),
+                    p.site_hex.clone(),
+                    p.site_b64.clone(),
+                    p.post,
+                )
+                .await
+            {
+                let mut map = self.0.pending_publishes.lock().await;
+                let slot = map.entry(key).or_default();
+                let mut rest: Vec<PendingPublish> = pending[i..].to_vec();
+                rest.append(slot);
+                *slot = rest;
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Take the per-DB write lock and flush pending publishes (used by the
+    /// replication debounce, which does not otherwise hold the lock).
+    async fn flush_pending(&self, vault: &str, plugin: &str, name: &str) -> Result<()> {
+        {
+            let map = self.0.pending_publishes.lock().await;
+            match map.get(&Self::key(vault, plugin, name)) {
+                Some(p) if !p.is_empty() => {}
+                _ => return Ok(()),
+            }
+        }
+        let lock = self.write_lock(vault, plugin, name).await;
+        let _guard = lock.lock().await;
+        self.flush_pending_locked(vault, plugin, name).await
     }
 
     /// Record that a plugin database changed and (re)arm the replication debounce.
@@ -347,6 +422,13 @@ impl PluginDbService {
 
     /// Apply the doc's batches into the replica, then maybe compact the log.
     async fn replicate_once(&self, vault: &str, plugin: &str, name: &str) -> Result<()> {
+        // Retry any server-authored batches whose publish previously failed,
+        // so the doc we replicate from is as complete as we can make it.
+        if let Err(e) = self.flush_pending(vault, plugin, name).await {
+            tracing::warn!(
+                "plugin-db pending publish retry for {plugin}/{name} (vault {vault}) failed: {e:#}"
+            );
+        }
         let view = self.fetch_doc(&Self::doc_id(vault, plugin, name)).await?;
 
         // Soft-deleted databases keep their replica; just stop replicating.
@@ -452,6 +534,12 @@ impl PluginDbService {
 
     /// Purge: delete the replica file, mark the DB tombstoned, and trim the Y.Doc.
     pub async fn purge(&self, vault: &str, plugin: &str, name: &str) -> Result<()> {
+        // Drop any queued-but-unpublished server batches; the DB is going away.
+        self.0
+            .pending_publishes
+            .lock()
+            .await
+            .remove(&Self::key(vault, plugin, name));
         // Mark deleted in the server DB so git stops dumping it.
         self.mark_deleted_row(vault, plugin, name).await?;
 
@@ -594,6 +682,13 @@ impl PluginDbService {
             .unwrap_or_default())
     }
 
+    /// Persist the server's applied cursor by **max-merging** into the stored
+    /// row: for each site, the stored db_version only ever increases. Cursors
+    /// are monotonic per site, so a max-merge is always safe — and it makes
+    /// concurrent `query_sql` / `execute_sql` / `replicate_once` refreshes
+    /// (which do not all share the per-DB write lock) unable to clobber each
+    /// other's advances with a stale snapshot. When the merge changes nothing
+    /// and the row exists, no write is issued (pure reads stay read-only).
     async fn store_cursor(
         &self,
         vault: &str,
@@ -601,14 +696,27 @@ impl PluginDbService {
         name: &str,
         cursor: &Cursor,
     ) -> Result<()> {
-        let json = serde_json::to_string(cursor).unwrap_or_else(|_| "{}".to_string());
         let existing = self.find_row(vault, plugin, name).await?;
         if let Some(model) = existing {
+            let mut merged: Cursor = serde_json::from_str(&model.cursor_json).unwrap_or_default();
+            let mut changed = false;
+            for (site, v) in cursor {
+                let entry = merged.entry(site.clone()).or_insert(i64::MIN);
+                if *v > *entry {
+                    *entry = *v;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Ok(());
+            }
+            let json = serde_json::to_string(&merged).unwrap_or_else(|_| "{}".to_string());
             let mut active: plugin_db_replicas::ActiveModel = model.into();
             active.cursor_json = Set(json);
             active.updated_at = Set(now_millis());
             active.update(&self.0.db).await?;
         } else {
+            let json = serde_json::to_string(cursor).unwrap_or_else(|_| "{}".to_string());
             plugin_db_replicas::ActiveModel {
                 id: Set(uuid::Uuid::new_v4().to_string()),
                 vault_id: Set(vault.to_string()),
@@ -703,6 +811,8 @@ impl PluginDbService {
         // the doc append, and the cursor advance form one atomic publish unit.
         let lock = self.write_lock(vault, plugin, name).await;
         let _guard = lock.lock().await;
+        // Earlier committed-but-unpublished batches must publish first.
+        self.flush_pending_locked(vault, plugin, name).await?;
         let config = self.0.config.clone();
         let (vault_s, plugin_s, name_s, sql) = (
             vault.to_string(),
@@ -720,8 +830,31 @@ impl PluginDbService {
             return Ok(());
         }
 
-        self.publish_own_batch(vault, plugin, name, rows, site_hex, site_b64, post)
+        if let Err(e) = self
+            .publish_own_batch(
+                vault,
+                plugin,
+                name,
+                rows.clone(),
+                site_hex.clone(),
+                site_b64.clone(),
+                post,
+            )
             .await
+        {
+            // The replica already holds the rollback; queue the batch so the
+            // replication debounce retries the publish (see execute_sql).
+            let key = Self::key(vault, plugin, name);
+            let mut map = self.0.pending_publishes.lock().await;
+            map.entry(key).or_default().push(PendingPublish {
+                rows,
+                site_hex,
+                site_b64,
+                post,
+            });
+            return Err(e);
+        }
+        Ok(())
     }
     /// Append a server-authored batch (already-computed own-site cr-sqlite
     /// changes) to the database's Y.Doc log and advance the stored server
@@ -885,9 +1018,10 @@ impl PluginDbService {
             return Err(AppError::NotFound);
         }
         // Refresh the replica so reads see all client writes the doc has.
-        let cursor = self.load_cursor(vault, plugin, name).await.map_err(|e| {
-            AppError::Internal(format!("load cursor: {e:#}"))
-        })?;
+        let cursor = self
+            .load_cursor(vault, plugin, name)
+            .await
+            .map_err(|e| AppError::Internal(format!("load cursor: {e:#}")))?;
         let config = self.0.config.clone();
         let (vault_s, plugin_s, name_s, schema_s, batches_s) = (
             vault.to_string(),
@@ -912,44 +1046,51 @@ impl PluginDbService {
         let path = replica_path(&self.0.config, vault, plugin, name);
         let sql = sql.to_string();
         let params = params.to_vec();
-        let res = tokio::task::spawn_blocking(move || -> std::result::Result<QuerySqlResult, String> {
-            // Plain SQLite + query_only: SELECT-only guaranteed at theConnection
-            // level too, so a misclassified statement cannot mutate the replica.
-            let conn = Connection::open(&path).map_err(|e| e.to_string())?;
-            conn.busy_timeout(Duration::from_secs(5)).map_err(|e| e.to_string())?;
-            conn.pragma_update(None, "query_only", true).map_err(|e| e.to_string())?;
-            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-            let columns = stmt
-                .column_names()
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>();
-            let sql_params: Vec<SqlValue> = params.iter().map(json_to_sql).collect();
-            let param_refs: Vec<&SqlValue> = sql_params.iter().collect();
-            let mut rows = stmt
-                .query(rusqlite::params_from_iter(param_refs))
-                .map_err(|e| e.to_string())?;
-            let mut out: Vec<Vec<JsonValue>> = Vec::new();
-            let mut truncated = false;
-            let mut count = 0usize;
-            while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-                if count >= limit {
-                    truncated = true;
-                    break;
+        let res =
+            tokio::task::spawn_blocking(move || -> std::result::Result<QuerySqlResult, String> {
+                // Plain SQLite + query_only: SELECT-only guaranteed at theConnection
+                // level too, so a misclassified statement cannot mutate the replica.
+                let conn = Connection::open(&path).map_err(|e| e.to_string())?;
+                conn.busy_timeout(Duration::from_secs(5))
+                    .map_err(|e| e.to_string())?;
+                conn.pragma_update(None, "query_only", true)
+                    .map_err(|e| e.to_string())?;
+                let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+                let columns = stmt
+                    .column_names()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>();
+                let sql_params: Vec<SqlValue> = params.iter().map(json_to_sql).collect();
+                let param_refs: Vec<&SqlValue> = sql_params.iter().collect();
+                let mut rows = stmt
+                    .query(rusqlite::params_from_iter(param_refs))
+                    .map_err(|e| e.to_string())?;
+                let mut out: Vec<Vec<JsonValue>> = Vec::new();
+                let mut truncated = false;
+                let mut count = 0usize;
+                while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                    if count >= limit {
+                        truncated = true;
+                        break;
+                    }
+                    let n = row.as_ref().column_count();
+                    let mut vals = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let v: SqlValue = row.get(i).map_err(|e| e.to_string())?;
+                        vals.push(sql_to_json(&v));
+                    }
+                    out.push(vals);
+                    count += 1;
                 }
-                let n = row.as_ref().column_count();
-                let mut vals = Vec::with_capacity(n);
-                for i in 0..n {
-                    let v: SqlValue = row.get(i).map_err(|e| e.to_string())?;
-                    vals.push(sql_to_json(&v));
-                }
-                out.push(vals);
-                count += 1;
-            }
-            std::result::Result::Ok(QuerySqlResult { columns, rows: out, truncated })
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("query task panicked: {e}")))?;
+                std::result::Result::Ok(QuerySqlResult {
+                    columns,
+                    rows: out,
+                    truncated,
+                })
+            })
+            .await
+            .map_err(|e| AppError::Internal(format!("query task panicked: {e}")))?;
         res.map_err(|e| AppError::BadRequest(e))
     }
 
@@ -975,7 +1116,9 @@ impl PluginDbService {
             return Err(AppError::BadRequest("statements must not be empty".into()));
         }
         if statements.len() > 100 {
-            return Err(AppError::BadRequest("at most 100 statements per call".into()));
+            return Err(AppError::BadRequest(
+                "at most 100 statements per call".into(),
+            ));
         }
         for s in statements {
             if let Err(msg) = lint_sql(&s.sql) {
@@ -997,6 +1140,12 @@ impl PluginDbService {
         let lock = self.write_lock(vault, plugin, name).await;
         let _guard = lock.lock().await;
 
+        // Publish order matters: earlier committed-but-unpublished batches
+        // must reach the doc before this write's batch.
+        self.flush_pending_locked(vault, plugin, name)
+            .await
+            .map_err(|e| AppError::Internal(format!("pending publish retry failed: {e:#}")))?;
+
         let doc_id = Self::doc_id(vault, plugin, name);
         let view = self
             .fetch_doc(&doc_id)
@@ -1013,9 +1162,10 @@ impl PluginDbService {
         // Refresh the replica so the upcoming writes merge on top of the
         // latest client state (otherwise stale server writes would clobber
         // concurrent client edits under LWW).
-        let cursor = self.load_cursor(vault, plugin, name).await.map_err(|e| {
-            AppError::Internal(format!("load cursor: {e:#}"))
-        })?;
+        let cursor = self
+            .load_cursor(vault, plugin, name)
+            .await
+            .map_err(|e| AppError::Internal(format!("load cursor: {e:#}")))?;
         let config = self.0.config.clone();
         let (vault_s, plugin_s, name_s, schema_s, batches_s) = (
             vault.to_string(),
@@ -1062,22 +1212,36 @@ impl PluginDbService {
         }
 
         // Publish the batch to the Y.Doc log and advance the server cursor.
-        // A failure here after the replica commit is returned as Internal:
-        // the replica has the write but clients see it only after a successful
-        // publish. The caller may retry the same statements (idempotent for
-        // LWW upserts); the next replication/compaction pass will not
-        // re-publish own-site rows (they are invisible to apply_to_replica).
+        // The replica commit is durable at this point; a publish failure only
+        // delays client visibility. On failure the batch is queued in
+        // `pending_publishes` and retried by the replication debounce (armed
+        // via `mark_write` by the caller) and by the next server-authored
+        // write — so the call still succeeds, and clients converge once a
+        // retry lands.
         if let Err(e) = self
-            .publish_own_batch(vault, plugin, name, rows, site_hex, site_b64, post)
+            .publish_own_batch(
+                vault,
+                plugin,
+                name,
+                rows.clone(),
+                site_hex.clone(),
+                site_b64.clone(),
+                post,
+            )
             .await
         {
             tracing::error!(
                 "execute_sql publish failed for {plugin}/{name} (vault {vault}) \
-                 after replica commit: {e:#}; clients will see the write on retry"
+                 after replica commit: {e:#}; queued for retry"
             );
-            return Err(AppError::Internal(format!(
-                "write committed to replica but publish to clients failed: {e:#}"
-            )));
+            let key = Self::key(vault, plugin, name);
+            let mut map = self.0.pending_publishes.lock().await;
+            map.entry(key).or_default().push(PendingPublish {
+                rows,
+                site_hex,
+                site_b64,
+                post,
+            });
         }
         std::result::Result::Ok(ExecuteSqlResult {
             rows_affected,
@@ -1136,7 +1300,10 @@ pub fn decode_doc(update: &[u8]) -> Result<DocView> {
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
     let deleted_at = meta_json.get("deletedAt").and_then(json_i64);
-    let schema_version = meta_json.get("schemaVersion").and_then(json_i64).unwrap_or(0);
+    let schema_version = meta_json
+        .get("schemaVersion")
+        .and_then(json_i64)
+        .unwrap_or(0);
     let compacted_through: HashMap<String, i64> = meta_json
         .get("compactedThrough")
         .map(json_i64_map)
@@ -1945,22 +2112,103 @@ fn json_to_sql(v: &JsonValue) -> SqlValue {
 // ---------- SQL classification guards ----------
 
 /// Reject SQL touching cr-sqlite/SQLite internals. Mirrors the client lint
-/// (`src/pluginDb/SyncedPluginDatabase.ts`): case-insensitive substring match
-/// for `crsql_` or `sqlite_`. These tables/functions are owned by the engine or
-/// the replication layer — server-side writes into them would corrupt sync.
+/// (`src/pluginDb/SyncedPluginDatabase.ts`). Token-aware: single-quoted string
+/// literals and comments are ignored (so `WHERE t = 'my_sqlite_note'` is
+/// fine), while bare identifiers and quoted identifiers (`"…"`, `` `…` ``,
+/// `[…]`) starting with `crsql_` or `sqlite_` are rejected — those tables and
+/// functions are owned by the engine or the replication layer, and writes into
+/// them would corrupt sync.
 fn lint_sql(sql: &str) -> std::result::Result<(), String> {
-    let lower = sql.to_ascii_lowercase();
-    if lower.contains("crsql_") {
-        return Err(format!(
-            "SQL references cr-sqlite internals (crsql_); those are managed by replication"
-        ));
-    }
-    if lower.contains("sqlite_") {
-        return Err(format!(
-            "SQL references SQLite internals (sqlite_); those are not writable from here"
-        ));
+    for ident in sql_identifiers(sql) {
+        let lower = ident.to_ascii_lowercase();
+        if lower.starts_with("crsql_") {
+            return Err(format!(
+                "SQL references cr-sqlite internals ({ident}); those are managed by replication"
+            ));
+        }
+        if lower.starts_with("sqlite_") {
+            return Err(format!(
+                "SQL references SQLite internals ({ident}); those are not accessible from here"
+            ));
+        }
     }
     Ok(())
+}
+
+/// Extract every identifier-like token from `sql`, skipping single-quoted
+/// string literals, `--` line comments, and `/* … */` block comments. Both
+/// bare identifiers (`[A-Za-z_][A-Za-z0-9_$]*`) and quoted identifiers
+/// (`"…"`, `` `…` ``, `[…]` — SQLite treats all three as identifiers) are
+/// yielded; doubled closing quotes inside quoted forms are handled.
+fn sql_identifiers(sql: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let b: Vec<char> = sql.chars().collect();
+    let n = b.len();
+    let mut i = 0;
+    while i < n {
+        let c = b[i];
+        match c {
+            // -- line comment
+            '-' if i + 1 < n && b[i + 1] == '-' => {
+                while i < n && b[i] != '\n' {
+                    i += 1;
+                }
+            }
+            // /* block comment */
+            '/' if i + 1 < n && b[i + 1] == '*' => {
+                i += 2;
+                while i + 1 < n && !(b[i] == '*' && b[i + 1] == '/') {
+                    i += 1;
+                }
+                i = (i + 2).min(n);
+            }
+            // 'string literal' with '' escapes — skipped entirely
+            '\'' => {
+                i += 1;
+                while i < n {
+                    if b[i] == '\'' {
+                        if i + 1 < n && b[i + 1] == '\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            // quoted identifiers: "…" / `…` (doubled-quote escape), […]
+            '"' | '`' | '[' => {
+                let close = if c == '[' { ']' } else { c };
+                i += 1;
+                let mut ident = String::new();
+                while i < n {
+                    if b[i] == close {
+                        if close != ']' && i + 1 < n && b[i + 1] == close {
+                            ident.push(close);
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    ident.push(b[i]);
+                    i += 1;
+                }
+                out.push(ident);
+            }
+            // bare identifier
+            _ if c.is_ascii_alphabetic() || c == '_' => {
+                let start = i;
+                while i < n && (b[i].is_ascii_alphanumeric() || b[i] == '_' || b[i] == '$') {
+                    i += 1;
+                }
+                out.push(b[start..i].iter().collect());
+            }
+            _ => i += 1,
+        }
+    }
+    out
 }
 
 /// The first keyword (leading ASCII-alphabetic run) of `sql`, upper-cased.
@@ -1974,10 +2222,7 @@ fn first_keyword(sql: &str) -> Option<String> {
     if bytes.is_empty() || !bytes[0].is_ascii_alphabetic() {
         return None;
     }
-    let kw: String = s
-        .chars()
-        .take_while(|c| c.is_ascii_alphabetic())
-        .collect();
+    let kw: String = s.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
     Some(kw.to_ascii_uppercase())
 }
 
@@ -2048,8 +2293,8 @@ pub mod routes {
         }
         principal.require_vault(vault_id)?;
         require_member(state, &principal.user.id, vault_id).await?;
-        let level = authorize_path(state, &principal.user, vault_id, &pseudo_path(plugin, name))
-            .await?;
+        let level =
+            authorize_path(state, &principal.user, vault_id, &pseudo_path(plugin, name)).await?;
         if need_full && level == Level::ReadOnly {
             return Err(AppError::Forbidden);
         }
@@ -2065,11 +2310,24 @@ pub mod routes {
     ) -> AppResult<Vec<PluginDbInfo>> {
         principal.require_vault(vault_id)?;
         require_member(state, &principal.user.id, vault_id).await?;
-        state
+        let dbs = state
             .plugindb
             .list_dbs(vault_id)
             .await
-            .map_err(|e| AppError::Internal(e.to_string()))
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        // Apply the same per-DB path ACL as query/execute: databases the
+        // caller is denied on are omitted (not even their names leak).
+        let mut visible = Vec::with_capacity(dbs.len());
+        for db in dbs {
+            let path = pseudo_path(&db.plugin, &db.name);
+            if authorize_path(state, &principal.user, vault_id, &path)
+                .await
+                .is_ok()
+            {
+                visible.push(db);
+            }
+        }
+        Ok(visible)
     }
 
     pub(crate) async fn query_inner(
@@ -2097,8 +2355,7 @@ pub mod routes {
         name: &str,
         statements: &[ExecuteStatement],
     ) -> AppResult<ExecuteSqlResult> {
-        let git_principal =
-            guard_principal(state, principal, vault_id, plugin, name, true).await?;
+        let git_principal = guard_principal(state, principal, vault_id, plugin, name, true).await?;
         let res = state
             .plugindb
             .execute_sql(vault_id, plugin, name, statements)
@@ -2204,9 +2461,17 @@ pub mod routes {
         Path((vault_id, plugin, name)): Path<(String, String, String)>,
         Json(body): Json<QueryBody>,
     ) -> AppResult<Json<QuerySqlResult>> {
-        let res =
-            query_inner(&state, &principal, &vault_id, &plugin, &name, &body.sql, &body.params, body.limit)
-                .await?;
+        let res = query_inner(
+            &state,
+            &principal,
+            &vault_id,
+            &plugin,
+            &name,
+            &body.sql,
+            &body.params,
+            body.limit,
+        )
+        .await?;
         Ok(Json(res))
     }
 
@@ -2220,10 +2485,12 @@ pub mod routes {
         let statements: Vec<ExecuteStatement> = body
             .statements
             .into_iter()
-            .map(|s| ExecuteStatement { sql: s.sql, params: s.params })
+            .map(|s| ExecuteStatement {
+                sql: s.sql,
+                params: s.params,
+            })
             .collect();
-        let res =
-            execute_inner(&state, &principal, &vault_id, &plugin, &name, &statements).await?;
+        let res = execute_inner(&state, &principal, &vault_id, &plugin, &name, &statements).await?;
         Ok(Json(res))
     }
 }
@@ -2429,6 +2696,26 @@ mod tests {
     }
 
     #[test]
+    fn lint_sql_is_token_aware() {
+        // Internals inside string literals are data, not references.
+        assert!(lint_sql("SELECT * FROM tasks WHERE title = 'my_sqlite_notes'").is_ok());
+        assert!(lint_sql("INSERT INTO tasks VALUES ('crsql_changes')").is_ok());
+        assert!(lint_sql("SELECT 'sqlite_master' AS label").is_ok());
+        // Escaped quote inside a literal doesn't end the literal early.
+        assert!(lint_sql("SELECT * FROM t WHERE a = 'it''s sqlite_master'").is_ok());
+        // Comments are skipped.
+        assert!(lint_sql("SELECT 1 -- sqlite_master\n").is_ok());
+        assert!(lint_sql("SELECT /* crsql_changes */ 1").is_ok());
+        // Quoted identifiers are identifiers, not strings — still rejected.
+        assert!(lint_sql("SELECT * FROM \"sqlite_master\"").is_err());
+        assert!(lint_sql("SELECT * FROM `crsql_changes`").is_err());
+        assert!(lint_sql("SELECT * FROM [sqlite_master]").is_err());
+        // Only identifiers *starting with* the reserved prefixes match.
+        assert!(lint_sql("SELECT my_sqlite_col FROM tasks").is_ok());
+        assert!(lint_sql("SELECT not_crsql_thing FROM tasks").is_ok());
+    }
+
+    #[test]
     fn is_read_statement_accepts_select_and_with() {
         assert!(is_read_statement("SELECT 1"));
         assert!(is_read_statement("  with t as (select 1) select * from t"));
@@ -2448,7 +2735,9 @@ mod tests {
         assert!(is_write_statement("replace INTO tasks VALUES (1)"));
         // WITH is rejected for writes: writable CTEs are rare and sniffing WITH
         // as a write keyword would be ambiguous.
-        assert!(!is_write_statement("WITH t AS (SELECT 1) INSERT INTO tasks SELECT * FROM t"));
+        assert!(!is_write_statement(
+            "WITH t AS (SELECT 1) INSERT INTO tasks SELECT * FROM t"
+        ));
         assert!(!is_write_statement("SELECT 1"));
         assert!(!is_write_statement("CREATE TABLE x (id)"));
         assert!(!is_write_statement("PRAGMA query_only = ON"));
@@ -2456,6 +2745,8 @@ mod tests {
         assert!(!is_write_statement("ATTACH 'x.db' AS other"));
         assert!(!is_write_statement("VACUUM"));
         assert!(!is_write_statement(""));
-        assert!(!is_write_statement("-- comment\nINSERT INTO tasks VALUES (1)"));
+        assert!(!is_write_statement(
+            "-- comment\nINSERT INTO tasks VALUES (1)"
+        ));
     }
 }

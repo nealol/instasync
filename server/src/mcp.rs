@@ -440,7 +440,6 @@ fn any_json_array_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema 
     schemars::json_schema!({ "type": "array" })
 }
 
-
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct PluginDbQueryArgs {
@@ -453,15 +452,23 @@ struct PluginDbQueryArgs {
     limit: Option<usize>,
 }
 
+/// One write statement in a `write_plugin_database` batch.
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PluginDbStatementArg {
+    sql: String,
+    #[serde(default)]
+    #[schemars(schema_with = "any_json_array_schema")]
+    params: Vec<serde_json::Value>,
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct PluginDbExecuteArgs {
     plugin: String,
     name: String,
-    sql: String,
-    #[serde(default)]
-    #[schemars(schema_with = "any_json_array_schema")]
-    params: Vec<serde_json::Value>,
+    /// Statements run in order inside one transaction.
+    statements: Vec<PluginDbStatementArg>,
 }
 
 fn base_view_fields(
@@ -540,21 +547,23 @@ impl InstaMcp {
         Parameters(args): Parameters<PluginDbQueryArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let c = ctx(&context)?;
-        tool_result(crate::plugindb::routes::query_inner(
-            &c.state,
-            &c.principal,
-            &c.vault_id,
-            &args.plugin,
-            &args.name,
-            &args.sql,
-            &args.params,
-            args.limit,
+        tool_result(
+            crate::plugindb::routes::query_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.plugin,
+                &args.name,
+                &args.sql,
+                &args.params,
+                args.limit,
+            )
+            .await,
         )
-        .await)
     }
 
     #[tool(
-        description = "Run one INSERT/UPDATE/DELETE/REPLACE against a synced plugin SQLite database; the change replicates to all vault devices (CRDT last-writer-wins). Schema changes are not allowed.",
+        description = "Run one or more INSERT/UPDATE/DELETE/REPLACE statements (one transaction) against a synced plugin SQLite database; params bind ?1..?N per statement. The changes replicate to all vault devices (CRDT last-writer-wins). Schema changes are not allowed.",
         annotations(
             title = "Plugin DB: Execute write",
             read_only_hint = false,
@@ -568,19 +577,25 @@ impl InstaMcp {
         Parameters(args): Parameters<PluginDbExecuteArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let c = ctx(&context)?;
-        let stmts = vec![crate::plugindb::ExecuteStatement {
-            sql: args.sql,
-            params: args.params,
-        }];
-        tool_result(crate::plugindb::routes::execute_inner(
-            &c.state,
-            &c.principal,
-            &c.vault_id,
-            &args.plugin,
-            &args.name,
-            &stmts,
+        let stmts: Vec<crate::plugindb::ExecuteStatement> = args
+            .statements
+            .into_iter()
+            .map(|s| crate::plugindb::ExecuteStatement {
+                sql: s.sql,
+                params: s.params,
+            })
+            .collect();
+        tool_result(
+            crate::plugindb::routes::execute_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.plugin,
+                &args.name,
+                &stmts,
+            )
+            .await,
         )
-        .await)
     }
 
     #[tool(

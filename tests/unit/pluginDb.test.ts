@@ -284,3 +284,45 @@ describe("SyncedPluginDatabase", () => {
     }
   });
 });
+
+describe("sqlIdentifiers / lint", () => {
+  it("extracts identifiers, skipping strings and comments", async () => {
+    const { sqlIdentifiers } = await import("../../src/pluginDb/SyncedPluginDatabase");
+    expect(sqlIdentifiers("SELECT a, b FROM tasks WHERE t = 'sqlite_master'")).toEqual([
+      "SELECT",
+      "a",
+      "b",
+      "FROM",
+      "tasks",
+      "WHERE",
+      "t",
+    ]);
+    expect(sqlIdentifiers("SELECT 1 -- crsql_changes\n+ 2")).toEqual(["SELECT"]);
+    expect(sqlIdentifiers("SELECT /* sqlite_master */ x")).toEqual(["SELECT", "x"]);
+    // Quoted identifiers are identifiers (with doubled-quote escapes).
+    expect(sqlIdentifiers('SELECT * FROM "sqlite_master"')).toEqual([
+      "SELECT",
+      "FROM",
+      "sqlite_master",
+    ]);
+    expect(sqlIdentifiers("SELECT * FROM `crsql_changes`")).toEqual([
+      "SELECT",
+      "FROM",
+      "crsql_changes",
+    ]);
+    expect(sqlIdentifiers("SELECT * FROM [sqlite_master]")).toEqual([
+      "SELECT",
+      "FROM",
+      "sqlite_master",
+    ]);
+    expect(sqlIdentifiers(`SELECT "we""ird" FROM t`)).toEqual(["SELECT", 'we"ird', "FROM", "t"]);
+    // Escaped quote inside a string literal does not end it early.
+    expect(sqlIdentifiers("SELECT * FROM t WHERE a = 'it''s crsql_x'")).toEqual([
+      "SELECT",
+      "FROM",
+      "t",
+      "WHERE",
+      "a",
+    ]);
+  });
+});

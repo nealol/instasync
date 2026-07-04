@@ -789,14 +789,10 @@ async fn login(app: &Router, sub: &str) -> String {
 
 /// Drive the mock login flow with an optional OpenID `picture` URL.
 async fn login_with_picture(app: &Router, sub: &str, picture: Option<&str>) -> String {
-    let mut uri = format!(
-        "/auth/login?redirect=http://app/cb&mock_sub={sub}&mock_name={sub}"
-    );
+    let mut uri = format!("/auth/login?redirect=http://app/cb&mock_sub={sub}&mock_name={sub}");
     if let Some(pic) = picture {
         uri.push_str("&mock_picture=");
-        uri.push_str(
-            &url::form_urlencoded::byte_serialize(pic.as_bytes()).collect::<String>(),
-        );
+        uri.push_str(&url::form_urlencoded::byte_serialize(pic.as_bytes()).collect::<String>());
     }
     let res = app
         .clone()
@@ -1113,7 +1109,11 @@ async fn login_creates_session_and_me_works() {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "invalid avatar: {url:?}");
-        assert_eq!(me["avatarUrl"], Value::Null, "error body should have no avatarUrl");
+        assert_eq!(
+            me["avatarUrl"],
+            Value::Null,
+            "error body should have no avatarUrl"
+        );
     }
     // Over-long URL (> 2048 bytes).
     let long_url = format!("https://example.com/{}", "a".repeat(2040));
@@ -1135,16 +1135,13 @@ async fn login_creates_session_and_me_works() {
     assert_eq!(me["avatarUrl"], "https://cdn.example.com/a.jpg");
 
     // Legacy: PATCH with `{}` still clears gitEmail for old clients.
-    let (status, me) = send(
-        &app,
-        "PATCH",
-        "/api/me",
-        Some(&token),
-        Some(json!({})),
-    )
-    .await;
+    let (status, me) = send(&app, "PATCH", "/api/me", Some(&token), Some(json!({}))).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(me["gitEmail"], Value::Null, "legacy {{}} should clear gitEmail");
+    assert_eq!(
+        me["gitEmail"],
+        Value::Null,
+        "legacy {{}} should clear gitEmail"
+    );
     // avatarUrlOverride should be unchanged (not cleared by legacy {{}}).
     assert_eq!(me["avatarUrlOverride"], "https://cdn.example.com/a.jpg");
 
@@ -1617,9 +1614,16 @@ async fn mcp_lists_tools_and_round_trips_note_edits() {
         );
         let title = annotations["title"].as_str().unwrap();
         assert!(
-            ["Canvas: ", "Base: ", "Note: ", "Attachment: ", "Search: ", "Plugin DB: "]
-                .iter()
-                .any(|prefix| title.starts_with(prefix)),
+            [
+                "Canvas: ",
+                "Base: ",
+                "Note: ",
+                "Attachment: ",
+                "Search: ",
+                "Plugin DB: "
+            ]
+            .iter()
+            .any(|prefix| title.starts_with(prefix)),
             "uncategorized title {title:?} on {}",
             tool["name"]
         );
@@ -3211,7 +3215,9 @@ async fn create_note_after_client_side_delete_succeeds() {
         let new_update = doc
             .transact()
             .encode_state_as_update_v1(&yrs::StateVector::default());
-        docs.lock().await.insert(vault_id.clone(), new_update.to_vec());
+        docs.lock()
+            .await
+            .insert(vault_id.clone(), new_update.to_vec());
     }
 
     // create_note must agree with list_notes and accept the freed path. Test it
@@ -3225,7 +3231,11 @@ async fn create_note_after_client_side_delete_succeeds() {
         Some(json!({"path": "ghost.md", "content": "boo 2"})),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "recreate should succeed, got {recreated}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "recreate should succeed, got {recreated}"
+    );
     assert_ne!(
         recreated["guid"].as_str().unwrap(),
         first_guid,
@@ -4161,9 +4171,10 @@ async fn plugin_db_sql_endpoints() {
     // Seed the per-DB doc with one published batch (two task rows).
     let (schema, batches, site_hex, max_v) = make_source_batch(&ext);
     let doc_id = format!("{vault_id}__plugindb__my-plugin__tasks");
-    docs.lock()
-        .await
-        .insert(doc_id.clone(), plugin_db_doc_update(&schema, &batches, None));
+    docs.lock().await.insert(
+        doc_id.clone(),
+        plugin_db_doc_update(&schema, &batches, None),
+    );
 
     // list_dbs before any replication -> empty (rows appear once the server
     // has replicated at least once, which a query triggers via its refresh).
@@ -4174,7 +4185,14 @@ async fn plugin_db_sql_endpoints() {
     // visible and a replica row now exists.
     let res = state
         .plugindb
-        .query_sql(&vault_id, "my-plugin", "tasks", "SELECT title FROM tasks ORDER BY id", &[], None)
+        .query_sql(
+            &vault_id,
+            "my-plugin",
+            "tasks",
+            "SELECT title FROM tasks ORDER BY id",
+            &[],
+            None,
+        )
         .await
         .expect("query");
     assert_eq!(res.columns, vec!["title".to_string()]);
@@ -4187,7 +4205,10 @@ async fn plugin_db_sql_endpoints() {
 
     let after = state.plugindb.list_dbs(&vault_id).await.unwrap();
     assert_eq!(
-        after.iter().map(|d| (d.plugin.clone(), d.name.clone())).collect::<Vec<_>>(),
+        after
+            .iter()
+            .map(|d| (d.plugin.clone(), d.name.clone()))
+            .collect::<Vec<_>>(),
         vec![("my-plugin".to_string(), "tasks".to_string())],
         "list_dbs reflects the now-replicated db"
     );
@@ -4228,7 +4249,14 @@ async fn plugin_db_sql_endpoints() {
     // query reflects the write.
     let res = state
         .plugindb
-        .query_sql(&vault_id, "my-plugin", "tasks", "SELECT title FROM tasks WHERE id = 'c'", &[], None)
+        .query_sql(
+            &vault_id,
+            "my-plugin",
+            "tasks",
+            "SELECT title FROM tasks WHERE id = 'c'",
+            &[],
+            None,
+        )
         .await
         .expect("query after write");
     let got: String = res.rows[0][0].as_str().expect("str").to_string();
@@ -4251,7 +4279,14 @@ async fn plugin_db_sql_endpoints() {
 
     let internal = state
         .plugindb
-        .query_sql(&vault_id, "my-plugin", "tasks", "SELECT * FROM sqlite_master", &[], None)
+        .query_sql(
+            &vault_id,
+            "my-plugin",
+            "tasks",
+            "SELECT * FROM sqlite_master",
+            &[],
+            None,
+        )
         .await;
     assert!(internal.is_err(), "sqlite_ internals rejected by lint");
 
@@ -4274,9 +4309,10 @@ async fn plugin_db_sql_endpoints() {
     // and a cursor caught up to the server's own site excludes them.
     // Clear the tombstone so bootstrap proceeds.
     docs.lock().await.remove(&doc_id);
-    docs.lock()
-        .await
-        .insert(doc_id.clone(), plugin_db_doc_update(&schema, &batches, None));
+    docs.lock().await.insert(
+        doc_id.clone(),
+        plugin_db_doc_update(&schema, &batches, None),
+    );
     // Re-run execute to re-publish (the doc was reset above).
     let stmts = vec![realtime_server::plugindb::ExecuteStatement {
         sql: "INSERT INTO tasks (id, title) VALUES (?1, ?2)".into(),
@@ -4297,18 +4333,10 @@ async fn plugin_db_sql_endpoints() {
         rows.iter().any(|r| r.table == "tasks"),
         "bootstrap includes server-authored rows after cursor advance"
     );
-    // A cursor caught up to both client and server sites yields nothing new.
-    let mut caught = HashMap::new();
-    caught.insert(site_hex.clone(), max_v);
-    let view = realtime_server::plugindb::decode_doc(docs.lock().await.get(&doc_id).cloned().unwrap().as_slice())
-        .unwrap();
-    let server_site = view.batches.last().map(|b| b.site_id.clone()).unwrap_or_default();
-    // The server site_id in the batch is base64; bootstrap cursor keys are hex.
-    // Just assert non-empty bootstrap from empty, already done; skip the caught-up
-    // edge since translating the server's base64 site to hex isn't worth the
-    // ceremony here (the unit-level cursor logic is covered in lib tests).
-    let _ = server_site;
-    let _ = caught;
+    // (The caught-up-cursor edge of bootstrap filtering is covered by the
+    // unit-level cursor tests in the lib; here we only assert the empty-cursor
+    // bootstrap above.)
+    let _ = max_v;
 
     // ---------- HTTP-level coverage of the new REST routes ----------
     //
@@ -4316,7 +4344,7 @@ async fn plugin_db_sql_endpoints() {
     // ApiPrincipal extractor, JSON (de)serialization, or the lib.rs wiring.
     // Build a git+ext-enabled app over the *same* fake y-sweet doc store (so
     // doc seeding still works), then drive the new routes through HTTP.
-    let (app, _git_dir2) = git_ext_app(&ys, Some(ext.clone())).await;
+    let (app, http_state, _git_dir2) = git_ext_app(&ys, Some(ext.clone())).await;
     let alice = login(&app, "alice").await;
     let (status, vault) = send(
         &app,
@@ -4333,9 +4361,10 @@ async fn plugin_db_sql_endpoints() {
     // the replica on the way so the rows are visible over HTTP.
     let (schema2, batches2, _site2, _max2) = make_source_batch(&ext);
     let http_doc_id = format!("{http_vault_id}__plugindb__my-plugin__tasks");
-    docs.lock()
-        .await
-        .insert(http_doc_id.clone(), plugin_db_doc_update(&schema2, &batches2, None));
+    docs.lock().await.insert(
+        http_doc_id.clone(),
+        plugin_db_doc_update(&schema2, &batches2, None),
+    );
 
     let (status, body) = send(
         &app,
@@ -4359,7 +4388,12 @@ async fn plugin_db_sql_endpoints() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["columns"], json!(["title"]));
-    let titles: Vec<Value> = body["rows"].as_array().unwrap().iter().map(|r| r[0].clone()).collect();
+    let titles: Vec<Value> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r[0].clone())
+        .collect();
     assert_eq!(titles, vec![json!("alpha"), json!("beta")]);
     assert_eq!(body["truncated"], json!(false));
 
@@ -4446,6 +4480,132 @@ async fn plugin_db_sql_endpoints() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Lint is token-aware: internals inside a string literal are fine.
+    let (status, _body) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{http_vault_id}/plugin-dbs/my-plugin/tasks/query"),
+        Some(&alice),
+        Some(json!({"sql":"SELECT title FROM tasks WHERE title = 'sqlite_master'"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // …but a quoted identifier is still an identifier.
+    let (status, _body) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{http_vault_id}/plugin-dbs/my-plugin/tasks/query"),
+        Some(&alice),
+        Some(json!({"sql":"SELECT * FROM \"sqlite_master\""})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // ---------- path-ACL behavior: read-only member, denied member ----------
+    use realtime_server::entities::permissions;
+    use sea_orm::{ActiveModelTrait, Set};
+    let carol = login(&app, "carol").await;
+    let dave = login(&app, "dave").await;
+    for (token, user) in [(&carol, "carol"), (&dave, "dave")] {
+        let (_, invite) = send(
+            &app,
+            "POST",
+            &format!("/api/vaults/{http_vault_id}/invites"),
+            Some(&alice),
+            Some(json!({})),
+        )
+        .await;
+        let code = invite["code"].as_str().unwrap().to_string();
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/api/invites/redeem",
+            Some(token),
+            Some(json!({"code": code})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{user} redeems invite");
+    }
+    let carol_id = send(&app, "GET", "/api/me", Some(&carol), None).await.1["userId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let dave_id = send(&app, "GET", "/api/me", Some(&dave), None).await.1["userId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for (uid, level) in [(&carol_id, "read-only"), (&dave_id, "deny")] {
+        permissions::ActiveModel {
+            id: Set(uuid::Uuid::new_v4().to_string()),
+            vault_id: Set(http_vault_id.clone()),
+            principal_user_id: Set(Some(uid.clone())),
+            path_prefix: Set(".realtime/plugin-dbs/my-plugin/tasks".to_string()),
+            level: Set(level.to_string()),
+        }
+        .insert(&http_state.db)
+        .await
+        .unwrap();
+    }
+
+    // Read-only member: query OK, execute 403.
+    let (status, _body) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{http_vault_id}/plugin-dbs/my-plugin/tasks/query"),
+        Some(&carol),
+        Some(json!({"sql":"SELECT 1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "read-only member can query");
+    let (status, _body) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{http_vault_id}/plugin-dbs/my-plugin/tasks/execute"),
+        Some(&carol),
+        Some(json!({"statements":[{"sql":"DELETE FROM tasks"}]})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "read-only member cannot execute"
+    );
+
+    // Denied member: query 403, and the database is omitted from list.
+    let (status, _body) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{http_vault_id}/plugin-dbs/my-plugin/tasks/query"),
+        Some(&dave),
+        Some(json!({"sql":"SELECT 1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "denied member cannot query");
+    let (status, body) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{http_vault_id}/plugin-dbs"),
+        Some(&dave),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["databases"],
+        json!([]),
+        "denied member does not even see the database's name"
+    );
+    // …while the owner still sees it.
+    let (_, body) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{http_vault_id}/plugin-dbs"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(body["databases"][0]["name"], "tasks");
 }
 
 /// The client fires `POST /api/vaults/{id}/files` fire-and-forget on every file
@@ -4903,7 +5063,7 @@ async fn history_test_app(ysweet_url: &str) -> (Router, std::path::PathBuf, std:
 async fn git_ext_app(
     ysweet_url: &str,
     crsqlite_ext_path: Option<String>,
-) -> (Router, std::path::PathBuf) {
+) -> (Router, realtime_server::state::AppState, std::path::PathBuf) {
     let mut db_path = std::env::temp_dir();
     db_path.push(format!("realtime-test-{}.db", uuid::Uuid::new_v4()));
     let mut git_dir = std::env::temp_dir();
@@ -4946,7 +5106,7 @@ async fn git_ext_app(
         web_dist_path: "../packages/web/dist".into(),
     };
     let state = build_state(config).await.unwrap();
-    (app(state), git_dir)
+    (app(state.clone()), state, git_dir)
 }
 
 /// Poll a vault repo until it holds at least `n` commits; returns HEAD's hash.

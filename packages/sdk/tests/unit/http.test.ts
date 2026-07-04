@@ -186,7 +186,11 @@ describe("RealtimeClient URL construction", () => {
       "POST https://x.test/api/vaults/v1/plugin-dbs/my-plugin/main/execute",
       "GET https://x.test/api/vaults/v1/plugin-dbs",
     ]);
-    expect(JSON.parse(requests[0].body!)).toEqual({ sql: "SELECT title FROM tasks", params: ["x"], limit: 10 });
+    expect(JSON.parse(requests[0].body!)).toEqual({
+      sql: "SELECT title FROM tasks",
+      params: ["x"],
+      limit: 10,
+    });
     expect(JSON.parse(requests[1].body!)).toEqual({
       statements: [{ sql: "INSERT INTO tasks VALUES (?1)", params: [1] }],
     });

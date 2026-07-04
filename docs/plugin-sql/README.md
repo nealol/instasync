@@ -66,15 +66,22 @@ server replica + git dump (.realtime/plugin-dbs/…)  +  bootstrap endpoint
   vault's trash bin and can be restored, or permanently purged.
 - **Access from outside Obsidian.** The server replica also backs server-side
   SQL access over REST: `GET /api/vaults/{id}/plugin-dbs` lists the databases
-  the server holds a replica for, `POST …/{plugin}/{name}/query` runs a
-  read-only `SELECT` (refreshed against the Y.Doc first), and
-  `POST …/{plugin}/{name}/execute` runs `INSERT`/`UPDATE`/`DELETE`/`REPLACE`
-  statements in one transaction and publishes the resulting changes as a
-  server-authored batch so all devices converge (CRDT last-writer-wins, just
-  like any peer's edit). Schema changes are rejected — the schema is owned by
-  plugin `migrate()` on clients. The same surfaces are exposed as MCP tools
-  (`list_plugin_databases`, `query_plugin_database`, `write_plugin_database`)
-  and through the TypeScript SDK (`VaultHandle.listPluginDbs()`,
+  the server holds a replica for (filtered by the caller's path ACL),
+  `POST …/{plugin}/{name}/query` runs a read-only `SELECT` (refreshed against
+  the Y.Doc first), and `POST …/{plugin}/{name}/execute` runs
+  `INSERT`/`UPDATE`/`DELETE`/`REPLACE` statements in one transaction and
+  publishes the resulting changes as a server-authored batch so all devices
+  converge (CRDT last-writer-wins, just like any peer's edit). If the batch
+  commits to the replica but the publish to the Y.Doc transiently fails, the
+  call still succeeds: the batch is queued in memory and retried by the next
+  replication pass or server-authored write (a server restart drops the queue;
+  the replica and git dump still retain the data). Schema changes are
+  rejected — the schema is owned by plugin `migrate()` on clients — and SQL
+  referencing `crsql_*`/`sqlite_*` identifiers is rejected (string literals
+  mentioning them are fine; the lint is token-aware). The same surfaces are
+  exposed as MCP tools (`list_plugin_databases`, `query_plugin_database`, and
+  `write_plugin_database`, which accepts multiple statements in one
+  transaction) and through the TypeScript SDK (`VaultHandle.listPluginDbs()`,
   `PluginDbResource.query()`, `PluginDbResource.execute()`). All of these
   require the cr-sqlite loadable extension on the server
   (`config.crsqlite_ext_path`); without it they return a clear error.
