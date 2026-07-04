@@ -5,6 +5,10 @@ import type {
   GitBackupConfig,
   PluginDbChangeRow,
   PluginDbCursor,
+  PluginDbEncodedVal,
+  PluginDbExecuteResult,
+  PluginDbQueryResult,
+  PluginDbStatement,
   PutGitBackupBody,
   ReindexResponse,
   SearchHit,
@@ -102,6 +106,21 @@ export class PluginDbResource {
       },
     );
     return res.changes;
+  }
+
+  /** Run a read-only SELECT against the server replica. */
+  query(
+    sql: string,
+    opts: { params?: PluginDbEncodedVal[]; limit?: number } = {},
+  ): Promise<PluginDbQueryResult> {
+    return this.http.request("POST", `${this.base}/query`, {
+      body: { sql, params: opts.params ?? [], limit: opts.limit },
+    });
+  }
+
+  /** Run write statements in one transaction; changes replicate to all devices. */
+  execute(statements: PluginDbStatement[]): Promise<PluginDbExecuteResult> {
+    return this.http.request("POST", `${this.base}/execute`, { body: { statements } });
   }
 
   /** Mark a write: replicate pending doc changes and produce a git commit. */

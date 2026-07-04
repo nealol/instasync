@@ -350,11 +350,20 @@ export class SyncedPluginDatabase {
     return this.db;
   }
 
+  /**
+   * Reject SQL referencing cr-sqlite/SQLite internals. Token-aware (mirrors
+   * the server lint in `server/src/plugindb.rs`): single-quoted string
+   * literals and comments are ignored, while bare and quoted identifiers
+   * starting with `crsql_` or `sqlite_` are rejected.
+   */
   private lint(sql: string): void {
-    if (/\b(crsql_|sqlite_)/i.test(sql)) {
-      throw new Error(
-        "exec/query may not touch crsql_* or sqlite_* internals; define schema in migrate()",
-      );
+    for (const ident of sqlIdentifiers(sql)) {
+      const lower = ident.toLowerCase();
+      if (lower.startsWith("crsql_") || lower.startsWith("sqlite_")) {
+        throw new Error(
+          `exec/query may not touch crsql_* or sqlite_* internals (${ident}); define schema in migrate()`,
+        );
+      }
     }
   }
 
@@ -656,6 +665,67 @@ export class DeletedError extends Error {
   constructor(pluginId: string, name: string) {
     super(`database ${pluginId}/${name} was deleted`);
   }
+}
+
+/**
+ * Extract every identifier-like token from `sql`, skipping single-quoted
+ * string literals (with `''` escapes), `--` line comments, and block
+ * comments. Bare identifiers and quoted identifiers (`"…"`, `` `…` ``,
+ * `[…]` — SQLite treats all three as identifiers) are both yielded.
+ * Mirrors `sql_identifiers` in `server/src/plugindb.rs`.
+ */
+export function sqlIdentifiers(sql: string): string[] {
+  const out: string[] = [];
+  const n = sql.length;
+  let i = 0;
+  while (i < n) {
+    const c = sql[i];
+    if (c === "-" && sql[i + 1] === "-") {
+      while (i < n && sql[i] !== "\n") i++;
+    } else if (c === "/" && sql[i + 1] === "*") {
+      i += 2;
+      while (i + 1 < n && !(sql[i] === "*" && sql[i + 1] === "/")) i++;
+      i = Math.min(i + 2, n);
+    } else if (c === "'") {
+      i++;
+      while (i < n) {
+        if (sql[i] === "'") {
+          if (sql[i + 1] === "'") {
+            i += 2;
+            continue;
+          }
+          i++;
+          break;
+        }
+        i++;
+      }
+    } else if (c === '"' || c === "`" || c === "[") {
+      const close = c === "[" ? "]" : c;
+      i++;
+      let ident = "";
+      while (i < n) {
+        if (sql[i] === close) {
+          if (close !== "]" && sql[i + 1] === close) {
+            ident += close;
+            i += 2;
+            continue;
+          }
+          i++;
+          break;
+        }
+        ident += sql[i];
+        i++;
+      }
+      out.push(ident);
+    } else if (/[A-Za-z_]/.test(c)) {
+      const start = i;
+      while (i < n && /[A-Za-z0-9_$]/.test(sql[i])) i++;
+      out.push(sql.slice(start, i));
+    } else {
+      i++;
+    }
+  }
+  return out;
 }
 
 /** Lexicographically-sortable-ish unique id (timestamp + random). */

@@ -315,6 +315,33 @@ export interface PluginDbChangeRow {
 /** Per-device applied cursor: max db_version seen per origin site id (hex). */
 export type PluginDbCursor = Record<string, number>;
 
+/** A synced plugin database the server holds a replica for. */
+export interface PluginDbInfo {
+  plugin: string;
+  name: string;
+  updatedAt: number;
+}
+
+/** Result of a read-only `PluginDbResource.query` call. */
+export interface PluginDbQueryResult {
+  columns: string[];
+  /** Cell values use the tagged wire encoding ({$blob}/{$int}) for non-JSON-native values. */
+  rows: PluginDbEncodedVal[][];
+  truncated: boolean;
+}
+
+/** Result of an `PluginDbResource.execute` call. */
+export interface PluginDbExecuteResult {
+  rowsAffected: number;
+  dbVersion: number;
+}
+
+/** One write statement in an `execute` batch (one transaction). */
+export interface PluginDbStatement {
+  sql: string;
+  params?: PluginDbEncodedVal[];
+}
+
 // ---------- doc tokens ----------
 
 /** y-sweet client token minted by `POST /api/doc-token`. */

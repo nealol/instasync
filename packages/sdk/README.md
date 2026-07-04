@@ -69,6 +69,6 @@ bump rules, and gating behavior.
 
 ## Coverage
 
-Vaults · invites · members · remote cursors + audit log (list/undo) · notes (CRUD, patch, move, permalinks, frontmatter, periodic) · attachments + content-addressed blobs · canvases (nodes/edges) · bases (views/filters/formulas/properties) · search/tags/backlinks · storage + blob GC · git backup config · plugin-db replication · y-sweet doc tokens · OAuth 2.1 (discovery, dynamic registration, PKCE, refresh) · streaming WebSocket API.
+Vaults · invites · members · remote cursors + audit log (list/undo) · notes (CRUD, patch, move, permalinks, frontmatter, periodic) · attachments + content-addressed blobs · canvases (nodes/edges) · bases (views/filters/formulas/properties) · search/tags/backlinks · storage + blob GC · git backup config · plugin-db replication + server-side SQL (list/query/execute) · y-sweet doc tokens · OAuth 2.1 (discovery, dynamic registration, PKCE, refresh) · streaming WebSocket API.
 
 Everything the MCP server's tools can do is covered via the same underlying REST endpoints.

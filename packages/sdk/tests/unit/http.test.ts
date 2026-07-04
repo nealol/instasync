@@ -173,4 +173,26 @@ describe("RealtimeClient URL construction", () => {
     );
     expect(requests[1].url).toBe("https://x.test/api/vaults/v1/plugin-dbs/my-plugin/main/touch");
   });
+
+  it("builds plugin-db SQL (query/execute/list) routes", async () => {
+    const { requests, client } = capture();
+    const vault = client.vault("v1");
+    const db = vault.pluginDb("my-plugin", "main");
+    await db.query("SELECT title FROM tasks", { params: ["x"], limit: 10 }).catch(() => {});
+    await db.execute([{ sql: "INSERT INTO tasks VALUES (?1)", params: [1] }]).catch(() => {});
+    await vault.listPluginDbs().catch(() => {});
+    expect(requests.map((r) => `${r.method} ${r.url}`)).toEqual([
+      "POST https://x.test/api/vaults/v1/plugin-dbs/my-plugin/main/query",
+      "POST https://x.test/api/vaults/v1/plugin-dbs/my-plugin/main/execute",
+      "GET https://x.test/api/vaults/v1/plugin-dbs",
+    ]);
+    expect(JSON.parse(requests[0].body!)).toEqual({
+      sql: "SELECT title FROM tasks",
+      params: ["x"],
+      limit: 10,
+    });
+    expect(JSON.parse(requests[1].body!)).toEqual({
+      statements: [{ sql: "INSERT INTO tasks VALUES (?1)", params: [1] }],
+    });
+  });
 });

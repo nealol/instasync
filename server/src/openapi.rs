@@ -88,6 +88,9 @@ use utoipa::{Modify, OpenApi};
         plugin_db_changes,
         plugin_db_touch,
         plugin_db_delete,
+        plugin_db_list,
+        plugin_db_query,
+        plugin_db_execute,
         history_list_commits,
         history_get_commit,
         history_get_tree,
@@ -356,6 +359,14 @@ async fn plugin_db_touch() {}
 
 #[utoipa::path(delete, path = "/api/vaults/{id}/plugin-dbs/{plugin}/{name}", tag = "plugin-dbs", security(("bearerAuth" = [])), params(("id" = String, Path), ("plugin" = String, Path), ("name" = String, Path)), responses((status = 200, description = "Database purged: replica, git dump, and batch log removed (irreversible)"), (status = 400, description = "Invalid plugin db id")))]
 async fn plugin_db_delete() {}
+#[utoipa::path(get, path = "/api/vaults/{id}/plugin-dbs", tag = "plugin-dbs", security(("bearerAuth" = [])), params(("id" = String, Path)), responses((status = 200, description = "Plugin databases the server holds a replica for ({ databases: [{ plugin, name, updatedAt }] })"), (status = 403, description = "Not a vault member")))]
+async fn plugin_db_list() {}
+
+#[utoipa::path(post, path = "/api/vaults/{id}/plugin-dbs/{plugin}/{name}/query", tag = "plugin-dbs", security(("bearerAuth" = [])), params(("id" = String, Path), ("plugin" = String, Path), ("name" = String, Path)), request_body = Object, responses((status = 200, description = "Read-only query result ({ columns, rows, truncated })"), (status = 400, description = "Invalid SQL or extension unavailable"), (status = 404, description = "Unknown database")))]
+async fn plugin_db_query() {}
+
+#[utoipa::path(post, path = "/api/vaults/{id}/plugin-dbs/{plugin}/{name}/execute", tag = "plugin-dbs", security(("bearerAuth" = [])), params(("id" = String, Path), ("plugin" = String, Path), ("name" = String, Path)), request_body = Object, responses((status = 200, description = "Write committed to the server replica ({ rowsAffected, dbVersion }); publication to clients is immediate, or queued and retried if the doc write transiently fails"), (status = 400, description = "Invalid SQL or extension unavailable"), (status = 403, description = "Read-only ACL"), (status = 404, description = "Unknown database")))]
+async fn plugin_db_execute() {}
 
 #[utoipa::path(get, path = "/api/vaults/{id}/history/commits", tag = "history", security(("bearerAuth" = [])), params(("id" = String, Path), ("limit" = Option<u64>, Query), ("before" = Option<String>, Query, description = "Keyset cursor: commits strictly before this hash"), ("path" = Option<String>, Query, description = "Restrict to one file's history (--follow); when set, each commit includes pathAtCommit (the followed file's path at that commit, for single-file rollback across renames)")), responses((status = 200, description = "Commit list with hasMore")))]
 async fn history_list_commits() {}

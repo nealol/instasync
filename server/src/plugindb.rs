@@ -123,12 +123,59 @@ fn json_i64_map(v: &JsonValue) -> HashMap<String, i64> {
 pub struct DocView {
     pub batches: Vec<Batch>,
     pub schema: Vec<String>,
+    /// `meta.schemaVersion` (default 0 when absent). The client writes this
+    /// alongside `meta.schema`; server-authored batches should mirror it.
+    pub schema_version: i64,
     pub deleted_at: Option<i64>,
     /// Per-device applied cursors: device site -> { origin site -> db_version }.
     pub cursors: HashMap<String, HashMap<String, i64>>,
     /// When each device last refreshed its cursor (ms epoch).
     pub cursors_at: HashMap<String, i64>,
     pub compacted_through: HashMap<String, i64>,
+}
+/// A live plugin database the server holds a replica for.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginDbInfo {
+    pub plugin: String,
+    pub name: String,
+    pub updated_at: i64,
+}
+
+/// Result of a read-only `query_sql` call.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuerySqlResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<JsonValue>>,
+    pub truncated: bool,
+}
+
+/// One write statement in an `execute_sql` batch.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecuteStatement {
+    pub sql: String,
+    #[serde(default)]
+    pub params: Vec<JsonValue>,
+}
+
+/// Result of an `execute_sql` batch.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecuteSqlResult {
+    pub rows_affected: u64,
+    pub db_version: i64,
+}
+
+/// A server-authored batch that committed to the replica but has not yet been
+/// published to the Y.Doc log (see `Inner::pending_publishes`).
+#[derive(Clone, Debug)]
+struct PendingPublish {
+    rows: Vec<ChangeRow>,
+    site_hex: String,
+    site_b64: String,
+    post: i64,
 }
 
 /// Cursor: origin site hex -> highest applied db_version.
@@ -148,6 +195,17 @@ struct Inner {
     db: DatabaseConnection,
     authenticator: Arc<Authenticator>,
     dbs: Mutex<HashMap<String, DbState>>,
+    /// Per-DB async write locks serializing server-authored write sequences
+    /// (execute_sql, rollback_to_dump): fetch->refresh->write->publish->cursor.
+    /// Replication (`replicate_once`) and read-only queries do NOT take these.
+    write_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Server-authored batches that committed to the replica but failed to
+    /// publish to the Y.Doc (doc write error). Keyed like `write_locks`.
+    /// Retried by `flush_pending_publishes` (called from `replicate_once` and
+    /// before the next `execute_sql`/`rollback_to_dump` publish) so clients
+    /// eventually converge. In-memory only: a restart drops the queue, but the
+    /// replica and git dump retain the data.
+    pending_publishes: tokio::sync::Mutex<HashMap<String, Vec<PendingPublish>>>,
     /// One-time probe result: the configured extension actually loads.
     ext_ok: std::sync::OnceLock<bool>,
 }
@@ -168,6 +226,8 @@ impl PluginDbService {
             db,
             authenticator,
             dbs: Mutex::new(HashMap::new()),
+            write_locks: tokio::sync::Mutex::new(HashMap::new()),
+            pending_publishes: tokio::sync::Mutex::new(HashMap::new()),
             ext_ok: std::sync::OnceLock::new(),
         }))
     }
@@ -218,6 +278,74 @@ impl PluginDbService {
 
     fn key(vault: &str, plugin: &str, name: &str) -> String {
         format!("{vault}\u{0}{plugin}\u{0}{name}")
+    }
+    /// Get (or insert) the per-DB async write lock. The caller locks the
+    /// returned `Arc<Mutex<()>>` for the whole read-apply-write-publish
+    /// sequence so concurrent server-authored writes to the same DB serialize.
+    async fn write_lock(
+        &self,
+        vault: &str,
+        plugin: &str,
+        name: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let key = Self::key(vault, plugin, name);
+        let mut locks = self.0.write_locks.lock().await;
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Retry any queued server-authored batches whose Y.Doc publish previously
+    /// failed. MUST be called with the per-DB write lock held. Batches are
+    /// retried in commit order; on the first failure the remainder are
+    /// re-queued and the error is returned (a later replication pass retries).
+    async fn flush_pending_locked(&self, vault: &str, plugin: &str, name: &str) -> Result<()> {
+        let key = Self::key(vault, plugin, name);
+        let pending = {
+            let mut map = self.0.pending_publishes.lock().await;
+            match map.remove(&key) {
+                Some(p) if !p.is_empty() => p,
+                _ => return Ok(()),
+            }
+        };
+        for (i, p) in pending.iter().enumerate() {
+            if let Err(e) = self
+                .publish_own_batch(
+                    vault,
+                    plugin,
+                    name,
+                    p.rows.clone(),
+                    p.site_hex.clone(),
+                    p.site_b64.clone(),
+                    p.post,
+                )
+                .await
+            {
+                let mut map = self.0.pending_publishes.lock().await;
+                let slot = map.entry(key).or_default();
+                let mut rest: Vec<PendingPublish> = pending[i..].to_vec();
+                rest.append(slot);
+                *slot = rest;
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Take the per-DB write lock and flush pending publishes (used by the
+    /// replication debounce, which does not otherwise hold the lock).
+    async fn flush_pending(&self, vault: &str, plugin: &str, name: &str) -> Result<()> {
+        {
+            let map = self.0.pending_publishes.lock().await;
+            match map.get(&Self::key(vault, plugin, name)) {
+                Some(p) if !p.is_empty() => {}
+                _ => return Ok(()),
+            }
+        }
+        let lock = self.write_lock(vault, plugin, name).await;
+        let _guard = lock.lock().await;
+        self.flush_pending_locked(vault, plugin, name).await
     }
 
     /// Record that a plugin database changed and (re)arm the replication debounce.
@@ -294,6 +422,13 @@ impl PluginDbService {
 
     /// Apply the doc's batches into the replica, then maybe compact the log.
     async fn replicate_once(&self, vault: &str, plugin: &str, name: &str) -> Result<()> {
+        // Retry any server-authored batches whose publish previously failed,
+        // so the doc we replicate from is as complete as we can make it.
+        if let Err(e) = self.flush_pending(vault, plugin, name).await {
+            tracing::warn!(
+                "plugin-db pending publish retry for {plugin}/{name} (vault {vault}) failed: {e:#}"
+            );
+        }
         let view = self.fetch_doc(&Self::doc_id(vault, plugin, name)).await?;
 
         // Soft-deleted databases keep their replica; just stop replicating.
@@ -399,6 +534,12 @@ impl PluginDbService {
 
     /// Purge: delete the replica file, mark the DB tombstoned, and trim the Y.Doc.
     pub async fn purge(&self, vault: &str, plugin: &str, name: &str) -> Result<()> {
+        // Drop any queued-but-unpublished server batches; the DB is going away.
+        self.0
+            .pending_publishes
+            .lock()
+            .await
+            .remove(&Self::key(vault, plugin, name));
         // Mark deleted in the server DB so git stops dumping it.
         self.mark_deleted_row(vault, plugin, name).await?;
 
@@ -541,6 +682,13 @@ impl PluginDbService {
             .unwrap_or_default())
     }
 
+    /// Persist the server's applied cursor by **max-merging** into the stored
+    /// row: for each site, the stored db_version only ever increases. Cursors
+    /// are monotonic per site, so a max-merge is always safe — and it makes
+    /// concurrent `query_sql` / `execute_sql` / `replicate_once` refreshes
+    /// (which do not all share the per-DB write lock) unable to clobber each
+    /// other's advances with a stale snapshot. When the merge changes nothing
+    /// and the row exists, no write is issued (pure reads stay read-only).
     async fn store_cursor(
         &self,
         vault: &str,
@@ -548,14 +696,27 @@ impl PluginDbService {
         name: &str,
         cursor: &Cursor,
     ) -> Result<()> {
-        let json = serde_json::to_string(cursor).unwrap_or_else(|_| "{}".to_string());
         let existing = self.find_row(vault, plugin, name).await?;
         if let Some(model) = existing {
+            let mut merged: Cursor = serde_json::from_str(&model.cursor_json).unwrap_or_default();
+            let mut changed = false;
+            for (site, v) in cursor {
+                let entry = merged.entry(site.clone()).or_insert(i64::MIN);
+                if *v > *entry {
+                    *entry = *v;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Ok(());
+            }
+            let json = serde_json::to_string(&merged).unwrap_or_else(|_| "{}".to_string());
             let mut active: plugin_db_replicas::ActiveModel = model.into();
             active.cursor_json = Set(json);
             active.updated_at = Set(now_millis());
             active.update(&self.0.db).await?;
         } else {
+            let json = serde_json::to_string(cursor).unwrap_or_else(|_| "{}".to_string());
             plugin_db_replicas::ActiveModel {
                 id: Set(uuid::Uuid::new_v4().to_string()),
                 vault_id: Set(vault.to_string()),
@@ -645,6 +806,13 @@ impl PluginDbService {
         if !self.ext_available() {
             return Err(anyhow!("cr-sqlite extension unavailable"));
         }
+        // Serialize against any other server-authored write to this DB
+        // (execute_sql, or a concurrent rollback). The blocking replica edit,
+        // the doc append, and the cursor advance form one atomic publish unit.
+        let lock = self.write_lock(vault, plugin, name).await;
+        let _guard = lock.lock().await;
+        // Earlier committed-but-unpublished batches must publish first.
+        self.flush_pending_locked(vault, plugin, name).await?;
         let config = self.0.config.clone();
         let (vault_s, plugin_s, name_s, sql) = (
             vault.to_string(),
@@ -662,10 +830,58 @@ impl PluginDbService {
             return Ok(());
         }
 
-        // Append the batch to the Y.Doc log.
+        if let Err(e) = self
+            .publish_own_batch(
+                vault,
+                plugin,
+                name,
+                rows.clone(),
+                site_hex.clone(),
+                site_b64.clone(),
+                post,
+            )
+            .await
+        {
+            // The replica already holds the rollback; queue the batch so the
+            // replication debounce retries the publish (see execute_sql).
+            let key = Self::key(vault, plugin, name);
+            let mut map = self.0.pending_publishes.lock().await;
+            map.entry(key).or_default().push(PendingPublish {
+                rows,
+                site_hex,
+                site_b64,
+                post,
+            });
+            return Err(e);
+        }
+        Ok(())
+    }
+    /// Append a server-authored batch (already-computed own-site cr-sqlite
+    /// changes) to the database's Y.Doc log and advance the stored server
+    /// cursor past its own site so replication doesn't re-apply it.
+    ///
+    /// Shared by [`rollback_to_dump`] and [`execute_sql`]. The caller MUST hold
+    /// the per-DB write lock so the replica write, the doc fetch, and the
+    /// cursor advance observe a consistent state.
+    async fn publish_own_batch(
+        &self,
+        vault: &str,
+        plugin: &str,
+        name: &str,
+        rows: Vec<ChangeRow>,
+        site_hex: String,
+        site_b64: String,
+        post: i64,
+    ) -> Result<()> {
         let doc_id = Self::doc_id(vault, plugin, name);
         let view = self.fetch_doc(&doc_id).await.unwrap_or_default();
-        let schema_version = view.batches.last().map(|b| b.schema_version).unwrap_or(1);
+        // Prefer the doc-level schemaVersion (decoded from meta); fall back to
+        // the last batch's value, then 1, matching the pre-refactor behavior.
+        let schema_version = if view.schema_version != 0 {
+            view.schema_version
+        } else {
+            view.batches.last().map(|b| b.schema_version).unwrap_or(1)
+        };
         let format = view
             .batches
             .last()
@@ -738,6 +954,300 @@ impl PluginDbService {
         }
         out
     }
+    /// List the plugin databases the server holds a replica for in `vault`.
+    /// Rows appear once the server has replicated a database at least once;
+    /// that is exactly the set the server can serve SQL for. An empty vault
+    /// yields an empty vec, not an error.
+    pub async fn list_dbs(&self, vault: &str) -> Result<Vec<PluginDbInfo>> {
+        let rows = plugin_db_replicas::Entity::find()
+            .filter(plugin_db_replicas::Column::VaultId.eq(vault))
+            .filter(plugin_db_replicas::Column::Deleted.eq(false))
+            .all(&self.0.db)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| PluginDbInfo {
+                plugin: r.plugin_id,
+                name: r.name,
+                updated_at: r.updated_at,
+            })
+            .collect())
+    }
+
+    /// Run a read-only SELECT against the server replica. `limit` is clamped to
+    /// `[1, 5000]` (default 500). Requires the cr-sqlite extension; the
+    /// replica is refreshed from the doc before reading so client writes
+    /// visible in the Y.Doc are reflected.
+    pub async fn query_sql(
+        &self,
+        vault: &str,
+        plugin: &str,
+        name: &str,
+        sql: &str,
+        params: &[JsonValue],
+        limit: Option<usize>,
+    ) -> std::result::Result<QuerySqlResult, crate::error::AppError> {
+        use crate::error::AppError;
+        if !self.ext_available() {
+            return Err(AppError::BadRequest(
+                "cr-sqlite extension unavailable on this server; plugin-db SQL is disabled".into(),
+            ));
+        }
+        if let Err(msg) = lint_sql(sql) {
+            return Err(AppError::BadRequest(msg));
+        }
+        if !is_read_statement(sql) {
+            return Err(AppError::BadRequest(
+                "query endpoint accepts only SELECT or WITH statements; \
+                 statement must start with SELECT or WITH"
+                    .into(),
+            ));
+        }
+        let doc_id = Self::doc_id(vault, plugin, name);
+        let view = self
+            .fetch_doc(&doc_id)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        if view.deleted_at.is_some() {
+            return Err(AppError::BadRequest("database is deleted".into()));
+        }
+        let replica = replica_path(&self.0.config, vault, plugin, name);
+        // Existence: the DB must have been created by a plugin client first
+        // (schema in the doc, or a replica file already materialized).
+        if view.schema.is_empty() && view.batches.is_empty() && !replica.exists() {
+            return Err(AppError::NotFound);
+        }
+        // Refresh the replica so reads see all client writes the doc has.
+        let cursor = self
+            .load_cursor(vault, plugin, name)
+            .await
+            .map_err(|e| AppError::Internal(format!("load cursor: {e:#}")))?;
+        let config = self.0.config.clone();
+        let (vault_s, plugin_s, name_s, schema_s, batches_s) = (
+            vault.to_string(),
+            plugin.to_string(),
+            name.to_string(),
+            view.schema.clone(),
+            view.batches.clone(),
+        );
+        let new_cursor = tokio::task::spawn_blocking(move || {
+            apply_to_replica(
+                &config, &vault_s, &plugin_s, &name_s, &schema_s, &batches_s, cursor,
+            )
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("replica refresh task panicked: {e}")))?
+        .map_err(|e| AppError::Internal(format!("replica refresh: {e:#}")))?;
+        self.store_cursor(vault, plugin, name, &new_cursor)
+            .await
+            .map_err(|e| AppError::Internal(format!("store cursor: {e:#}")))?;
+
+        let limit = limit.unwrap_or(500).clamp(1, 5000);
+        let path = replica_path(&self.0.config, vault, plugin, name);
+        let sql = sql.to_string();
+        let params = params.to_vec();
+        let res =
+            tokio::task::spawn_blocking(move || -> std::result::Result<QuerySqlResult, String> {
+                // Plain SQLite + query_only: SELECT-only guaranteed at theConnection
+                // level too, so a misclassified statement cannot mutate the replica.
+                let conn = Connection::open(&path).map_err(|e| e.to_string())?;
+                conn.busy_timeout(Duration::from_secs(5))
+                    .map_err(|e| e.to_string())?;
+                conn.pragma_update(None, "query_only", true)
+                    .map_err(|e| e.to_string())?;
+                let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+                let columns = stmt
+                    .column_names()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>();
+                let sql_params: Vec<SqlValue> = params.iter().map(json_to_sql).collect();
+                let param_refs: Vec<&SqlValue> = sql_params.iter().collect();
+                let mut rows = stmt
+                    .query(rusqlite::params_from_iter(param_refs))
+                    .map_err(|e| e.to_string())?;
+                let mut out: Vec<Vec<JsonValue>> = Vec::new();
+                let mut truncated = false;
+                let mut count = 0usize;
+                while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                    if count >= limit {
+                        truncated = true;
+                        break;
+                    }
+                    let n = row.as_ref().column_count();
+                    let mut vals = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let v: SqlValue = row.get(i).map_err(|e| e.to_string())?;
+                        vals.push(sql_to_json(&v));
+                    }
+                    out.push(vals);
+                    count += 1;
+                }
+                std::result::Result::Ok(QuerySqlResult {
+                    columns,
+                    rows: out,
+                    truncated,
+                })
+            })
+            .await
+            .map_err(|e| AppError::Internal(format!("query task panicked: {e}")))?;
+        res.map_err(|e| AppError::BadRequest(e))
+    }
+
+    /// Run write statements (INSERT/UPDATE/DELETE/REPLACE) in one transaction
+    /// against the server replica, then publish the resulting cr-sqlite
+    /// changes as a server-authored batch so all clients converge (CRDT
+    /// last-writer-wins). Schema changes are not allowed — the schema is
+    /// owned by plugin `migrate()` on clients.
+    pub async fn execute_sql(
+        &self,
+        vault: &str,
+        plugin: &str,
+        name: &str,
+        statements: &[ExecuteStatement],
+    ) -> std::result::Result<ExecuteSqlResult, crate::error::AppError> {
+        use crate::error::AppError;
+        if !self.ext_available() {
+            return Err(AppError::BadRequest(
+                "cr-sqlite extension unavailable on this server; plugin-db SQL is disabled".into(),
+            ));
+        }
+        if statements.is_empty() {
+            return Err(AppError::BadRequest("statements must not be empty".into()));
+        }
+        if statements.len() > 100 {
+            return Err(AppError::BadRequest(
+                "at most 100 statements per call".into(),
+            ));
+        }
+        for s in statements {
+            if let Err(msg) = lint_sql(&s.sql) {
+                return Err(AppError::BadRequest(msg));
+            }
+            if !is_write_statement(&s.sql) {
+                return Err(AppError::BadRequest(
+                    "execute endpoint accepts only INSERT/UPDATE/DELETE/REPLACE; \
+                     statement must start with one of those keywords"
+                        .into(),
+                ));
+            }
+        }
+
+        // Serialize the whole read-apply-write-publish-cursor sequence against
+        // other server-authored writes to this DB. LWW clocks must be current
+        // before writing, or concurrent client edits would lose to stale
+        // server writes; the locked span covers fetch→refresh→execute→publish.
+        let lock = self.write_lock(vault, plugin, name).await;
+        let _guard = lock.lock().await;
+
+        // Publish order matters: earlier committed-but-unpublished batches
+        // must reach the doc before this write's batch.
+        self.flush_pending_locked(vault, plugin, name)
+            .await
+            .map_err(|e| AppError::Internal(format!("pending publish retry failed: {e:#}")))?;
+
+        let doc_id = Self::doc_id(vault, plugin, name);
+        let view = self
+            .fetch_doc(&doc_id)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        if view.deleted_at.is_some() {
+            return Err(AppError::BadRequest("database is deleted".into()));
+        }
+        let replica = replica_path(&self.0.config, vault, plugin, name);
+        if view.schema.is_empty() && view.batches.is_empty() && !replica.exists() {
+            return Err(AppError::NotFound);
+        }
+
+        // Refresh the replica so the upcoming writes merge on top of the
+        // latest client state (otherwise stale server writes would clobber
+        // concurrent client edits under LWW).
+        let cursor = self
+            .load_cursor(vault, plugin, name)
+            .await
+            .map_err(|e| AppError::Internal(format!("load cursor: {e:#}")))?;
+        let config = self.0.config.clone();
+        let (vault_s, plugin_s, name_s, schema_s, batches_s) = (
+            vault.to_string(),
+            plugin.to_string(),
+            name.to_string(),
+            view.schema.clone(),
+            view.batches.clone(),
+        );
+        let new_cursor = tokio::task::spawn_blocking(move || {
+            apply_to_replica(
+                &config, &vault_s, &plugin_s, &name_s, &schema_s, &batches_s, cursor,
+            )
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("replica refresh task panicked: {e}")))?
+        .map_err(|e| AppError::Internal(format!("replica refresh: {e:#}")))?;
+        self.store_cursor(vault, plugin, name, &new_cursor)
+            .await
+            .map_err(|e| AppError::Internal(format!("store cursor: {e:#}")))?;
+
+        // Execute the batch against the replica (extension loaded), in one
+        // transaction. Returns own-site cr-sqlite change rows past `pre`.
+        let config = self.0.config.clone();
+        let (vault_s, plugin_s, name_s) = (vault.to_string(), plugin.to_string(), name.to_string());
+        let stmts_owned: Vec<(String, Vec<JsonValue>)> = statements
+            .iter()
+            .map(|s| (s.sql.clone(), s.params.clone()))
+            .collect();
+        let exec_res = tokio::task::spawn_blocking(move || {
+            execute_against_replica(&config, &vault_s, &plugin_s, &name_s, &stmts_owned)
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("execute task panicked: {e}")))?
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        let (rows_affected, rows, site_hex, site_b64, post) = exec_res;
+
+        if rows.is_empty() {
+            // All statements were no-ops (no cr-sqlite change rows). The
+            // replica is already current; nothing to publish.
+            return std::result::Result::Ok(ExecuteSqlResult {
+                rows_affected,
+                db_version: post,
+            });
+        }
+
+        // Publish the batch to the Y.Doc log and advance the server cursor.
+        // The replica commit is durable at this point; a publish failure only
+        // delays client visibility. On failure the batch is queued in
+        // `pending_publishes` and retried by the replication debounce (armed
+        // via `mark_write` by the caller) and by the next server-authored
+        // write — so the call still succeeds, and clients converge once a
+        // retry lands.
+        if let Err(e) = self
+            .publish_own_batch(
+                vault,
+                plugin,
+                name,
+                rows.clone(),
+                site_hex.clone(),
+                site_b64.clone(),
+                post,
+            )
+            .await
+        {
+            tracing::error!(
+                "execute_sql publish failed for {plugin}/{name} (vault {vault}) \
+                 after replica commit: {e:#}; queued for retry"
+            );
+            let key = Self::key(vault, plugin, name);
+            let mut map = self.0.pending_publishes.lock().await;
+            map.entry(key).or_default().push(PendingPublish {
+                rows,
+                site_hex,
+                site_b64,
+                post,
+            });
+        }
+        std::result::Result::Ok(ExecuteSqlResult {
+            rows_affected,
+            db_version: post,
+        })
+    }
 }
 
 /// Parse a `{vault}__plugindb__{plugin}__{name}` doc id. Unambiguous because
@@ -790,6 +1300,10 @@ pub fn decode_doc(update: &[u8]) -> Result<DocView> {
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
     let deleted_at = meta_json.get("deletedAt").and_then(json_i64);
+    let schema_version = meta_json
+        .get("schemaVersion")
+        .and_then(json_i64)
+        .unwrap_or(0);
     let compacted_through: HashMap<String, i64> = meta_json
         .get("compactedThrough")
         .map(json_i64_map)
@@ -811,6 +1325,7 @@ pub fn decode_doc(update: &[u8]) -> Result<DocView> {
     Ok(DocView {
         batches,
         schema,
+        schema_version,
         deleted_at,
         cursors,
         cursors_at,
@@ -1013,6 +1528,76 @@ fn apply_dump_rollback(
     }
     let _ = conn.query_row("SELECT crsql_finalize()", [], |_| Ok(()));
     Ok((rows, site_hex, site_b64, post))
+}
+/// Execute a batch of write statements against the replica in one transaction,
+/// returning `(rows_affected, own_site_change_rows, site_hex, site_b64, post_db_version)`.
+///
+/// The extension is loaded via `open_replica`. `rusqlite`'s `execute` rejects
+/// statements that return rows (e.g. `INSERT … RETURNING`) and any SQL with
+/// trailing content after the first statement (`Error::MultipleStatement`), so
+/// the caller's `is_write_statement` / `lint_sql` guards plus this keep the
+/// replica schema-owned and single-statement-per-row.
+fn execute_against_replica(
+    config: &Config,
+    vault: &str,
+    plugin: &str,
+    name: &str,
+    statements: &[(String, Vec<JsonValue>)],
+) -> Result<(u64, Vec<ChangeRow>, String, String, i64)> {
+    let path = replica_path(config, vault, plugin, name);
+    if !path.exists() {
+        return Err(anyhow!("no server replica for this database"));
+    }
+    let (mut conn, _is_new) = open_replica(config, &path)?;
+    let pre: i64 = conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
+    let site_bytes: Vec<u8> = conn.query_row("SELECT crsql_site_id()", [], |row| row.get(0))?;
+    let site_hex = bytes_to_hex(&site_bytes);
+    let site_b64 = bytes_to_b64(&site_bytes);
+
+    let mut rows_affected: u64 = 0;
+    let tx = conn.transaction()?;
+    {
+        for (sql, params) in statements {
+            let sql_params: Vec<SqlValue> = params.iter().map(json_to_sql).collect();
+            let param_refs: Vec<&SqlValue> = sql_params.iter().collect();
+            rows_affected += tx.execute(sql, rusqlite::params_from_iter(param_refs))? as u64;
+        }
+    }
+    tx.commit()?;
+
+    let post: i64 = conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
+
+    // Collect this site's own changes past `pre` (same readback as rollback).
+    let mut rows = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq \
+             FROM crsql_changes \
+             WHERE db_version > ?1 AND site_id = crsql_site_id() \
+             ORDER BY db_version, seq",
+        )?;
+        let mapped = stmt.query_map([pre], |row| {
+            let pk: Vec<u8> = row.get(1)?;
+            let val: SqlValue = row.get(3)?;
+            let site: Vec<u8> = row.get(6)?;
+            Ok(ChangeRow {
+                table: row.get(0)?,
+                pk: bytes_to_b64(&pk),
+                cid: row.get(2)?,
+                val: sql_to_json(&val),
+                col_version: row.get(4)?,
+                db_version: row.get(5)?,
+                site_id: bytes_to_b64(&site),
+                cl: row.get(7)?,
+                seq: row.get(8)?,
+            })
+        })?;
+        for r in mapped {
+            rows.push(r?);
+        }
+    }
+    let _ = conn.query_row("SELECT crsql_finalize()", [], |_| Ok(()));
+    Ok((rows_affected, rows, site_hex, site_b64, post))
 }
 
 /// Table column metadata: `(all_columns, pk_columns)` in declared order.
@@ -1524,6 +2109,138 @@ fn json_to_sql(v: &JsonValue) -> SqlValue {
     }
 }
 
+// ---------- SQL classification guards ----------
+
+/// Reject SQL touching cr-sqlite/SQLite internals. Mirrors the client lint
+/// (`src/pluginDb/SyncedPluginDatabase.ts`). Token-aware: single-quoted string
+/// literals and comments are ignored (so `WHERE t = 'my_sqlite_note'` is
+/// fine), while bare identifiers and quoted identifiers (`"…"`, `` `…` ``,
+/// `[…]`) starting with `crsql_` or `sqlite_` are rejected — those tables and
+/// functions are owned by the engine or the replication layer, and writes into
+/// them would corrupt sync.
+fn lint_sql(sql: &str) -> std::result::Result<(), String> {
+    for ident in sql_identifiers(sql) {
+        let lower = ident.to_ascii_lowercase();
+        if lower.starts_with("crsql_") {
+            return Err(format!(
+                "SQL references cr-sqlite internals ({ident}); those are managed by replication"
+            ));
+        }
+        if lower.starts_with("sqlite_") {
+            return Err(format!(
+                "SQL references SQLite internals ({ident}); those are not accessible from here"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Extract every identifier-like token from `sql`, skipping single-quoted
+/// string literals, `--` line comments, and `/* … */` block comments. Both
+/// bare identifiers (`[A-Za-z_][A-Za-z0-9_$]*`) and quoted identifiers
+/// (`"…"`, `` `…` ``, `[…]` — SQLite treats all three as identifiers) are
+/// yielded; doubled closing quotes inside quoted forms are handled.
+fn sql_identifiers(sql: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let b: Vec<char> = sql.chars().collect();
+    let n = b.len();
+    let mut i = 0;
+    while i < n {
+        let c = b[i];
+        match c {
+            // -- line comment
+            '-' if i + 1 < n && b[i + 1] == '-' => {
+                while i < n && b[i] != '\n' {
+                    i += 1;
+                }
+            }
+            // /* block comment */
+            '/' if i + 1 < n && b[i + 1] == '*' => {
+                i += 2;
+                while i + 1 < n && !(b[i] == '*' && b[i + 1] == '/') {
+                    i += 1;
+                }
+                i = (i + 2).min(n);
+            }
+            // 'string literal' with '' escapes — skipped entirely
+            '\'' => {
+                i += 1;
+                while i < n {
+                    if b[i] == '\'' {
+                        if i + 1 < n && b[i + 1] == '\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            // quoted identifiers: "…" / `…` (doubled-quote escape), […]
+            '"' | '`' | '[' => {
+                let close = if c == '[' { ']' } else { c };
+                i += 1;
+                let mut ident = String::new();
+                while i < n {
+                    if b[i] == close {
+                        if close != ']' && i + 1 < n && b[i + 1] == close {
+                            ident.push(close);
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    ident.push(b[i]);
+                    i += 1;
+                }
+                out.push(ident);
+            }
+            // bare identifier
+            _ if c.is_ascii_alphabetic() || c == '_' => {
+                let start = i;
+                while i < n && (b[i].is_ascii_alphanumeric() || b[i] == '_' || b[i] == '$') {
+                    i += 1;
+                }
+                out.push(b[start..i].iter().collect());
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// The first keyword (leading ASCII-alphabetic run) of `sql`, upper-cased.
+/// Leading whitespace is skipped; a leading comment is *not* stripped (a
+/// statement starting with `--` or `/*` yields `None`, which every caller
+/// rejects via the read/write keyword check). Keyword sniffing can't safely
+/// classify writable CTEs, so `WITH` is accepted for reads only.
+fn first_keyword(sql: &str) -> Option<String> {
+    let s = sql.trim_start();
+    let bytes = s.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let kw: String = s.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+    Some(kw.to_ascii_uppercase())
+}
+
+/// First keyword must be SELECT or WITH.
+fn is_read_statement(sql: &str) -> bool {
+    matches!(first_keyword(sql).as_deref(), Some("SELECT") | Some("WITH"))
+}
+
+/// First keyword must be INSERT, UPDATE, DELETE, or REPLACE. (DDL, PRAGMA,
+/// ATTACH, BEGIN/COMMIT, VACUUM etc. are all rejected — the schema is owned by
+/// plugin migrations on the client; WITH is excluded from writes deliberately:
+/// writable CTEs are rare and keyword-sniffing WITH is ambiguous.)
+fn is_write_statement(sql: &str) -> bool {
+    matches!(
+        first_keyword(sql).as_deref(),
+        Some("INSERT") | Some("UPDATE") | Some("DELETE") | Some("REPLACE")
+    )
+}
 // ---------- HTTP routes ----------
 
 pub mod routes {
@@ -1535,8 +2252,9 @@ pub mod routes {
 
     use crate::error::{AppError, AppResult};
     use crate::routes::{authorize_path, require_member};
-    use crate::session::AuthUser;
+    use crate::session::{now_millis, ApiPrincipal};
     use crate::state::AppState;
+    use crate::ysweet::Level;
 
     /// `[A-Za-z0-9_-]{1,80}` without `__` — must match the client validation
     /// (`__` is the doc-id separator and would make ids ambiguous to parse).
@@ -1558,14 +2276,106 @@ pub mod routes {
         pub since: Option<String>,
     }
 
+    /// Shared guard: validate ids, pin the cursor principal to this vault,
+    /// require membership, and check the path ACL. `need_full` rejects a
+    /// read-only ACL level for mutating endpoints. Returns the git principal
+    /// for attribution (1-day TTL, matching the old `AuthUser` guard).
+    pub(crate) async fn guard_principal(
+        state: &AppState,
+        principal: &ApiPrincipal,
+        vault_id: &str,
+        plugin: &str,
+        name: &str,
+        need_full: bool,
+    ) -> AppResult<crate::state::Principal> {
+        if !valid_id(plugin) || !valid_id(name) {
+            return Err(AppError::BadRequest("invalid plugin db id".into()));
+        }
+        principal.require_vault(vault_id)?;
+        require_member(state, &principal.user.id, vault_id).await?;
+        let level =
+            authorize_path(state, &principal.user, vault_id, &pseudo_path(plugin, name)).await?;
+        if need_full && level == Level::ReadOnly {
+            return Err(AppError::Forbidden);
+        }
+        Ok(principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000))
+    }
+
+    // ---------- shared inner fns (REST + MCP) ----------
+
+    pub(crate) async fn list_inner(
+        state: &AppState,
+        principal: &ApiPrincipal,
+        vault_id: &str,
+    ) -> AppResult<Vec<PluginDbInfo>> {
+        principal.require_vault(vault_id)?;
+        require_member(state, &principal.user.id, vault_id).await?;
+        let dbs = state
+            .plugindb
+            .list_dbs(vault_id)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        // Apply the same per-DB path ACL as query/execute: databases the
+        // caller is denied on are omitted (not even their names leak).
+        let mut visible = Vec::with_capacity(dbs.len());
+        for db in dbs {
+            let path = pseudo_path(&db.plugin, &db.name);
+            if authorize_path(state, &principal.user, vault_id, &path)
+                .await
+                .is_ok()
+            {
+                visible.push(db);
+            }
+        }
+        Ok(visible)
+    }
+
+    pub(crate) async fn query_inner(
+        state: &AppState,
+        principal: &ApiPrincipal,
+        vault_id: &str,
+        plugin: &str,
+        name: &str,
+        sql: &str,
+        params: &[JsonValue],
+        limit: Option<usize>,
+    ) -> AppResult<QuerySqlResult> {
+        guard_principal(state, principal, vault_id, plugin, name, false).await?;
+        state
+            .plugindb
+            .query_sql(vault_id, plugin, name, sql, params, limit)
+            .await
+    }
+
+    pub(crate) async fn execute_inner(
+        state: &AppState,
+        principal: &ApiPrincipal,
+        vault_id: &str,
+        plugin: &str,
+        name: &str,
+        statements: &[ExecuteStatement],
+    ) -> AppResult<ExecuteSqlResult> {
+        let git_principal = guard_principal(state, principal, vault_id, plugin, name, true).await?;
+        let res = state
+            .plugindb
+            .execute_sql(vault_id, plugin, name, statements)
+            .await?;
+        // Attribute the write in git (same pair as touch).
+        state.plugindb.mark_write(vault_id, plugin, name).await;
+        state.git.mark_write(vault_id, &git_principal).await;
+        Ok(res)
+    }
+
+    // ---------- REST handlers ----------
+
     /// `GET /api/vaults/{id}/plugin-dbs/{plugin}/{name}/changes?since=…`
     pub async fn get_changes(
         State(state): State<AppState>,
-        AuthUser(user): AuthUser,
+        principal: ApiPrincipal,
         Path((vault_id, plugin, name)): Path<(String, String, String)>,
         Query(q): Query<ChangesQuery>,
     ) -> AppResult<Json<Value>> {
-        guard(&state, &user, &vault_id, &plugin, &name).await?;
+        guard_principal(&state, &principal, &vault_id, &plugin, &name, false).await?;
         let since: Cursor = q
             .since
             .as_deref()
@@ -1582,55 +2392,106 @@ pub mod routes {
     /// `POST /api/vaults/{id}/plugin-dbs/{plugin}/{name}/touch`
     pub async fn touch(
         State(state): State<AppState>,
-        AuthUser(user): AuthUser,
+        principal: ApiPrincipal,
         Path((vault_id, plugin, name)): Path<(String, String, String)>,
     ) -> AppResult<Json<Value>> {
-        let principal = guard(&state, &user, &vault_id, &plugin, &name).await?;
+        let git_principal =
+            guard_principal(&state, &principal, &vault_id, &plugin, &name, true).await?;
         // Replicate the DB changes, and produce a user-attributed git commit.
         state.plugindb.mark_write(&vault_id, &plugin, &name).await;
-        state.git.mark_write(&vault_id, &principal).await;
+        state.git.mark_write(&vault_id, &git_principal).await;
         Ok(Json(serde_json::json!({ "ok": true })))
     }
 
     /// `DELETE /api/vaults/{id}/plugin-dbs/{plugin}/{name}` — purge (irreversible).
     pub async fn delete_plugin_db(
         State(state): State<AppState>,
-        AuthUser(user): AuthUser,
+        principal: ApiPrincipal,
         Path((vault_id, plugin, name)): Path<(String, String, String)>,
     ) -> AppResult<Json<Value>> {
-        let principal = guard(&state, &user, &vault_id, &plugin, &name).await?;
+        let git_principal =
+            guard_principal(&state, &principal, &vault_id, &plugin, &name, true).await?;
         state
             .plugindb
             .purge(&vault_id, &plugin, &name)
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
         // A clean "database deleted" commit reflects the removed dump.
-        state.git.mark_write(&vault_id, &principal).await;
+        state.git.mark_write(&vault_id, &git_principal).await;
         Ok(Json(serde_json::json!({ "deleted": true })))
     }
 
-    /// Shared guard: validate ids, require membership, and check the path ACL.
-    async fn guard(
-        state: &AppState,
-        user: &crate::entities::users::Model,
-        vault_id: &str,
-        plugin: &str,
-        name: &str,
-    ) -> AppResult<crate::state::Principal> {
-        if !valid_id(plugin) || !valid_id(name) {
-            return Err(AppError::BadRequest("invalid plugin db id".into()));
-        }
-        require_member(state, &user.id, vault_id).await?;
-        // ACL on the pseudo-path: a `deny` rule errors out (Forbidden).
-        let _level = authorize_path(state, user, vault_id, &pseudo_path(plugin, name)).await?;
-        Ok(crate::state::Principal {
-            user_id: user.id.clone(),
-            display_name: user.display_name.clone(),
-            email: user.email.clone(),
-            git_email: user.git_email.clone(),
-            actor: crate::state::PrincipalActor::User,
-            expires_at_ms: now_millis() + 24 * 60 * 60 * 1000,
-        })
+    // ---------- new SQL endpoints ----------
+
+    #[derive(Deserialize)]
+    pub struct QueryBody {
+        pub sql: String,
+        #[serde(default)]
+        pub params: Vec<JsonValue>,
+        pub limit: Option<usize>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ExecuteStatementBody {
+        pub sql: String,
+        #[serde(default)]
+        pub params: Vec<JsonValue>,
+    }
+
+    #[derive(Deserialize)]
+    pub struct ExecuteBody {
+        pub statements: Vec<ExecuteStatementBody>,
+    }
+
+    /// `GET /api/vaults/{id}/plugin-dbs` — list databases the server replicates.
+    pub async fn list_plugin_dbs(
+        State(state): State<AppState>,
+        principal: ApiPrincipal,
+        Path(vault_id): Path<String>,
+    ) -> AppResult<Json<Value>> {
+        let dbs = list_inner(&state, &principal, &vault_id).await?;
+        Ok(Json(serde_json::json!({ "databases": dbs })))
+    }
+
+    /// `POST /api/vaults/{id}/plugin-dbs/{plugin}/{name}/query` — read-only SELECT.
+    pub async fn query_plugin_db(
+        State(state): State<AppState>,
+        principal: ApiPrincipal,
+        Path((vault_id, plugin, name)): Path<(String, String, String)>,
+        Json(body): Json<QueryBody>,
+    ) -> AppResult<Json<QuerySqlResult>> {
+        let res = query_inner(
+            &state,
+            &principal,
+            &vault_id,
+            &plugin,
+            &name,
+            &body.sql,
+            &body.params,
+            body.limit,
+        )
+        .await?;
+        Ok(Json(res))
+    }
+
+    /// `POST /api/vaults/{id}/plugin-dbs/{plugin}/{name}/execute` — write batch.
+    pub async fn execute_plugin_db(
+        State(state): State<AppState>,
+        principal: ApiPrincipal,
+        Path((vault_id, plugin, name)): Path<(String, String, String)>,
+        Json(body): Json<ExecuteBody>,
+    ) -> AppResult<Json<ExecuteSqlResult>> {
+        let statements: Vec<ExecuteStatement> = body
+            .statements
+            .into_iter()
+            .map(|s| ExecuteStatement {
+                sql: s.sql,
+                params: s.params,
+            })
+            .collect();
+        let res = execute_inner(&state, &principal, &vault_id, &plugin, &name, &statements).await?;
+        Ok(Json(res))
     }
 }
 
@@ -1823,5 +2684,69 @@ mod tests {
         }
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].db_version, 3);
+    }
+    #[test]
+    fn lint_sql_rejects_crsql_and_sqlite_internals() {
+        assert!(lint_sql("SELECT crsql_site_id()").is_err());
+        assert!(lint_sql("SELECT * FROM sqlite_master").is_err());
+        assert!(lint_sql("select CrsQL_db_version()").is_err());
+        assert!(lint_sql("select SQLite_master").is_err());
+        assert!(lint_sql("INSERT INTO tasks VALUES (1)").is_ok());
+        assert!(lint_sql("  select 1").is_ok());
+    }
+
+    #[test]
+    fn lint_sql_is_token_aware() {
+        // Internals inside string literals are data, not references.
+        assert!(lint_sql("SELECT * FROM tasks WHERE title = 'my_sqlite_notes'").is_ok());
+        assert!(lint_sql("INSERT INTO tasks VALUES ('crsql_changes')").is_ok());
+        assert!(lint_sql("SELECT 'sqlite_master' AS label").is_ok());
+        // Escaped quote inside a literal doesn't end the literal early.
+        assert!(lint_sql("SELECT * FROM t WHERE a = 'it''s sqlite_master'").is_ok());
+        // Comments are skipped.
+        assert!(lint_sql("SELECT 1 -- sqlite_master\n").is_ok());
+        assert!(lint_sql("SELECT /* crsql_changes */ 1").is_ok());
+        // Quoted identifiers are identifiers, not strings — still rejected.
+        assert!(lint_sql("SELECT * FROM \"sqlite_master\"").is_err());
+        assert!(lint_sql("SELECT * FROM `crsql_changes`").is_err());
+        assert!(lint_sql("SELECT * FROM [sqlite_master]").is_err());
+        // Only identifiers *starting with* the reserved prefixes match.
+        assert!(lint_sql("SELECT my_sqlite_col FROM tasks").is_ok());
+        assert!(lint_sql("SELECT not_crsql_thing FROM tasks").is_ok());
+    }
+
+    #[test]
+    fn is_read_statement_accepts_select_and_with() {
+        assert!(is_read_statement("SELECT 1"));
+        assert!(is_read_statement("  with t as (select 1) select * from t"));
+        assert!(is_read_statement("select * from tasks"));
+        assert!(!is_read_statement("INSERT INTO tasks VALUES (1)"));
+        assert!(!is_read_statement("CREATE TABLE x (id)"));
+        assert!(!is_read_statement("-- comment\nSELECT 1"));
+        assert!(!is_read_statement(""));
+        assert!(!is_read_statement("   "));
+    }
+
+    #[test]
+    fn is_write_statement_accepts_mutating_keywords_only() {
+        assert!(is_write_statement("INSERT INTO tasks VALUES (1)"));
+        assert!(is_write_statement("  update tasks set title='x'"));
+        assert!(is_write_statement("DELETE FROM tasks"));
+        assert!(is_write_statement("replace INTO tasks VALUES (1)"));
+        // WITH is rejected for writes: writable CTEs are rare and sniffing WITH
+        // as a write keyword would be ambiguous.
+        assert!(!is_write_statement(
+            "WITH t AS (SELECT 1) INSERT INTO tasks SELECT * FROM t"
+        ));
+        assert!(!is_write_statement("SELECT 1"));
+        assert!(!is_write_statement("CREATE TABLE x (id)"));
+        assert!(!is_write_statement("PRAGMA query_only = ON"));
+        assert!(!is_write_statement("BEGIN"));
+        assert!(!is_write_statement("ATTACH 'x.db' AS other"));
+        assert!(!is_write_statement("VACUUM"));
+        assert!(!is_write_statement(""));
+        assert!(!is_write_statement(
+            "-- comment\nINSERT INTO tasks VALUES (1)"
+        ));
     }
 }

@@ -412,6 +412,18 @@ pub fn app(state: AppState) -> Router {
             "/api/vaults/{id}/plugin-dbs/{plugin}/{name}",
             delete(plugindb::routes::delete_plugin_db),
         )
+        .route(
+            "/api/vaults/{id}/plugin-dbs",
+            get(plugindb::routes::list_plugin_dbs),
+        )
+        .route(
+            "/api/vaults/{id}/plugin-dbs/{plugin}/{name}/query",
+            post(plugindb::routes::query_plugin_db),
+        )
+        .route(
+            "/api/vaults/{id}/plugin-dbs/{plugin}/{name}/execute",
+            post(plugindb::routes::execute_plugin_db),
+        )
         // Reverse-proxy the bundled y-sweet so clients need only this server's URL.
         .route("/d/{*rest}", any(proxy::proxy))
         // Single-socket multiplexing: one client socket fans out to per-doc
