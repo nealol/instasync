@@ -1802,13 +1802,24 @@ fn open_replica(config: &Config, path: &Path) -> Result<(Connection, bool)> {
     Ok((conn, is_new))
 }
 
-/// Apply the published schema DDL to a replica, skipping statements whose
-/// target table already exists. This makes the operation idempotent: a new
-/// replica gets the full schema, and an existing replica picks up only tables
-/// added by a subsequent client migration. The DDL from the client is
-/// `CREATE TABLE name …` plus `SELECT crsql_as_crr('name')` per CRR table
-/// (see `collectSchema` in `src/pluginDb/snapshot.ts`); neither uses
-/// `IF NOT EXISTS`, so a naive re-run would fail with "table already exists".
+/// Apply the published schema DDL to a replica idempotently. A new replica
+/// gets the full schema; an existing replica picks up tables added by a
+/// subsequent client migration *and* columns added to tables it already has.
+/// The DDL from the client is `CREATE TABLE name …` plus
+/// `SELECT crsql_as_crr('name')` per CRR table (see `collectSchema` in
+/// `src/pluginDb/snapshot.ts`); neither uses `IF NOT EXISTS`, so a naive re-run
+/// would fail with "table already exists".
+///
+/// A client `ALTER TABLE … ADD COLUMN` migration republishes the full, mutated
+/// `CREATE TABLE` (SQLite rewrites `sqlite_master` to inline the new column).
+/// Skipping that statement wholesale — as this did previously — left the
+/// column off the replica forever: the base table kept its old shape, cr-sqlite
+/// silently dropped incoming `crsql_changes` rows for the unknown column, and
+/// the git dump never changed. So for an existing table we now diff its columns
+/// against the published `CREATE TABLE` and `ALTER TABLE … ADD COLUMN` the
+/// difference, wrapping CRR tables in `crsql_begin_alter`/`crsql_commit_alter`
+/// so cr-sqlite rebuilds the clock/triggers for the new column. The diff runs
+/// on every replicate, so replicas already stuck without the column self-heal.
 fn apply_schema_idempotent(conn: &Connection, schema: &[String]) -> Result<()> {
     // Collect existing table names once (base tables + crsql sidecars).
     let existing: std::collections::HashSet<String> = {
@@ -1822,8 +1833,11 @@ fn apply_schema_idempotent(conn: &Connection, schema: &[String]) -> Result<()> {
     };
     for stmt in schema {
         if let Some(table) = create_table_target(stmt) {
-            // Skip CREATE TABLE for a base table that already exists.
+            // Table exists: reconcile any columns a client migration added
+            // rather than skipping the (now-mutated) CREATE TABLE wholesale.
             if existing.contains(&table) {
+                let is_crr = existing.contains(&format!("{table}__crsql_clock"));
+                reconcile_added_columns(conn, &table, stmt, is_crr)?;
                 continue;
             }
         }
@@ -1837,6 +1851,146 @@ fn apply_schema_idempotent(conn: &Connection, schema: &[String]) -> Result<()> {
             .with_context(|| format!("apply schema stmt: {stmt}"))?;
     }
     Ok(())
+}
+
+/// `ALTER TABLE … ADD COLUMN` for every column present in the published
+/// `create_stmt` but missing from the replica's `table`. CRR tables are wrapped
+/// in `crsql_begin_alter`/`crsql_commit_alter` so cr-sqlite rebuilds its clock
+/// and triggers for the new column(s). A no-op when the columns already match.
+fn reconcile_added_columns(
+    conn: &Connection,
+    table: &str,
+    create_stmt: &str,
+    is_crr: bool,
+) -> Result<()> {
+    let (current, _pk) = table_columns(conn, table)?;
+    let have: std::collections::HashSet<String> =
+        current.iter().map(|c| c.to_ascii_lowercase()).collect();
+    let missing: Vec<(String, String)> = parse_create_table_columns(create_stmt)
+        .into_iter()
+        .filter(|(name, _)| !have.contains(&name.to_ascii_lowercase()))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    if is_crr {
+        conn.execute_batch(&format!("SELECT crsql_begin_alter('{table}')"))
+            .with_context(|| format!("crsql_begin_alter({table})"))?;
+    }
+    for (name, def) in &missing {
+        conn.execute_batch(&format!("ALTER TABLE \"{table}\" ADD COLUMN {def}"))
+            .with_context(|| format!("add column {name} to {table}"))?;
+    }
+    if is_crr {
+        conn.execute_batch(&format!("SELECT crsql_commit_alter('{table}')"))
+            .with_context(|| format!("crsql_commit_alter({table})"))?;
+    }
+    Ok(())
+}
+
+/// Parse `(column_name, full_definition)` for each column in a
+/// `CREATE TABLE … (…)` statement, in declared order. Table-level constraints
+/// (`PRIMARY KEY`, `FOREIGN KEY`, `UNIQUE`, `CHECK`, `CONSTRAINT …`) are
+/// skipped. The full definition is returned verbatim so it can be reused as the
+/// tail of an `ALTER TABLE … ADD COLUMN` statement.
+fn parse_create_table_columns(stmt: &str) -> Vec<(String, String)> {
+    // Locate the body between the first `(` and its matching `)`, tracking
+    // nesting and string/identifier quoting so commas inside are ignored.
+    let chars: Vec<char> = stmt.chars().collect();
+    let Some(open) = chars.iter().position(|&c| c == '(') else {
+        return Vec::new();
+    };
+    let mut items: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    let mut i = open;
+    // Quote state: single-quote string, or one of the identifier quotes.
+    let mut squote = false;
+    let mut dquote = false;
+    let mut bquote = false;
+    let mut bracket = false;
+    while i < chars.len() {
+        let c = chars[i];
+        let quoted = squote || dquote || bquote || bracket;
+        if quoted {
+            cur.push(c);
+            if squote && c == '\'' {
+                squote = false;
+            } else if dquote && c == '"' {
+                dquote = false;
+            } else if bquote && c == '`' {
+                bquote = false;
+            } else if bracket && c == ']' {
+                bracket = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' => {
+                squote = true;
+                cur.push(c);
+            }
+            '"' => {
+                dquote = true;
+                cur.push(c);
+            }
+            '`' => {
+                bquote = true;
+                cur.push(c);
+            }
+            '[' => {
+                bracket = true;
+                cur.push(c);
+            }
+            '(' => {
+                depth += 1;
+                // The outermost `(` opens the body itself; don't record it.
+                if depth > 1 {
+                    cur.push(c);
+                }
+            }
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    // End of the body.
+                    if !cur.trim().is_empty() {
+                        items.push(cur.trim().to_string());
+                    }
+                    break;
+                }
+                cur.push(c);
+            }
+            ',' if depth == 1 => {
+                if !cur.trim().is_empty() {
+                    items.push(cur.trim().to_string());
+                }
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+        i += 1;
+    }
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    for item in items {
+        let first = item.trim_start();
+        let keyword = first
+            .split(|c: char| c.is_whitespace() || c == '(')
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        if matches!(
+            keyword.as_str(),
+            "CONSTRAINT" | "PRIMARY" | "FOREIGN" | "UNIQUE" | "CHECK"
+        ) {
+            continue;
+        }
+        if let Some(name) = parse_quoted_identifier(first) {
+            out.push((name, item));
+        }
+    }
+    out
 }
 
 /// Extract the table name from a `CREATE TABLE [name] …` statement (handling
@@ -2837,6 +2991,87 @@ mod tests {
         assert!(
             dump.contains("INSERT INTO \"notes\""),
             "dump should contain the notes row"
+        );
+    }
+
+    #[test]
+    fn parse_create_table_columns_extracts_columns_skips_constraints() {
+        let cols = parse_create_table_columns(
+            "CREATE TABLE tasks (id PRIMARY KEY NOT NULL, title TEXT, \
+             done INTEGER DEFAULT 0, PRIMARY KEY (id), \
+             CONSTRAINT fk FOREIGN KEY (id) REFERENCES other(id))",
+        );
+        let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["id", "title", "done"]);
+        // The full definition is preserved for reuse as an ADD COLUMN tail.
+        assert_eq!(cols[2].1, "done INTEGER DEFAULT 0");
+    }
+
+    #[test]
+    fn apply_to_replica_picks_up_added_column_from_migration() {
+        let Some(config) = ext_config() else {
+            eprintln!("skipping migration test: CRSQLITE_EXT_PATH not set");
+            return;
+        };
+        let path = replica_path(&config, "vcol", "p", "n");
+        // Seed a replica whose `tasks` table has no `done` column yet
+        // (simulating a replicate from before the client's ADD COLUMN migration).
+        {
+            let (conn, _new) = open_replica(&config, &path).unwrap();
+            conn.execute_batch("CREATE TABLE tasks (id PRIMARY KEY NOT NULL, title)")
+                .unwrap();
+            conn.execute_batch("SELECT crsql_as_crr('tasks')").unwrap();
+            conn.execute("INSERT INTO tasks (id, title) VALUES ('a', 'x')", [])
+                .unwrap();
+            conn.execute("SELECT crsql_finalize()", []).ok();
+        }
+        // The client migrated `tasks` to add `done`. The republished schema
+        // inlines the new column into the CREATE TABLE, and a batch carries a
+        // change for `done`. Before the fix the column was never added, the
+        // change row was silently dropped, and the dump never mentioned `done`.
+        let schema = vec![
+            "CREATE TABLE tasks (id PRIMARY KEY NOT NULL, title, done INTEGER DEFAULT 0)"
+                .to_string(),
+            "SELECT crsql_as_crr('tasks')".to_string(),
+        ];
+        let batch = Batch {
+            id: "b1".into(),
+            site_id: "AQ==".into(),
+            from_db_version: 0,
+            to_db_version: 1,
+            schema_version: 2,
+            changes: vec![ChangeRow {
+                table: "tasks".into(),
+                pk: "AQ==".into(),
+                cid: "done".into(),
+                val: JsonValue::Number(1.into()),
+                col_version: 1,
+                db_version: 1,
+                site_id: "AQ==".into(),
+                cl: 1,
+                seq: 0,
+            }],
+            format: crate::caps::PLUGIN_DB_SYNC.into(),
+        };
+        let new_cursor =
+            apply_to_replica(&config, "vcol", "p", "n", &schema, &[batch], HashMap::new())
+                .expect("replicate with added column must succeed");
+        assert!(new_cursor.contains_key("AQ=="));
+
+        // The replica's `tasks` table now has the `done` column...
+        let (conn, _new) = open_replica(&config, &path).unwrap();
+        let (cols, _pk) = table_columns(&conn, "tasks").unwrap();
+        assert!(
+            cols.iter().any(|c| c == "done"),
+            "replica table must gain the added column, got {cols:?}"
+        );
+        // ...and the change row for it applied (idempotent re-apply is a no-op).
+        apply_to_replica(&config, "vcol", "p", "n", &schema, &[], HashMap::new())
+            .expect("re-applying an unchanged schema must be a no-op");
+        let dump = dump_replica(&config, "vcol", "p", "n").unwrap().unwrap();
+        assert!(
+            dump.contains("done"),
+            "dump should include the added column, got:\n{dump}"
         );
     }
 
