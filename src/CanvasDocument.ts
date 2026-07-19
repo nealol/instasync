@@ -10,9 +10,14 @@ import {
   type StructuredCanvas,
 } from "./structured/canvas";
 import type { JsonValue } from "./structured/reconcile";
-import { applyCanvasOperations, type CanvasOperation } from "./structured/canvasOperations";
+import {
+  applyCanvasOperations,
+  canonicalizeCanvasOrders,
+  type CanvasOperation,
+} from "./structured/canvasOperations";
 
 const EMPTY_CANVAS: StructuredCanvas = { nodes: {}, edges: {}, nodeOrder: [], edgeOrder: [] };
+const CANVAS_ORDER_ORIGIN = Symbol("realtime-canvas-order-canonicalization");
 
 export class CanvasDocument extends StructuredDocument {
   private binding: CanvasBinding;
@@ -73,6 +78,7 @@ export class CanvasDocument extends StructuredDocument {
 
   protected async finishStartupReconcile(): Promise<void> {
     await super.finishStartupReconcile();
+    this.canonicalizeOrders();
     this.binding.applyRemote();
   }
 
@@ -95,12 +101,21 @@ export class CanvasDocument extends StructuredDocument {
   }
 
   protected onRootChanged(origin?: unknown): void {
+    if (origin !== CANVAS_ORDER_ORIGIN && this.canonicalizeOrders()) return;
     super.onRootChanged(origin);
     // Don't bounce our own just-captured canvas edit back into the live view —
     // that would re-import mid-drag and disrupt the selection. Remote edits
     // (and disk folds) carry a different origin and do get applied.
     if (origin === CANVAS_LOCAL_ORIGIN) return;
     this.binding.scheduleRemote();
+  }
+
+  private canonicalizeOrders(): boolean {
+    let changed = false;
+    this.ydoc.transact(() => {
+      changed = canonicalizeCanvasOrders(this.root);
+    }, CANVAS_ORDER_ORIGIN);
+    return changed;
   }
 
   protected destroySubclass(): void {

@@ -4,6 +4,7 @@ import { applyTextToYText } from "../diff";
 export interface TextEditorAdapter {
   getText(): string;
   applyText(text: string): void;
+  hasLocalChanges?(): boolean;
   onChange(listener: () => void): () => void;
 }
 
@@ -31,6 +32,11 @@ export class YTextEditorBinding {
     this.yObserver = () => this.pullFromShared();
     ytext.observe(this.yObserver);
     this.removeEditorListener = editor.onChange(() => this.pushFromEditor());
+    if (readiness.isReady()) {
+      this.ready = true;
+      this.reconcileOnAttach();
+      return;
+    }
     void readiness.whenReady().then(() => {
       if (this.destroyed) return;
       this.ready = true;
@@ -42,7 +48,7 @@ export class YTextEditorBinding {
     const shared = this.ytext.toString();
     const current = this.editor.getText();
     if (shared === current) return;
-    if (current !== this.editorAtBind && this.mayPush()) {
+    if ((current !== this.editorAtBind || this.editor.hasLocalChanges?.()) && this.mayPush()) {
       this.writeShared(current);
     } else if (shared.length > 0) {
       this.editor.applyText(shared);

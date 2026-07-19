@@ -389,6 +389,26 @@ export class SyncedPluginDatabase {
     return db.execO<T & {}>(sql, bind as never[]);
   }
 
+  /**
+   * Execute SQL from Realtime's local debugging UI.
+   *
+   * Unlike the public plugin API, this intentionally permits SQLite and
+   * cr-sqlite internal tables. Keep it off the public handle: malformed writes
+   * here can corrupt the local replica and are only appropriate for debugging.
+   */
+  async debugExecute(sql: string): Promise<Record<string, SqlValue>[]> {
+    const db = this.assertReady();
+    // cr-sqlite returns null at runtime when the statement has no result
+    // columns, despite execO's array-only declaration.
+    const rows = (await db.execO<Record<string, SqlValue>>(sql)) ?? [];
+    // The statement may have mutated user or internal tables. Preserve the
+    // normal local-write behavior even though read-only statements make these
+    // two calls no-ops beyond their debounced checks.
+    this.schedulePublish();
+    this.scheduleSnapshot();
+    return rows;
+  }
+
   async transaction<T>(cb: (tx: SqlTx) => Promise<T>): Promise<T> {
     const db = this.assertReady();
     let result!: T;

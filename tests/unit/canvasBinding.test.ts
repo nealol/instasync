@@ -109,6 +109,83 @@ describe("CanvasBinding startup", () => {
     expect(vault.offref).toHaveBeenCalledTimes(3);
   });
 
+  it("captures edits from every open view of the same Canvas", () => {
+    const initial = { nodes: [{ id: "a", type: "text", text: "initial" }], edges: [] };
+    let firstData = structuredClone(initial);
+    let secondData = structuredClone(initial);
+    const makeCanvas = (read: () => unknown, write: (value: any) => void) => ({
+      getData: vi.fn(() => structuredClone(read())),
+      importData: vi.fn((value: unknown) => write(structuredClone(value))),
+      requestSave: vi.fn(),
+      requestFrame: vi.fn(),
+    });
+    const first = makeCanvas(
+      () => firstData,
+      (value) => (firstData = value),
+    );
+    const second = makeCanvas(
+      () => secondData,
+      (value) => (secondData = value),
+    );
+    const views = [first, second].map((canvas) => ({
+      getViewType: () => "canvas",
+      file: { path: "Board.canvas" },
+      canvas,
+      containerEl: document.createElement("div"),
+    }));
+    const workspace = {
+      iterateAllLeaves: (callback: (leaf: unknown) => void) => {
+        for (const view of views) callback({ view });
+      },
+      getLeavesOfType: () => views.map((view) => ({ view })),
+    };
+    const doc = makeOperationalDoc(initial);
+    const binding = new CanvasBinding({ app: { workspace } } as any, doc as any);
+    binding.tryBind();
+    expect(binding.isActive()).toBe(true);
+    doc.applyCanvasOperations.mockClear();
+
+    secondData = { nodes: [{ id: "a", type: "text", text: "from second" }], edges: [] };
+    second.requestSave();
+    expect(doc.applyCanvasOperations).toHaveBeenCalledWith(
+      [
+        {
+          type: "node-patch",
+          id: "a",
+          patch: { set: { text: "from second" }, remove: [] },
+        },
+      ],
+      expect.anything(),
+    );
+
+    binding.destroy();
+    doc.awareness.destroy();
+  });
+
+  it("keeps disk folding enabled when any open Canvas view is unsupported", () => {
+    const initial = { nodes: [{ id: "a", type: "text", text: "initial" }], edges: [] };
+    const fixture = makeLiveCanvasFixture("Board.canvas", initial);
+    const unsupportedView = {
+      getViewType: () => "canvas",
+      file: { path: "Board.canvas" },
+      canvas: { requestSave: vi.fn() },
+      containerEl: document.createElement("div"),
+    };
+    const workspace = {
+      iterateAllLeaves: (callback: (leaf: unknown) => void) => {
+        fixture.workspace.iterateAllLeaves(callback);
+        callback({ view: unsupportedView });
+      },
+      getLeavesOfType: () => [],
+    };
+    const doc = makeOperationalDoc(initial);
+    const binding = new CanvasBinding({ app: { workspace } } as any, doc as any);
+    binding.tryBind();
+    expect(binding.isActive()).toBe(false);
+    binding.destroy();
+    doc.awareness.destroy();
+  });
+
   it("does not import CRDT data into an open canvas before the document is ready", () => {
     const host = document.createElement("div");
     const originalRequestSave = vi.fn();

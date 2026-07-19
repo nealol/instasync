@@ -3,6 +3,7 @@ import * as Y from "yjs";
 import { parseCanvas, reconcileCanvas, serializeCanvas } from "../../src/structured/canvas";
 import {
   applyCanvasOperations,
+  canonicalizeCanvasOrders,
   diffCanvas,
   normalizeCanvas,
   type CanvasOperation,
@@ -225,5 +226,32 @@ describe("Canvas operation application", () => {
       expect(new Set(firstOrder).size).toBe(3);
       expect(firstOrder).toHaveLength(3);
     }
+  });
+
+  it("canonicalizes duplicate raw order entries created by concurrent reorders", () => {
+    const clients = makeCanvasClients();
+    applyCanvasOperations(
+      clients.first.getMap("root"),
+      [{ type: "node-order", order: ["group", "text", "file"] }],
+      clients.first.clientID,
+    );
+    applyCanvasOperations(
+      clients.second.getMap("root"),
+      [{ type: "node-order", order: ["file", "group", "text"] }],
+      clients.second.clientID,
+    );
+    clients.syncBoth();
+
+    const firstOrder = clients.first.getMap("root").get("nodeOrder") as Y.Array<string>;
+    expect(firstOrder.toArray()).toHaveLength(6);
+    clients.first.transact(() => canonicalizeCanvasOrders(clients.first.getMap("root")));
+    clients.syncFirstToSecond();
+
+    const expected = firstOrder.toArray();
+    expect(expected).toHaveLength(3);
+    expect(new Set(expected).size).toBe(3);
+    expect((clients.second.getMap("root").get("nodeOrder") as Y.Array<string>).toArray()).toEqual(
+      expected,
+    );
   });
 });

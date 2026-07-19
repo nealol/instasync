@@ -29,6 +29,12 @@ import { CompatibilityError } from "../caps";
 // internal callers and docs links.
 export type { OpenOptions, DeleteOrRestoreOptions, DatabaseHandle };
 
+export interface DebugDatabase {
+  pluginId: string;
+  name: string;
+  state: SyncedPluginDatabase["state"];
+}
+
 export class RealtimeSqlAPI implements RealtimeSql {
   private plugin: RealtimePlugin;
   private engines = new Map<string, SyncedPluginDatabase>();
@@ -247,6 +253,39 @@ export class RealtimeSqlAPI implements RealtimeSql {
         }
       },
     };
+  }
+
+  /** Active local databases available to the internal SQL debugging view. */
+  debugDatabases(): DebugDatabase[] {
+    return [...this.engines.values()]
+      .map((engine) => ({
+        pluginId: engine.pluginId,
+        name: engine.name,
+        state: engine.state,
+      }))
+      .sort((a, b) =>
+        a.pluginId === b.pluginId
+          ? a.name.localeCompare(b.name)
+          : a.pluginId.localeCompare(b.pluginId),
+      );
+  }
+
+  /** Execute unrestricted SQL against one active local database. Internal UI only. */
+  debugExecute(
+    pluginId: string,
+    name: string,
+    sql: string,
+  ): Promise<Record<string, import("./types").SqlValue>[]> {
+    this.requireAvailable();
+    const scope = this.scope();
+    if (this.activeScope !== scope) {
+      return Promise.reject(new Error("The selected local database is no longer available."));
+    }
+    const engine = this.engines.get(this.key(scope, pluginId, name));
+    if (!engine) {
+      return Promise.reject(new Error("The selected local database is no longer open."));
+    }
+    return engine.debugExecute(sql);
   }
 
   /** Soft-delete: tombstone the doc AND drop it into the vault trash bin. */

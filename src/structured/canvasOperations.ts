@@ -133,9 +133,26 @@ export function applyCanvasOperations(
           break;
       }
     }
+    canonicalizeCanvasOrders(root);
   };
   if (doc) doc.transact(apply);
   else apply();
+}
+
+/** Remove duplicate/dead order entries and append every live item exactly once. */
+export function canonicalizeCanvasOrders(root: Y.Map<any>): boolean {
+  const nodes = root.get("nodes");
+  const edges = root.get("edges");
+  const nodeOrder = root.get("nodeOrder");
+  const edgeOrder = root.get("edgeOrder");
+  let changed = false;
+  if (nodes instanceof Y.Map && nodeOrder instanceof Y.Array) {
+    changed = canonicalizeOrder(nodeOrder, nodes) || changed;
+  }
+  if (edges instanceof Y.Map && edgeOrder instanceof Y.Array) {
+    changed = canonicalizeOrder(edgeOrder, edges) || changed;
+  }
+  return changed;
 }
 
 function restoreItem(
@@ -237,10 +254,26 @@ function validOrder(order: readonly string[], items: Y.Map<any>): string[] {
       result.push(id);
     }
   }
-  for (const id of items.keys()) {
+  for (const id of [...items.keys()].sort()) {
     if (!seen.has(id)) result.push(id);
   }
   return result;
+}
+
+function canonicalizeOrder(order: Y.Array<any>, items: Y.Map<any>): boolean {
+  const current = order.toArray();
+  const next = validOrder(
+    current.filter((candidate): candidate is string => typeof candidate === "string"),
+    items,
+  );
+  if (
+    current.length === next.length &&
+    current.every((candidate, index) => candidate === next[index])
+  ) {
+    return false;
+  }
+  reconcileArray(order, next, {});
+  return true;
 }
 
 function ensureMap(root: Y.Map<any>, key: string): Y.Map<any> {

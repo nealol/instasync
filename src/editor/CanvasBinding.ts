@@ -7,6 +7,7 @@ import {
   mountPresenceStack,
   readCanvasViewport,
   setCanvasPresence,
+  type CanvasPresenceState,
 } from "../presence";
 import { CanvasTextCardBinding } from "./CanvasTextCardBinding";
 import { CanvasViewAdapter } from "./CanvasViewAdapter";
@@ -46,7 +47,145 @@ interface BoundCanvasView {
   };
 }
 
+interface CanvasDiscovery {
+  supported: BoundCanvasView[];
+  unsupported: number;
+}
+
+/**
+ * Owns one live binding per open view of a Canvas file. Disk write-through may
+ * only be suppressed when every matching view exposes the private APIs needed
+ * for bidirectional synchronization.
+ */
 export class CanvasBinding {
+  private readonly views = new Map<InternalCanvas, CanvasViewBinding>();
+  private readonly attachmentPaths = new Map<CanvasViewBinding, Set<string>>();
+  private readonly presenceStates = new Map<CanvasViewBinding, CanvasPresenceState>();
+  private prioritizedAttachments = new Set<string>();
+  private activePresenceView: CanvasViewBinding | null = null;
+  private unsupportedViews = 0;
+
+  constructor(
+    private readonly plugin: RealtimePlugin,
+    private readonly doc: CanvasDocument,
+  ) {}
+
+  /** True only when every open view is patched and safe to use instead of disk folding. */
+  isActive(): boolean {
+    return this.views.size > 0 && this.unsupportedViews === 0;
+  }
+
+  tryBind(): void {
+    this.reconcileViews(true);
+  }
+
+  unbindIfStale(): void {
+    this.reconcileViews(false);
+  }
+
+  applyRemote(): void {
+    for (const binding of this.views.values()) binding.applyRemote();
+  }
+
+  scheduleRemote(): void {
+    for (const binding of this.views.values()) binding.scheduleRemote();
+  }
+
+  destroy(): void {
+    for (const binding of [...this.views.values()]) binding.destroy();
+    this.views.clear();
+    this.attachmentPaths.clear();
+    this.presenceStates.clear();
+    this.activePresenceView = null;
+    this.updatePrioritizedAttachments(new Set());
+    setCanvasPresence(this.doc.awareness, null);
+  }
+
+  private reconcileViews(createMissing: boolean): void {
+    const discovery = findOpenCanvases(this.plugin, this.doc.path);
+    this.unsupportedViews = discovery.unsupported;
+    const live = new Map(discovery.supported.map((found) => [found.canvas, found]));
+
+    for (const [canvas, binding] of [...this.views]) {
+      if (!live.has(canvas) || binding.isStale()) {
+        binding.destroy();
+        this.views.delete(canvas);
+      }
+    }
+    if (!createMissing) return;
+    for (const found of discovery.supported) {
+      if (this.views.has(found.canvas)) continue;
+      try {
+        const binding = new CanvasViewBinding(
+          this.plugin,
+          this.doc,
+          found,
+          (owner, paths) => this.onAttachmentPaths(owner, paths),
+          (owner, state) => this.onPresence(owner, state),
+          (owner) => this.removeView(owner),
+        );
+        this.views.set(found.canvas, binding);
+      } catch (error) {
+        this.unsupportedViews++;
+        console.error(`[Realtime] failed to bind open canvas view for ${this.doc.path}`, error);
+      }
+    }
+  }
+
+  private removeView(binding: CanvasViewBinding): void {
+    for (const [canvas, candidate] of this.views) {
+      if (candidate !== binding) continue;
+      binding.destroy();
+      this.views.delete(canvas);
+      return;
+    }
+    binding.destroy();
+  }
+
+  private onAttachmentPaths(binding: CanvasViewBinding, paths: Set<string>): void {
+    if (paths.size) this.attachmentPaths.set(binding, paths);
+    else this.attachmentPaths.delete(binding);
+    const combined = new Set<string>();
+    for (const values of this.attachmentPaths.values()) {
+      for (const path of values) combined.add(path);
+    }
+    this.updatePrioritizedAttachments(combined);
+  }
+
+  private updatePrioritizedAttachments(next: Set<string>): void {
+    const added = [...next].filter((path) => !this.prioritizedAttachments.has(path));
+    const removed = [...this.prioritizedAttachments].filter((path) => !next.has(path));
+    this.plugin.vaultSync?.unprioritizeCanvasAttachments(removed);
+    this.plugin.vaultSync?.prioritizeCanvasAttachments(added);
+    this.prioritizedAttachments = next;
+  }
+
+  private onPresence(binding: CanvasViewBinding, state: CanvasPresenceState | null): void {
+    if (state) this.presenceStates.set(binding, state);
+    else this.presenceStates.delete(binding);
+    if (!state && this.activePresenceView === binding) this.activePresenceView = null;
+    if (
+      state &&
+      (!this.activePresenceView || state.editingNodeId !== undefined || state.interaction)
+    ) {
+      this.activePresenceView = binding;
+    }
+    if (!this.activePresenceView || !this.presenceStates.has(this.activePresenceView)) {
+      this.activePresenceView =
+        [...this.presenceStates].find(
+          ([, value]) => value.editingNodeId || value.interaction,
+        )?.[0] ??
+        this.presenceStates.keys().next().value ??
+        null;
+    }
+    setCanvasPresence(
+      this.doc.awareness,
+      this.activePresenceView ? (this.presenceStates.get(this.activePresenceView) ?? null) : null,
+    );
+  }
+}
+
+class CanvasViewBinding {
   private plugin: RealtimePlugin;
   private doc: CanvasDocument;
   private canvas: InternalCanvas | null = null;
@@ -82,25 +221,22 @@ export class CanvasBinding {
   private attachmentPaths = new Set<string>();
   private attachmentEventRefs: EventRef[] = [];
 
-  constructor(plugin: RealtimePlugin, doc: CanvasDocument) {
+  constructor(
+    plugin: RealtimePlugin,
+    doc: CanvasDocument,
+    found: BoundCanvasView,
+    private readonly updateAttachmentPaths: (
+      binding: CanvasViewBinding,
+      paths: Set<string>,
+    ) => void,
+    private readonly updatePresence: (
+      binding: CanvasViewBinding,
+      state: CanvasPresenceState | null,
+    ) => void,
+    private readonly invalidate: (binding: CanvasViewBinding) => void,
+  ) {
     this.plugin = plugin;
     this.doc = doc;
-  }
-
-  /** True only while we're patched onto a live, recognized canvas view. */
-  isActive(): boolean {
-    return this.canvas !== null;
-  }
-
-  tryBind(): void {
-    const found = this.findOpenCanvas();
-    // Same live canvas we are already patched onto — nothing to do.
-    if (found && found.canvas === this.canvas) return;
-    // The leaf was closed (canvas == null) or reopened as a fresh Canvas
-    // instance: drop the stale patch before binding the new one, so live
-    // editing survives close/reopen instead of silently dying.
-    if (this.canvas && (!found || found.canvas !== this.canvas)) this.unpatch();
-    if (!found) return;
     const { canvas, host, view } = found;
     this.canvas = canvas;
     this.adapter = new CanvasViewAdapter(canvas, typeof view.setViewData !== "function");
@@ -127,7 +263,6 @@ export class CanvasBinding {
       return result;
     };
     canvas.requestSave = this.patchedRequestSave;
-    this.applyRemote();
     // Mount presence avatar stack + canvas cursor overlay. Both clean up via
     // presenceCleanup, which is called in unpatch().
     const stackCleanup = mountPresenceStack(
@@ -149,9 +284,12 @@ export class CanvasBinding {
       (nodeId) => {
         this.editingNodeId = nodeId;
         this.publishPresence(this.interactionActive);
+        if (nodeId) this.scheduleRemote();
       },
+      host,
     );
     this.textCardBinding.start();
+    this.applyRemote();
   }
 
   /**
@@ -162,15 +300,8 @@ export class CanvasBinding {
    * read the *other* file's content into this CRDT, or write this CRDT's
    * content into the other file on disk.
    */
-  private isStaleView(): boolean {
+  isStale(): boolean {
     return this.view?.file?.path !== this.doc.path;
-  }
-
-  /** Unpatch if the bound canvas is gone or its view now shows another file. */
-  unbindIfStale(): void {
-    if (!this.canvas) return;
-    const found = this.findOpenCanvas();
-    if (!found || found.canvas !== this.canvas || this.isStaleView()) this.unpatch();
   }
 
   /** Push the CRDT's current value into the live view and converge disk. */
@@ -178,13 +309,17 @@ export class CanvasBinding {
     if (!this.canvas) return;
     // The leaf may have switched this reused view to a different file since we
     // bound; importing here would overwrite that file with this doc's content.
-    if (this.isStaleView()) {
-      this.unpatch();
+    if (this.isStale()) {
+      this.invalidate(this);
       return;
     }
     // Do not import the constructor-time empty Y.Doc into an already-open
     // canvas. The real value arrives after IndexedDB/server startup reconcile.
     if (!this.doc.isReady()) return;
+    if (this.textCardBinding?.hasUnboundActiveEditor()) {
+      this.remotePending = true;
+      return;
+    }
     const next = this.doc.canvasData();
     this.prioritizeAttachments(normalizeCanvas(next));
     const nextHash = hashCanvasData(next);
@@ -274,13 +409,14 @@ export class CanvasBinding {
     this.attachmentIndicator?.remove();
     this.attachmentIndicator = null;
     this.host = null;
-    this.plugin.vaultSync?.unprioritizeCanvasAttachments(this.attachmentPaths);
     this.attachmentPaths.clear();
+    this.updateAttachmentPaths(this, new Set());
     for (const eventRef of this.attachmentEventRefs) this.plugin.app.vault?.offref(eventRef);
     this.attachmentEventRefs = [];
     dbg("canvas presence cleanup", this.doc.path);
     this.presenceCleanup?.();
     this.presenceCleanup = null;
+    this.updatePresence(this, null);
     // Only restore when we're still the top patch. If another binding patched
     // over us (the canvas instance is shared across files in a leaf), leave
     // the chain intact — its closure delegates to the save it captured, and
@@ -303,11 +439,8 @@ export class CanvasBinding {
     const referencedPaths = canvasAttachmentPaths(canvas);
     const paths = this.plugin.vaultSync?.canvasBinaryPaths(referencedPaths) ?? [];
     const next = new Set(paths);
-    const added = paths.filter((path) => !this.attachmentPaths.has(path));
-    const removed = [...this.attachmentPaths].filter((path) => !next.has(path));
-    this.plugin.vaultSync?.unprioritizeCanvasAttachments(removed);
-    this.plugin.vaultSync?.prioritizeCanvasAttachments(added);
     this.attachmentPaths = next;
+    this.updateAttachmentPaths(this, next);
     this.renderAttachmentIndicator();
   }
 
@@ -376,7 +509,7 @@ export class CanvasBinding {
   }
 
   private startInteraction(): void {
-    if (this.interactionActive || !this.canvas || this.isStaleView()) return;
+    if (this.interactionActive || !this.canvas || this.isStale()) return;
     this.interactionActive = true;
     this.publishPresence(true);
     // Sampling is durable but bounded. Awareness handles smooth pointer motion.
@@ -401,7 +534,7 @@ export class CanvasBinding {
   private publishPresence(interacting: boolean): void {
     const canvas = this.canvas;
     if (!canvas) {
-      setCanvasPresence(this.doc.awareness, null);
+      this.updatePresence(this, null);
       return;
     }
     const data = normalizeCanvas(canvas.getData());
@@ -416,7 +549,7 @@ export class CanvasBinding {
         { id, x: x as number, y: y as number, width: width as number, height: height as number },
       ];
     });
-    setCanvasPresence(this.doc.awareness, {
+    this.updatePresence(this, {
       version: 1,
       sequence: ++this.presenceSequence,
       ...(selectedNodeIds.length ? { selectedNodeIds } : {}),
@@ -434,8 +567,8 @@ export class CanvasBinding {
       // The reused view may now show a different file: its data belongs to
       // that file, not this document. Folding it in would overwrite this
       // canvas everywhere with the other canvas's content.
-      if (this.isStaleView()) {
-        this.unpatch();
+      if (this.isStale()) {
+        this.invalidate(this);
         return;
       }
       // Saves can fire while Obsidian is still mounting/reusing a canvas view.
@@ -467,28 +600,40 @@ export class CanvasBinding {
       console.error(`[Realtime] failed to capture canvas update for ${this.doc.path}`, e);
     }
   }
+}
 
-  private findOpenCanvas(): BoundCanvasView | null {
-    let found: BoundCanvasView | null = null;
-    const inspect = (leaf: any) => {
-      if (found) return;
-      const view = leaf?.view;
-      if (view?.getViewType?.() !== "canvas" || view?.file?.path !== this.doc.path) return;
-      const canvas = view.canvas;
-      if (isInternalCanvas(canvas)) found = { canvas, host: view.containerEl, view };
-      else if (!loggedUnsupported) {
-        loggedUnsupported = true;
-        console.warn(
-          "[Realtime] Obsidian canvas private API shape is unsupported; using disk write-through fallback.",
-        );
+function findOpenCanvases(plugin: RealtimePlugin, path: string): CanvasDiscovery {
+  const supported: BoundCanvasView[] = [];
+  const seenViews = new Set<unknown>();
+  const seenCanvases = new Set<InternalCanvas>();
+  let unsupported = 0;
+  const inspect = (leaf: any) => {
+    const view = leaf?.view;
+    if (seenViews.has(view) || view?.getViewType?.() !== "canvas" || view?.file?.path !== path) {
+      return;
+    }
+    seenViews.add(view);
+    const canvas = view.canvas;
+    if (isInternalCanvas(canvas)) {
+      if (!seenCanvases.has(canvas)) {
+        seenCanvases.add(canvas);
+        supported.push({ canvas, host: view.containerEl, view });
       }
-    };
+      return;
+    }
+    unsupported++;
+    if (!loggedUnsupported) {
+      loggedUnsupported = true;
+      console.warn(
+        "[Realtime] Obsidian canvas private API shape is unsupported; using disk write-through fallback.",
+      );
+    }
+  };
 
-    const workspace = this.plugin.app.workspace as any;
-    workspace?.iterateAllLeaves?.(inspect);
-    for (const leaf of workspace?.getLeavesOfType?.("canvas") ?? []) inspect(leaf);
-    return found;
-  }
+  const workspace = plugin.app.workspace as any;
+  workspace?.iterateAllLeaves?.(inspect);
+  for (const leaf of workspace?.getLeavesOfType?.("canvas") ?? []) inspect(leaf);
+  return { supported, unsupported };
 }
 
 function isInternalCanvas(value: unknown): value is InternalCanvas {

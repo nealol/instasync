@@ -131,9 +131,21 @@ describe("Realtime — two isolated Obsidian devices", function () {
           vault: vaultB,
           copy: true,
         },
+        "goog:chromeOptions": {
+          args: [
+            "--headless=new",
+            "--disable-gpu",
+            "--window-size=1440,1000",
+            "--window-position=-32000,-32000",
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows",
+          ],
+        },
       },
       cacheDir,
     } as any);
+    await B.execute(() => window.electron?.remote?.getCurrentWindow?.().hide?.());
 
     // Device A: sign in, seed a file, create a vault from the local files.
     adminToken = await signInDevice(A, authUrl, "alice");
@@ -179,6 +191,15 @@ describe("Realtime — two isolated Obsidian devices", function () {
 
   after(async function () {
     await B?.deleteSession();
+  });
+
+  it("launches both Obsidian sessions without visible windows", async function () {
+    for (const device of [A, B]) {
+      const visible = await device.execute(
+        () => window.electron?.remote?.getCurrentWindow?.().isVisible?.() ?? true,
+      );
+      expect(visible).toBe(false);
+    }
   });
 
   describe("onboarding & access control", function () {
@@ -601,6 +622,132 @@ describe("Realtime — two isolated Obsidian devices", function () {
         },
         { timeout: 60 * SECONDS, timeoutMsg: "B never received A's live canvas edit" },
       );
+    });
+
+    it("keeps concurrent live Canvas text edits in Y.Text", async function () {
+      await openFileInLeaf(B, "Board.canvas");
+      await B.pause(SECONDS);
+      await bindOpenStructured(B);
+
+      const editTextNode = async (
+        device: WebdriverIO.Browser,
+        insert: string | null,
+        atEnd: boolean,
+        flush: boolean,
+      ) =>
+        device.executeObsidian(
+          async ({ app }: any, p: string, value: string | null, end: boolean, save: boolean) => {
+            let result: any = null;
+            app.workspace.iterateAllLeaves((leaf: any) => {
+              if (result || leaf?.view?.getViewType?.() !== "canvas" || leaf.view.file?.path !== p)
+                return;
+              const canvas = leaf.view.canvas;
+              const node = canvas?.nodes?.get?.("n1");
+              node?.attach?.();
+              node?.render?.();
+              node?.startEditing?.();
+              const cm = node?.child?.editMode?.cm;
+              if (value !== null && cm) {
+                const from = end ? cm.state.doc.length : 0;
+                cm.dispatch({ changes: { from, insert: value }, userEvent: "input.type" });
+                if (save) node.child.save(cm.state.doc.toString(), true);
+              }
+              const doc = app.plugins.plugins.realtime.vaultSync?.structuredDocuments?.get(p);
+              const awareness = doc?.awareness?.getLocalState?.();
+              result = {
+                editor: cm?.state?.doc?.toString?.() ?? null,
+                shared: doc?.canvasNodeText?.("n1")?.toString?.() ?? null,
+                editingNodeId: awareness?.canvasPresence?.editingNodeId ?? null,
+              };
+            });
+            return result;
+          },
+          "Board.canvas",
+          insert,
+          atEnd,
+          flush,
+        );
+
+      await editTextNode(A, null, false, false);
+      await editTextNode(B, null, false, false);
+      await A.pause(300);
+      await B.pause(300);
+
+      const afterLocal = await editTextNode(A, "A", false, false);
+      expect(afterLocal).toMatchObject({
+        editor: "Ahello",
+        shared: "Ahello",
+        editingNodeId: "n1",
+      });
+      await B.waitUntil(
+        async () => {
+          const state = await editTextNode(B, null, false, false);
+          return state?.editor === "Ahello";
+        },
+        {
+          timeout: 5000,
+          interval: 50,
+          timeoutMsg: "B did not receive A's immediate Canvas Y.Text edit",
+        },
+      );
+      const afterRemoteCommit = await editTextNode(B, "B", true, true);
+      await A.waitUntil(
+        async () => (await editTextNode(A, null, false, false))?.editor === "AhelloB",
+        {
+          timeout: 1500,
+          interval: 50,
+          timeoutMsg: "A did not merge B's Canvas Y.Text edit",
+        },
+      );
+      const afterRemote = await editTextNode(A, null, false, false);
+
+      expect(afterRemoteCommit).toMatchObject({
+        editor: "AhelloB",
+        shared: "AhelloB",
+        editingNodeId: "n1",
+      });
+      expect(afterRemote).toMatchObject({
+        editor: "AhelloB",
+        shared: "AhelloB",
+        editingNodeId: "n1",
+      });
+    });
+
+    it("binds duplicate Canvas leaves independently", async function () {
+      const opened = await A.executeObsidian(async ({ app }: any, p: string) => {
+        const file = app.vault.getAbstractFileByPath(p);
+        if (!file) return false;
+        await app.workspace.getLeaf("split").openFile(file);
+        return true;
+      }, "Board.canvas");
+      expect(opened).toBe(true);
+      await A.pause(500);
+      await bindOpenStructured(A);
+
+      const result = await A.executeObsidian(async ({ app }: any, p: string) => {
+        const canvases: any[] = [];
+        app.workspace.iterateAllLeaves((leaf: any) => {
+          if (leaf?.view?.getViewType?.() === "canvas" && leaf.view.file?.path === p) {
+            canvases.push(leaf.view.canvas);
+          }
+        });
+        const doc = app.plugins.plugins.realtime.vaultSync?.structuredDocuments?.get(p);
+        const second = canvases[1];
+        const node = second?.nodes?.get?.("n1");
+        if (node) {
+          node.setData({ ...node.getData(), text: "from-second-leaf" });
+          second.requestSave();
+        }
+        return {
+          openCanvases: canvases.length,
+          shared: doc?.canvasNodeText?.("n1")?.toString?.() ?? null,
+        };
+      }, "Board.canvas");
+
+      expect(result).toEqual({
+        openCanvases: 2,
+        shared: "from-second-leaf",
+      });
     });
 
     it("applies a remote edit into A's open canvas view in place", async function () {

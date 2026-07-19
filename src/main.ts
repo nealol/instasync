@@ -19,6 +19,7 @@ import { FILE_HISTORY_VIEW_TYPE, FileHistoryView } from "./history/FileHistoryVi
 import { openTimelineModal } from "./history/TimelineModal";
 import { RealtimeSqlAPI } from "./pluginDb/api";
 import { RealtimeCursorsAPI } from "./cursors/api";
+import { SQL_QUERY_VIEW_TYPE, SqlQueryView } from "./sql/SqlQueryView";
 import type {
   RealtimeCursors,
   RealtimePluginApi,
@@ -154,6 +155,12 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
           new Notice(`${PLUGIN_NAME}: rebased ${n} plugin database(s) from server.`);
         })();
       },
+    });
+    this.registerView(SQL_QUERY_VIEW_TYPE, (leaf) => new SqlQueryView(leaf, this));
+    this.addCommand({
+      id: "realtime-open-sql-query",
+      name: "Open SQL query editor",
+      callback: () => void this.activateSqlQueryView(),
     });
     this.addCommand({
       id: "realtime-setup-vault",
@@ -329,6 +336,13 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
     const leaf = this.app.workspace.getRightLeaf(false);
     if (!leaf) return;
     await leaf.setViewState({ type: FILE_HISTORY_VIEW_TYPE, active: true });
+    await this.app.workspace.revealLeaf(leaf);
+  }
+
+  /** Open a fresh SQL query editor in the main workspace. */
+  async activateSqlQueryView(): Promise<void> {
+    const leaf = this.app.workspace.getLeaf("tab");
+    await leaf.setViewState({ type: SQL_QUERY_VIEW_TYPE, active: true });
     await this.app.workspace.revealLeaf(leaf);
   }
 

@@ -81,6 +81,18 @@ describe("YTextEditorBinding", () => {
     binding.destroy();
   });
 
+  it("preserves text typed before a polled Canvas editor attaches", () => {
+    const doc = new Y.Doc();
+    const ytext = doc.getText("text");
+    ytext.insert(0, "shared");
+    const adapter = editor("local shared");
+    adapter.hasLocalChanges = () => true;
+    const binding = new YTextEditorBinding(adapter, ytext, ready());
+    expect(ytext.toString()).toBe("local shared");
+    expect(adapter.getText()).toBe("local shared");
+    binding.destroy();
+  });
+
   it("pulls remote text and removes listeners on destroy", async () => {
     const doc = new Y.Doc();
     const ytext = doc.getText("text");

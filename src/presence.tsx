@@ -365,6 +365,10 @@ export function PresenceAvatarStack({
               className: "realtime-presence-avatar",
               src: entry.avatarUrl,
               alt: entry.name,
+              // Some themes override inherited border radii on images. The
+              // clip-path keeps note and canvas presence photos circular even
+              // under an !important theme rule.
+              style: { borderRadius: "50%", clipPath: "circle(50%)" },
             })
           : createElement(
               "div",
@@ -775,7 +779,6 @@ export function mountCanvasCursorOverlay(
     }
     pending = null;
     setCanvasCursor(awareness, null);
-    setCanvasPresence(awareness, null);
     render();
   };
 
@@ -816,7 +819,6 @@ export function mountCanvasCursorOverlay(
     viewRunning = false;
     if (viewRaf !== null) cancelAnimationFrame(viewRaf);
     setCanvasCursor(awareness, null);
-    setCanvasPresence(awareness, null);
     root.unmount();
     layer.remove();
   };

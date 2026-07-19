@@ -471,6 +471,9 @@ describe("PresenceAvatarStack", () => {
     const wrap0 = wraps[0] as HTMLElement;
     expect(wrap0.style.getPropertyValue("--realtime-presence-color")).toBe("#ff0000");
     expect(wrap0.querySelector("img")?.getAttribute("src")).toBe("https://example.com/a.png");
+    const avatar = wrap0.querySelector(".realtime-presence-avatar") as HTMLImageElement;
+    expect(avatar.style.borderRadius).toBe("50%");
+    expect(avatar.style.clipPath).toBe("circle(50%)");
     const wrap1 = wraps[1] as HTMLElement;
     expect(wrap1.style.getPropertyValue("--realtime-presence-color")).toBe("#00ff00");
     expect(wrap1.querySelector(".realtime-presence-avatar-fallback")?.textContent).toBe("BO");

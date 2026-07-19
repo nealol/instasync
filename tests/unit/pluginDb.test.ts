@@ -23,6 +23,30 @@ async function titles(db: { query: <T>(s: string) => Promise<T[]> }): Promise<st
 }
 
 describe("SyncedPluginDatabase", () => {
+  it("allows the internal debug executor to inspect protected SQLite tables", async () => {
+    const db = makeEngine({ doc: new Y.Doc(), snap: newSnapStore() });
+    try {
+      await db.start();
+      await db.whenLive();
+
+      await expect(db.query("SELECT name FROM sqlite_master")).rejects.toThrow(
+        "may not touch crsql_* or sqlite_* internals",
+      );
+      const rows = await db.debugExecute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+      );
+      expect(rows.some((row) => row.name === "tasks")).toBe(true);
+      await expect(db.debugExecute("SELECT count(*) AS count FROM crsql_changes")).resolves.toEqual(
+        [{ count: 0 }],
+      );
+      await expect(
+        db.debugExecute("UPDATE tasks SET title = 'debugged' WHERE id = 'missing'"),
+      ).resolves.toEqual([]);
+    } finally {
+      await db.close();
+    }
+  });
+
   it("converges two peers through a shared batch log", async () => {
     const doc = new Y.Doc();
     const a = makeEngine({ doc, snap: newSnapStore() });

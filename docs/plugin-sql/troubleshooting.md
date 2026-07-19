@@ -48,6 +48,19 @@ The [lint](./api-reference.md#the-crsql_--sqlite_-lint) blocks `crsql_*` /
 `crsql_as_crr`, `crsql_begin_alter`, `crsql_commit_alter`) into the `migrate`
 callback, where the lint does not apply.
 
+## Inspecting the local database
+
+Run **"Realtime: Open SQL query editor"** from the command palette. Each command
+opens a new workspace tab with a database picker, a monospaced SQL editor, and a
+Bases-style result table. The picker lists databases that another plugin
+currently has open on this device.
+
+The editor deliberately bypasses the public API's `crsql_*` / `sqlite_*` lint.
+It can also run writes, so an `UPDATE`, `DELETE`, or schema change against an
+internal table can damage the local replica. Use it for debugging; if the
+replica becomes inconsistent, close the owning plugin's handle and rebase the
+database from the server.
+
 ## A collaborator's changes aren't applying (`state: "needs-migration"`)
 
 A peer is on a newer `schemaVersion`. Your client buffers their batches until your

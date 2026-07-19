@@ -63,6 +63,17 @@ export const config: WebdriverIO.Config = {
         vault: path.resolve(here, "vaults/vaultA"),
         copy: true,
       },
+      "goog:chromeOptions": {
+        args: [
+          "--headless=new",
+          "--disable-gpu",
+          "--window-size=1440,1000",
+          "--window-position=-32000,-32000",
+          "--disable-background-timer-throttling",
+          "--disable-renderer-backgrounding",
+          "--disable-backgrounding-occluded-windows",
+        ],
+      },
     } as any,
   ],
 
@@ -71,6 +82,10 @@ export const config: WebdriverIO.Config = {
   cacheDir: path.resolve(repoRoot, ".obsidian-cache"),
   mochaOpts: { ui: "bdd", timeout: 240_000 },
   logLevel: "warn",
+
+  async before(_capabilities, _specs, browser) {
+    await browser.execute(() => window.electron?.remote?.getCurrentWindow?.().hide?.());
+  },
 
   async onPrepare() {
     obsidianProtocolSnapshot = snapshotObsidianProtocolRegistry();
