@@ -28,6 +28,22 @@ await vault.search.search("world");
 await vault.attachments.upload("img/pic.png", bytes);
 ```
 
+## Atomic Canvas edits
+
+`canvases.applyOperations()` sends one field-level batch. Patches name the fields to set and remove, so an unchanged stale field never becomes an edit. Deletes create tombstones; use `node-restore` or `edge-restore` when restoring an ID on purpose.
+
+```ts
+await vault.canvases.applyOperations("Planning.canvas", {
+  mutationId: crypto.randomUUID(),
+  operations: [
+    { type: "node-patch", id: "task-1", patch: { set: { x: 320 }, remove: [] } },
+    { type: "edge-delete", id: "old-link" },
+  ],
+});
+```
+
+The server applies the array in one Yjs transaction and rejects the whole batch if any operation fails. A repeated `mutationId` doesn't apply the batch twice; its response reflects the document's current value. Existing node and edge helpers try operation batches first, then retry through their older REST routes when a server returns 404.
+
 Get a token interactively (Node): `loginViaBrowser({ baseUrl })` from `@realtime-md/sdk/node` (requires the loopback origin in the server's `ALLOWED_LOGIN_REDIRECTS`), or paste one from `{baseUrl}/auth/login`.
 
 ## As a remote cursor (robot)
@@ -55,7 +71,7 @@ A cursor secret token (from cursor creation) works too: `new CursorClient({ base
 
 ## Errors
 
-Non-2xx responses throw `ApiError` (`status`, `message`); 401 → `AuthError`, 404 → `NotFoundError`. Token providers can refresh once on 401 before the error surfaces.
+Non-2xx responses throw `ApiError` (`status`, `message`); 400 → `ValidationError`, 401 → `AuthError`, 404 → `NotFoundError`, and 409 → `ConflictError`. Token providers can refresh once on 401 before the error surfaces.
 
 ## Compatibility & versioning
 

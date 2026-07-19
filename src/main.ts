@@ -219,25 +219,25 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
       this.app.workspace.on("file-menu", (menu, file) => {
         if (!(file instanceof TFile)) return;
         this.addPermalinkMenuItem(menu, file);
-        if (file.extension === "md") this.addPublicShareMenuItems(menu, file);
+        if (!["canvas", "base"].includes(file.extension)) this.addPublicShareMenuItems(menu, file);
       }),
     );
     this.addCommand({
       id: "realtime-share-publicly",
-      name: "Share current note publicly",
+      name: "Share current file publicly",
       callback: () => {
         const file = this.app.workspace.getActiveFile();
         if (file) void this.sharePublicly(file);
-        else new Notice(`${PLUGIN_NAME}: no active note to share.`);
+        else new Notice(`${PLUGIN_NAME}: no active file to share.`);
       },
     });
     this.addCommand({
       id: "realtime-stop-sharing-publicly",
-      name: "Stop publicly sharing current note",
+      name: "Stop publicly sharing current file",
       callback: () => {
         const file = this.app.workspace.getActiveFile();
         if (file) void this.stopSharingPublicly(file);
-        else new Notice(`${PLUGIN_NAME}: no active note.`);
+        else new Notice(`${PLUGIN_NAME}: no active file.`);
       },
     });
 
@@ -483,7 +483,7 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
    * Public-share actions in the file context menu. Both items are always shown
    * (no async share lookup before the menu opens): "Share publicly" is
    * idempotent server-side and re-copies the existing link, and "Stop publicly
-   * sharing" reports when the note was not shared.
+   * sharing" reports when the file was not shared.
    */
   private addPublicShareMenuItems(menu: Menu, file: TFile): void {
     menu.addItem((item) => {
@@ -500,12 +500,19 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
     });
   }
 
-  /** Create (or fetch) the public share link for a note and copy it. */
+  /** Create (or fetch) the public share link for a note or binary attachment. */
   private async sharePublicly(file: TFile): Promise<void> {
-    const vaultId = this.requireShareContext("share a note");
+    const vaultId = this.requireShareContext("share a file");
     if (!vaultId) return;
     try {
-      const share = await this.auth.createPublicShare(vaultId, file.path);
+      if (file.extension === "canvas" || file.extension === "base") {
+        new Notice(`${PLUGIN_NAME}: structured files cannot be shared publicly.`);
+        return;
+      }
+      const share =
+        file.extension === "md"
+          ? await this.auth.createPublicShare(vaultId, file.path)
+          : await this.auth.createPublicAttachmentShare(vaultId, file.path);
       await navigator.clipboard?.writeText(share.url);
       new Notice(`${PLUGIN_NAME}: public link copied.`);
     } catch (e) {
@@ -514,16 +521,21 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
     }
   }
 
-  /** Revoke the public share link for a note, if any. */
+  /** Revoke the public share link for a note or binary attachment, if any. */
   private async stopSharingPublicly(file: TFile): Promise<void> {
-    const vaultId = this.requireShareContext("stop sharing a note");
+    const vaultId = this.requireShareContext("stop sharing a file");
     if (!vaultId) return;
     try {
-      await this.auth.deletePublicShare(vaultId, file.path);
-      new Notice(`${PLUGIN_NAME}: note is no longer publicly shared.`);
+      if (file.extension === "canvas" || file.extension === "base") {
+        new Notice(`${PLUGIN_NAME}: structured files cannot be shared publicly.`);
+        return;
+      }
+      if (file.extension === "md") await this.auth.deletePublicShare(vaultId, file.path);
+      else await this.auth.deletePublicAttachmentShare(vaultId, file.path);
+      new Notice(`${PLUGIN_NAME}: file is no longer publicly shared.`);
     } catch (e) {
       if (e instanceof Error && e.message.includes("not found")) {
-        new Notice(`${PLUGIN_NAME}: note was not publicly shared.`);
+        new Notice(`${PLUGIN_NAME}: file was not publicly shared.`);
         return;
       }
       console.error(`[${PLUGIN_NAME}] failed to stop sharing`, e);
@@ -654,7 +666,8 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
   async loadSettings(): Promise<void> {
     const raw = await this.loadData();
     this.settings = sanitizeSettings(raw);
-    // Migrate legacy plaintext token from data.json to SecretStorage.
+    // Migrate the legacy plaintext token from data.json to SecretStorage.
+    // AuthClient performs the second-stage legacy-to-current key migration.
     const legacy =
       raw && typeof raw === "object" ? (raw as Record<string, unknown>).sessionToken : undefined;
     if (typeof legacy === "string" && legacy) {

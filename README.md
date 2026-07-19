@@ -10,8 +10,10 @@ For this prototype, **the whole vault is synced** — every Markdown file, plus 
 - **Per-file documents** — each Markdown file is its own Yjs document (a `Y.Text` named `contents`) hosted on the y-sweet server, keyed by a stable guid.
 - **Binary files** — synced by content hash, not through the text CRDT (`src/BinarySync.ts`): the bytes go to a content-addressed blob store on the server (`BLOB_DIR/{vaultId}/{hash}`) and only the hash travels through the index. Concurrent edits to the same binary can't be merged, so they're resolved by a keep-local / keep-remote modal on the device that detects the divergence. Large files upload in the background, deferred while notes are actively syncing.
 - **Remote Cursors / MCP** — vault admins can create app-specific remote cursors. Each cursor has an MCP resource URL (`/mcp/i/{appId}`) and supports OAuth 2.1 for MCP clients, while direct REST automation can still use the generated cursor secret as a bearer token.
+- **Public sharing** — file-menu actions copy revocable public links for Markdown notes and binary attachments. Attachment links expose only the exact file version that was shared and stop resolving if the attachment changes or the link is revoked.
 - **Editor binding** — when a file is open, a CodeMirror 6 view plugin (`src/editor/LiveEdit.ts`) binds the editor to the shared text in both directions. When a file is *not* open, `src/Document.ts` keeps the file on disk in sync with the shared text.
 - **Live cursors** — `src/editor/RemoteSelections.ts` renders each collaborator's caret and selection, labelled with a generated **two-word name** (e.g. "Brave Otter") and a color, broadcast over Yjs awareness.
+- **Realtime Canvas** — node moves, resizes, text, styles, edges, and ordering sync as field-level operations. Drag previews, selections, collaborator labels, and viewport follow use awareness, so they never alter the `.canvas` file. Text cards use `Y.Text` when Obsidian exposes a compatible CodeMirror editor; changed private APIs fall back to snapshot or disk sync.
 
 ## Running a server
 
@@ -110,6 +112,12 @@ and `/api/doc-token`.
 5. Each client gets a random two-word cursor name; reroll it with the dice button.
 
 The status bar shows `Realtime: connecting… / live / error`.
+
+### Working together in Canvas
+
+Open the same `.canvas` file on two joined devices. Durable edits sync during a drag instead of waiting for Obsidian's delayed save, while remote selections and drag outlines appear without writing transient data into the file. Click a collaborator label to follow their pan and zoom; any local pan, zoom, file change, or collaborator departure stops follow mode.
+
+If the plugin can't use the installed Obsidian version's private Canvas methods, editing still works through full Canvas imports or disk write-through. A small loading notice appears when a Canvas references a synced binary that hasn't arrived yet. Markdown links in file nodes don't enter binary sync.
 
 ## Plugin SQL API for developers
 

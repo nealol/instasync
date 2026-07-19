@@ -5,7 +5,7 @@ import type { ChangeSpec } from "@codemirror/state";
 import { EditorView, ViewPlugin, type PluginValue, type ViewUpdate } from "@codemirror/view";
 import type * as Y from "yjs";
 import type { Document } from "../Document";
-import { ensureDocumentForEditor } from "./context";
+import { ensureDocumentForEditor, requestSaveForEditor } from "./context";
 import { ySyncAnnotation } from "./annotations";
 import { applyTextToYText } from "../diff";
 import { dbg, snip } from "../debug";
@@ -170,6 +170,7 @@ export class LiveEditPluginValue implements PluginValue {
       changes,
       annotations: [ySyncAnnotation.of(this.editor)],
     });
+    requestSaveForEditor(this.editor);
   }
 
   /** Push local editor edits into the shared Y.Text. */

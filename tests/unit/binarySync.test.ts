@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
 import * as Y from "yjs";
 import { YSweetProvider } from "@y-sweet/client";
 import { BinarySync, type BinaryMeta } from "../../src/BinarySync";
@@ -174,6 +174,48 @@ describe("BinarySync", () => {
       await waitFor(() => A.uploadStates.at(-1) === "idle", { timeout: 15_000, label: "drains" });
       expect(A.uploadStates).toContain("uploading");
       expect(A.binaries.has("huge.bin")).toBe(true);
+    } finally {
+      A.bs.destroy();
+      A.provider.destroy();
+      A.indexDoc.destroy();
+    }
+  });
+
+  it("prioritizes a Canvas-referenced large file ahead of the text-busy deferral", async () => {
+    const A = makeDevice("A");
+    try {
+      await synced(A.provider);
+      A.vaultSyncStub.busy = true;
+      const big = new Uint8Array(6 * 1024 * 1024);
+      big[0] = 7;
+      A.vault.binaries.set("canvas-image.png", big.buffer);
+      A.bs.seedBaseline();
+      A.bs.prioritizePaths(["canvas-image.png", "canvas-image.png"]);
+      await A.bs.reconcileAll(["canvas-image.png"]);
+      await waitFor(() => A.binaries.has("canvas-image.png"), {
+        timeout: 15_000,
+        label: "urgent Canvas attachment published",
+      });
+      expect(A.uploadStates).toContain("uploading");
+    } finally {
+      A.bs.destroy();
+      A.indexDoc.destroy();
+    }
+  });
+
+  it("does not rehash an agreed Canvas attachment on repeated priority requests", async () => {
+    const A = makeDevice("A");
+    try {
+      await synced(A.provider);
+      A.vault.binaries.set("repeated.png", bytes([1, 3, 5, 7]));
+      A.bs.seedBaseline();
+      const readBinary = vi.spyOn(A.plugin.app.vault, "readBinary");
+      A.bs.prioritizePaths(["repeated.png"]);
+      A.bs.prioritizePaths(["repeated.png"]);
+      A.bs.prioritizePaths(["repeated.png"]);
+      await waitFor(() => A.binaries.has("repeated.png"), { label: "priority upload published" });
+      await waitFor(() => A.uploadStates.at(-1) === "idle", { label: "priority upload settled" });
+      expect(readBinary).toHaveBeenCalledTimes(2);
     } finally {
       A.bs.destroy();
       A.provider.destroy();

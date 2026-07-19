@@ -29,7 +29,8 @@ use crate::session::{bearer_token, hash_token, now_millis, ApiActor, ApiPrincipa
 use crate::state::AppState;
 use crate::structured::{
     self, BaseViewBody, BaseViewPatchBody, CanvasEdgeBody, CanvasEdgePatchBody, CanvasNodeBody,
-    CanvasNodePatchBody, CreateStructuredBody, MoveStructuredBody,
+    CanvasNodePatchBody, CanvasOperation, CanvasOperationBatchBody, CreateStructuredBody,
+    MoveStructuredBody,
 };
 use crate::{SERVER_NAME, SERVER_SLUG};
 
@@ -379,6 +380,13 @@ struct CanvasEdgePatchArgs {
     id: String,
     #[serde(flatten)]
     patch: serde_json::Map<String, serde_json::Value>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct CanvasOperationBatchArgs {
+    path: String,
+    operations: Vec<serde_json::Value>,
+    mutation_id: Option<String>,
 }
 #[derive(Deserialize, JsonSchema)]
 struct IdPathArgs {
@@ -821,6 +829,45 @@ impl InstaMcp {
                 &c.vault_id,
                 &args.path,
                 &args.id,
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Apply an atomic batch of Canvas node, edge, and ordering operations",
+        annotations(
+            title = "Canvas: Apply operation batch",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn apply_canvas_operations(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<CanvasOperationBatchArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = ctx(&context)?;
+        let operations: Result<Vec<CanvasOperation>, _> = args
+            .operations
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect();
+        let operations = operations.map_err(|error| {
+            ErrorData::invalid_params(format!("invalid Canvas operation: {error}"), None)
+        })?;
+        tool_result(
+            structured::apply_canvas_operations_inner(
+                &c.state,
+                &c.principal,
+                &c.vault_id,
+                &args.path,
+                CanvasOperationBatchBody {
+                    operations,
+                    mutation_id: args.mutation_id,
+                },
             )
             .await,
         )

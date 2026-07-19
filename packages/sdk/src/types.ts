@@ -152,6 +152,17 @@ export interface PublicShare {
   createdAt: number;
 }
 
+/** A public link to one exact version of a binary attachment. */
+export interface PublicAttachmentShare {
+  id: string;
+  /** Absolute URL of the public attachment. */
+  url: string;
+  path: string;
+  hash: string;
+  size: number;
+  createdAt: number;
+}
+
 /** Stable permalink for a note, returned by the note-permalinks endpoint. */
 export interface PermalinkResponse {
   kind: string;
@@ -218,6 +229,28 @@ export interface CanvasEdgeBody {
   fromNode: string;
   toNode: string;
   [field: string]: unknown;
+}
+
+export interface CanvasFieldPatch {
+  set?: Record<string, unknown>;
+  remove?: string[];
+}
+
+export type CanvasOperation =
+  | { type: "node-create"; node: Record<string, unknown> }
+  | { type: "node-patch"; id: string; patch: CanvasFieldPatch }
+  | { type: "node-delete"; id: string }
+  | { type: "node-restore"; node: Record<string, unknown> }
+  | { type: "edge-create"; edge: Record<string, unknown> }
+  | { type: "edge-patch"; id: string; patch: CanvasFieldPatch }
+  | { type: "edge-delete"; id: string }
+  | { type: "edge-restore"; edge: Record<string, unknown> }
+  | { type: "node-order"; order: string[] }
+  | { type: "edge-order"; order: string[] };
+
+export interface CanvasOperationBatch {
+  operations: CanvasOperation[];
+  mutationId?: string;
 }
 
 export interface BaseViewBody {

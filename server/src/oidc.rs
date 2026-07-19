@@ -151,7 +151,15 @@ pub async fn callback(
         resolve_oidc_identity(&state, &flow, &params).await?
     };
 
-    let user = upsert_user(&state.db, &issuer, &subject, &email, &name, picture.as_deref()).await?;
+    let user = upsert_user(
+        &state.db,
+        &issuer,
+        &subject,
+        &email,
+        &name,
+        picture.as_deref(),
+    )
+    .await?;
     if let Some(oauth_flow_key) = flow.oauth_flow_key {
         return crate::oauth::finish_authorize(state, oauth_flow_key, user).await;
     }

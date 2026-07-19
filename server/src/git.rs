@@ -43,8 +43,7 @@ use crate::state::{Principal, PrincipalActor};
 use crate::structured::canvas_to_file_json;
 use crate::ydoc::{
     decode_binaries_entries, decode_config_entries, decode_files_map, decode_structured,
-    decode_structured_index,
-    decode_text,
+    decode_structured_index, decode_text,
 };
 
 /// A principal seen contributing to a vault during one debounce window.

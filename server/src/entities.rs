@@ -174,6 +174,30 @@ pub mod public_shares {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+pub mod public_attachment_shares {
+    use sea_orm::entity::prelude::*;
+
+    /// Public links to one exact version of a binary attachment. The path and
+    /// hash must still match the live vault index for the link to resolve.
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "public_attachment_shares")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub vault_id: String,
+        pub path: String,
+        pub hash: String,
+        pub size: i64,
+        pub created_by: String,
+        pub created_at: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod note_search {
     use sea_orm::entity::prelude::*;
 

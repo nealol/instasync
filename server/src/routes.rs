@@ -267,18 +267,24 @@ fn validate_git_email(value: &str) -> Result<(), AppError> {
 /// URL, at most 2048 bytes, with no ASCII control characters or whitespace.
 fn validate_avatar_url(value: &str) -> Result<(), AppError> {
     if value.len() > 2048 {
-        return Err(AppError::BadRequest("avatar_url is not a valid http(s) URL".into()));
+        return Err(AppError::BadRequest(
+            "avatar_url is not a valid http(s) URL".into(),
+        ));
     }
     if value
         .bytes()
         .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
     {
-        return Err(AppError::BadRequest("avatar_url contains invalid characters".into()));
+        return Err(AppError::BadRequest(
+            "avatar_url contains invalid characters".into(),
+        ));
     }
     let url = url::Url::parse(value)
         .map_err(|_| AppError::BadRequest("avatar_url is not a valid http(s) URL".into()))?;
     if url.scheme() != "http" && url.scheme() != "https" {
-        return Err(AppError::BadRequest("avatar_url is not a valid http(s) URL".into()));
+        return Err(AppError::BadRequest(
+            "avatar_url is not a valid http(s) URL".into(),
+        ));
     }
     Ok(())
 }

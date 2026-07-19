@@ -37,13 +37,25 @@ export function serializeCanvas(value: JsonValue): string {
   const edgeOrder = Array.isArray(root.edgeOrder)
     ? root.edgeOrder.filter(isString)
     : Object.keys(edges);
-  const orderedNodes = [...nodeOrder, ...Object.keys(nodes).filter((id) => !nodeOrder.includes(id))]
+  const orderedNodes = uniqueCanvasOrder(nodeOrder, nodes)
     .map((id) => nodes[id])
     .filter(isObject);
-  const orderedEdges = [...edgeOrder, ...Object.keys(edges).filter((id) => !edgeOrder.includes(id))]
+  const orderedEdges = uniqueCanvasOrder(edgeOrder, edges)
     .map((id) => edges[id])
     .filter(isObject);
   return `${JSON.stringify({ nodes: orderedNodes, edges: orderedEdges }, null, 2)}\n`;
+}
+
+function uniqueCanvasOrder(order: readonly string[], items: Record<string, JsonValue>): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const id of [...order, ...Object.keys(items)]) {
+    if (id in items && !seen.has(id)) {
+      seen.add(id);
+      result.push(id);
+    }
+  }
+  return result;
 }
 
 /**

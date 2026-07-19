@@ -6,7 +6,7 @@ import {
   staticToken,
   type TokenProvider,
 } from "../../src/http";
-import { ApiError, AuthError, NotFoundError } from "../../src/errors";
+import { AuthError, ConflictError, NotFoundError, ValidationError } from "../../src/errors";
 import { RealtimeClient } from "../../src/client";
 
 function jsonResponse(status: number, body: unknown): Response {
@@ -81,8 +81,23 @@ describe("Http", () => {
     await expect(http.request("GET", "/api/x")).rejects.toMatchObject({
       status: 409,
       message: "HTTP 409",
-      constructor: ApiError,
+      constructor: ConflictError,
     });
+  });
+
+  it("maps validation and conflict responses to stable errors", async () => {
+    const validation = new Http({
+      baseUrl: "https://x.test",
+      auth: staticToken("t"),
+      fetch: mockFetch(() => jsonResponse(400, { error: "bad patch" })),
+    });
+    await expect(validation.request("POST", "/api/x")).rejects.toThrow(ValidationError);
+    const conflict = new Http({
+      baseUrl: "https://x.test",
+      auth: staticToken("t"),
+      fetch: mockFetch(() => jsonResponse(409, { error: "tombstoned" })),
+    });
+    await expect(conflict.request("POST", "/api/x")).rejects.toThrow(ConflictError);
   });
 
   it("retries once via onUnauthorized and succeeds", async () => {
@@ -193,6 +208,63 @@ describe("RealtimeClient URL construction", () => {
     });
     expect(JSON.parse(requests[1].body!)).toEqual({
       statements: [{ sql: "INSERT INTO tasks VALUES (?1)", params: [1] }],
+    });
+  });
+
+  it("submits atomic Canvas operations and explicit restores", async () => {
+    const { requests, client } = capture();
+    const canvases = client.vault("v1").canvases;
+    await canvases.applyOperations("Boards/My Board.canvas", {
+      mutationId: "retry-1",
+      operations: [
+        {
+          type: "node-patch",
+          id: "n1",
+          patch: { set: { x: 10 }, remove: ["color"] },
+        },
+      ],
+    });
+    await canvases.restoreNode("Boards/My Board.canvas", { id: "n2", type: "text" });
+    expect(requests.map((request) => `${request.method} ${request.url}`)).toEqual([
+      "POST https://x.test/api/vaults/v1/canvas-operations/Boards/My%20Board.canvas",
+      "POST https://x.test/api/vaults/v1/canvas-operations/Boards/My%20Board.canvas",
+    ]);
+    expect(JSON.parse(requests[0].body!)).toMatchObject({
+      mutationId: "retry-1",
+      operations: [{ type: "node-patch", id: "n1" }],
+    });
+    expect(JSON.parse(requests[1].body!)).toEqual({
+      operations: [{ type: "node-restore", node: { id: "n2", type: "text" } }],
+    });
+  });
+
+  it("routes Canvas convenience edits through batches and falls back on older servers", async () => {
+    const requests: { url: string; method: string; body?: string }[] = [];
+    let operationRequests = 0;
+    const fetch = mockFetch((url, init) => {
+      requests.push({ url, method: init.method ?? "GET", body: init.body as string | undefined });
+      if (url.includes("/canvas-operations/") && operationRequests++ === 1) {
+        return jsonResponse(404, { error: "not found" });
+      }
+      return jsonResponse(200, {});
+    });
+    const client = new RealtimeClient({ baseUrl: "https://x.test", token: "t", fetch });
+    const canvases = client.vault("v1").canvases;
+    await canvases.updateNode("Board.canvas", "n1", { x: 12 });
+    await canvases.deleteEdge("Board.canvas", "e1");
+    expect(requests.map((request) => `${request.method} ${request.url}`)).toEqual([
+      "POST https://x.test/api/vaults/v1/canvas-operations/Board.canvas",
+      "POST https://x.test/api/vaults/v1/canvas-operations/Board.canvas",
+      "DELETE https://x.test/api/vaults/v1/canvas-edges/Board.canvas",
+    ]);
+    expect(JSON.parse(requests[0].body!)).toEqual({
+      operations: [
+        {
+          type: "node-patch",
+          id: "n1",
+          patch: { set: { x: 12 }, remove: [] },
+        },
+      ],
     });
   });
 });

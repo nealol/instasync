@@ -2,7 +2,10 @@ use axum::extract::{Path, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map as JsonMap, Value as JsonValue};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock, Weak};
+use tokio::sync::Mutex;
+use utoipa::ToSchema;
 
 use crate::audit::{self, AuditEntry};
 use crate::error::{AppError, AppResult};
@@ -11,6 +14,20 @@ use crate::session::{now_millis, ApiPrincipal};
 use crate::state::AppState;
 use crate::ydoc::{self, StructuredIndexEntry};
 use crate::ysweet::{ensure_doc, Level};
+
+static CANVAS_MUTATION_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
+
+async fn canvas_mutation_lock(document_id: &str) -> Arc<Mutex<()>> {
+    let locks = CANVAS_MUTATION_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().await;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(document_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(document_id.to_string(), Arc::downgrade(&lock));
+    lock
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,6 +102,63 @@ pub struct CanvasEdgePatchBody {
     pub patch: JsonMap<String, JsonValue>,
 }
 
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CanvasOperationBatchBody {
+    pub operations: Vec<CanvasOperation>,
+    pub mutation_id: Option<String>,
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum CanvasOperation {
+    NodeCreate {
+        #[schema(value_type = Object)]
+        node: JsonMap<String, JsonValue>,
+    },
+    NodePatch {
+        id: String,
+        patch: CanvasFieldPatch,
+    },
+    NodeDelete {
+        id: String,
+    },
+    NodeRestore {
+        #[schema(value_type = Object)]
+        node: JsonMap<String, JsonValue>,
+    },
+    EdgeCreate {
+        #[schema(value_type = Object)]
+        edge: JsonMap<String, JsonValue>,
+    },
+    EdgePatch {
+        id: String,
+        patch: CanvasFieldPatch,
+    },
+    EdgeDelete {
+        id: String,
+    },
+    EdgeRestore {
+        #[schema(value_type = Object)]
+        edge: JsonMap<String, JsonValue>,
+    },
+    NodeOrder {
+        order: Vec<String>,
+    },
+    EdgeOrder {
+        order: Vec<String>,
+    },
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct CanvasFieldPatch {
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub set: JsonMap<String, JsonValue>,
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
 #[derive(Deserialize)]
 pub struct BaseViewBody {
     pub name: String,
@@ -137,9 +211,11 @@ pub fn ordered_canvas_items(
     let mut seen = HashSet::new();
     if let Some(order) = order {
         for id in order.iter().filter_map(JsonValue::as_str) {
-            if let Some(item) = items.get(id) {
+            if seen.insert(id.to_string()) {
+                let Some(item) = items.get(id) else {
+                    continue;
+                };
                 out.push(item.clone());
-                seen.insert(id.to_string());
             }
         }
     }
@@ -445,6 +521,99 @@ pub async fn delete_canvas_edge(
         })
         .await?,
     ))
+}
+
+pub async fn apply_canvas_operations(
+    State(state): State<AppState>,
+    principal: ApiPrincipal,
+    Path((vault_id, path)): Path<(String, String)>,
+    Json(body): Json<CanvasOperationBatchBody>,
+) -> AppResult<Json<StructuredResponse>> {
+    match apply_canvas_operations_inner(&state, &principal, &vault_id, &path, body).await {
+        Ok(response) => Ok(Json(response)),
+        Err(error) => {
+            tracing::warn!(vault_id, path, error = %error, "Canvas operation batch failed");
+            Err(error)
+        }
+    }
+}
+
+pub(crate) async fn apply_canvas_operations_inner(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+    path: &str,
+    body: CanvasOperationBatchBody,
+) -> AppResult<StructuredResponse> {
+    if body.operations.is_empty() {
+        return Err(AppError::BadRequest("operations must not be empty".into()));
+    }
+    if body
+        .mutation_id
+        .as_ref()
+        .is_some_and(|id| id.is_empty() || id.len() > 128)
+    {
+        return Err(AppError::BadRequest("invalid mutationId".into()));
+    }
+    let entry = require_structured_access(state, principal, vault_id, path, "canvas", true).await?;
+    let document_id = doc_id(vault_id, &entry.guid);
+    let mutation_lock = canvas_mutation_lock(&document_id).await;
+    let _mutation_guard = mutation_lock.lock().await;
+    let current = ydoc::read_update(state, &document_id).await?;
+    let mut value =
+        ydoc::decode_structured(&current).map_err(|error| AppError::Internal(error.to_string()))?;
+    let before = value.clone();
+    let root = value
+        .as_object_mut()
+        .ok_or_else(|| AppError::Internal("structured root is not object".into()))?;
+
+    if let Some(mutation_id) = body.mutation_id.as_ref() {
+        let seen = ensure_array(root, "canvasMutationIds");
+        if seen.iter().any(|value| value.as_str() == Some(mutation_id)) {
+            return Ok(StructuredResponse {
+                permalink: permalink_for_guid(state, &entry.guid),
+                path: entry.path,
+                guid: entry.guid,
+                kind: entry.kind,
+                value: canvas_to_file_json(value),
+            });
+        }
+    }
+
+    let operation_count = body.operations.len();
+    apply_canvas_operation_batch(root, body.operations)?;
+    if let Some(mutation_id) = body.mutation_id {
+        let seen = ensure_array(root, "canvasMutationIds");
+        if seen.len() >= 256 {
+            seen.remove(0);
+        }
+        seen.push(json!(mutation_id));
+    }
+
+    let update = ydoc::build_structured_update(&current, &value)?;
+    if !update.is_empty() {
+        ydoc::write_update(state, &document_id, update).await?;
+        mark_structured_write(state, vault_id, principal).await;
+    }
+    if audit::is_cursor(principal) {
+        audit::record(
+            state,
+            principal,
+            vault_id,
+            AuditEntry::new("canvas_operations", path)
+                .before(pretty_json(&canvas_to_file_json(before)))
+                .after(pretty_json(&canvas_to_file_json(value.clone())))
+                .details(json!({ "operationCount": operation_count })),
+        )
+        .await;
+    }
+    Ok(StructuredResponse {
+        permalink: permalink_for_guid(state, &entry.guid),
+        path: entry.path,
+        guid: entry.guid,
+        kind: entry.kind,
+        value: canvas_to_file_json(value),
+    })
 }
 
 pub async fn read_base(
@@ -1122,30 +1291,18 @@ pub(crate) fn canvas_file_to_map(value: JsonValue) -> JsonValue {
 
 fn add_node(root: &mut JsonMap<String, JsonValue>, body: CanvasNodeBody) -> AppResult<()> {
     let id = body.id.unwrap_or_else(gen_canvas_id);
-    let nodes = ensure_object(root, "nodes");
-    if nodes.contains_key(&id) {
-        return Err(AppError::Conflict("node exists".into()));
-    }
     let mut node = body.fields;
     node.insert("id".into(), json!(id.clone()));
-    nodes.insert(id.clone(), JsonValue::Object(node));
-    ensure_order(root, "nodeOrder", &id);
-    Ok(())
+    apply_canvas_operation_batch(root, vec![CanvasOperation::NodeCreate { node }])
 }
 
 fn add_edge(root: &mut JsonMap<String, JsonValue>, body: CanvasEdgeBody) -> AppResult<()> {
     let id = body.id.unwrap_or_else(gen_canvas_id);
-    let edges = ensure_object(root, "edges");
-    if edges.contains_key(&id) {
-        return Err(AppError::Conflict("edge exists".into()));
-    }
     let mut edge = body.fields;
     edge.insert("id".into(), json!(id.clone()));
     edge.insert("fromNode".into(), json!(body.from_node));
     edge.insert("toNode".into(), json!(body.to_node));
-    edges.insert(id.clone(), JsonValue::Object(edge));
-    ensure_order(root, "edgeOrder", &id);
-    Ok(())
+    apply_canvas_operation_batch(root, vec![CanvasOperation::EdgeCreate { edge }])
 }
 
 fn patch_item(
@@ -1154,32 +1311,26 @@ fn patch_item(
     id: &str,
     patch: JsonMap<String, JsonValue>,
 ) -> AppResult<()> {
-    let items = ensure_object(root, map_key);
-    let item = items
-        .get_mut(id)
-        .and_then(JsonValue::as_object_mut)
-        .ok_or(AppError::NotFound)?;
-    for (key, value) in patch {
-        item.insert(key, value);
-    }
-    item.insert("id".into(), json!(id));
-    Ok(())
+    let patch = CanvasFieldPatch {
+        set: patch,
+        remove: Vec::new(),
+    };
+    let operation = if map_key == "nodes" {
+        CanvasOperation::NodePatch {
+            id: id.into(),
+            patch,
+        }
+    } else {
+        CanvasOperation::EdgePatch {
+            id: id.into(),
+            patch,
+        }
+    };
+    apply_canvas_operation_batch(root, vec![operation])
 }
 
 fn delete_node(root: &mut JsonMap<String, JsonValue>, id: &str) -> AppResult<()> {
-    delete_item(root, "nodes", "nodeOrder", id)?;
-    let mut delete_edges = Vec::new();
-    for (edge_id, edge) in ensure_object(root, "edges").iter() {
-        if edge.get("fromNode").and_then(JsonValue::as_str) == Some(id)
-            || edge.get("toNode").and_then(JsonValue::as_str) == Some(id)
-        {
-            delete_edges.push(edge_id.clone());
-        }
-    }
-    for edge_id in delete_edges {
-        delete_item(root, "edges", "edgeOrder", &edge_id)?;
-    }
-    Ok(())
+    apply_canvas_operation_batch(root, vec![CanvasOperation::NodeDelete { id: id.into() }])
 }
 
 fn delete_item(
@@ -1188,11 +1339,182 @@ fn delete_item(
     order_key: &str,
     id: &str,
 ) -> AppResult<()> {
-    ensure_object(root, map_key)
-        .remove(id)
+    let operation = if map_key == "nodes" {
+        CanvasOperation::NodeDelete { id: id.into() }
+    } else {
+        CanvasOperation::EdgeDelete { id: id.into() }
+    };
+    let _ = order_key;
+    apply_canvas_operation_batch(root, vec![operation])
+}
+
+fn apply_canvas_operation_batch(
+    root: &mut JsonMap<String, JsonValue>,
+    operations: Vec<CanvasOperation>,
+) -> AppResult<()> {
+    for operation in operations {
+        match operation {
+            CanvasOperation::NodeCreate { node } => {
+                create_canvas_item(root, "nodes", "nodeOrder", "deletedNodeIds", node, false)?
+            }
+            CanvasOperation::NodeRestore { node } => {
+                create_canvas_item(root, "nodes", "nodeOrder", "deletedNodeIds", node, true)?
+            }
+            CanvasOperation::EdgeCreate { edge } => {
+                create_canvas_item(root, "edges", "edgeOrder", "deletedEdgeIds", edge, false)?
+            }
+            CanvasOperation::EdgeRestore { edge } => {
+                create_canvas_item(root, "edges", "edgeOrder", "deletedEdgeIds", edge, true)?
+            }
+            CanvasOperation::NodePatch { id, patch } => {
+                apply_canvas_patch(root, "nodes", &id, patch)?
+            }
+            CanvasOperation::EdgePatch { id, patch } => {
+                apply_canvas_patch(root, "edges", &id, patch)?
+            }
+            CanvasOperation::NodeDelete { id } => {
+                tombstone_canvas_item(root, "nodes", "nodeOrder", "deletedNodeIds", &id);
+                let connected: Vec<String> = ensure_object(root, "edges")
+                    .iter()
+                    .filter(|(_, edge)| {
+                        edge.get("fromNode").and_then(JsonValue::as_str) == Some(id.as_str())
+                            || edge.get("toNode").and_then(JsonValue::as_str) == Some(id.as_str())
+                    })
+                    .map(|(edge_id, _)| edge_id.clone())
+                    .collect();
+                for edge_id in connected {
+                    tombstone_canvas_item(root, "edges", "edgeOrder", "deletedEdgeIds", &edge_id);
+                }
+            }
+            CanvasOperation::EdgeDelete { id } => {
+                tombstone_canvas_item(root, "edges", "edgeOrder", "deletedEdgeIds", &id)
+            }
+            CanvasOperation::NodeOrder { order } => {
+                set_canvas_order(root, "nodes", "nodeOrder", order)?
+            }
+            CanvasOperation::EdgeOrder { order } => {
+                set_canvas_order(root, "edges", "edgeOrder", order)?
+            }
+        }
+    }
+    validate_canvas_edges(root)
+}
+
+fn create_canvas_item(
+    root: &mut JsonMap<String, JsonValue>,
+    map_key: &str,
+    order_key: &str,
+    tombstone_key: &str,
+    mut item: JsonMap<String, JsonValue>,
+    restore: bool,
+) -> AppResult<()> {
+    let id = item
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| AppError::BadRequest("Canvas item id is required".into()))?
+        .to_string();
+    if ensure_object(root, tombstone_key).contains_key(&id) {
+        if !restore {
+            return Err(AppError::Conflict("Canvas item is tombstoned".into()));
+        }
+        ensure_object(root, tombstone_key).remove(&id);
+    }
+    if ensure_object(root, map_key).contains_key(&id) {
+        return Err(AppError::Conflict("Canvas item exists".into()));
+    }
+    item.insert("id".into(), json!(id.clone()));
+    ensure_object(root, map_key).insert(id.clone(), JsonValue::Object(item));
+    ensure_order(root, order_key, &id);
+    Ok(())
+}
+
+fn apply_canvas_patch(
+    root: &mut JsonMap<String, JsonValue>,
+    map_key: &str,
+    id: &str,
+    patch: CanvasFieldPatch,
+) -> AppResult<()> {
+    if id.is_empty() {
+        return Err(AppError::BadRequest("Canvas item id is required".into()));
+    }
+    let item = ensure_object(root, map_key)
+        .get_mut(id)
+        .and_then(JsonValue::as_object_mut)
         .ok_or(AppError::NotFound)?;
+    for key in patch.remove {
+        if key != "id" {
+            item.remove(&key);
+        }
+    }
+    for (key, value) in patch.set {
+        if key != "id" {
+            item.insert(key, value);
+        }
+    }
+    item.insert("id".into(), json!(id));
+    Ok(())
+}
+
+fn tombstone_canvas_item(
+    root: &mut JsonMap<String, JsonValue>,
+    map_key: &str,
+    order_key: &str,
+    tombstone_key: &str,
+    id: &str,
+) {
+    ensure_object(root, map_key).remove(id);
+    ensure_object(root, tombstone_key).insert(id.into(), json!(-1));
     if let Some(order) = root.get_mut(order_key).and_then(JsonValue::as_array_mut) {
-        order.retain(|v| v.as_str() != Some(id));
+        order.retain(|value| value.as_str() != Some(id));
+    }
+}
+
+fn set_canvas_order(
+    root: &mut JsonMap<String, JsonValue>,
+    map_key: &str,
+    order_key: &str,
+    order: Vec<String>,
+) -> AppResult<()> {
+    let items = ensure_object(root, map_key);
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+    for id in order {
+        if !items.contains_key(&id) {
+            return Err(AppError::BadRequest(format!(
+                "unknown Canvas item id: {id}"
+            )));
+        }
+        if seen.insert(id.clone()) {
+            normalized.push(json!(id));
+        }
+    }
+    for id in items.keys() {
+        if seen.insert(id.clone()) {
+            normalized.push(json!(id));
+        }
+    }
+    root.insert(order_key.into(), JsonValue::Array(normalized));
+    Ok(())
+}
+
+fn validate_canvas_edges(root: &mut JsonMap<String, JsonValue>) -> AppResult<()> {
+    let node_ids: HashSet<String> = ensure_object(root, "nodes").keys().cloned().collect();
+    for edge in ensure_object(root, "edges").values() {
+        let edge = edge
+            .as_object()
+            .ok_or_else(|| AppError::BadRequest("Canvas edge must be an object".into()))?;
+        for key in ["fromNode", "toNode"] {
+            let id = edge
+                .get(key)
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| AppError::BadRequest(format!("Canvas edge {key} is required")))?;
+            if !node_ids.contains(id) {
+                return Err(AppError::BadRequest(format!(
+                    "Canvas edge references unknown node: {id}"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -1390,11 +1712,104 @@ mod tests {
     }
 
     #[test]
+    fn canvas_file_order_ignores_duplicate_ids() {
+        let value = json!({
+            "nodes": {"a": {"id": "a"}, "b": {"id": "b"}},
+            "edges": {},
+            "nodeOrder": ["a", "a", "b", "a"],
+            "edgeOrder": []
+        });
+        let file = canvas_to_file_json(value);
+        assert_eq!(file["nodes"], json!([{"id": "a"}, {"id": "b"}]));
+    }
+
+    #[test]
     fn node_delete_cascades_edges() {
         let mut root = canvas_file_to_map(json!({ "nodes": [{"id":"a"},{"id":"b"}], "edges": [{"id":"e", "fromNode":"a", "toNode":"b"}] })).as_object().unwrap().clone();
         delete_node(&mut root, "a").unwrap();
         assert_eq!(root["edges"], json!({}));
         assert_eq!(root["edgeOrder"], json!([]));
+        assert_eq!(root["deletedNodeIds"]["a"], json!(-1));
+        assert_eq!(root["deletedEdgeIds"]["e"], json!(-1));
+    }
+
+    #[test]
+    fn canvas_batch_patches_fields_removes_fields_and_restores_tombstones() {
+        let mut root = canvas_file_to_map(json!({
+            "nodes": [{"id":"a","type":"text","text":"keep","x":0,"color":"1"}],
+            "edges": []
+        }))
+        .as_object()
+        .unwrap()
+        .clone();
+        apply_canvas_operation_batch(
+            &mut root,
+            vec![CanvasOperation::NodePatch {
+                id: "a".into(),
+                patch: CanvasFieldPatch {
+                    set: JsonMap::from_iter([("x".into(), json!(42))]),
+                    remove: vec!["color".into(), "id".into()],
+                },
+            }],
+        )
+        .unwrap();
+        assert_eq!(root["nodes"]["a"]["text"], json!("keep"));
+        assert_eq!(root["nodes"]["a"]["x"], json!(42));
+        assert!(root["nodes"]["a"].get("color").is_none());
+        assert_eq!(root["nodes"]["a"]["id"], json!("a"));
+
+        apply_canvas_operation_batch(
+            &mut root,
+            vec![CanvasOperation::NodeDelete { id: "a".into() }],
+        )
+        .unwrap();
+        assert!(apply_canvas_operation_batch(
+            &mut root,
+            vec![CanvasOperation::NodeCreate {
+                node: JsonMap::from_iter([("id".into(), json!("a"))]),
+            }],
+        )
+        .is_err());
+        apply_canvas_operation_batch(
+            &mut root,
+            vec![CanvasOperation::NodeRestore {
+                node: JsonMap::from_iter([
+                    ("id".into(), json!("a")),
+                    ("type".into(), json!("text")),
+                ]),
+            }],
+        )
+        .unwrap();
+        assert_eq!(root["nodes"]["a"]["id"], json!("a"));
+        assert!(root["deletedNodeIds"].get("a").is_none());
+    }
+
+    #[test]
+    fn canvas_batch_validates_edges_after_atomic_node_creation() {
+        let mut root = canvas_file_to_map(json!({"nodes":[],"edges":[]}))
+            .as_object()
+            .unwrap()
+            .clone();
+        apply_canvas_operation_batch(
+            &mut root,
+            vec![
+                CanvasOperation::NodeCreate {
+                    node: JsonMap::from_iter([("id".into(), json!("a"))]),
+                },
+                CanvasOperation::NodeCreate {
+                    node: JsonMap::from_iter([("id".into(), json!("b"))]),
+                },
+                CanvasOperation::EdgeCreate {
+                    edge: JsonMap::from_iter([
+                        ("id".into(), json!("e")),
+                        ("fromNode".into(), json!("a")),
+                        ("toNode".into(), json!("b")),
+                    ]),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(root["edges"]["e"]["toNode"], json!("b"));
     }
 
     #[test]

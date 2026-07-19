@@ -38,6 +38,7 @@ interface UploadJob {
   bytes: ArrayBuffer;
   size: number;
   attempts: number;
+  urgent: boolean;
 }
 
 /**
@@ -64,6 +65,7 @@ export class BinarySync {
   private lastSyncedHash = new Map<string, string>();
   /** Serializes reconcile() per path so concurrent triggers can't interleave. */
   private chains = new Map<string, Promise<void>>();
+  private pendingReconcile = new Set<string>();
   /** Paths we are currently writing to disk, to ignore the resulting vault event. */
   private writing = new Set<string>();
   /** Paths migrated away from binary sync during this session. */
@@ -73,6 +75,7 @@ export class BinarySync {
 
   /** Background upload queue (latest job per path wins). */
   private uploadQueue: UploadJob[] = [];
+  private urgentPaths = new Set<string>();
   private draining = false;
   /** True only while a single blob transfer is actually in flight. */
   private activeUpload = false;
@@ -145,6 +148,30 @@ export class BinarySync {
     await this.reconcile(path);
   }
 
+  /** Prioritize Canvas-referenced files without creating a second transfer path. */
+  prioritizePaths(paths: Iterable<string>): void {
+    if (this.destroyed) return;
+    const added: string[] = [];
+    for (const path of paths) {
+      if (!this.urgentPaths.has(path)) added.push(path);
+      this.urgentPaths.add(path);
+    }
+    for (const job of this.uploadQueue) {
+      if (this.urgentPaths.has(job.path)) job.urgent = true;
+    }
+    this.uploadQueue.sort((left, right) => Number(right.urgent) - Number(left.urgent));
+    for (const path of added) void this.reconcile(path);
+    this.scheduleDrain();
+  }
+
+  unprioritizePaths(paths: Iterable<string>): void {
+    for (const path of paths) {
+      this.urgentPaths.delete(path);
+      const job = this.uploadQueue.find((candidate) => candidate.path === path);
+      if (job) job.urgent = false;
+    }
+  }
+
   stopTrackingPath(path: string): void {
     this.ignoredPaths.add(path);
     this.lastSyncedHash.delete(path);
@@ -188,9 +215,18 @@ export class BinarySync {
 
   /** Run `fn` exclusively for `path`, chaining after any in-flight reconcile. */
   private reconcile(path: string): Promise<void> {
-    const prev = this.chains.get(path) ?? Promise.resolve();
-    const next = prev
-      .then(() => this.reconcileNow(path))
+    const active = this.chains.get(path);
+    if (active) {
+      this.pendingReconcile.add(path);
+      return active;
+    }
+    const next = Promise.resolve()
+      .then(async () => {
+        do {
+          this.pendingReconcile.delete(path);
+          await this.reconcileNow(path);
+        } while (this.pendingReconcile.delete(path) && !this.destroyed);
+      })
       .catch((e) => {
         console.error(`[Realtime] binary reconcile failed for ${path}`, e);
       });
@@ -215,6 +251,7 @@ export class BinarySync {
     if (localHash === remoteHash) {
       if (remoteHash) this.lastSyncedHash.set(path, remoteHash);
       else this.lastSyncedHash.delete(path);
+      this.urgentPaths.delete(path);
       return;
     }
 
@@ -306,6 +343,7 @@ export class BinarySync {
     await this.writeDisk(path, bytes);
     if (this.destroyed) return;
     this.lastSyncedHash.set(path, hash);
+    this.urgentPaths.delete(path);
     dbg("binary downloaded", path, hash, bytes.byteLength);
   }
 
@@ -402,13 +440,21 @@ export class BinarySync {
     if (!bytes) return;
     const hash = await sha256Hex(bytes);
     if (this.destroyed) return;
-    this.enqueueUpload({ path, hash, bytes, size: bytes.byteLength, attempts: 0 });
+    this.enqueueUpload({
+      path,
+      hash,
+      bytes,
+      size: bytes.byteLength,
+      attempts: 0,
+      urgent: this.urgentPaths.has(path),
+    });
   }
 
   private enqueueUpload(job: UploadJob): void {
     // Latest job per path wins.
     this.uploadQueue = this.uploadQueue.filter((j) => j.path !== job.path);
-    this.uploadQueue.push(job);
+    if (job.urgent) this.uploadQueue.unshift(job);
+    else this.uploadQueue.push(job);
     this.refreshUploadStatus();
     this.scheduleDrain();
   }
@@ -442,7 +488,7 @@ export class BinarySync {
         const job = this.uploadQueue[0];
         // Hold large transfers back while notes are actively syncing — they
         // stay queued and surface as "pending" rather than "uploading".
-        if (job.size >= LARGE_FILE_BYTES && this.vaultSync.isTextSyncBusy()) {
+        if (!job.urgent && job.size >= LARGE_FILE_BYTES && this.vaultSync.isTextSyncBusy()) {
           this.scheduleDrain(DRAIN_RETRY_MS);
           break;
         }
@@ -481,6 +527,7 @@ export class BinarySync {
     if (this.destroyed) return;
     // Publish only now that the bytes are on the server.
     this.publishMeta(job.path, { hash: job.hash, size: job.size });
+    this.urgentPaths.delete(job.path);
     dbg("binary uploaded+published", job.path, job.hash, job.size);
   }
 
@@ -550,6 +597,8 @@ export class BinarySync {
     }
     this.uploadQueue = [];
     this.chains.clear();
+    this.pendingReconcile.clear();
+    this.urgentPaths.clear();
     this.refreshUploadStatus();
   }
 }

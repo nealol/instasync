@@ -3,7 +3,7 @@ import { TFile, Notice, normalizePath } from "obsidian";
 import type RealtimePlugin from "./main";
 import { applyTextToYText } from "./diff";
 import { dbg, snip } from "./debug";
-import { ensureParentFolder, getFileByPath, isOpenInWorkspace } from "./vaultHelpers";
+import { ensureParentFolder, getFileByPath, isOpenInEditableMarkdown } from "./vaultHelpers";
 import { openTextConflictModal } from "./TextConflictModal";
 import { SyncedDoc } from "./SyncedDoc";
 
@@ -12,6 +12,7 @@ import { SyncedDoc } from "./SyncedDoc";
  * disk content into the shared text, so our own ytext observer can ignore them.
  */
 const DISK_ORIGIN = Symbol("realtime-disk");
+const DISK_WRITE_RETRY_MS = 2_000;
 
 /**
  * A single collaboratively-edited Markdown file. Owns its own Y.Doc and
@@ -86,7 +87,7 @@ export class Document extends SyncedDoc {
     // external change, which it then 3-way merges into its editor buffer,
     // duplicating the just-typed text (and that merge gets re-sent to peers).
     window.setTimeout(() => {
-      if (this.destroyed || this.boundEditors > 0 || this.isOpenInWorkspace()) return;
+      if (this.destroyed || this.boundEditors > 0 || this.isOpenInEditableMarkdown()) return;
       void this.writeToDisk(this.content);
     }, 0);
   }
@@ -178,7 +179,7 @@ export class Document extends SyncedDoc {
 
       // The editor (if open) receives the merged text via the ytext observer;
       // writing through vault.modify would make Obsidian merge an external change.
-      if (!this.hasBoundEditor && !this.isOpenInWorkspace()) {
+      if (!this.hasBoundEditor && !this.isOpenInEditableMarkdown()) {
         await this.writeToDisk(this.content);
       }
     } catch (e) {
@@ -203,11 +204,11 @@ export class Document extends SyncedDoc {
     this.plugin.vaultSync?.noteTextActivity();
     // While a note is open, Obsidian owns its editor buffer and persistence;
     // writing through vault.modify would appear as an external file change.
-    if (this.hasBoundEditor || this.isOpenInWorkspace()) return;
+    if (this.hasBoundEditor || this.isOpenInEditableMarkdown()) return;
     this.scheduleWriteToDisk();
   }
 
-  private scheduleWriteToDisk(): void {
+  private scheduleWriteToDisk(delayMs = 100): void {
     if (this.writeTimer !== null) {
       window.clearTimeout(this.writeTimer);
     }
@@ -221,11 +222,11 @@ export class Document extends SyncedDoc {
         this.destroyed ||
         !this.startupBaselineCaptured ||
         this.hasBoundEditor ||
-        this.isOpenInWorkspace()
+        this.isOpenInEditableMarkdown()
       )
         return;
       void this.writeToDisk(this.content);
-    }, 100);
+    }, delayMs);
   }
 
   /** Called by VaultSync when the local file changed and no editor is bound. */
@@ -267,8 +268,8 @@ export class Document extends SyncedDoc {
     return getFileByPath(this.plugin.app, this.path);
   }
 
-  private isOpenInWorkspace(): boolean {
-    return isOpenInWorkspace(this.plugin.app, this.path);
+  private isOpenInEditableMarkdown(): boolean {
+    return isOpenInEditableMarkdown(this.plugin.app, this.path);
   }
 
   private async readFromDisk(): Promise<string | null> {
@@ -289,14 +290,14 @@ export class Document extends SyncedDoc {
         // external change it 3-way-merges, duplicating text. This is the last
         // line of defence behind the callers' own open-state checks (which can
         // race an open that happens during an awaited read/schedule).
-        if (this.hasBoundEditor || this.isOpenInWorkspace()) {
+        if (this.hasBoundEditor || this.isOpenInEditableMarkdown()) {
           dbg(
             "writeToDisk SKIP (open/bound)",
             this.path,
             "bound",
             this.boundEditors,
             "open",
-            this.isOpenInWorkspace(),
+            this.isOpenInEditableMarkdown(),
           );
           return;
         }
@@ -304,14 +305,14 @@ export class Document extends SyncedDoc {
         // Re-check destroyed after the await: a doc replaced mid-write (rename,
         // guid change) must not clobber the file its successor now owns.
         if (this.destroyed) return;
-        if (this.hasBoundEditor || this.isOpenInWorkspace()) {
+        if (this.hasBoundEditor || this.isOpenInEditableMarkdown()) {
           dbg(
             "writeToDisk SKIP after read (open/bound)",
             this.path,
             "bound",
             this.boundEditors,
             "open",
-            this.isOpenInWorkspace(),
+            this.isOpenInEditableMarkdown(),
           );
           return;
         }
@@ -324,7 +325,7 @@ export class Document extends SyncedDoc {
           "bound",
           this.boundEditors,
           "open",
-          this.isOpenInWorkspace(),
+          this.isOpenInEditableMarkdown(),
         );
         await this.plugin.app.vault.modify(file, text);
       } else {
@@ -336,6 +337,7 @@ export class Document extends SyncedDoc {
       }
     } catch (e) {
       console.error(`[Realtime] writeToDisk failed for ${this.path}`, e);
+      if (!this.destroyed) this.scheduleWriteToDisk(DISK_WRITE_RETRY_MS);
     } finally {
       // Release on the next tick so the resulting vault 'modify' event,
       // which is dispatched asynchronously, is still treated as our own.

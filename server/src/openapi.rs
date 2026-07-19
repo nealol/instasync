@@ -13,6 +13,11 @@ use utoipa::{Modify, OpenApi};
         description = "REST, OAuth, auth, permalink, and public upload surfaces for Realtime. MCP JSON-RPC, y-sweet proxy, raw blob store, and doc-token endpoints are intentionally excluded."
     ),
     modifiers(&SecurityAddon),
+    components(schemas(
+        crate::structured::CanvasOperationBatchBody,
+        crate::structured::CanvasOperation,
+        crate::structured::CanvasFieldPatch
+    )),
     paths(
         auth_login,
         auth_callback,
@@ -63,6 +68,10 @@ use utoipa::{Modify, OpenApi};
         upload_attachment,
         delete_attachment,
         move_attachment,
+        create_attachment_share,
+        get_attachment_share,
+        delete_attachment_share,
+        view_shared_attachment,
         public_upload,
         note_by_guid,
         note_by_path,
@@ -73,6 +82,7 @@ use utoipa::{Modify, OpenApi};
         delete_canvas,
         canvas_nodes,
         canvas_edges,
+        canvas_operations,
         move_canvas,
         list_bases,
         read_base,
@@ -108,6 +118,7 @@ use utoipa::{Modify, OpenApi};
         (name = "canvas", description = "Vault-scoped Obsidian Canvas APIs"),
         (name = "bases", description = "Vault-scoped Obsidian Base APIs"),
         (name = "attachments", description = "Vault-scoped attachment APIs and signed uploads"),
+        (name = "shares", description = "Authenticated share management and public file delivery"),
         (name = "plugin-dbs", description = "Synced plugin database (cr-sqlite) bootstrap, replication, and purge APIs"),
         (name = "permalinks", description = "Public note redirect endpoints"),
         (name = "history", description = "Vault git history browsing and admin rollback")
@@ -176,6 +187,9 @@ async fn canvas_nodes() {}
 
 #[utoipa::path(post, patch, delete, path = "/api/vaults/{id}/canvas-edges/{path}", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Canvas edge mutation")))]
 async fn canvas_edges() {}
+
+#[utoipa::path(post, path = "/api/vaults/{id}/canvas-operations/{path}", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), request_body = crate::structured::CanvasOperationBatchBody, responses((status = 200, description = "Atomically applied Canvas operation batch"), (status = 400, description = "Invalid Canvas operation"), (status = 409, description = "Canvas operation conflict")))]
+async fn canvas_operations() {}
 
 #[utoipa::path(post, path = "/api/vaults/{id}/canvas-moves/{path}", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Moved Canvas")))]
 async fn move_canvas() {}
@@ -347,6 +361,18 @@ async fn delete_attachment() {}
 
 #[utoipa::path(post, path = "/api/vaults/{id}/attachment-moves/{path}", tag = "attachments", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), request_body = Object, responses((status = 200, description = "Moved attachment")))]
 async fn move_attachment() {}
+
+#[utoipa::path(post, path = "/api/vaults/{id}/attachment-shares", tag = "shares", security(("bearerAuth" = [])), params(("id" = String, Path)), request_body = Object, responses((status = 200, description = "Created or returned the attachment's current public share"), (status = 404, description = "Attachment not found")))]
+async fn create_attachment_share() {}
+
+#[utoipa::path(get, path = "/api/vaults/{id}/attachment-shares", tag = "shares", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Query)), responses((status = 200, description = "Current attachment share or null")))]
+async fn get_attachment_share() {}
+
+#[utoipa::path(delete, path = "/api/vaults/{id}/attachment-shares", tag = "shares", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Query)), responses((status = 200, description = "Revoked attachment share"), (status = 404, description = "Attachment is not shared")))]
+async fn delete_attachment_share() {}
+
+#[utoipa::path(get, path = "/a/{share_id}", tag = "shares", params(("share_id" = String, Path)), responses((status = 200, description = "Public attachment bytes"), (status = 404, description = "Share is revoked or the attachment changed")))]
+async fn view_shared_attachment() {}
 
 #[utoipa::path(post, path = "/upload", tag = "attachments", request_body(content = String, content_type = "multipart/form-data"), responses((status = 200, description = "Uploaded via signed link"), (status = 401, description = "Invalid or expired upload token"), (status = 409, description = "Upload token already used"), (status = 413, description = "Too large")))]
 async fn public_upload() {}

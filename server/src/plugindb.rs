@@ -2008,7 +2008,11 @@ fn create_table_target(stmt: &str) -> Option<String> {
     let rest_lower = &lower[offset..];
     let rest_lower = rest_lower.trim_start();
     let skip = rest_lower.len()
-        - rest_lower.strip_prefix("if not exists").map(str::trim_start).unwrap_or(rest_lower).len();
+        - rest_lower
+            .strip_prefix("if not exists")
+            .map(str::trim_start)
+            .unwrap_or(rest_lower)
+            .len();
     let rest_orig = rest_orig[skip..].trim_start();
     parse_quoted_identifier(rest_orig)
 }
@@ -2987,7 +2991,10 @@ mod tests {
         // The replica now has the `notes` table with its clock sidecar, and
         // the change row is visible via a dump.
         let dump = dump_replica(&config, "v", "p", "n").unwrap().unwrap();
-        assert!(dump.contains("-- crr: notes"), "dump should list notes as a CRR");
+        assert!(
+            dump.contains("-- crr: notes"),
+            "dump should list notes as a CRR"
+        );
         assert!(
             dump.contains("INSERT INTO \"notes\""),
             "dump should contain the notes row"

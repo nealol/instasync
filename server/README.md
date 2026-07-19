@@ -26,7 +26,11 @@ a `path → sha256` mapping through the CRDT index and stores the bytes in a
 under `/api/vaults/{id}/blobs/{hash}` for the matching plugin, while consumer-facing
 attachment APIs live under `/api/vaults/{id}/attachments/*`. Attachments enforce an
 extension allowlist, an attachment-specific size cap, SSRF checks for from-URL
-fetches, and signed single-use public upload links via `/upload`.
+fetches, and signed single-use public upload links via `/upload`. Vault members can
+also create revocable public download links through
+`/api/vaults/{id}/attachment-shares`; returned `/a/{share_id}` links require no
+authentication and resolve only while the shared path still points to the exact
+content hash captured at creation.
 
 **Remote Cursors / MCP** expose a vault-scoped MCP resource at `/mcp/i/{appId}`.
 MCP clients can use OAuth 2.1 against this server, and direct REST automation can

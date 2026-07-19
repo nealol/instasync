@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import * as Y from "yjs";
 import { Awareness } from "y-protocols/awareness";
 import { createRoot } from "react-dom/client";
@@ -8,6 +8,10 @@ import {
   markViewing,
   setCanvasCursor,
   readCanvasViewport,
+  writeCanvasViewport,
+  readCanvasPresence,
+  setCanvasPresence,
+  mountCanvasCursorOverlay,
   PresenceAvatarStack,
   initials,
   type PresenceEntry,
@@ -137,6 +141,116 @@ describe("setCanvasCursor", () => {
   });
 });
 
+describe("Canvas collaboration awareness", () => {
+  it("round-trips versioned selection, drag, editing, and viewport state", () => {
+    const aw = makeAwareness();
+    const state = {
+      version: 1 as const,
+      sequence: 4,
+      selectedNodeIds: ["a", "b"],
+      interaction: {
+        kind: "drag" as const,
+        nodes: [{ id: "a", x: 10, y: 20, width: 100, height: 80 }],
+      },
+      editingNodeId: "b",
+      viewport: { x: 5, y: 6, scale: 2 },
+    };
+    setCanvasPresence(aw, state);
+    expect(readCanvasPresence(aw.getLocalState()?.canvasPresence)).toEqual(state);
+    setCanvasPresence(aw, null);
+    expect(aw.getLocalState()?.canvasPresence ?? null).toBeNull();
+    aw.destroy();
+  });
+
+  it("rejects unsupported versions and malformed payloads", () => {
+    expect(readCanvasPresence({ version: 2, sequence: 1 })).toBeNull();
+    expect(readCanvasPresence({ version: 1, sequence: -1 })).toBeNull();
+    expect(readCanvasPresence({ version: 1, sequence: 1, selectedNodeIds: [3] })).toBeNull();
+    expect(
+      readCanvasPresence({
+        version: 1,
+        sequence: 1,
+        interaction: { kind: "drag", nodes: [{ id: "a", x: 0 }] },
+      }),
+    ).toBeNull();
+  });
+
+  it("renders remote selection labels and drag ghosts in local world coordinates", async () => {
+    const aw = makeAwareness();
+    const remoteId = aw.doc.clientID + 1;
+    const states = aw.getStates() as Map<number, any>;
+    states.set(remoteId, {
+      user: { name: "Remote", color: "#ff0000" },
+      viewing: { kind: "canvas" },
+      canvasCursor: { x: 20, y: 30, space: "canvas" },
+      canvasPresence: {
+        version: 1,
+        sequence: 2,
+        selectedNodeIds: ["a"],
+        interaction: {
+          kind: "drag",
+          nodes: [{ id: "a", x: 10, y: 20, width: 100, height: 50 }],
+        },
+        viewport: { x: 5, y: 6, scale: 2 },
+      },
+    });
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const wrapper = document.createElement("div");
+    Object.defineProperties(wrapper, {
+      clientWidth: { value: 800 },
+      clientHeight: { value: 600 },
+      clientLeft: { value: 0 },
+      clientTop: { value: 0 },
+    });
+    wrapper.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, width: 800, height: 600 } as DOMRect);
+    const canvas = {
+      x: 0,
+      y: 0,
+      scale: 2,
+      wrapperEl: wrapper,
+      posFromDom: ({ x, y }: { x: number; y: number }) => ({ x: x / 2, y: y / 2 }),
+      domFromPos: ({ x, y }: { x: number; y: number }) => ({ x: x * 2, y: y * 2 }),
+      getData: () => ({
+        nodes: [{ id: "a", type: "text", x: 10, y: 20, width: 100, height: 50 }],
+        edges: [],
+      }),
+      setViewport: vi.fn(),
+      requestFrame: vi.fn(),
+    };
+    const cleanup = mountCanvasCursorOverlay(host, aw, () => canvas);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(host.querySelector(".realtime-canvas-presence-box.is-selection")).not.toBeNull();
+    expect(host.querySelector(".realtime-canvas-presence-box.is-drag")).not.toBeNull();
+    expect(host.textContent).toContain("Remote");
+    expect(host.querySelector(".realtime-canvas-cursor")).not.toBeNull();
+    const followButton = host.querySelector<HTMLButtonElement>(
+      ".realtime-canvas-cursor-label",
+    )!;
+    expect(followButton.getAttribute("aria-label")).toContain("Follow Remote");
+    followButton.click();
+    expect(canvas.setViewport).toHaveBeenCalledWith({ x: 5, y: 6, scale: 2 });
+    canvas.setViewport.mockClear();
+    host.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    states.get(remoteId).canvasPresence = {
+      ...states.get(remoteId).canvasPresence,
+      sequence: 3,
+      viewport: { x: 50, y: 60, scale: 1 },
+    };
+    (aw as any).emit("change", [
+      { added: [], updated: [remoteId], removed: [] },
+      "remote",
+    ]);
+    expect(canvas.setViewport).not.toHaveBeenCalled();
+    cleanup();
+    expect(aw.getLocalState()?.canvasPresence ?? null).toBeNull();
+    expect(host.querySelector(".realtime-canvas-presence-layer")).toBeNull();
+    aw.destroy();
+    host.remove();
+  });
+});
+
 describe("readCanvasViewport", () => {
   it("returns null for non-canvas objects", () => {
     expect(readCanvasViewport(null)).toBeNull();
@@ -206,6 +320,29 @@ describe("readCanvasViewport", () => {
     expect(vp!.canvasRect.cx).toBe(27);
     expect(vp!.canvasRect.top).toBe(9);
     expect(vp!.canvasRect.cy).toBe(19);
+  });
+});
+
+describe("Canvas viewport follow adapter", () => {
+  it("applies viewport through a feature-detected setter", () => {
+    const requestFrame = vi.fn();
+    const setViewport = vi.fn();
+    expect(
+      writeCanvasViewport(
+        { setViewport, requestFrame },
+        { x: 10, y: 20, scale: 1.5 },
+      ),
+    ).toBe(true);
+    expect(setViewport).toHaveBeenCalledWith({ x: 10, y: 20, scale: 1.5 });
+    expect(requestFrame).toHaveBeenCalledOnce();
+  });
+
+  it("falls back to x/y plus setScale and rejects unsupported shapes", () => {
+    const canvas = { x: 0, y: 0, setScale: vi.fn() };
+    expect(writeCanvasViewport(canvas, { x: 4, y: 5, scale: 2 })).toBe(true);
+    expect(canvas).toMatchObject({ x: 4, y: 5 });
+    expect(canvas.setScale).toHaveBeenCalledWith(2);
+    expect(writeCanvasViewport({}, { x: 1, y: 2, scale: 1 })).toBe(false);
   });
 });
 

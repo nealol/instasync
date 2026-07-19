@@ -1,5 +1,5 @@
 import type { Http } from "../http";
-import type { PublicShare } from "../types";
+import type { PublicAttachmentShare, PublicShare } from "../types";
 
 /**
  * Public read-only share links for notes (`/view/{id}` in the web viewer).
@@ -30,5 +30,29 @@ export class SharesResource {
   /** Stop publicly sharing a note. Throws NotFound if it was not shared. */
   async remove(path: string): Promise<void> {
     await this.http.request("DELETE", `/api/vaults/${this.vaultId}/shares`, { query: { path } });
+  }
+
+  /** Create (or return) a public link for the current version of an attachment. */
+  createAttachment(path: string): Promise<PublicAttachmentShare> {
+    return this.http.request("POST", `/api/vaults/${this.vaultId}/attachment-shares`, {
+      body: { path },
+    });
+  }
+
+  /** The attachment's current share, or null if it is not publicly shared. */
+  async getAttachment(path: string): Promise<PublicAttachmentShare | null> {
+    const res = await this.http.request<{ share: PublicAttachmentShare | null }>(
+      "GET",
+      `/api/vaults/${this.vaultId}/attachment-shares`,
+      { query: { path } },
+    );
+    return res.share;
+  }
+
+  /** Stop publicly sharing an attachment. */
+  async removeAttachment(path: string): Promise<void> {
+    await this.http.request("DELETE", `/api/vaults/${this.vaultId}/attachment-shares`, {
+      query: { path },
+    });
   }
 }

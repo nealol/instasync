@@ -38,6 +38,70 @@ export interface CanvasCursorState {
   space: "canvas";
 }
 
+export interface CanvasPresenceState {
+  version: 1;
+  sequence: number;
+  selectedNodeIds?: string[];
+  interaction?: {
+    kind: "drag" | "resize";
+    nodes: Array<{ id: string; x: number; y: number; width: number; height: number }>;
+  };
+  editingNodeId?: string;
+  viewport?: { x: number; y: number; scale: number };
+}
+
+export function readCanvasPresence(value: unknown): CanvasPresenceState | null {
+  if (!value || typeof value !== "object") return null;
+  const state = value as Record<string, unknown>;
+  if (
+    state.version !== 1 ||
+    !Number.isSafeInteger(state.sequence) ||
+    (state.sequence as number) < 0
+  )
+    return null;
+  if (
+    state.selectedNodeIds !== undefined &&
+    (!Array.isArray(state.selectedNodeIds) ||
+      state.selectedNodeIds.some((id) => typeof id !== "string"))
+  )
+    return null;
+  if (state.viewport !== undefined) {
+    const viewport = state.viewport as Record<string, unknown>;
+    if (
+      !viewport ||
+      typeof viewport.x !== "number" ||
+      typeof viewport.y !== "number" ||
+      typeof viewport.scale !== "number" ||
+      !Number.isFinite(viewport.scale) ||
+      viewport.scale <= 0
+    )
+      return null;
+  }
+  if (state.interaction !== undefined) {
+    const interaction = state.interaction as Record<string, unknown>;
+    if (
+      !interaction ||
+      (interaction.kind !== "drag" && interaction.kind !== "resize") ||
+      !Array.isArray(interaction.nodes) ||
+      interaction.nodes.some((node) => !isCanvasPresenceNode(node))
+    )
+      return null;
+  }
+  if (state.editingNodeId !== undefined && typeof state.editingNodeId !== "string") return null;
+  return state as unknown as CanvasPresenceState;
+}
+
+function isCanvasPresenceNode(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const node = value as Record<string, unknown>;
+  return (
+    typeof node.id === "string" &&
+    ["x", "y", "width", "height"].every(
+      (key) => typeof node[key] === "number" && Number.isFinite(node[key]),
+    )
+  );
+}
+
 // ---------- canvas viewport adapter ----------
 
 /**
@@ -124,6 +188,34 @@ export function readCanvasViewport(canvas: unknown): CanvasViewport | null {
     posFromDom: (p) => (posFromDom as Function).call(canvas, p),
     domFromPos: (p) => (domFromPos as Function).call(canvas, p),
   };
+}
+
+/** Feature-detected viewport mutation used by optional local follow mode. */
+export function writeCanvasViewport(
+  canvas: unknown,
+  viewport: { x: number; y: number; scale: number },
+): boolean {
+  if (!canvas || typeof canvas !== "object" || viewport.scale <= 0) return false;
+  const target = canvas as Record<string, unknown>;
+  try {
+    if (typeof target.setViewport === "function") {
+      (target.setViewport as Function).call(canvas, {
+        x: viewport.x,
+        y: viewport.y,
+        scale: viewport.scale,
+      });
+    } else if ("x" in target && "y" in target && typeof target.setScale === "function") {
+      target.x = viewport.x;
+      target.y = viewport.y;
+      (target.setScale as Function).call(canvas, viewport.scale);
+    } else {
+      return false;
+    }
+    (target.requestFrame as Function | undefined)?.call(canvas);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Validate and adopt the Canvas instance's cached `canvasRect`, if usable. */
@@ -235,6 +327,13 @@ export function setCanvasCursor(awareness: Awareness, cursor: CanvasCursorState 
   awareness.setLocalStateField("canvasCursor", cursor);
 }
 
+export function setCanvasPresence(
+  awareness: Awareness,
+  presence: CanvasPresenceState | null,
+): void {
+  awareness.setLocalStateField("canvasPresence", presence);
+}
+
 // ---------- React avatar stack ----------
 
 /**
@@ -243,7 +342,11 @@ export function setCanvasCursor(awareness: Awareness, cursor: CanvasCursorState 
  * `--realtime-presence-color` set to the device's cursor color and a centered
  * border ring via `::after`.
  */
-export function PresenceAvatarStack({ entries }: { entries: PresenceEntry[] }): ReactElement | null {
+export function PresenceAvatarStack({
+  entries,
+}: {
+  entries: PresenceEntry[];
+}): ReactElement | null {
   if (entries.length === 0) return null;
   return createElement(
     "div",
@@ -294,11 +397,7 @@ export function mountPresenceStack(
   const root = createRoot(container);
 
   const render = () => {
-    const entries = collectPresenceEntries(
-      awareness.getStates(),
-      awareness.doc.clientID,
-      kind,
-    );
+    const entries = collectPresenceEntries(awareness.getStates(), awareness.doc.clientID, kind);
     root.render(PresenceAvatarStack({ entries }));
   };
 
@@ -340,6 +439,7 @@ export function mountCanvasCursorOverlay(
   layer.className = "realtime-canvas-presence-layer";
   host.appendChild(layer);
   const root = createRoot(layer);
+  let followedClientId: number | null = null;
 
   /** Read the live viewport; null when the canvas private API is unavailable. */
   const viewport = () => readCanvasViewport(getCanvas());
@@ -394,18 +494,154 @@ export function mountCanvasCursorOverlay(
     return markers;
   };
 
+  const lastSequences = new Map<number, number>();
+  const canvasNodes = () => {
+    const canvas = getCanvas() as { getData?: () => unknown } | null;
+    const data = canvas?.getData?.() as { nodes?: unknown[] } | undefined;
+    const result = new Map<
+      string,
+      { id: string; x: number; y: number; width: number; height: number }
+    >();
+    for (const node of data?.nodes ?? []) {
+      if (isCanvasPresenceNode(node)) {
+        const value = node as { id: string; x: number; y: number; width: number; height: number };
+        result.set(value.id, value);
+      }
+    }
+    return result;
+  };
+
+  const collectPresence = () => {
+    const localId = awareness.doc.clientID;
+    const nodes = canvasNodes();
+    const entries: Array<{
+      key: string;
+      name: string;
+      color: string;
+      kind: "selection" | "drag" | "resize" | "editing";
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+    }> = [];
+    awareness.getStates().forEach((rawState, clientId) => {
+      if (clientId === localId || !rawState || typeof rawState !== "object") return;
+      const state = rawState as Record<string, unknown>;
+      const presence = readCanvasPresence(state.canvasPresence);
+      if (!presence) return;
+      const prior = lastSequences.get(clientId);
+      if (prior !== undefined && presence.sequence < prior) return;
+      lastSequences.set(clientId, presence.sequence);
+      const user = state.user as AwarenessUser | undefined;
+      const name = user?.name ?? "Anonymous";
+      const color = user?.color ?? "#30bced";
+      const interaction = new Map(presence.interaction?.nodes.map((node) => [node.id, node]));
+      for (const id of presence.selectedNodeIds ?? []) {
+        const node = interaction.get(id) ?? nodes.get(id);
+        if (node)
+          entries.push({
+            key: `${clientId}:selection:${id}`,
+            name,
+            color,
+            kind: "selection",
+            ...node,
+          });
+      }
+      for (const node of presence.interaction?.nodes ?? []) {
+        entries.push({
+          key: `${clientId}:${presence.interaction!.kind}:${node.id}`,
+          name,
+          color,
+          kind: presence.interaction!.kind,
+          ...node,
+        });
+      }
+      if (presence.editingNodeId) {
+        const node = nodes.get(presence.editingNodeId);
+        if (node)
+          entries.push({
+            key: `${clientId}:editing:${node.id}`,
+            name,
+            color,
+            kind: "editing",
+            ...node,
+          });
+      }
+    });
+    return entries.flatMap((entry) => {
+      const topLeft = worldToLayer(entry.x, entry.y);
+      const bottomRight = worldToLayer(entry.x + entry.width, entry.y + entry.height);
+      if (!topLeft || !bottomRight) return [];
+      return [
+        {
+          ...entry,
+          x: topLeft.x,
+          y: topLeft.y,
+          width: bottomRight.x - topLeft.x,
+          height: bottomRight.y - topLeft.y,
+        },
+      ];
+    });
+  };
+
   const render = () => {
     const markers = collectMarkers();
+    const presence = collectPresence();
     root.render(
       createElement(
         "div",
         null,
+        presence.map((entry) =>
+          createElement(
+            "div",
+            {
+              key: entry.key,
+              className: `realtime-canvas-presence-box is-${entry.kind}`,
+              style: {
+                "--realtime-presence-color": entry.color,
+                "--realtime-canvas-x": `${entry.x}px`,
+                "--realtime-canvas-y": `${entry.y}px`,
+                "--realtime-canvas-width": `${entry.width}px`,
+                "--realtime-canvas-height": `${entry.height}px`,
+                position: "absolute",
+                left: 0,
+                top: 0,
+                width: entry.width,
+                height: entry.height,
+                transform: `translate(${entry.x}px, ${entry.y}px)`,
+                border: `2px ${entry.kind === "drag" || entry.kind === "resize" ? "dashed" : "solid"} ${entry.color}`,
+                borderRadius: 6,
+                boxSizing: "border-box",
+                pointerEvents: "none",
+              } as CSSProperties,
+            },
+            createElement(
+              "div",
+              {
+                className: "realtime-canvas-presence-label",
+                style: {
+                  position: "absolute",
+                  left: -2,
+                  bottom: "100%",
+                  padding: "1px 5px",
+                  borderRadius: "4px 4px 4px 0",
+                  background: entry.color,
+                  color: "white",
+                  fontSize: 11,
+                  whiteSpace: "nowrap",
+                },
+              },
+              entry.name,
+            ),
+          ),
+        ),
         markers.map((m) =>
           createElement(
             "div",
             {
               key: m.key,
               className: "realtime-canvas-cursor",
+              "data-client-id": m.key,
               style: {
                 "--realtime-presence-color": m.color,
                 "--realtime-canvas-x": `${m.x}px`,
@@ -413,15 +649,51 @@ export function mountCanvasCursorOverlay(
               } as CSSProperties,
             },
             createElement("div", { className: "realtime-canvas-cursor-dot" }),
-            createElement("div", { className: "realtime-canvas-cursor-label" }, m.name),
+            createElement(
+              "button",
+              {
+                type: "button",
+                className: "realtime-canvas-cursor-label",
+                "aria-label": `Follow ${m.name}'s Canvas view`,
+                style: {
+                  display: "block",
+                  border: 0,
+                  lineHeight: "inherit",
+                  pointerEvents: "auto",
+                  cursor: "pointer",
+                },
+                onClick: (event) => {
+                  event.stopPropagation();
+                  followedClientId = followedClientId === m.key ? null : m.key;
+                  applyFollowedViewport();
+                },
+              },
+              m.name,
+            ),
           ),
         ),
       ),
     );
   };
 
-  const listener = () => render();
-  awareness.on("change", listener);
+  const applyFollowedViewport = () => {
+    if (followedClientId === null) return;
+    const state = awareness.getStates().get(followedClientId) as
+      | Record<string, unknown>
+      | undefined;
+    const viewing = state?.viewing as { kind?: string } | undefined;
+    const presence = readCanvasPresence(state?.canvasPresence);
+    if (!state || viewing?.kind !== "canvas" || !presence?.viewport) {
+      followedClientId = null;
+      return;
+    }
+    if (!writeCanvasViewport(getCanvas(), presence.viewport)) followedClientId = null;
+  };
+  const awarenessListener = () => {
+    applyFollowedViewport();
+    render();
+  };
+  awareness.on("change", awarenessListener);
   render();
 
   // Viewport watcher: re-render remote markers when the local pan/zoom moves.
@@ -503,6 +775,7 @@ export function mountCanvasCursorOverlay(
     }
     pending = null;
     setCanvasCursor(awareness, null);
+    setCanvasPresence(awareness, null);
     render();
   };
 
@@ -516,6 +789,11 @@ export function mountCanvasCursorOverlay(
   host.addEventListener("pointerleave", onPointerLeave);
   window.addEventListener("blur", onBlur);
   document.addEventListener("visibilitychange", onVisibilityChange);
+  const cancelFollow = () => {
+    followedClientId = null;
+  };
+  host.addEventListener("pointerdown", cancelFollow, true);
+  host.addEventListener("wheel", cancelFollow, true);
 
   // Start the viewport watcher whenever a remote state appears, so remote
   // cursors move in lockstep with the local pan/zoom even before we publish.
@@ -526,16 +804,19 @@ export function mountCanvasCursorOverlay(
   ensureWatcher();
 
   return () => {
-    awareness.off("change", listener);
+    awareness.off("change", awarenessListener);
     awareness.off("change", ensureWatcher);
     host.removeEventListener("pointermove", onPointerMove);
     host.removeEventListener("pointerleave", onPointerLeave);
     window.removeEventListener("blur", onBlur);
     document.removeEventListener("visibilitychange", onVisibilityChange);
+    host.removeEventListener("pointerdown", cancelFollow, true);
+    host.removeEventListener("wheel", cancelFollow, true);
     if (rafId !== null) cancelAnimationFrame(rafId);
     viewRunning = false;
     if (viewRaf !== null) cancelAnimationFrame(viewRaf);
     setCanvasCursor(awareness, null);
+    setCanvasPresence(awareness, null);
     root.unmount();
     layer.remove();
   };

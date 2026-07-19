@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import * as Y from "yjs";
 import { YSweetProvider } from "@y-sweet/client";
-import { VaultSync } from "../../src/VaultSync";
+import { VaultSync, shouldSyncCanvasBinaryPath } from "../../src/VaultSync";
 import { getClientToken } from "../../src/ysweet";
 import { startAuthHarness, type AuthHarness } from "../support/authServer";
 import { makeFakePlugin, type FakePlugin } from "../support/fakePlugin";
@@ -32,6 +32,13 @@ function makeIndexPeer(plugin: FakePlugin, vaultId: string) {
 }
 
 describe("VaultSync index", () => {
+  it("respects binary settings for missing Canvas attachments", () => {
+    expect(shouldSyncCanvasBinaryPath("image.png", false, "")).toBe(false);
+    expect(shouldSyncCanvasBinaryPath("private/image.png", true, "private/**")).toBe(false);
+    expect(shouldSyncCanvasBinaryPath("note.md", true, "")).toBe(false);
+    expect(shouldSyncCanvasBinaryPath("image.png", true, "")).toBe(true);
+  });
+
   it("propagates create / delete / rename through namespaced docs", async () => {
     const vault = await harness.createVault(aliceToken, "notes");
     const vaultId = vault.id;

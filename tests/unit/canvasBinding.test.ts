@@ -1,9 +1,114 @@
 import { describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { Awareness } from "y-protocols/awareness";
-import { CanvasBinding } from "../../src/editor/CanvasBinding";
+import { CanvasBinding, canvasAttachmentPaths } from "../../src/editor/CanvasBinding";
+import { makeLiveCanvasFixture } from "../support/canvasHarness";
+
+function makeOperationalDoc(data: unknown) {
+  let current = data;
+  return {
+    path: "Board.canvas",
+    awareness: new Awareness(new Y.Doc()),
+    isReady: () => true,
+    canvasData: () => current,
+    setRemote: (next: unknown) => {
+      current = next;
+    },
+    applyCanvasOperations: vi.fn(),
+    reconcileFromCanvasData: vi.fn(),
+  };
+}
 
 describe("CanvasBinding startup", () => {
+  it("falls back safely when Canvas data APIs move to the view", () => {
+    let data = { nodes: [{ id: "a", type: "text", text: "old", x: 0 }], edges: [] };
+    const rawCanvas = { getData: {}, importData: {}, requestSave: vi.fn() };
+    const host = document.createElement("div");
+    const view = {
+      canvas: rawCanvas,
+      containerEl: host,
+      file: { path: "Board.canvas" },
+      getViewType: () => "canvas",
+      getViewData: () => JSON.stringify(data),
+      setViewData: vi.fn((value: string) => {
+        data = JSON.parse(value);
+      }),
+    };
+    const workspace = {
+      iterateAllLeaves: (callback: (leaf: unknown) => void) => callback({ view }),
+      getLeavesOfType: () => [],
+    };
+    const doc = makeOperationalDoc(data);
+    const binding = new CanvasBinding({ app: { workspace } } as any, doc as any);
+    binding.tryBind();
+    expect(binding.isActive()).toBe(false);
+    rawCanvas.requestSave();
+    expect(doc.applyCanvasOperations).not.toHaveBeenCalled();
+    binding.destroy();
+    doc.awareness.destroy();
+  });
+
+  it("discovers unique Canvas file-node attachment paths", () => {
+    expect(
+      canvasAttachmentPaths({
+        nodes: {
+          a: { id: "a", type: "file", file: "img/a.png" },
+          b: { id: "b", type: "file", file: "img/a.png" },
+          c: { id: "c", type: "text", text: "ignored" },
+        },
+        edges: {},
+        nodeOrder: ["a", "b", "c"],
+        edgeOrder: [],
+      }),
+    ).toEqual(["img/a.png"]);
+  });
+
+  it("prioritizes only binary Canvas references selected by VaultSync", () => {
+    const initial = {
+      nodes: [
+        { id: "note", type: "file", file: "note.md" },
+        { id: "image", type: "file", file: "image.png" },
+      ],
+      edges: [],
+    };
+    const fixture = makeLiveCanvasFixture("Board.canvas", initial);
+    const doc = makeOperationalDoc(initial);
+    const vaultSync = {
+      canvasBinaryPaths: vi.fn(() => ["image.png"]),
+      prioritizeCanvasAttachments: vi.fn(),
+      unprioritizeCanvasAttachments: vi.fn(),
+    };
+    let attachmentExists = false;
+    let refreshAttachments = () => {};
+    const vault = {
+      getAbstractFileByPath: vi.fn(() => (attachmentExists ? { path: "image.png" } : null)),
+      on: vi.fn((_event: string, callback: () => void) => {
+        refreshAttachments = callback;
+        return {};
+      }),
+      offref: vi.fn(),
+    };
+    const binding = new CanvasBinding(
+      {
+        app: {
+          workspace: fixture.workspace,
+          vault,
+        },
+        vaultSync,
+      } as any,
+      doc as any,
+    );
+    binding.tryBind();
+    expect(vaultSync.canvasBinaryPaths).toHaveBeenCalledWith(["image.png", "note.md"]);
+    expect(vaultSync.prioritizeCanvasAttachments).toHaveBeenCalledWith(["image.png"]);
+    expect(fixture.host.querySelector(".realtime-canvas-attachment-status")).not.toBeNull();
+    attachmentExists = true;
+    refreshAttachments();
+    expect(fixture.host.querySelector(".realtime-canvas-attachment-status")).toBeNull();
+    binding.destroy();
+    expect(vault.offref).toHaveBeenCalledTimes(3);
+  });
+
   it("does not import CRDT data into an open canvas before the document is ready", () => {
     const host = document.createElement("div");
     const originalRequestSave = vi.fn();
@@ -194,5 +299,149 @@ describe("CanvasBinding reused view (file switch)", () => {
     bindingB.destroy();
     docA.awareness.destroy();
     docB.awareness.destroy();
+  });
+});
+
+describe("CanvasBinding operation shadow", () => {
+  it("captures only the local field changed against the displayed shadow", () => {
+    const initial = { nodes: [{ id: "a", type: "text", text: "old", x: 0, y: 0 }], edges: [] };
+    const fixture = makeLiveCanvasFixture("Board.canvas", initial);
+    const doc = makeOperationalDoc(initial);
+    const binding = new CanvasBinding({ app: { workspace: fixture.workspace } } as any, doc as any);
+    binding.tryBind();
+
+    // Yjs can already contain this remote text while the view still has the
+    // prior snapshot. A local drag must publish x only, never stale text.
+    doc.setRemote({ nodes: [{ id: "a", type: "text", text: "remote", x: 0, y: 0 }], edges: [] });
+    fixture.setData({ nodes: [{ id: "a", type: "text", text: "old", x: 90, y: 0 }], edges: [] });
+    fixture.canvas.requestSave();
+
+    expect(doc.applyCanvasOperations).toHaveBeenCalledWith(
+      [{ type: "node-patch", id: "a", patch: { set: { x: 90 }, remove: [] } }],
+      expect.anything(),
+    );
+    expect(doc.reconcileFromCanvasData).not.toHaveBeenCalled();
+
+    binding.destroy();
+    doc.awareness.destroy();
+  });
+
+  it("updates the shadow on an equal remote state and suppresses delayed saves", () => {
+    const initial = { nodes: [{ id: "a", type: "text", text: "same" }], edges: [] };
+    const fixture = makeLiveCanvasFixture("Board.canvas", initial);
+    const doc = makeOperationalDoc(initial);
+    const binding = new CanvasBinding({ app: { workspace: fixture.workspace } } as any, doc as any);
+    binding.tryBind();
+    doc.applyCanvasOperations.mockClear();
+
+    fixture.canvas.requestSave();
+    expect(doc.applyCanvasOperations).not.toHaveBeenCalled();
+
+    binding.destroy();
+    doc.awareness.destroy();
+  });
+});
+
+describe("CanvasBinding interaction scheduling", () => {
+  it("samples bounded durable updates and captures the final drag state", () => {
+    vi.useFakeTimers();
+    const initial = { nodes: [{ id: "a", type: "text", text: "A", x: 0, y: 0 }], edges: [] };
+    const fixture = makeLiveCanvasFixture("Board.canvas", initial);
+    const awareness = new Awareness(new Y.Doc());
+    const doc = {
+      path: "Board.canvas",
+      awareness,
+      isReady: () => true,
+      canvasData: () => initial,
+      applyCanvasOperations: vi.fn(),
+      reconcileFromCanvasData: vi.fn(),
+    };
+    const binding = new CanvasBinding({ app: { workspace: fixture.workspace } } as any, doc as any);
+    binding.tryBind();
+
+    fixture.host.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    for (let index = 1; index <= 500; index++) {
+      fixture.setData({ nodes: [{ id: "a", type: "text", text: "A", x: index, y: 0 }], edges: [] });
+      fixture.host.dispatchEvent(new PointerEvent("pointermove", { bubbles: true }));
+    }
+    vi.advanceTimersByTime(300);
+    window.dispatchEvent(new PointerEvent("pointerup"));
+
+    expect(doc.applyCanvasOperations.mock.calls.length).toBeLessThanOrEqual(5);
+    expect(doc.applyCanvasOperations).toHaveBeenLastCalledWith(
+      [{ type: "node-patch", id: "a", patch: { set: { x: 500 }, remove: [] } }],
+      expect.anything(),
+    );
+
+    binding.destroy();
+    awareness.destroy();
+    vi.useRealTimers();
+  });
+
+  it("defers remote deletion during a drag and flushes on pointer release", () => {
+    vi.useFakeTimers();
+    const initial = { nodes: [{ id: "a", type: "text", text: "A", x: 0, y: 0 }], edges: [] };
+    const remote = { nodes: [], edges: [] };
+    const fixture = makeLiveCanvasFixture("Board.canvas", initial);
+    const doc = makeOperationalDoc(initial);
+    const binding = new CanvasBinding({ app: { workspace: fixture.workspace } } as any, doc as any);
+    binding.tryBind();
+    fixture.canvas.importData.mockClear();
+
+    fixture.host.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    doc.setRemote(remote);
+    binding.scheduleRemote();
+    vi.advanceTimersByTime(100);
+    expect(fixture.canvas.importData).not.toHaveBeenCalled();
+
+    window.dispatchEvent(new PointerEvent("pointerup"));
+    expect(fixture.canvas.importData).toHaveBeenCalledTimes(1);
+    expect(fixture.canvas.importData).toHaveBeenCalledWith(remote, true);
+
+    binding.destroy();
+    doc.awareness.destroy();
+    vi.useRealTimers();
+  });
+
+  it("removes timers and lifecycle listeners on destroy", () => {
+    vi.useFakeTimers();
+    const initial = { nodes: [{ id: "a", type: "text", text: "A", x: 0, y: 0 }], edges: [] };
+    const fixture = makeLiveCanvasFixture("Board.canvas", initial);
+    const doc = makeOperationalDoc(initial);
+    const binding = new CanvasBinding({ app: { workspace: fixture.workspace } } as any, doc as any);
+    binding.tryBind();
+    expect(doc.awareness.getLocalState()?.canvasPresence).toMatchObject({ version: 1 });
+    fixture.host.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    binding.destroy();
+    expect(doc.awareness.getLocalState()?.canvasPresence ?? null).toBeNull();
+    doc.applyCanvasOperations.mockClear();
+    vi.advanceTimersByTime(500);
+    window.dispatchEvent(new PointerEvent("pointerup"));
+    expect(doc.applyCanvasOperations).not.toHaveBeenCalled();
+    doc.awareness.destroy();
+    expect(vi.getTimerCount()).toBe(0);
+    vi.useRealTimers();
+  });
+
+  it("leaves no timers after repeated Canvas mount and unmount cycles", () => {
+    vi.useFakeTimers();
+    for (let index = 0; index < 25; index++) {
+      const initial = {
+        nodes: [{ id: "a", type: "text", text: String(index), x: 0, y: 0 }],
+        edges: [],
+      };
+      const fixture = makeLiveCanvasFixture(`Board-${index}.canvas`, initial);
+      const doc = makeOperationalDoc(initial);
+      doc.path = `Board-${index}.canvas`;
+      const binding = new CanvasBinding(
+        { app: { workspace: fixture.workspace } } as any,
+        doc as any,
+      );
+      binding.tryBind();
+      binding.destroy();
+      doc.awareness.destroy();
+    }
+    expect(vi.getTimerCount()).toBe(0);
+    vi.useRealTimers();
   });
 });

@@ -649,6 +649,15 @@ async fn test_app_with_attachment_max(
     ysweet_public_url: &str,
     attachment_max_bytes: u64,
 ) -> Router {
+    app_from_config(&test_config(
+        ysweet_url,
+        ysweet_public_url,
+        attachment_max_bytes,
+    ))
+    .await
+}
+
+fn test_config(ysweet_url: &str, ysweet_public_url: &str, attachment_max_bytes: u64) -> Config {
     let mut path = std::env::temp_dir();
     path.push(format!("realtime-test-{}.db", uuid::Uuid::new_v4()));
     let database_url = format!("sqlite://{}?mode=rwc", path.display());
@@ -659,7 +668,7 @@ async fn test_app_with_attachment_max(
     let mut git_dir = std::env::temp_dir();
     git_dir.push(format!("realtime-git-{}", uuid::Uuid::new_v4()));
 
-    let config = Config {
+    Config {
         database_url,
         bind_addr: "127.0.0.1:0".into(),
         public_base_url: "http://auth.test".into(),
@@ -705,9 +714,11 @@ async fn test_app_with_attachment_max(
         upload_token: "test-upload-token".into(),
         crsqlite_ext_path: None,
         web_dist_path: "../packages/web/dist".into(),
-    };
-    let state = build_state(config).await.unwrap();
-    app(state)
+    }
+}
+
+async fn app_from_config(config: &Config) -> Router {
+    app(build_state(config.clone()).await.unwrap())
 }
 
 async fn send(
@@ -1191,6 +1202,31 @@ async fn server_info_returns_stable_id_without_auth() {
 }
 
 #[tokio::test]
+async fn server_info_and_session_survive_restart() {
+    let ys = fake_ysweet().await;
+    let config = test_config(&ys, &ys, realtime_server::blobs::MAX_BLOB_BYTES);
+
+    let first = app_from_config(&config).await;
+    let token = login(&first, "alice").await;
+    let (status, before) = send(&first, "GET", "/api/server-info", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let server_id = before["serverId"]
+        .as_str()
+        .expect("serverId string")
+        .to_string();
+    drop(first);
+
+    let second = app_from_config(&config).await;
+    let (status, after) = send(&second, "GET", "/api/server-info", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(after["serverId"].as_str(), Some(server_id.as_str()));
+
+    let (status, identity) = send(&second, "GET", "/api/me", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(identity["displayName"], "alice");
+}
+
+#[tokio::test]
 async fn logout_revokes_session() {
     let ys = fake_ysweet().await;
     let app = test_app(&ys, &ys).await;
@@ -1233,6 +1269,13 @@ async fn openapi_json_and_swagger_docs_are_served() {
     let paths = spec["paths"].as_object().unwrap();
     assert!(paths.contains_key("/api/vaults/{id}/notes/{path}"));
     assert!(paths.contains_key("/api/vaults/{id}/attachments/upload-link"));
+    assert!(paths.contains_key("/api/vaults/{id}/canvas-operations/{path}"));
+    assert!(
+        paths["/api/vaults/{id}/canvas-operations/{path}"]["post"]["requestBody"]["content"]
+            ["application/json"]["schema"]["$ref"]
+            .as_str()
+            .is_some_and(|value| value.ends_with("/CanvasOperationBatchBody"))
+    );
     assert!(paths.contains_key("/oauth/token"));
     assert!(paths.contains_key("/upload"));
     assert!(paths.contains_key("/n/{guid}"));
@@ -1603,6 +1646,9 @@ async fn mcp_lists_tools_and_round_trips_note_edits() {
     let tools = list["result"]["tools"].as_array().unwrap();
     assert!(tools.iter().any(|tool| tool["name"] == "create_note"));
     assert!(tools.iter().any(|tool| tool["name"] == "read_attachment"));
+    assert!(tools
+        .iter()
+        .any(|tool| tool["name"] == "apply_canvas_operations"));
     // Every tool advertises annotations so clients can auto-allow read-only
     // tools; titles carry the category prefix (Canvas/Base/Note/Attachment/Search).
     for tool in tools {
@@ -1681,6 +1727,45 @@ async fn mcp_lists_tools_and_round_trips_note_edits() {
         read["result"]["structuredContent"]["data"]["content"],
         "hello mcp"
     );
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/canvases"),
+        Some(&session),
+        Some(json!({"path": "mcp.canvas", "value": {"nodes": [], "edges": []}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, applied) = mcp_call(
+        &app,
+        app_id,
+        secret,
+        5,
+        "tools/call",
+        json!({
+            "name": "apply_canvas_operations",
+            "arguments": {
+                "path": "mcp.canvas",
+                "mutationId": "mcp-canvas-1",
+                "operations": [
+                    {"type": "node-create", "node": {"id": "n1", "type": "text", "text": "live", "x": 1, "y": 2}}
+                ]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    assert_eq!(applied["result"]["isError"], false);
+    let (_, canvas) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/canvas/mcp.canvas"),
+        Some(&session),
+        None,
+    )
+    .await;
+    assert_eq!(canvas["value"]["nodes"][0]["text"], "live");
 }
 
 #[tokio::test]
@@ -3400,6 +3485,103 @@ async fn canvas_move_update_embeds_rewrites_note_references() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(note["content"], "![[Archived/Board.canvas]]");
+}
+
+#[tokio::test]
+async fn canvas_operation_batches_are_atomic_authorized_and_idempotent() {
+    let ys = fake_ysweet_store().await;
+    let app = test_app(&ys, &ys).await;
+    let token = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&token),
+        Some(json!({"name": "Canvas operations"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap();
+    let route = format!("/api/vaults/{vault_id}/canvas-operations/Board.canvas");
+    let (_, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/canvases"),
+        Some(&token),
+        Some(json!({
+            "path": "Board.canvas",
+            "value": {
+                "nodes": [{"id": "a", "type": "text", "text": "before", "x": 0, "y": 0}],
+                "edges": []
+            }
+        })),
+    )
+    .await;
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &route,
+        None,
+        Some(json!({"operations": [{"type": "node-delete", "id": "a"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &route,
+        Some(&token),
+        Some(json!({
+            "operations": [
+                {"type": "node-patch", "id": "a", "patch": {"set": {"text": "must roll back"}}},
+                {"type": "edge-create", "edge": {"id": "bad", "fromNode": "a", "toNode": "missing"}}
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, unchanged) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/canvas/Board.canvas"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(unchanged["value"]["nodes"][0]["text"], "before");
+    assert_eq!(unchanged["value"]["edges"], json!([]));
+
+    let batch = json!({
+        "mutationId": "retry-safe-1",
+        "operations": [
+            {"type": "node-patch", "id": "a", "patch": {"set": {"text": "after", "color": "2"}}},
+            {"type": "node-create", "node": {"id": "b", "type": "text", "text": "new", "x": 10, "y": 0}},
+            {"type": "edge-create", "edge": {"id": "e", "fromNode": "a", "toNode": "b"}}
+        ]
+    });
+    let (first_result, second_result) = tokio::join!(
+        send(&app, "POST", &route, Some(&token), Some(batch.clone())),
+        send(&app, "POST", &route, Some(&token), Some(batch)),
+    );
+    let (status, first) = first_result;
+    assert_eq!(status, StatusCode::OK);
+    let (status, second) = second_result;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second["value"], first["value"]);
+    assert_eq!(second["value"]["nodes"].as_array().unwrap().len(), 2);
+    assert_eq!(second["value"]["nodes"][0]["text"], "after");
+    assert_eq!(second["value"]["edges"][0]["id"], "e");
+
+    let (_, persisted) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/canvas/Board.canvas"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(persisted["value"], second["value"]);
 }
 
 #[tokio::test]
@@ -6294,5 +6476,180 @@ async fn public_share_lifecycle_create_view_and_revoke() {
         None,
     )
     .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn public_attachment_share_is_scoped_to_the_shared_version_and_revocable() {
+    let ys = fake_ysweet_store().await;
+    let app = test_app(&ys, &ys).await;
+    let alice = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&alice),
+        Some(json!({"name": "v"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap();
+    let attachment_path = "images/public.png";
+    let attachment_url = format!("/api/vaults/{vault_id}/attachments/{attachment_path}");
+    let first_bytes = b"first image".to_vec();
+    let (status, _) = send_raw(
+        &app,
+        "PUT",
+        &attachment_url,
+        Some(&alice),
+        first_bytes.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let share_api = format!("/api/vaults/{vault_id}/attachment-shares");
+    let (status, share) = send(
+        &app,
+        "POST",
+        &share_api,
+        Some(&alice),
+        Some(json!({"path": attachment_path})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let share_id = share["id"].as_str().unwrap();
+    assert!(share["url"]
+        .as_str()
+        .unwrap()
+        .ends_with(&format!("/a/{share_id}")));
+
+    let public_url = format!("/a/{share_id}");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&public_url)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "image/png"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::X_CONTENT_TYPE_OPTIONS)
+            .unwrap(),
+        "nosniff"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.as_ref(), first_bytes.as_slice());
+
+    // Idempotent while the path still points at the same content.
+    let (status, same) = send(
+        &app,
+        "POST",
+        &share_api,
+        Some(&alice),
+        Some(json!({"path": attachment_path})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(same["id"], share["id"]);
+
+    // Replacing the file invalidates the link until the owner explicitly
+    // shares the new version.
+    let (status, _) = send_raw(
+        &app,
+        "PUT",
+        &attachment_url,
+        Some(&alice),
+        b"second image".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(&app, "GET", &public_url, None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, replacement) = send(
+        &app,
+        "POST",
+        &share_api,
+        Some(&alice),
+        Some(json!({"path": attachment_path})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replacement["id"], share["id"]);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&public_url)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.as_ref(), b"second image");
+
+    let race_path = "images/race.png";
+    let (status, _) = send_raw(
+        &app,
+        "PUT",
+        &format!("/api/vaults/{vault_id}/attachments/{race_path}"),
+        Some(&alice),
+        b"race image".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let first_create = send(
+        &app,
+        "POST",
+        &share_api,
+        Some(&alice),
+        Some(json!({"path": race_path})),
+    );
+    let second_create = send(
+        &app,
+        "POST",
+        &share_api,
+        Some(&alice),
+        Some(json!({"path": race_path})),
+    );
+    let ((first_status, first_share), (second_status, second_share)) =
+        tokio::join!(first_create, second_create);
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(second_status, StatusCode::OK);
+    assert_eq!(first_share["id"], second_share["id"]);
+
+    let mallory = login(&app, "mallory").await;
+    let (status, _) = send(
+        &app,
+        "POST",
+        &share_api,
+        Some(&mallory),
+        Some(json!({"path": attachment_path})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = send(
+        &app,
+        "DELETE",
+        &format!("{share_api}?path=images%2Fpublic.png"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let replacement_url = format!("/a/{}", replacement["id"].as_str().unwrap());
+    let (status, _) = send(&app, "GET", &replacement_url, None, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }

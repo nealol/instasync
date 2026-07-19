@@ -228,6 +228,34 @@ export class VaultSync {
     this.pumpDocQueue();
   }
 
+  prioritizeCanvasAttachments(paths: Iterable<string>): void {
+    this.binarySync.prioritizePaths(paths);
+  }
+
+  unprioritizeCanvasAttachments(paths: Iterable<string>): void {
+    this.binarySync.unprioritizePaths(paths);
+  }
+
+  canvasBinaryPaths(paths: Iterable<string>): string[] {
+    const binaryPaths: string[] = [];
+    for (const path of paths) {
+      if (
+        !shouldSyncCanvasBinaryPath(
+          path,
+          this.plugin.settings.syncBinaries,
+          this.plugin.settings.binaryExcludeGlobs,
+        )
+      ) {
+        continue;
+      }
+      const file = this.plugin.app.vault.getAbstractFileByPath(path);
+      if ((file && this.classify(file) === "binary") || (!file && this.binarySync.hasPath(path))) {
+        binaryPaths.push(path);
+      }
+    }
+    return binaryPaths;
+  }
+
   pathForGuid(guid: string): string | null {
     for (const [path, value] of this.files.entries()) {
       if (value === guid) return path;
@@ -1145,4 +1173,15 @@ export class VaultSync {
     void this.indexPersistence.destroy();
     this.indexDoc.destroy();
   }
+}
+
+export function shouldSyncCanvasBinaryPath(
+  path: string,
+  syncBinaries: boolean,
+  excludeGlobs: string,
+): boolean {
+  if (!syncBinaries || isConflictCopy(path)) return false;
+  const extension = path.split(".").pop()?.toLowerCase();
+  if (extension === "md" || extension === "canvas" || extension === "base") return false;
+  return !matchesAnyGlob(path, parseGlobs(excludeGlobs));
 }

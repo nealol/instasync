@@ -65,6 +65,7 @@ rtmd cursor list/create/rename/rm/token/audit/undo
 rtmd vault list / vault create <name>
 rtmd members list/promote/rm ; rtmd invite create/redeem
 rtmd attach ls/get/put/from-url/rm
+rtmd canvas-apply <path> [--file batch.json] [--mutation-id <id>]
 rtmd storage [--gc] ; rtmd backup get/set/rm/test
 rtmd whoami / logout
 ```

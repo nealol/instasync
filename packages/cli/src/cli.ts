@@ -9,6 +9,7 @@ import { registerHistoryCommands } from "./commands/history";
 import { registerCursorCommands } from "./commands/cursor";
 import { registerAdminCommands } from "./commands/admin";
 import { registerAttachCommands } from "./commands/attach";
+import { registerCanvasCommands } from "./commands/canvas";
 
 const program = new Command("rtmd")
   .description("Command-line client for a Realtime.md server")
@@ -24,6 +25,7 @@ registerHistoryCommands(program);
 registerCursorCommands(program);
 registerAdminCommands(program);
 registerAttachCommands(program);
+registerCanvasCommands(program);
 
 program.parseAsync(process.argv).catch((err: unknown) => {
   if (err instanceof CliError) {

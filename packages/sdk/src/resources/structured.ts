@@ -1,8 +1,10 @@
 import type { Http } from "../http";
 import { encodePath } from "../http";
+import { NotFoundError } from "../errors";
 import type {
   BaseViewBody,
   CanvasEdgeBody,
+  CanvasOperationBatch,
   CanvasNodeBody,
   StructuredResponse,
   StructuredSummary,
@@ -51,13 +53,34 @@ export class CanvasesResource {
     );
   }
 
-  addNode(path: string, node: CanvasNodeBody): Promise<StructuredResponse> {
+  applyOperations(path: string, batch: CanvasOperationBatch): Promise<StructuredResponse> {
     return this.http.request(
       "POST",
-      `/api/vaults/${this.vaultId}/canvas-nodes/${encodePath(path)}`,
-      {
-        body: node,
-      },
+      `/api/vaults/${this.vaultId}/canvas-operations/${encodePath(path)}`,
+      { body: batch },
+    );
+  }
+
+  restoreNode(path: string, node: Record<string, unknown>, mutationId?: string) {
+    return this.applyOperations(path, {
+      operations: [{ type: "node-restore", node }],
+      mutationId,
+    });
+  }
+
+  restoreEdge(path: string, edge: Record<string, unknown>, mutationId?: string) {
+    return this.applyOperations(path, {
+      operations: [{ type: "edge-restore", edge }],
+      mutationId,
+    });
+  }
+
+  addNode(path: string, node: CanvasNodeBody): Promise<StructuredResponse> {
+    const value = { ...node, id: node.id ?? crypto.randomUUID() };
+    return this.operationWithLegacyFallback(path, { type: "node-create", node: value }, () =>
+      this.http.request("POST", `/api/vaults/${this.vaultId}/canvas-nodes/${encodePath(path)}`, {
+        body: value,
+      }),
     );
   }
 
@@ -66,32 +89,30 @@ export class CanvasesResource {
     id: string,
     patch: Record<string, unknown>,
   ): Promise<StructuredResponse> {
-    return this.http.request(
-      "PATCH",
-      `/api/vaults/${this.vaultId}/canvas-nodes/${encodePath(path)}`,
-      {
-        body: { id, ...patch },
-      },
+    return this.operationWithLegacyFallback(
+      path,
+      { type: "node-patch", id, patch: { set: patch, remove: [] } },
+      () =>
+        this.http.request("PATCH", `/api/vaults/${this.vaultId}/canvas-nodes/${encodePath(path)}`, {
+          body: { id, ...patch },
+        }),
     );
   }
 
   deleteNode(path: string, id: string): Promise<StructuredResponse> {
-    return this.http.request(
-      "DELETE",
-      `/api/vaults/${this.vaultId}/canvas-nodes/${encodePath(path)}`,
-      {
+    return this.operationWithLegacyFallback(path, { type: "node-delete", id }, () =>
+      this.http.request("DELETE", `/api/vaults/${this.vaultId}/canvas-nodes/${encodePath(path)}`, {
         body: { id },
-      },
+      }),
     );
   }
 
   addEdge(path: string, edge: CanvasEdgeBody): Promise<StructuredResponse> {
-    return this.http.request(
-      "POST",
-      `/api/vaults/${this.vaultId}/canvas-edges/${encodePath(path)}`,
-      {
-        body: edge,
-      },
+    const value = { ...edge, id: edge.id ?? crypto.randomUUID() };
+    return this.operationWithLegacyFallback(path, { type: "edge-create", edge: value }, () =>
+      this.http.request("POST", `/api/vaults/${this.vaultId}/canvas-edges/${encodePath(path)}`, {
+        body: value,
+      }),
     );
   }
 
@@ -100,23 +121,35 @@ export class CanvasesResource {
     id: string,
     patch: Record<string, unknown>,
   ): Promise<StructuredResponse> {
-    return this.http.request(
-      "PATCH",
-      `/api/vaults/${this.vaultId}/canvas-edges/${encodePath(path)}`,
-      {
-        body: { id, ...patch },
-      },
+    return this.operationWithLegacyFallback(
+      path,
+      { type: "edge-patch", id, patch: { set: patch, remove: [] } },
+      () =>
+        this.http.request("PATCH", `/api/vaults/${this.vaultId}/canvas-edges/${encodePath(path)}`, {
+          body: { id, ...patch },
+        }),
     );
   }
 
   deleteEdge(path: string, id: string): Promise<StructuredResponse> {
-    return this.http.request(
-      "DELETE",
-      `/api/vaults/${this.vaultId}/canvas-edges/${encodePath(path)}`,
-      {
+    return this.operationWithLegacyFallback(path, { type: "edge-delete", id }, () =>
+      this.http.request("DELETE", `/api/vaults/${this.vaultId}/canvas-edges/${encodePath(path)}`, {
         body: { id },
-      },
+      }),
     );
+  }
+
+  private async operationWithLegacyFallback(
+    path: string,
+    operation: CanvasOperationBatch["operations"][number],
+    legacy: () => Promise<StructuredResponse>,
+  ): Promise<StructuredResponse> {
+    try {
+      return await this.applyOperations(path, { operations: [operation] });
+    } catch (error) {
+      if (!(error instanceof NotFoundError)) throw error;
+      return legacy();
+    }
   }
 }
 

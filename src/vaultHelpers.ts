@@ -49,6 +49,40 @@ export function isOpenInWorkspace(app: App, path: string): boolean {
   return false;
 }
 
+/** True if `path` is open in an editable Markdown source/live-preview view. */
+export function isOpenInEditableMarkdown(app: App, path: string): boolean {
+  const workspace = app.workspace as any;
+  const inspected = new Set<any>();
+
+  const isEditable = (leaf: any): boolean => {
+    const view = leaf?.view;
+    if (!view || view.file?.path !== path || inspected.has(view)) return false;
+    inspected.add(view);
+
+    if (typeof view.getMode === "function") {
+      return view.getMode() === "source";
+    }
+
+    // Older Obsidian versions may not expose getMode(). Preserve the existing
+    // anti-merge protection when the matching Markdown view cannot be classified.
+    return true;
+  };
+
+  if (typeof workspace?.iterateAllLeaves === "function") {
+    let found = false;
+    workspace.iterateAllLeaves((leaf: any) => {
+      if (isEditable(leaf)) found = true;
+    });
+    if (found) return true;
+  }
+
+  if (typeof workspace?.getLeavesOfType === "function") {
+    const leaves = workspace.getLeavesOfType("markdown") ?? [];
+    return leaves.some(isEditable);
+  }
+  return false;
+}
+
 /** Resolve a vault-relative path to a {@link TFile}, or null if absent / a folder. */
 export function getFileByPath(app: App, path: string): TFile | null {
   const af = app.vault.getAbstractFileByPath(path);

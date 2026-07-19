@@ -201,6 +201,35 @@ pub(crate) async fn read_attachment_public(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
 }
 
+/// Read a public attachment only while the live vault index still maps the
+/// shared path to the exact hash captured when the link was created.
+pub(crate) async fn read_attachment_public_exact(
+    state: &AppState,
+    vault_id: &str,
+    path: &str,
+    expected_hash: &str,
+) -> AppResult<Response> {
+    validate_attachment_path(state, path)?;
+    let update = ydoc::read_update(state, vault_id).await?;
+    let (hash, size) = ydoc::decode_binaries_map(&update)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .into_iter()
+        .find_map(|(p, meta)| if p == path { binary_meta(meta) } else { None })
+        .filter(|(hash, _)| hash == expected_hash)
+        .ok_or(AppError::NotFound)?;
+    let file = tokio::fs::File::open(blob_path(state, vault_id, &hash)?)
+        .await
+        .map_err(|_| AppError::NotFound)?;
+    let body = Body::from_stream(ReaderStream::new(file));
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, content_type_for_path(path))
+        .header(header::CONTENT_LENGTH, size.to_string())
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CONTENT_SECURITY_POLICY, "sandbox")
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
+}
+
 pub(crate) async fn read_attachment_inner(
     state: &AppState,
     principal: &ApiPrincipal,
@@ -599,7 +628,9 @@ async fn attachment_exists(
     }
 }
 
-async fn require_attachment(
+/// Resolve attachment metadata after enforcing vault scope, membership, and
+/// path policy. This does not read the blob bytes.
+pub(crate) async fn require_attachment(
     state: &AppState,
     principal: &ApiPrincipal,
     vault_id: &str,

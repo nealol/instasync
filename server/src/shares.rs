@@ -23,7 +23,7 @@ use yrs::updates::decoder::Decode;
 use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
 
 use crate::attachments;
-use crate::entities::{public_shares, vault_files};
+use crate::entities::{public_attachment_shares, public_shares, vault_files};
 use crate::error::{AppError, AppResult};
 use crate::routes::require_member;
 use crate::session::{now_millis, ApiPrincipal};
@@ -40,6 +40,17 @@ pub struct ShareResponse {
     pub url: String,
     pub path: String,
     pub guid: String,
+    pub created_at: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentShareResponse {
+    pub id: String,
+    pub url: String,
+    pub path: String,
+    pub hash: String,
+    pub size: i64,
     pub created_at: i64,
 }
 
@@ -88,6 +99,13 @@ fn share_url(state: &AppState, id: &str) -> String {
     )
 }
 
+fn attachment_share_url(state: &AppState, id: &str) -> String {
+    format!(
+        "{}/a/{id}",
+        state.config.public_base_url.trim_end_matches('/')
+    )
+}
+
 fn title_for_path(path: &str) -> String {
     let name = path.rsplit('/').next().unwrap_or(path);
     name.strip_suffix(".md").unwrap_or(name).to_string()
@@ -115,6 +133,32 @@ async fn share_by_guid(
         .filter(public_shares::Column::Guid.eq(guid))
         .one(&state.db)
         .await?)
+}
+
+async fn attachment_share_by_path(
+    state: &AppState,
+    vault_id: &str,
+    path: &str,
+) -> AppResult<Option<public_attachment_shares::Model>> {
+    Ok(public_attachment_shares::Entity::find()
+        .filter(public_attachment_shares::Column::VaultId.eq(vault_id))
+        .filter(public_attachment_shares::Column::Path.eq(path))
+        .one(&state.db)
+        .await?)
+}
+
+fn attachment_share_response(
+    state: &AppState,
+    share: public_attachment_shares::Model,
+) -> AttachmentShareResponse {
+    AttachmentShareResponse {
+        url: attachment_share_url(state, &share.id),
+        id: share.id,
+        path: share.path,
+        hash: share.hash,
+        size: share.size,
+        created_at: share.created_at,
+    }
 }
 
 /// Look up a live share and the current path of the note it points at.
@@ -230,9 +274,110 @@ pub async fn delete_share(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+pub async fn create_attachment_share(
+    State(state): State<AppState>,
+    principal: ApiPrincipal,
+    Path(vault_id): Path<String>,
+    Json(body): Json<CreateShareBody>,
+) -> AppResult<Json<AttachmentShareResponse>> {
+    let attachment =
+        attachments::require_attachment(&state, &principal, &vault_id, &body.path).await?;
+
+    if let Some(existing) = attachment_share_by_path(&state, &vault_id, &body.path).await? {
+        if existing.hash == attachment.hash {
+            return Ok(Json(attachment_share_response(&state, existing)));
+        }
+
+        // Keep the existing id and update its captured version atomically. This
+        // avoids a revoke/recreate gap and makes concurrent re-shares converge.
+        let mut updated: public_attachment_shares::ActiveModel = existing.into();
+        updated.hash = Set(attachment.hash.clone());
+        updated.size = Set(attachment.size);
+        return Ok(Json(attachment_share_response(
+            &state,
+            updated.update(&state.db).await?,
+        )));
+    }
+
+    let id = nanoid::nanoid!(16, &nanoid::alphabet::SAFE);
+    let created_at = now_millis();
+    let insert = public_attachment_shares::ActiveModel {
+        id: Set(id.clone()),
+        vault_id: Set(vault_id.clone()),
+        path: Set(attachment.path.clone()),
+        hash: Set(attachment.hash.clone()),
+        size: Set(attachment.size),
+        created_by: Set(principal.user.id.clone()),
+        created_at: Set(created_at),
+    }
+    .insert(&state.db)
+    .await;
+
+    match insert {
+        Ok(created) => Ok(Json(attachment_share_response(&state, created))),
+        Err(error) => {
+            // Another request may have inserted the same (vault, path) after
+            // our lookup. Re-read the unique-index winner so concurrent
+            // idempotent creates return the same link instead of a 500.
+            if let Some(winner) =
+                attachment_share_by_path(&state, &vault_id, &attachment.path).await?
+            {
+                if winner.hash == attachment.hash {
+                    return Ok(Json(attachment_share_response(&state, winner)));
+                }
+            }
+            Err(error.into())
+        }
+    }
+}
+
+pub async fn get_attachment_share(
+    State(state): State<AppState>,
+    principal: ApiPrincipal,
+    Path(vault_id): Path<String>,
+    Query(query): Query<SharePathQuery>,
+) -> AppResult<Json<serde_json::Value>> {
+    principal.require_vault(&vault_id)?;
+    require_member(&state, &principal.user.id, &vault_id).await?;
+    let share = attachment_share_by_path(&state, &vault_id, &query.path).await?;
+    Ok(Json(match share {
+        Some(share) => serde_json::json!({ "share": attachment_share_response(&state, share) }),
+        None => serde_json::json!({ "share": null }),
+    }))
+}
+
+pub async fn delete_attachment_share(
+    State(state): State<AppState>,
+    principal: ApiPrincipal,
+    Path(vault_id): Path<String>,
+    Query(query): Query<SharePathQuery>,
+) -> AppResult<Json<serde_json::Value>> {
+    principal.require_vault(&vault_id)?;
+    require_member(&state, &principal.user.id, &vault_id).await?;
+    let share = attachment_share_by_path(&state, &vault_id, &query.path)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    public_attachment_shares::Entity::delete_by_id(share.id)
+        .exec(&state.db)
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 // ---------------------------------------------------------------------------
 // Public view API (no auth)
 // ---------------------------------------------------------------------------
+
+pub async fn view_shared_attachment(
+    State(state): State<AppState>,
+    Path(share_id): Path<String>,
+) -> AppResult<Response> {
+    let share = public_attachment_shares::Entity::find_by_id(share_id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    attachments::read_attachment_public_exact(&state, &share.vault_id, &share.path, &share.hash)
+        .await
+}
 
 pub async fn view_share(
     State(state): State<AppState>,

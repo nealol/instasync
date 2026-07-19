@@ -136,6 +136,16 @@ export interface PublicShareResponse {
   createdAt: number;
 }
 
+/** A public link to one exact version of a binary attachment. */
+export interface PublicAttachmentShareResponse {
+  id: string;
+  url: string;
+  path: string;
+  hash: string;
+  size: number;
+  createdAt: number;
+}
+
 /** Per-vault storage breakdown, from `GET /api/vaults/{id}/storage`. */
 export interface StorageUsage {
   blobsCurrentBytes: number;
@@ -244,12 +254,30 @@ export class AuthClient {
     return sessionTokenKey(this.plugin.settings.authServerUrl, serverId, userId);
   }
 
+  private tokenRecord(userId = this.plugin.settings.userId): { key: string; token: string } | null {
+    const keys = [this.tokenKey(userId), this.tokenKey("")];
+    if (userId) {
+      for (const session of this.knownSessions()) {
+        let sameServer = false;
+        try {
+          sameServer = normalizeServerUrl(session.serverUrl) === this.baseUrl;
+        } catch {
+          continue;
+        }
+        if (sameServer && session.userId === userId) keys.push(session.tokenKey);
+      }
+    }
+    keys.push(LEGACY_TOKEN_KEY);
+
+    for (const key of new Set(keys)) {
+      const token = this.plugin.app.secretStorage.getSecret(key);
+      if (token) return { key, token };
+    }
+    return null;
+  }
+
   private getToken(): string {
-    return (
-      this.plugin.app.secretStorage.getSecret(this.tokenKey()) ??
-      this.plugin.app.secretStorage.getSecret(this.tokenKey("")) ??
-      ""
-    );
+    return this.tokenRecord()?.token ?? "";
   }
 
   private setToken(value: string, userId = this.plugin.settings.userId): void {
@@ -257,11 +285,18 @@ export class AuthClient {
   }
 
   private deleteToken(): void {
-    // SecretStorage has no delete; clear by storing an empty value. Also clear
-    // the legacy global key so a stale token can't linger and keep the client
-    // looking signed in after logout.
-    this.plugin.app.secretStorage.setSecret(this.tokenKey(), "");
-    this.plugin.app.secretStorage.setSecret(LEGACY_TOKEN_KEY, "");
+    const record = this.tokenRecord();
+    const keys = [
+      record?.key,
+      this.tokenKey(this.plugin.settings.userId),
+      this.tokenKey(""),
+      LEGACY_TOKEN_KEY,
+    ];
+    // SecretStorage has no delete; clear each exact fallback that could
+    // otherwise make this account appear signed in again after logout.
+    for (const key of new Set(keys.filter((key): key is string => !!key))) {
+      this.plugin.app.secretStorage.setSecret(key, "");
+    }
   }
 
   get isLoggedIn(): boolean {
@@ -304,53 +339,104 @@ export class AuthClient {
     throw new CompatibilityError(result.reason, result.detail, info.version);
   }
 
-  /**
-   * Ensure `authServerId` is known for the current server, fetching it from
-   * `/api/server-info` if needed and migrating any token stored under the legacy
-   * global key into the per-server key. Best-effort: callers may ignore failures
-   * (e.g. offline), in which case the legacy key keeps working.
-   */
+  /** Ensure the current server id is known and migrate recognized saved sessions. */
   async ensureServerId(): Promise<string> {
     const existing = this.plugin.settings.authServerId;
-    if (existing) {
+    const active = this.tokenRecord();
+    const sessionsBefore = this.knownSessions();
+    let serverId: string;
+    try {
+      ({ serverId } = await this.serverInfoChecked(this.baseUrl));
+    } catch (e) {
+      // Existing installs should still start while offline, but a cap failure
+      // means the server explicitly advertised an incompatible protocol.
+      if (e instanceof CompatibilityError || !existing) throw e;
+      return existing;
+    }
+
+    const serverOnlyKey = serverSessionTokenKey(this.baseUrl, serverId);
+    const activeNeedsMigration =
+      active !== null &&
+      (active.key === LEGACY_TOKEN_KEY ||
+        active.key === serverOnlyKey ||
+        !existing ||
+        existing !== serverId);
+
+    if (activeNeedsMigration) {
+      let me: MeResponse;
       try {
-        const { serverId } = await this.serverInfoChecked(this.baseUrl);
-        if (serverId !== existing) {
-          this.plugin.settings.authServerId = serverId;
-          await this.plugin.saveSettings();
-        }
-        return serverId;
+        me = await this.apiAt<MeResponse>(this.baseUrl, "/api/me", active.token);
       } catch (e) {
-        // Existing installs should still start while offline, but a cap failure
-        // means the server explicitly advertised an incompatible protocol.
-        if (e instanceof CompatibilityError) throw e;
-        return existing;
+        if (!(e instanceof AuthError)) {
+          // Do not bind credentials to an unverified server after a transient
+          // failure. Keeping the old id makes the next startup retry.
+          if (existing) return existing;
+          throw e;
+        }
+        // A rejected active token is already cleared by the unauthorized
+        // helper. Accept the fetched identity so startup can show sign-in.
+        this.plugin.settings.authServerId = serverId;
+        await this.plugin.saveSettings();
+        return serverId;
+      }
+
+      this.plugin.settings.authServerId = serverId;
+      const destination = sessionTokenKey(this.baseUrl, serverId, me.userId);
+      this.plugin.app.secretStorage.setSecret(destination, active.token);
+      this.saveKnownSessions([
+        this.knownSession(me, destination, this.baseUrl, serverId),
+        ...sessionsBefore.filter(
+          (session) => session.tokenKey !== active.key && session.tokenKey !== destination,
+        ),
+      ]);
+      if (active.key !== destination) {
+        this.plugin.app.secretStorage.setSecret(active.key, "");
+      }
+      this.applyIdentity(me);
+      this.plugin.updateLocalAwareness();
+    } else {
+      this.plugin.settings.authServerId = serverId;
+    }
+
+    // A repaired server id can leave multiple saved accounts under the old
+    // namespace. Validate and migrate each independently.
+    for (const candidate of sessionsBefore) {
+      let sameServer = false;
+      try {
+        sameServer = normalizeServerUrl(candidate.serverUrl) === this.baseUrl;
+      } catch {
+        continue;
+      }
+      if (!sameServer || candidate.serverId === serverId || candidate.tokenKey === active?.key) {
+        continue;
+      }
+      const token = this.plugin.app.secretStorage.getSecret(candidate.tokenKey);
+      if (!token) continue;
+
+      try {
+        const me = await this.apiAt<MeResponse>(this.baseUrl, "/api/me", token);
+        const destination = sessionTokenKey(this.baseUrl, serverId, me.userId);
+        this.plugin.app.secretStorage.setSecret(destination, token);
+        this.saveKnownSessions([
+          this.knownSession(me, destination, this.baseUrl, serverId),
+          ...this.knownSessions().filter(
+            (session) =>
+              session.tokenKey !== candidate.tokenKey && session.tokenKey !== destination,
+          ),
+        ]);
+        this.plugin.app.secretStorage.setSecret(candidate.tokenKey, "");
+      } catch (e) {
+        if (e instanceof AuthError) {
+          this.plugin.app.secretStorage.setSecret(candidate.tokenKey, "");
+          this.forgetSession(candidate.tokenKey);
+        }
+        // Network and server failures leave the candidate untouched so a later
+        // startup can retry it.
       }
     }
-    const { serverId } = await this.serverInfoChecked(this.baseUrl);
-    this.plugin.settings.authServerId = serverId;
-    await this.migrateLegacyToken();
+
     await this.plugin.saveSettings();
     return serverId;
-  }
-
-  /** Move a token from the legacy global key to this server's namespaced key. */
-  private async migrateLegacyToken(): Promise<void> {
-    const legacy = this.plugin.app.secretStorage.getSecret(LEGACY_TOKEN_KEY);
-    if (!legacy) return;
-    let me: MeResponse | null = null;
-    try {
-      me = await this.apiAt<MeResponse>(this.baseUrl, "/api/me", legacy);
-    } catch {
-      // Keep the old per-server migration path if the token can't be validated.
-    }
-    this.plugin.app.secretStorage.setSecret(
-      me ? this.tokenKey(me.userId) : this.tokenKey(""),
-      legacy,
-    );
-    if (me) this.rememberSession(me, this.tokenKey(me.userId));
-    // SecretStorage has no delete; clear the legacy key by storing empty.
-    this.plugin.app.secretStorage.setSecret(LEGACY_TOKEN_KEY, "");
   }
 
   // --- low-level request -----------------------------------------------------
@@ -374,15 +460,23 @@ export class AuthClient {
       throw: false,
     });
 
-    if (res.status === 401) {
-      if (normalizeServerUrl(baseUrl) === this.baseUrl) await this.clearSession();
-      throw new AuthError("Session expired. Please sign in again.");
-    }
+    if (res.status === 401) await this.unauthorized(baseUrl, token ?? "");
     if (res.status < 200 || res.status >= 300) {
       const msg = (res.json as { error?: string })?.error ?? `HTTP ${res.status}`;
       throw new Error(msg);
     }
     return res.json as T;
+  }
+
+  private async unauthorized(baseUrl: string, token: string): Promise<never> {
+    if (
+      normalizeServerUrl(baseUrl) === this.baseUrl &&
+      token !== "" &&
+      token === this.tokenRecord()?.token
+    ) {
+      await this.clearSession();
+    }
+    throw new AuthError("Session expired. Please sign in again.");
   }
 
   // --- session ---------------------------------------------------------------
@@ -418,6 +512,13 @@ export class AuthClient {
     this.plugin.settings.userId = me.userId;
     this.setToken(token, me.userId);
     this.rememberSession(me, this.tokenKey(me.userId));
+    this.applyIdentity(me);
+    await this.plugin.saveSettings();
+    this.plugin.updateLocalAwareness();
+  }
+
+  private applyIdentity(me: MeResponse): void {
+    this.plugin.settings.userId = me.userId;
     this.plugin.settings.userDisplayName = me.displayName;
     this.plugin.settings.userEmail = me.email;
     this.plugin.settings.gitEmail = me.gitEmail ?? "";
@@ -431,8 +532,6 @@ export class AuthClient {
     if (me.displayName && !this.plugin.settings.clientNameCustomized) {
       this.plugin.settings.clientName = me.displayName;
     }
-    await this.plugin.saveSettings();
-    this.plugin.updateLocalAwareness();
   }
 
   private async clearSession(): Promise<void> {
@@ -547,8 +646,8 @@ export class AuthClient {
         };
         valid.push(updated);
         this.rememberSession(updated, session.tokenKey);
-      } catch {
-        this.forgetSession(session.tokenKey);
+      } catch (e) {
+        if (e instanceof AuthError) this.forgetSession(session.tokenKey);
       }
     }
     return valid;
@@ -665,9 +764,27 @@ export class AuthClient {
   }
 
   private rememberSession(me: MeResponse, tokenKey: string): void {
-    const session: KnownSession = {
-      serverUrl: this.baseUrl,
-      serverId: this.plugin.settings.authServerId,
+    const session = this.knownSession(
+      me,
+      tokenKey,
+      this.baseUrl,
+      this.plugin.settings.authServerId,
+    );
+    this.saveKnownSessions([
+      session,
+      ...this.knownSessions().filter((existing) => existing.tokenKey !== tokenKey),
+    ]);
+  }
+
+  private knownSession(
+    me: MeResponse,
+    tokenKey: string,
+    serverUrl: string,
+    serverId: string,
+  ): KnownSession {
+    return {
+      serverUrl,
+      serverId,
       userId: me.userId,
       email: me.email,
       gitEmail: me.gitEmail,
@@ -677,10 +794,6 @@ export class AuthClient {
       avatarUrl: me.avatarUrl,
       tokenKey,
     };
-    this.saveKnownSessions([
-      session,
-      ...this.knownSessions().filter((existing) => existing.tokenKey !== tokenKey),
-    ]);
   }
 
   private forgetSession(tokenKey: string): void {
@@ -889,6 +1002,25 @@ export class AuthClient {
     await this.api(`/api/vaults/${vaultId}/shares?${params.toString()}`, { method: "DELETE" });
   }
 
+  /** Create (or return the existing) public link for a binary attachment. */
+  createPublicAttachmentShare(
+    vaultId: string,
+    path: string,
+  ): Promise<PublicAttachmentShareResponse> {
+    return this.api<PublicAttachmentShareResponse>(`/api/vaults/${vaultId}/attachment-shares`, {
+      method: "POST",
+      body: { path },
+    });
+  }
+
+  /** Stop publicly sharing a binary attachment. */
+  async deletePublicAttachmentShare(vaultId: string, path: string): Promise<void> {
+    const params = new URLSearchParams({ path });
+    await this.api(`/api/vaults/${vaultId}/attachment-shares?${params.toString()}`, {
+      method: "DELETE",
+    });
+  }
+
   search(vaultId: string, q: string, limit?: number): Promise<SearchHit[]> {
     const params = new URLSearchParams({ q });
     if (limit !== undefined) params.set("limit", String(limit));
@@ -934,38 +1066,29 @@ export class AuthClient {
     return `${this.baseUrl}/api/vaults/${vaultId}/blobs/${hash}`;
   }
 
-  private get authHeaders(): Record<string, string> {
-    const token = this.getToken();
-    return token ? { Authorization: `Bearer ${token}` } : {};
-  }
-
   /** True if the server already holds the blob (lets callers skip re-upload). */
   async blobExists(vaultId: string, hash: string): Promise<boolean> {
+    const token = this.getToken();
     const res = await requestUrl({
       url: this.blobUrl(vaultId, hash),
       method: "HEAD",
-      headers: this.authHeaders,
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
       throw: false,
     });
-    if (res.status === 401) {
-      await this.clearSession();
-      throw new AuthError("Session expired. Please sign in again.");
-    }
+    if (res.status === 401) await this.unauthorized(this.baseUrl, token);
     return res.status >= 200 && res.status < 300;
   }
 
   /** Download blob bytes by hash. */
   async getBlob(vaultId: string, hash: string): Promise<ArrayBuffer> {
+    const token = this.getToken();
     const res = await requestUrl({
       url: this.blobUrl(vaultId, hash),
       method: "GET",
-      headers: this.authHeaders,
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
       throw: false,
     });
-    if (res.status === 401) {
-      await this.clearSession();
-      throw new AuthError("Session expired. Please sign in again.");
-    }
+    if (res.status === 401) await this.unauthorized(this.baseUrl, token);
     if (res.status < 200 || res.status >= 300) {
       throw new Error(`blob download failed: ${blobErrorMessage(res)}`);
     }
@@ -974,18 +1097,16 @@ export class AuthClient {
 
   /** Upload blob bytes; idempotent and content-verified server-side. */
   async putBlob(vaultId: string, hash: string, data: ArrayBuffer): Promise<void> {
+    const token = this.getToken();
     const res = await requestUrl({
       url: this.blobUrl(vaultId, hash),
       method: "PUT",
-      headers: this.authHeaders,
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
       contentType: "application/octet-stream",
       body: data,
       throw: false,
     });
-    if (res.status === 401) {
-      await this.clearSession();
-      throw new AuthError("Session expired. Please sign in again.");
-    }
+    if (res.status === 401) await this.unauthorized(this.baseUrl, token);
     if (res.status < 200 || res.status >= 300) {
       throw new Error(`blob upload failed: ${blobErrorMessage(res)}`);
     }
@@ -1084,16 +1205,14 @@ export class AuthClient {
 
   /** Raw bytes of a path at a commit; throws "blob no longer available" on 410. */
   async getHistoryBlob(vaultId: string, hash: string, path: string): Promise<ArrayBuffer> {
+    const token = this.getToken();
     const res = await requestUrl({
       url: `${this.baseUrl}/api/vaults/${vaultId}/history/commits/${hash}/blob?path=${encodeURIComponent(path)}`,
       method: "GET",
-      headers: this.authHeaders,
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
       throw: false,
     });
-    if (res.status === 401) {
-      await this.clearSession();
-      throw new AuthError("Session expired. Please sign in again.");
-    }
+    if (res.status === 401) await this.unauthorized(this.baseUrl, token);
     if (res.status === 410) throw new Error("blob no longer available");
     if (res.status < 200 || res.status >= 300) {
       throw new Error(`history blob download failed: ${blobErrorMessage(res)}`);

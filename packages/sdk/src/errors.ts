@@ -25,9 +25,27 @@ export class NotFoundError extends ApiError {
   }
 }
 
+/** 400 — a request failed stable server-side validation. */
+export class ValidationError extends ApiError {
+  constructor(message = "validation failed") {
+    super(400, message);
+    this.name = "ValidationError";
+  }
+}
+
+/** 409 — a mutation conflicts with current Canvas state. */
+export class ConflictError extends ApiError {
+  constructor(message = "conflict") {
+    super(409, message);
+    this.name = "ConflictError";
+  }
+}
+
 /** Map a status + server `{error}` message to the right error class. */
 export function errorForStatus(status: number, message: string): ApiError {
   if (status === 401) return new AuthError(message);
+  if (status === 400) return new ValidationError(message);
   if (status === 404) return new NotFoundError(message);
+  if (status === 409) return new ConflictError(message);
   return new ApiError(status, message);
 }

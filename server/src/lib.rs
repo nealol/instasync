@@ -164,6 +164,13 @@ pub fn app(state: AppState) -> Router {
                 .post(shares::create_share)
                 .delete(shares::delete_share),
         )
+        .route(
+            "/api/vaults/{id}/attachment-shares",
+            get(shares::get_attachment_share)
+                .post(shares::create_attachment_share)
+                .delete(shares::delete_attachment_share),
+        )
+        .route("/a/{share_id}", get(shares::view_shared_attachment))
         // Public (unauthenticated) read-only share viewer API.
         .route("/api/view/{share_id}", get(shares::view_share))
         .route("/api/view/{share_id}/events", get(shares::view_events))
@@ -317,6 +324,10 @@ pub fn app(state: AppState) -> Router {
             post(structured::add_canvas_edge)
                 .patch(structured::update_canvas_edge)
                 .delete(structured::delete_canvas_edge),
+        )
+        .route(
+            "/api/vaults/{id}/canvas-operations/{*path}",
+            post(structured::apply_canvas_operations),
         )
         .route(
             "/api/vaults/{id}/canvas-moves/{*path}",

@@ -2,7 +2,7 @@
 // live in "@realtime-md/sdk/node".
 
 export * from "./types";
-export { ApiError, AuthError, NotFoundError } from "./errors";
+export { ApiError, AuthError, ConflictError, NotFoundError, ValidationError } from "./errors";
 export {
   Http,
   staticToken,

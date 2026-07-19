@@ -151,7 +151,9 @@ describe("Document sync", () => {
       activeVaultId: vaultId,
     });
     vault.files.set("note.md", "local buffer");
-    (plugin.app.workspace as any).getLeavesOfType = () => [{ view: { file: { path: "note.md" } } }];
+    (plugin.app.workspace as any).getLeavesOfType = () => [
+      { view: { file: { path: "note.md" }, getMode: () => "source" } },
+    ];
 
     const doc = new Document(plugin as any, "note.md", guid, docId(guid), true);
     const peer = new Peer(memberPlugin, docId(guid));
@@ -171,6 +173,36 @@ describe("Document sync", () => {
     }
   });
 
+  it("writes remote updates to disk while the note is open in preview mode", async () => {
+    const guid = freshGuid();
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    vault.files.set("note.md", "local preview");
+    (plugin.app.workspace as any).getLeavesOfType = () => [
+      { view: { file: { path: "note.md" }, getMode: () => "preview" } },
+    ];
+
+    const doc = new Document(plugin as any, "note.md", guid, docId(guid), true);
+    const peer = new Peer(memberPlugin, docId(guid));
+    try {
+      await doc.whenReady();
+      await peer.whenSynced();
+      await waitFor(() => peer.getText() === "local preview", { label: "preview seed synced" });
+
+      peer.setText("remote preview update");
+      await waitFor(() => vault.files.get("note.md") === "remote preview update", {
+        label: "preview disk receives remote update",
+      });
+
+      expect(doc.content).toBe("remote preview update");
+    } finally {
+      doc.destroy();
+      peer.destroy();
+    }
+  });
+
   it("does not ingest disk modify events while a live editor binding owns the note", async () => {
     const guid = freshGuid();
     const { plugin, vault } = makeFakePlugin(harness.authUrl, {
@@ -178,7 +210,9 @@ describe("Document sync", () => {
       activeVaultId: vaultId,
     });
     vault.files.set("note.md", "shared buffer");
-    (plugin.app.workspace as any).getLeavesOfType = () => [{ view: { file: { path: "note.md" } } }];
+    (plugin.app.workspace as any).getLeavesOfType = () => [
+      { view: { file: { path: "note.md" }, getMode: () => "source" } },
+    ];
 
     const doc = new Document(plugin as any, "note.md", guid, docId(guid), true);
     const peer = new Peer(memberPlugin, docId(guid));
@@ -208,7 +242,9 @@ describe("Document sync", () => {
       activeVaultId: vaultId,
     });
     vault.files.set("note.md", "before");
-    (plugin.app.workspace as any).getLeavesOfType = () => [{ view: { file: { path: "note.md" } } }];
+    (plugin.app.workspace as any).getLeavesOfType = () => [
+      { view: { file: { path: "note.md" }, getMode: () => "source" } },
+    ];
 
     const doc = new Document(plugin as any, "note.md", guid, docId(guid), true);
     const peer = new Peer(memberPlugin, docId(guid));
@@ -255,7 +291,7 @@ describe("Document sync", () => {
       await waitFor(() => doc.content === "base + remote", { label: "remote reached doc" });
       // Open the note before the debounce timer fires.
       (plugin.app.workspace as any).getLeavesOfType = () => [
-        { view: { file: { path: "note.md" } } },
+        { view: { file: { path: "note.md" }, getMode: () => "source" } },
       ];
       await new Promise((r) => setTimeout(r, 250));
 
@@ -307,6 +343,41 @@ describe("Document sync", () => {
       expect(doc.content).toBe("external edit");
     } finally {
       doc.destroy();
+    }
+  });
+
+  it("retries a failed remote disk write without folding back a stale echo", async () => {
+    const guid = freshGuid();
+    const { doc, vault } = makeDoc(guid, {
+      file: { path: "note.md", content: "before retry" },
+    });
+    const peer = new Peer(memberPlugin, docId(guid));
+    try {
+      await doc.whenReady();
+      await peer.whenSynced();
+      await waitFor(() => peer.getText() === "before retry", { label: "retry seed synced" });
+
+      const originalModify = vault.modify.bind(vault);
+      let attempts = 0;
+      vault.modify = async (file, text) => {
+        attempts++;
+        if (attempts === 1) throw new Error("transient write failure");
+        await originalModify(file, text);
+      };
+
+      peer.setText("after retry");
+      await waitFor(() => doc.content === "after retry", { label: "retry remote reached doc" });
+      await waitFor(() => vault.files.get("note.md") === "after retry", {
+        timeout: 10_000,
+        label: "retry converged disk",
+      });
+
+      expect(attempts).toBe(2);
+      expect(doc.content).toBe("after retry");
+      expect(peer.getText()).toBe("after retry");
+    } finally {
+      doc.destroy();
+      peer.destroy();
     }
   });
 
@@ -393,7 +464,7 @@ describe("Document sync", () => {
         const text = await originalRead(file);
         if (reads >= 1) {
           (plugin.app.workspace as any).getLeavesOfType = () => [
-            { view: { file: { path: "note.md" } } },
+            { view: { file: { path: "note.md" }, getMode: () => "source" } },
           ];
         }
         return text;
@@ -423,7 +494,9 @@ describe("Document sync", () => {
       activeVaultId: vaultId,
     });
     vault.files.set("note.md", "disk lags editor");
-    (plugin.app.workspace as any).getLeavesOfType = () => [{ view: { file: { path: "note.md" } } }];
+    (plugin.app.workspace as any).getLeavesOfType = () => [
+      { view: { file: { path: "note.md" }, getMode: () => "source" } },
+    ];
 
     const doc = new Document(plugin as any, "note.md", guid, docId(guid), true);
     const peer = new Peer(memberPlugin, docId(guid));

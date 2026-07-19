@@ -1,4 +1,5 @@
 import type RealtimePlugin from "./main";
+import * as Y from "yjs";
 import { StructuredDocument, DISK_ORIGIN } from "./StructuredDocument";
 import { CanvasBinding, CANVAS_LOCAL_ORIGIN } from "./editor/CanvasBinding";
 import {
@@ -9,6 +10,7 @@ import {
   type StructuredCanvas,
 } from "./structured/canvas";
 import type { JsonValue } from "./structured/reconcile";
+import { applyCanvasOperations, type CanvasOperation } from "./structured/canvasOperations";
 
 const EMPTY_CANVAS: StructuredCanvas = { nodes: {}, edges: {}, nodeOrder: [], edgeOrder: [] };
 
@@ -32,8 +34,24 @@ export class CanvasDocument extends StructuredDocument {
     this.applyValue(parseCanvas(JSON.stringify(data ?? {})), origin);
   }
 
+  applyCanvasOperations(operations: readonly CanvasOperation[], origin: unknown): void {
+    this.ydoc.transact(
+      () => applyCanvasOperations(this.root, operations, this.ydoc.clientID),
+      origin,
+    );
+  }
+
   canvasData(): unknown {
     return JSON.parse(serializeCanvas(this.value));
+  }
+
+  canvasNodeText(nodeId: string): Y.Text | null {
+    const nodes = this.root.get("nodes");
+    if (!(nodes instanceof Y.Map)) return null;
+    const node = nodes.get(nodeId);
+    if (!(node instanceof Y.Map)) return null;
+    const text = node.get("text");
+    return text instanceof Y.Text ? text : null;
   }
 
   tryBindLiveCanvas(): void {
@@ -82,7 +100,7 @@ export class CanvasDocument extends StructuredDocument {
     // that would re-import mid-drag and disrupt the selection. Remote edits
     // (and disk folds) carry a different origin and do get applied.
     if (origin === CANVAS_LOCAL_ORIGIN) return;
-    this.binding.applyRemote();
+    this.binding.scheduleRemote();
   }
 
   protected destroySubclass(): void {

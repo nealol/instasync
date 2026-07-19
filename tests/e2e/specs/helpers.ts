@@ -323,6 +323,30 @@ export async function bindOpenStructured(b: any): Promise<void> {
   });
 }
 
+export async function canvasBindingActive(b: any, path: string): Promise<boolean> {
+  return b.executeObsidian(async ({ app }: any, p: string) => {
+    const vaultSync = (app as any).plugins.plugins.realtime.vaultSync;
+    const document = vaultSync?.structuredDocuments?.get?.(p);
+    if (document?.binding?.isActive?.() !== true) return false;
+    let usable = false;
+    app.workspace.iterateAllLeaves((leaf: any) => {
+      const view = leaf?.view;
+      if (view?.getViewType?.() !== "canvas" || view?.file?.path !== p) return;
+      try {
+        const data = view.canvas?.getData?.();
+        usable =
+          !!data &&
+          Array.isArray(data.nodes) &&
+          Array.isArray(data.edges) &&
+          typeof view.canvas?.importData === "function";
+      } catch {
+        usable = false;
+      }
+    });
+    return usable;
+  }, path);
+}
+
 /** Detach all leaves of a given view type (e.g. "canvas", "bases"). */
 export async function detachLeaves(b: any, viewType: string): Promise<void> {
   await b.executeObsidian(async ({ app }: any, vt: string) => {
@@ -336,7 +360,11 @@ export async function canvasViewData(b: any, path: string): Promise<any | null> 
     let result: any = null;
     app.workspace.iterateAllLeaves((leaf: any) => {
       const v = leaf?.view;
-      if (v?.getViewType?.() === "canvas" && v?.file?.path === p && v.canvas?.getData) {
+      if (v?.getViewType?.() !== "canvas" || v?.file?.path !== p) return;
+      if (typeof v.getViewData === "function") {
+        const value = v.getViewData();
+        result = typeof value === "string" ? JSON.parse(value) : value;
+      } else if (typeof v.canvas?.getData === "function") {
         result = v.canvas.getData();
       }
     });
@@ -351,16 +379,15 @@ export async function editCanvasView(b: any, path: string, data: any): Promise<v
       let done = false;
       app.workspace.iterateAllLeaves((leaf: any) => {
         const v = leaf?.view;
-        if (
-          !done &&
-          v?.getViewType?.() === "canvas" &&
-          v?.file?.path === p &&
-          v.canvas?.importData
-        ) {
+        if (done || v?.getViewType?.() !== "canvas" || v?.file?.path !== p) return;
+        if (typeof v.setViewData === "function") {
+          v.setViewData(JSON.stringify(d), true);
+        } else if (typeof v.canvas?.importData === "function") {
           v.canvas.importData(d, true);
-          v.canvas.requestSave();
-          done = true;
-        }
+        } else return;
+        if (typeof v.canvas?.requestSave === "function") v.canvas.requestSave();
+        else if (typeof v.requestSave === "function") v.requestSave();
+        done = true;
       });
       if (!done) throw new Error("no open canvas view for " + p);
     },

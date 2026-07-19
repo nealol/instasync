@@ -69,7 +69,8 @@ pub async fn read_update_with(
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| AppError::Internal(format!("as-update {doc_id}: exhausted retries"))))
+    Err(last_err
+        .unwrap_or_else(|| AppError::Internal(format!("as-update {doc_id}: exhausted retries"))))
 }
 
 pub async fn write_update(state: &AppState, doc_id: &str, update: Vec<u8>) -> AppResult<()> {
