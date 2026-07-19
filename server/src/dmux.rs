@@ -19,7 +19,7 @@
 //!   DATA     = [4][channel][raw yjs bytes …]           both directions
 //!   CLOSE    = [5][channel]                            both directions
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -35,7 +35,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::time::{timeout, Duration};
+use tokio::time::{interval, timeout, Duration, Instant, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as WsMsg};
 
 use crate::proxy::{
@@ -56,6 +56,15 @@ const CONTROL_CHANNEL: u64 = 0;
 
 /// Outbound queue depth per direction; bounds memory if one side stalls.
 const CHANNEL_CAPACITY: usize = 256;
+/// Hard fan-out bound for one client connection.
+const MAX_CHANNELS: usize = 1_024;
+/// Bound OPEN parsing/allocation and the request forwarded to tungstenite.
+const MAX_OPEN_PATH_BYTES: usize = 4_096;
+/// Bound dial-task creation even when a client immediately closes each channel.
+const MAX_OPENS_PER_WINDOW: usize = 128;
+const OPEN_RATE_WINDOW: Duration = Duration::from_secs(10);
+/// The browser client sends mux PING frames every five seconds.
+const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Process-wide count of live upstream y-sweet sockets across every `/dmux`
 /// connection — the fan-out metric the eval called for. Logged on each change.
@@ -76,6 +85,39 @@ impl Drop for UpstreamGuard {
     fn drop(&mut self) {
         let n = UPSTREAM_SOCKETS.fetch_sub(1, Ordering::Relaxed) - 1;
         tracing::debug!(upstream_sockets = n, "dmux: upstream socket closed");
+    }
+}
+
+struct OpenLimiter {
+    seen_channels: HashSet<u64>,
+    window_started: Instant,
+    opens_in_window: usize,
+}
+
+impl OpenLimiter {
+    fn new(now: Instant) -> Self {
+        Self {
+            seen_channels: HashSet::new(),
+            window_started: now,
+            opens_in_window: 0,
+        }
+    }
+
+    fn admit(&mut self, channel: u64, active_channels: usize, now: Instant) -> bool {
+        if now.duration_since(self.window_started) >= OPEN_RATE_WINDOW {
+            self.window_started = now;
+            self.opens_in_window = 0;
+        }
+        self.opens_in_window += 1;
+        if channel == CONTROL_CHANNEL
+            || self.seen_channels.contains(&channel)
+            || active_channels >= MAX_CHANNELS
+            || self.opens_in_window > MAX_OPENS_PER_WINDOW
+        {
+            return false;
+        }
+        self.seen_channels.insert(channel);
+        true
     }
 }
 
@@ -100,6 +142,10 @@ async fn handle(client: WebSocket, state: AppState) {
 
     // channel id -> sender into that channel's upstream pump.
     let mut channels: HashMap<u64, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let mut open_limiter = OpenLimiter::new(Instant::now());
+    let mut last_client_activity = Instant::now();
+    let mut idle_tick = interval(Duration::from_secs(5));
+    idle_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // Upstream tasks notify this loop when their channel has ended, so terminal
     // paths such as OPEN_ERR or upstream close do not leave stale senders behind.
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<u64>();
@@ -113,11 +159,21 @@ async fn handle(client: WebSocket, state: AppState) {
                     // Text/ping/pong/close: ping/pong are handled by axum; ignore the rest.
                     continue;
                 };
+                last_client_activity = Instant::now();
                 match parse_frame(&buf) {
                     Some(Frame::Open {
                         channel,
                         path_and_query,
                     }) => {
+                        if !open_limiter.admit(channel, channels.len(), Instant::now()) {
+                            let _ = out_tx.try_send(encode_simple(FRAME_OPEN_ERR, channel));
+                            tracing::warn!(
+                                channel,
+                                active_channels = channels.len(),
+                                "dmux: rejected channel open"
+                            );
+                            continue;
+                        }
                         // Register the channel synchronously, then dial upstream in a
                         // spawned task. Dialing here would block the whole multiplexed
                         // socket (head-of-line) — a slow/hung upstream would freeze every
@@ -166,12 +222,19 @@ async fn handle(client: WebSocket, state: AppState) {
                     channels.remove(&channel);
                 }
             }
+            _ = idle_tick.tick() => {
+                if last_client_activity.elapsed() > CLIENT_IDLE_TIMEOUT {
+                    tracing::debug!("dmux: idle client connection closed");
+                    break;
+                }
+            }
         }
     }
 
     // Client gone: drop every channel (ends each upstream pump) and the writer.
     channels.clear();
     drop(out_tx);
+    writer.abort();
     let _ = writer.await;
 }
 
@@ -315,7 +378,7 @@ fn parse_frame(buf: &[u8]) -> Option<Frame<'_>> {
         t if t == FRAME_OPEN => {
             let (len, rest) = read_varint(rest)?;
             let len = len as usize;
-            if rest.len() < len {
+            if len > MAX_OPEN_PATH_BYTES || rest.len() < len {
                 return None;
             }
             let path_and_query = String::from_utf8(rest[..len].to_vec()).ok()?;
@@ -329,7 +392,7 @@ fn parse_frame(buf: &[u8]) -> Option<Frame<'_>> {
             payload: rest,
         }),
         t if t == FRAME_CLOSE => Some(Frame::Close { channel }),
-        t if t == FRAME_PING => Some(Frame::Ping),
+        t if t == FRAME_PING && channel == CONTROL_CHANNEL => Some(Frame::Ping),
         _ => None,
     }
 }
@@ -432,5 +495,41 @@ mod tests {
         write_varint(&mut buf, 10); // claims 10 bytes
         buf.extend_from_slice(b"short");
         assert!(parse_frame(&buf).is_none());
+    }
+
+    #[test]
+    fn rejects_oversized_open_path() {
+        let mut buf = Vec::new();
+        write_varint(&mut buf, FRAME_OPEN);
+        write_varint(&mut buf, 1);
+        write_varint(&mut buf, (MAX_OPEN_PATH_BYTES + 1) as u64);
+        buf.resize(buf.len() + MAX_OPEN_PATH_BYTES + 1, b'x');
+        assert!(parse_frame(&buf).is_none());
+    }
+
+    #[test]
+    fn open_limiter_rejects_control_duplicates_rate_and_fanout() {
+        let start = Instant::now();
+        let mut limiter = OpenLimiter::new(start);
+        assert!(!limiter.admit(CONTROL_CHANNEL, 0, start));
+        assert!(limiter.admit(1, 0, start));
+        assert!(!limiter.admit(1, 0, start));
+
+        let mut rate_limiter = OpenLimiter::new(start);
+        for channel in 1..=MAX_OPENS_PER_WINDOW as u64 {
+            assert!(rate_limiter.admit(channel, 0, start));
+        }
+        assert!(!rate_limiter.admit((MAX_OPENS_PER_WINDOW + 1) as u64, 0, start));
+
+        let mut fanout_limiter = OpenLimiter::new(start);
+        let mut now = start;
+        for active in 0..MAX_CHANNELS {
+            if active > 0 && active % MAX_OPENS_PER_WINDOW == 0 {
+                now += OPEN_RATE_WINDOW;
+            }
+            assert!(fanout_limiter.admit((active + 1) as u64, active, now));
+        }
+        now += OPEN_RATE_WINDOW;
+        assert!(!fanout_limiter.admit((MAX_CHANNELS + 1) as u64, MAX_CHANNELS, now));
     }
 }

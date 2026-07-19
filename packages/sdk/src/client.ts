@@ -136,7 +136,9 @@ export class RealtimeClient {
   }
 
   /** Mint a y-sweet client token for direct document access. */
-  docToken(vaultId: string, docId: string): Promise<DocTokenResponse> {
-    return this.http.request("POST", "/api/doc-token", { body: { vaultId, docId } });
+  docToken(vaultId: string, docId: string, path?: string): Promise<DocTokenResponse> {
+    return this.http.request("POST", "/api/doc-token", {
+      body: { vaultId, docId, ...(path ? { path } : {}) },
+    });
   }
 }

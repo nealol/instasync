@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import * as Y from "yjs";
-import { reconcileInto, toValue } from "../../src/structured/reconcile";
+import { mergeStructuredStartup, reconcileInto, toValue } from "../../src/structured/reconcile";
 import {
   parseCanvas,
   reconcileCanvas,
@@ -37,6 +37,32 @@ describe("structured reconciler", () => {
     expect(root.get("text")).toBeInstanceOf(Y.Text);
     reconcileInto(root, { text: "hello world" });
     expect(toValue(root)).toEqual({ text: "hello world" });
+  });
+
+  it("retains remote additions while folding an offline local edit", () => {
+    expect(
+      mergeStructuredStartup(
+        { nodes: { a: { x: 0 } }, nodeOrder: ["a"] },
+        { nodes: { a: { x: 50 } }, nodeOrder: ["a"] },
+        {
+          nodes: { a: { x: 0 }, b: { x: 10 } },
+          nodeOrder: ["a", "b"],
+        },
+      ),
+    ).toEqual({
+      nodes: { a: { x: 50 }, b: { x: 10 } },
+      nodeOrder: ["a", "b"],
+    });
+  });
+
+  it("does not erase a remote edit with a concurrent local deletion", () => {
+    expect(
+      mergeStructuredStartup(
+        { filters: { status: "open", owner: "alice" } },
+        { filters: { owner: "alice" } },
+        { filters: { status: "closed", owner: "alice" } },
+      ),
+    ).toEqual({ filters: { status: "closed", owner: "alice" } });
   });
 });
 

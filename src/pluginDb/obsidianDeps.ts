@@ -45,7 +45,12 @@ export function buildEngineDeps(
   const vaultId = plugin.settings.activeVaultId;
   const adapter = plugin.app.vault.adapter;
   const dir = plugin.manifest.dir ?? `.obsidian/plugins/${plugin.manifest.id}`;
-  const dbDir = `${dir}/plugin-dbs/${pluginId}`;
+  const serverScope = encodeURIComponent(
+    plugin.settings.authServerId || plugin.settings.authServerUrl,
+  );
+  const vaultScope = encodeURIComponent(vaultId);
+  const scope = `server-${serverScope}/vault-${vaultScope}`;
+  const dbDir = `${dir}/plugin-dbs/${scope}/${pluginId}`;
   const snapPath = `${dbDir}/${name}.snap`;
   const tmpPath = `${snapPath}.tmp`;
 
@@ -95,14 +100,8 @@ export function buildEngineDeps(
         console.warn("[Realtime] snapshot delete failed", e);
       }
     },
-    bootstrap: async (cursor: Cursor): Promise<ChangeRow[]> => {
-      try {
-        return await plugin.auth.pluginDbChanges(vaultId, pluginId, name, cursor);
-      } catch (e) {
-        console.warn("[Realtime] plugin db bootstrap failed", e);
-        return [];
-      }
-    },
+    bootstrap: (cursor: Cursor): Promise<ChangeRow[]> =>
+      plugin.auth.pluginDbChanges(vaultId, pluginId, name, cursor),
     touch: () => {
       void plugin.auth.touchPluginDb(vaultId, pluginId, name).catch(() => {});
     },
@@ -117,7 +116,8 @@ function makeDocHandle(plugin: RealtimePlugin, docId: string): PluginDbDocHandle
     showDebuggerLink: false,
     ...muxProviderOptions(),
   });
-  const persistence = new IndexeddbPersistence(docId, doc);
+  const serverScope = plugin.settings.authServerId || plugin.settings.authServerUrl;
+  const persistence = new IndexeddbPersistence(`realtime:plugindb:${serverScope}:${docId}`, doc);
 
   let connected = false;
   const statusCbs = new Set<(c: boolean) => void>();

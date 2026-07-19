@@ -49,7 +49,7 @@ export abstract class SyncedDoc {
     });
 
     this.provider = new YSweetProvider(
-      () => getClientToken(plugin, serverDocId),
+      () => getClientToken(plugin, serverDocId, path),
       serverDocId,
       this.ydoc,
       { connect: false, showDebuggerLink: false, ...muxProviderOptions() },

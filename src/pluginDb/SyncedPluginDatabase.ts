@@ -257,7 +257,11 @@ export class SyncedPluginDatabase {
   }
 
   private async runMigrate(fromVersion: number): Promise<void> {
-    await this.db!.tx(async (tx) => {
+    await this.runMigrateOn(this.db!, fromVersion);
+  }
+
+  private async runMigrateOn(db: DB, fromVersion: number): Promise<void> {
+    await db.tx(async (tx) => {
       await this.opts.migrate(this.wrapTx(tx as unknown as DB, false), fromVersion);
     });
   }
@@ -308,21 +312,22 @@ export class SyncedPluginDatabase {
   private async bootstrapFromServer(): Promise<void> {
     if (!this.opts.bootstrap) return;
     this.setState("bootstrapping");
-    try {
-      const rows = await this.opts.bootstrap(this.cursor);
-      if (rows.length > 0) {
-        await this.db!.tx(async (tx) => {
-          await applyChanges(tx as unknown as DB, rows);
-        });
-        // Advance the applied cursor to the high-water mark per site.
-        for (const r of rows) {
-          const site = bytesToHex(base64ToBytes(r.site_id));
-          this.cursor[site] = Math.max(this.cursor[site] ?? 0, r.db_version);
-        }
-      }
-    } catch (e) {
-      console.warn(`[Realtime] bootstrap failed for ${this.docId}`, e);
+    this.cursor = await this.bootstrapInto(this.db!, this.cursor);
+  }
+
+  private async bootstrapInto(db: DB, cursor: Cursor): Promise<Cursor> {
+    if (!this.opts.bootstrap) return { ...cursor };
+    const rows = await this.opts.bootstrap(cursor);
+    if (rows.length === 0) return { ...cursor };
+    await db.tx(async (tx) => {
+      await applyChanges(tx as unknown as DB, rows);
+    });
+    const advanced = { ...cursor };
+    for (const row of rows) {
+      const site = bytesToHex(base64ToBytes(row.site_id));
+      advanced[site] = Math.max(advanced[site] ?? 0, row.db_version);
     }
+    return advanced;
   }
 
   private async handleTombstoned(): Promise<void> {
@@ -344,6 +349,9 @@ export class SyncedPluginDatabase {
   private assertReady(): DB {
     if (this.closed || !this.db)
       throw new Error(`database ${this.pluginId}/${this.name} is not open`);
+    if (this.rebasing) {
+      throw new Error(`database ${this.pluginId}/${this.name} is rebasing`);
+    }
     if (this._state === "error" && this._errorReason === "deleted") {
       throw new DeletedError(this.pluginId, this.name);
     }
@@ -443,21 +451,43 @@ export class SyncedPluginDatabase {
         continue;
       }
       if (rows.length === 0) continue;
-      for (let i = 0; i < rows.length; i += MAX_BATCH_ROWS) {
-        const chunk = rows.slice(i, i + MAX_BATCH_ROWS);
+
+      // A cursor contains only db_version, so rows from one committed version
+      // are indivisible: splitting them would make the receiver advance to V
+      // after the first chunk and skip every later chunk ending at the same V.
+      // Keep versions whole even when one unusually large transaction exceeds
+      // the target row count.
+      const chunks: ChangeRow[][] = [];
+      let chunk: ChangeRow[] = [];
+      for (let start = 0; start < rows.length; ) {
+        const version = rows[start].db_version;
+        let end = start + 1;
+        while (end < rows.length && rows[end].db_version === version) end++;
+        if (chunk.length > 0 && chunk.length + (end - start) > MAX_BATCH_ROWS) {
+          chunks.push(chunk);
+          chunk = [];
+        }
+        for (let index = start; index < end; index++) chunk.push(rows[index]);
+        start = end;
+      }
+      if (chunk.length > 0) chunks.push(chunk);
+
+      let fromDbVersion = since;
+      for (const changes of chunks) {
         const batch: Batch = {
           id: makeBatchId(),
           siteId: site,
-          fromDbVersion: since,
-          toDbVersion: chunk[chunk.length - 1].db_version,
+          fromDbVersion,
+          toDbVersion: changes[changes.length - 1].db_version,
           schemaVersion: this.schemaVersion,
-          changes: chunk,
+          changes,
           createdAt: Date.now(),
           format: SYNC_FORMAT,
         };
         this.appliedBatchIds.add(batch.id);
         this.sync.appendBatch(batch);
         this.published[site] = batch.toDbVersion;
+        fromDbVersion = batch.toDbVersion;
         publishedAny = true;
       }
     }
@@ -587,8 +617,12 @@ export class SyncedPluginDatabase {
   async rebaseFromServer(): Promise<void> {
     if (this.closed || !this.sqlite || this.rebasing) return;
     this.rebasing = true;
+    const previousState = this._state;
     try {
       await this.doRebase();
+    } catch (error) {
+      if (!this.closed) this.setState(previousState);
+      throw error;
     } finally {
       this.rebasing = false;
     }
@@ -601,16 +635,36 @@ export class SyncedPluginDatabase {
       this.publishTimer = null;
     }
     await this.publishNow();
-    await this.opts.deleteSnapshot().catch(() => {});
-    await this.resetDb();
-    await this.runMigrate(0);
-    await this.bootstrapFromServer();
-    // Re-apply the log on top of the fresh bootstrap.
+    if (!this.opts.bootstrap) {
+      throw new Error(`database ${this.pluginId}/${this.name} has no server bootstrap source`);
+    }
+
+    // Build the replacement completely before touching the live database. A
+    // failed request or decode therefore leaves both the current DB and its
+    // snapshot intact.
+    const replacement = await openMemoryDb(this.sqlite!);
+    let replacementCursor: Cursor;
+    try {
+      await this.runMigrateOn(replacement, 0);
+      replacementCursor = await this.bootstrapInto(replacement, {});
+    } catch (error) {
+      await replacement.close().catch(() => {});
+      throw error;
+    }
+
+    const previous = this.db;
+    this.db = replacement;
+    this.siteHex = replacement.siteid.toLowerCase();
+    this.cursor = replacementCursor;
+    this.published = {};
     this.appliedBatchIds.clear();
+    await previous?.close().catch(() => {});
+
+    // Re-apply the log on top of the fresh bootstrap.
     await this.enqueueApply(this.sync?.listBatches() ?? []);
     await this.publishNow();
     if (this._state !== "needs-migration") this.setState("live");
-    this.scheduleSnapshot();
+    await this.persistSnapshot();
   }
 
   // --- delete / restore ------------------------------------------------------
@@ -633,19 +687,22 @@ export class SyncedPluginDatabase {
 
   async close(): Promise<void> {
     if (this.closed) return;
+    const failed = this._state === "error";
     if (this.publishTimer) {
       clearTimeout(this.publishTimer);
       this.publishTimer = null;
     }
-    await this.publishNow();
+    if (!failed) await this.publishNow();
     this.closed = true;
     if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
     this.unobserveBatches?.();
     this.unobserveMeta?.();
-    try {
-      await this.persistSnapshot();
-    } catch {
-      /* best effort */
+    if (!failed) {
+      try {
+        await this.persistSnapshot();
+      } catch {
+        /* best effort */
+      }
     }
     if (this.db) await this.db.close().catch(() => {});
     this.db = null;

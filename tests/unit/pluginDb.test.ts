@@ -1,9 +1,15 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import * as Y from "yjs";
 import { makeEngine, makeRelay, newSnapStore } from "../support/crsqliteHarness";
 import { _resetSqliteForTests, readAllChanges } from "../../src/pluginDb/crsqlite";
+import { RealtimeSqlAPI } from "../../src/pluginDb/api";
 import { MAX_BATCH_ROWS, SYNC_FORMAT } from "../../src/pluginDb/types";
+import { CompatibilityError } from "../../src/caps";
 import { waitFor } from "../support/util";
+
+vi.mock("../../src/pluginDb/obsidianDeps", () => ({
+  buildEngineDeps: vi.fn(),
+}));
 
 interface TaskRow {
   id: string;
@@ -214,6 +220,87 @@ describe("SyncedPluginDatabase", () => {
     }
   });
 
+  it("publishes one committed db_version atomically when it exceeds the row target", async () => {
+    const doc = new Y.Doc();
+    const producer = makeEngine({ doc, snap: newSnapStore() });
+    const consumer = makeEngine({ doc, snap: newSnapStore() });
+    try {
+      await producer.start();
+      await producer.whenLive();
+      await producer.transaction(async (tx) => {
+        for (let index = 0; index < 600; index++) {
+          await tx.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, [
+            `bulk-${index.toString().padStart(3, "0")}`,
+            `row-${index}`,
+          ]);
+        }
+      });
+
+      const batches = doc.getArray<any>("batches");
+      await waitFor(
+        () => batches.toArray().some((batch) => batch.changes.length > MAX_BATCH_ROWS),
+        { label: "oversized transaction published atomically" },
+      );
+      const oversized = batches.toArray().find((batch) => batch.changes.length > MAX_BATCH_ROWS);
+      expect(
+        new Set(oversized.changes.map((row: { db_version: number }) => row.db_version)).size,
+      ).toBe(1);
+
+      await consumer.start();
+      await consumer.whenLive();
+      await waitFor(async () => (await titles(consumer)).length === 600, {
+        timeout: 20_000,
+        label: "consumer received every row in oversized transaction",
+      });
+      expect(await titles(consumer)).toHaveLength(600);
+    } finally {
+      await producer.close();
+      await consumer.close();
+    }
+  });
+
+  it("rejects startup when the authoritative bootstrap fails", async () => {
+    const snap = newSnapStore();
+    const db = makeEngine({
+      doc: new Y.Doc(),
+      snap,
+      bootstrap: async () => {
+        throw new Error("bootstrap unavailable");
+      },
+    });
+    try {
+      await expect(db.start()).rejects.toThrow("bootstrap unavailable");
+      expect(db.state).toBe("error");
+    } finally {
+      await db.close();
+    }
+    expect(snap.text).toBeNull();
+  });
+
+  it("keeps the live database intact when a rebase bootstrap fails", async () => {
+    let failBootstrap = false;
+    const db = makeEngine({
+      doc: new Y.Doc(),
+      snap: newSnapStore(),
+      bootstrap: async () => {
+        if (failBootstrap) throw new Error("rebase unavailable");
+        return [];
+      },
+    });
+    try {
+      await db.start();
+      await db.whenLive();
+      await db.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["local", "still-live"]);
+
+      failBootstrap = true;
+      await expect(db.rebaseFromServer()).rejects.toThrow("rebase unavailable");
+      expect(db.state).toBe("live");
+      expect(await titles(db)).toEqual(["still-live"]);
+    } finally {
+      await db.close();
+    }
+  });
+
   it("replays own-site batches that are newer than the restored snapshot", async () => {
     const doc = new Y.Doc();
     const snap = newSnapStore();
@@ -334,10 +421,9 @@ describe("SyncedPluginDatabase", () => {
       // The crash site is `Math.max(applied, batch.toDbVersion)` which runs
       // AFTER applyChanges succeeds — so the row lands but the cursor never
       // advances and the batch is retried forever. Assert the cursor moved.
-      await waitFor(
-        () => ((consumer as any).cursor[producerSite] ?? 0) >= last.db_version,
-        { label: "cursor advanced past the bigint batch" },
-      );
+      await waitFor(() => ((consumer as any).cursor[producerSite] ?? 0) >= last.db_version, {
+        label: "cursor advanced past the bigint batch",
+      });
     } finally {
       await producer.close();
       await consumer.close();
@@ -384,5 +470,52 @@ describe("sqlIdentifiers / lint", () => {
       "WHERE",
       "a",
     ]);
+  });
+});
+
+describe("RealtimeSqlAPI lifecycle", () => {
+  const makePlugin = () => ({
+    settings: {
+      enabled: true,
+      authServerUrl: "https://sync.example.test",
+      authServerId: "server-a",
+      userId: "user-a",
+      activeVaultId: "vault-a",
+    },
+    auth: {
+      isLoggedIn: true,
+      ensureServerId: vi.fn(async () => "server-a"),
+    },
+    lastCompatibilityError: null as null | {
+      reason: "server-incompatible";
+      detail: string;
+      serverVersion?: string;
+    },
+  });
+
+  it("closes cached engines when the active vault scope changes", async () => {
+    const plugin = makePlugin();
+    const api = new RealtimeSqlAPI(plugin as any);
+    const close = vi.fn(async () => {});
+    (api as any).activeScope = (api as any).scope();
+    (api as any).engines.set("cached", { close });
+
+    plugin.settings.activeVaultId = "vault-b";
+    await api.reconcileLifecycle();
+
+    expect(close).toHaveBeenCalledOnce();
+    expect((api as any).engines.size).toBe(0);
+    expect((api as any).activeScope).toBeNull();
+  });
+
+  it("blocks SQL availability on a server capability mismatch", async () => {
+    const plugin = makePlugin();
+    plugin.lastCompatibilityError = {
+      reason: "server-incompatible",
+      detail: "server requires an unsupported pluginDbSync format",
+    };
+    const api = new RealtimeSqlAPI(plugin as any);
+
+    await expect(api.whenAvailable()).rejects.toBeInstanceOf(CompatibilityError);
   });
 });

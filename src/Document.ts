@@ -335,6 +335,7 @@ export class Document extends SyncedDoc {
         if (this.destroyed || this.content !== text) return;
         await this.plugin.app.vault.create(path, text);
       }
+      this.plugin.vaultSync?.noteMaterialized(this.path, "text");
     } catch (e) {
       console.error(`[Realtime] writeToDisk failed for ${this.path}`, e);
       if (!this.destroyed) this.scheduleWriteToDisk(DISK_WRITE_RETRY_MS);

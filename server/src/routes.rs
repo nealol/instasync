@@ -1246,6 +1246,23 @@ pub async fn upsert_file(
     Json(body): Json<UpsertFileBody>,
 ) -> AppResult<Json<Value>> {
     require_member(&state, &user.id, &vault_id).await?;
+    if body.path.is_empty() {
+        return Err(AppError::BadRequest("file path must not be empty".into()));
+    }
+
+    if let Some(existing) = vault_files::Entity::find()
+        .filter(vault_files::Column::VaultId.eq(&vault_id))
+        .filter(vault_files::Column::Guid.eq(&body.guid))
+        .one(&state.db)
+        .await?
+    {
+        if authorize_path(&state, &user, &vault_id, &existing.path).await? != Level::Full {
+            return Err(AppError::Forbidden);
+        }
+    }
+    if authorize_path(&state, &user, &vault_id, &body.path).await? != Level::Full {
+        return Err(AppError::Forbidden);
+    }
 
     // Atomic upsert: the client fires registry updates fire-and-forget on every
     // file event, so the same guid can arrive concurrently (delete/restore/move)
@@ -1262,6 +1279,9 @@ pub async fn upsert_file(
 pub struct DocTokenBody {
     pub vault_id: String,
     pub doc_id: String,
+    /// Path claimed by a client that is creating a brand-new file document.
+    /// Existing registry entries always win over this value.
+    pub path: Option<String>,
 }
 
 pub async fn doc_token(
@@ -1281,7 +1301,14 @@ pub async fn doc_token(
         return Err(AppError::Forbidden);
     }
 
-    let level = authorize_doc(&state, &user, &body.vault_id, &body.doc_id).await?;
+    let level = authorize_doc_with_claim(
+        &state,
+        &user,
+        &body.vault_id,
+        &body.doc_id,
+        body.path.as_deref(),
+    )
+    .await?;
 
     ensure_doc(&state, &body.doc_id).await?;
     let token = mint_client_token(&state, &body.doc_id, level).await?;
@@ -1331,27 +1358,61 @@ pub(crate) async fn authorize_doc(
     vault_id: &str,
     doc_id: &str,
 ) -> AppResult<Level> {
-    // Index doc (== vaultId) and unknown guids are treated as vault-level ("").
-    let path = if doc_id == vault_id {
-        String::new()
-    } else {
-        let prefix = format!("{vault_id}__");
-        let guid = doc_id.strip_prefix(&prefix).unwrap_or_else(|| {
-            // Defensive: callers should validate the doc_id namespace before
-            // reaching here. A malformed id is treated as vault-level access
-            // rather than panicking, but logged for investigation.
-            tracing::warn!("authorize_doc: doc_id {doc_id} missing vault prefix {prefix}");
-            ""
-        });
-        vault_files::Entity::find()
-            .filter(vault_files::Column::VaultId.eq(vault_id))
-            .filter(vault_files::Column::Guid.eq(guid))
-            .one(&state.db)
-            .await?
-            .map(|f| f.path)
-            .unwrap_or_default()
-    };
+    authorize_doc_with_claim(state, user, vault_id, doc_id, None).await
+}
 
+async fn authorize_doc_with_claim(
+    state: &AppState,
+    user: &users::Model,
+    vault_id: &str,
+    doc_id: &str,
+    claimed_path: Option<&str>,
+) -> AppResult<Level> {
+    if doc_id == vault_id {
+        // A Y.Map cannot hide individual entries. Only uniformly-authorized
+        // principals may receive the shared index document.
+        return authorize_uniform_vault(state, user, vault_id).await;
+    }
+
+    let prefix = format!("{vault_id}__");
+    let suffix = doc_id.strip_prefix(&prefix).ok_or(AppError::Forbidden)?;
+
+    if let Some(plugin_db) = suffix.strip_prefix("plugindb__") {
+        let mut parts = plugin_db.split("__");
+        let plugin = parts.next().filter(|part| !part.is_empty());
+        let name = parts.next().filter(|part| !part.is_empty());
+        if plugin.is_none() || name.is_none() || parts.next().is_some() {
+            return Err(AppError::Forbidden);
+        }
+        let path = crate::plugindb::routes::pseudo_path(
+            plugin.expect("checked above"),
+            name.expect("checked above"),
+        );
+        return authorize_path(state, user, vault_id, &path).await;
+    }
+
+    // Normal file guids never contain the plugin-db separator.
+    if suffix.is_empty() || suffix.contains("__") {
+        return Err(AppError::Forbidden);
+    }
+
+    let registered = vault_files::Entity::find()
+        .filter(vault_files::Column::VaultId.eq(vault_id))
+        .filter(vault_files::Column::Guid.eq(suffix))
+        .one(&state.db)
+        .await?;
+    let path = match registered {
+        Some(file) => file.path,
+        // Creator documents connect before their index entry is published.
+        // The claimed path permits that one empty-document bootstrap without
+        // turning every unknown guid into vault-level access.
+        None => match claimed_path.filter(|path| !path.is_empty()) {
+            Some(path) => path.to_string(),
+            // Preserve direct document creation for principals whose policy is
+            // uniform across the vault. Partial ACLs must provide a path.
+            None => return authorize_uniform_vault(state, user, vault_id).await,
+        },
+    };
     authorize_path(state, user, vault_id, &path).await
 }
 
@@ -1365,7 +1426,45 @@ pub(crate) async fn authorize_path(
         .filter(permissions::Column::VaultId.eq(vault_id))
         .all(&state.db)
         .await?;
+    resolve_path_level(&rows, user, path)
+}
 
+/// Resolve the vault root and every configured prefix to the same level.
+/// Shared index documents and unscoped blob requests are safe only under this
+/// uniform policy because their payloads contain entries from every path.
+pub(crate) async fn authorize_uniform_vault(
+    state: &AppState,
+    user: &users::Model,
+    vault_id: &str,
+) -> AppResult<Level> {
+    let rows = permissions::Entity::find()
+        .filter(permissions::Column::VaultId.eq(vault_id))
+        .all(&state.db)
+        .await?;
+    let root = resolve_path_level(&rows, user, "")?;
+    for row in &rows {
+        let applies = row
+            .principal_user_id
+            .as_ref()
+            .map(|id| id == &user.id)
+            .unwrap_or(true);
+        if !applies || row.path_prefix.is_empty() {
+            continue;
+        }
+        match resolve_path_level(&rows, user, &row.path_prefix) {
+            Ok(level) if level == root => {}
+            Ok(_) | Err(AppError::Forbidden) => return Err(AppError::Forbidden),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(root)
+}
+
+fn resolve_path_level(
+    rows: &[permissions::Model],
+    user: &users::Model,
+    path: &str,
+) -> AppResult<Level> {
     // Most specific match wins: longer prefix first, user-specific over everyone.
     // NOTE: path matching is case-sensitive, consistent with how Obsidian and the
     // sync layer store paths. Clients on case-insensitive filesystems (macOS,
@@ -1382,7 +1481,7 @@ pub(crate) async fn authorize_path(
         let specificity =
             r.path_prefix.len() as i64 * 2 + if r.principal_user_id.is_some() { 1 } else { 0 };
         if best.as_ref().map(|(s, _)| specificity > *s).unwrap_or(true) {
-            best = Some((specificity, r.level));
+            best = Some((specificity, r.level.clone()));
         }
     }
 

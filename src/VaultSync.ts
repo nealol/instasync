@@ -21,6 +21,7 @@ import { BinarySync } from "./BinarySync";
 import { ConfigSync } from "./ConfigSync";
 import { enabledConfigCategories } from "./configCategories";
 import { matchesAnyGlob, parseGlobs } from "./glob";
+import { LocalSyncState, type MaterializedKind } from "./localSyncState";
 
 type FileKind = "text" | "structured" | "binary" | "ignore";
 type StructuredKind = "canvas" | "base";
@@ -122,6 +123,8 @@ export class VaultSync {
   private binarySync: BinarySync;
   /** Per-device opt-in sync for whitelisted files under `.obsidian`. */
   private configSync: ConfigSync;
+  /** Device-local proof that a path was previously materialized on disk. */
+  private localSyncState: LocalSyncState;
 
   private documents = new Map<string, Document>();
   private structuredDocuments = new Map<string, StructuredDocument>();
@@ -152,10 +155,13 @@ export class VaultSync {
     this.files = this.indexDoc.getMap("files");
     this.structured = this.indexDoc.getMap("structured");
     this.trash = this.indexDoc.getMap("trash");
-    this.binarySync = new BinarySync(plugin, this, this.indexDoc);
-    this.configSync = new ConfigSync(plugin, this.indexDoc);
 
     const vaultId = plugin.settings.activeVaultId;
+    const serverScope = plugin.settings.authServerId || plugin.settings.authServerUrl;
+    const localScope = `${serverScope}:${vaultId}`;
+    this.localSyncState = new LocalSyncState(localScope);
+    this.binarySync = new BinarySync(plugin, this, this.indexDoc, this.localSyncState);
+    this.configSync = new ConfigSync(plugin, this.indexDoc, this.localSyncState);
 
     // Connect only after the persisted index has loaded (see init()), so local
     // offline map changes merge with the server instead of racing it. The index
@@ -166,7 +172,7 @@ export class VaultSync {
       this.indexDoc,
       { connect: false, showDebuggerLink: false, ...muxProviderOptions() },
     );
-    this.indexPersistence = new IndexeddbPersistence(vaultId, this.indexDoc);
+    this.indexPersistence = new IndexeddbPersistence(`realtime:index:${localScope}`, this.indexDoc);
 
     this.filesObserver = this.onFilesChanged.bind(this);
     this.files.observe(this.filesObserver);
@@ -197,15 +203,61 @@ export class VaultSync {
   /** Load the persisted index, then connect so local offline changes sync. */
   private async init(): Promise<void> {
     try {
-      await this.indexPersistence.whenSynced;
+      await Promise.all([this.indexPersistence.whenSynced, this.localSyncState.whenSynced]);
     } catch (e) {
       console.error("[Realtime] index persistence failed to load", e);
     }
     if (this.destroyed) return;
-    // Capture the persisted (pre-merge) binary baseline before connecting.
+    await this.foldOfflineDeletions();
+    if (this.destroyed) return;
+    // Capture the persisted (pre-remote-merge) binary baseline before connecting.
     this.binarySync.seedBaseline();
     this.configSync.seedBaseline();
     void connectYSweetProvider(this.indexProvider);
+  }
+
+  /**
+   * Fold deletions made while Obsidian was stopped into the persisted index
+   * before connecting. Missing paths on a fresh device are still pulled.
+   */
+  private async foldOfflineDeletions(): Promise<void> {
+    this.indexDoc.transact(() => {
+      for (const [path, guid] of this.files.entries()) {
+        if (!this.localSyncState.has(path) || this.localFileExists(path)) continue;
+        this.recordTrashIn({ path, kind: "text", guid });
+        this.files.delete(path);
+        this.localSyncState.remove(path);
+      }
+      for (const [path, meta] of this.structured.entries()) {
+        if (
+          !isStructuredMeta(meta) ||
+          !this.localSyncState.has(path) ||
+          this.localFileExists(path)
+        ) {
+          continue;
+        }
+        this.recordTrashIn({ path, kind: meta.kind, guid: meta.guid });
+        this.structured.delete(path);
+        this.localSyncState.remove(path);
+      }
+    });
+
+    this.binarySync.foldOfflineDeletions((path) =>
+      shouldSyncCanvasBinaryPath(
+        path,
+        this.plugin.settings.syncBinaries,
+        this.plugin.settings.binaryExcludeGlobs,
+      ),
+    );
+    if (this.plugin.settings.syncConfigEnabled) {
+      await this.configSync.foldOfflineDeletions(
+        enabledConfigCategories(this.plugin.settings.configSyncCategories),
+      );
+    }
+  }
+
+  noteMaterialized(path: string, kind: MaterializedKind): void {
+    this.localSyncState.mark(path, kind);
   }
 
   /** Nudge the index provider and every document to reconnect if stalled. */
@@ -397,6 +449,12 @@ export class VaultSync {
       const pathVersion = this.currentPathVersion(path);
       if (isConflictCopy(path)) continue;
       const kind = this.classify(file);
+      if (kind === "text") {
+        this.localSyncState.mark(path, "text");
+      } else if (kind === "structured") {
+        const structuredKind = this.structuredKindForExtension(file.extension);
+        if (structuredKind) this.localSyncState.mark(path, structuredKind);
+      }
       if (kind === "structured") {
         const structuredKind = this.structuredKindForExtension(file.extension);
         if (!structuredKind) continue;
@@ -621,6 +679,7 @@ export class VaultSync {
         console.error(`[Realtime] failed to apply remote delete for ${path}`, e);
       }
     }
+    this.localSyncState.remove(path);
   }
 
   // --- Document registry -----------------------------------------------------
@@ -824,6 +883,12 @@ export class VaultSync {
     const path = file.path;
     const pathVersion = this.bumpPathVersion(path);
     const kind = this.classify(file);
+    if (kind === "text") {
+      this.localSyncState.mark(path, "text");
+    } else if (kind === "structured" && file instanceof TFile) {
+      const structuredKind = this.structuredKindForExtension(file.extension);
+      if (structuredKind) this.localSyncState.mark(path, structuredKind);
+    }
     if (kind === "binary") {
       this.binarySync.onLocalChanged(path);
       return;
@@ -872,6 +937,7 @@ export class VaultSync {
   private onLocalDelete(file: TAbstractFile): void {
     if (this.destroyed || !this.initialSynced) return;
     const path = file.path;
+    this.localSyncState.remove(path);
     this.bumpPathVersion(path);
     if (this.documents.has(path) || this.files.has(path)) {
       this.removeDocument(path);
@@ -907,6 +973,7 @@ export class VaultSync {
   private async handleLocalRename(file: TAbstractFile, oldPath: string): Promise<void> {
     if (this.destroyed || !this.initialSynced || !(file instanceof TFile)) return;
     const newPath = file.path;
+    this.localSyncState.remove(oldPath);
     this.bumpPathVersion(oldPath);
     const newPathVersion = this.bumpPathVersion(newPath);
 
@@ -923,6 +990,12 @@ export class VaultSync {
     this.removeStructuredDocument(oldPath);
 
     const kind = this.classify(file);
+    if (kind === "text") {
+      this.localSyncState.mark(newPath, "text");
+    } else if (kind === "structured") {
+      const structuredKind = this.structuredKindForExtension(file.extension);
+      if (structuredKind) this.localSyncState.mark(newPath, structuredKind);
+    }
     if (kind === "text") {
       const finalGuid = guid ?? newGuid();
       const doc = this.ensureDocument(newPath, finalGuid, !wasTracked);
@@ -1162,6 +1235,7 @@ export class VaultSync {
     this.vaultEvents = [];
     this.binarySync.destroy();
     this.configSync.destroy();
+    this.localSyncState.destroy();
     this.files.unobserve(this.filesObserver);
     this.structured.unobserve(this.structuredObserver);
     this.indexProvider.off(EVENT_CONNECTION_STATUS, this.statusListener);

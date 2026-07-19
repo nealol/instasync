@@ -2551,7 +2551,7 @@ pub mod routes {
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
     }
 
-    fn pseudo_path(plugin: &str, name: &str) -> String {
+    pub(crate) fn pseudo_path(plugin: &str, name: &str) -> String {
         format!(".realtime/plugin-dbs/{plugin}/{name}")
     }
 

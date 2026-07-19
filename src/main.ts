@@ -334,6 +334,7 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
 
   async reloadSync(): Promise<void> {
     this.stopSync();
+    await this.sqlApi.reconcileLifecycle();
     await this.maybeStartSync();
   }
 
@@ -350,6 +351,7 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
 
   async logout(): Promise<void> {
     this.stopSync();
+    await this.sqlApi.resetForLifecycle();
     await this.auth.logout();
     this.setStatus("signin");
   }
@@ -563,6 +565,7 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
   async createAndActivateVault(name: string): Promise<void> {
     const vault = await this.auth.createVault(name);
     this.stopSync();
+    await this.sqlApi.resetForLifecycle();
     this.settings.activeVaultId = vault.id;
     await this.saveSettings();
     // runInitialSync seeds the empty remote index from the local Markdown files.
@@ -579,6 +582,7 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
     if (vaultId === this.settings.activeVaultId && this.vaultSync) return;
 
     this.stopSync();
+    await this.sqlApi.resetForLifecycle();
     await this.wipeLocalSyncedFiles();
     this.settings.activeVaultId = vaultId;
     await this.saveSettings();

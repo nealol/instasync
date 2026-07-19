@@ -1049,10 +1049,10 @@ export class AuthClient {
   }
 
   /** Mint a y-sweet client token for a (namespaced) doc id in the active vault. */
-  docToken(vaultId: string, docId: string): Promise<ClientToken> {
+  docToken(vaultId: string, docId: string, path?: string): Promise<ClientToken> {
     return this.api<ClientToken>("/api/doc-token", {
       method: "POST",
-      body: { vaultId, docId },
+      body: { vaultId, docId, ...(path ? { path } : {}) },
     });
   }
 
@@ -1062,15 +1062,15 @@ export class AuthClient {
   // from the JSON API (these carry raw bytes, not JSON). All three are vault
   // scoped: the server requires membership of `vaultId`.
 
-  private blobUrl(vaultId: string, hash: string): string {
-    return `${this.baseUrl}/api/vaults/${vaultId}/blobs/${hash}`;
+  private blobUrl(vaultId: string, path: string, hash: string): string {
+    return `${this.baseUrl}/api/vaults/${vaultId}/blobs/${hash}?path=${encodeURIComponent(path)}`;
   }
 
   /** True if the server already holds the blob (lets callers skip re-upload). */
-  async blobExists(vaultId: string, hash: string): Promise<boolean> {
+  async blobExists(vaultId: string, path: string, hash: string): Promise<boolean> {
     const token = this.getToken();
     const res = await requestUrl({
-      url: this.blobUrl(vaultId, hash),
+      url: this.blobUrl(vaultId, path, hash),
       method: "HEAD",
       headers: token ? { Authorization: `Bearer ${token}` } : {},
       throw: false,
@@ -1080,10 +1080,10 @@ export class AuthClient {
   }
 
   /** Download blob bytes by hash. */
-  async getBlob(vaultId: string, hash: string): Promise<ArrayBuffer> {
+  async getBlob(vaultId: string, path: string, hash: string): Promise<ArrayBuffer> {
     const token = this.getToken();
     const res = await requestUrl({
-      url: this.blobUrl(vaultId, hash),
+      url: this.blobUrl(vaultId, path, hash),
       method: "GET",
       headers: token ? { Authorization: `Bearer ${token}` } : {},
       throw: false,
@@ -1096,10 +1096,10 @@ export class AuthClient {
   }
 
   /** Upload blob bytes; idempotent and content-verified server-side. */
-  async putBlob(vaultId: string, hash: string, data: ArrayBuffer): Promise<void> {
+  async putBlob(vaultId: string, path: string, hash: string, data: ArrayBuffer): Promise<void> {
     const token = this.getToken();
     const res = await requestUrl({
-      url: this.blobUrl(vaultId, hash),
+      url: this.blobUrl(vaultId, path, hash),
       method: "PUT",
       headers: token ? { Authorization: `Bearer ${token}` } : {},
       contentType: "application/octet-stream",

@@ -28,7 +28,7 @@ const LEGACY_TOKEN_KEY = "realtime-session-token";
 const KNOWN_SESSIONS_KEY = "realtime-known-sessions";
 const SERVER_URL = "https://sync.example.test";
 const CAPS = {
-  restApi: "2",
+  restApi: "3",
   oauth: "1",
   pluginDbSync: "crsqlite-1",
   attachmentShim: "https://realtime.md/attachment-shim/v1",

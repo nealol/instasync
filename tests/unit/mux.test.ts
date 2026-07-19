@@ -192,6 +192,12 @@ describe("MuxWebSocket", () => {
 
     a.send(new Uint8Array([9]));
     expect(server.frames().some((f) => f?.type === "data")).toBe(false);
+
+    // Closing the final channel releases the idle connection registry entry.
+    // A later provider gets a fresh transport rather than retaining the dead
+    // socket object forever.
+    new MuxWebSocket(DOC_URL);
+    expect(FakeServerSocket.instances).toHaveLength(2);
   });
 });
 

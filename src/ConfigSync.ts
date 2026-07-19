@@ -8,6 +8,7 @@ import {
   type ConfigCategoryId,
 } from "./configCategories";
 import { dbg } from "./debug";
+import type { LocalSyncState } from "./localSyncState";
 
 export interface ConfigMeta {
   hash: string;
@@ -101,6 +102,7 @@ export class ConfigSync {
   private plugin: RealtimePlugin;
   private indexDoc: Y.Doc;
   private configFiles: Y.Map<ConfigMeta>;
+  private localSyncState?: LocalSyncState;
   private enabledCategories = new Set<ConfigCategoryId>();
   private lastSyncedHash = new Map<string, string>();
   private chains = new Map<string, Promise<void>>();
@@ -119,9 +121,10 @@ export class ConfigSync {
   private observer: (event: Y.YMapEvent<ConfigMeta>) => void;
   private focusHandler = () => void this.reconcileAll();
 
-  constructor(plugin: RealtimePlugin, indexDoc: Y.Doc) {
+  constructor(plugin: RealtimePlugin, indexDoc: Y.Doc, localSyncState?: LocalSyncState) {
     this.plugin = plugin;
     this.indexDoc = indexDoc;
+    this.localSyncState = localSyncState;
     this.configFiles = indexDoc.getMap<ConfigMeta>("configFiles");
     this.observer = this.onConfigFilesChanged.bind(this);
     this.configFiles.observe(this.observer);
@@ -146,6 +149,21 @@ export class ConfigSync {
       if (meta?.hash) this.lastSyncedHash.set(path, meta.hash);
     }
     dbg("ConfigSync seedBaseline", this.lastSyncedHash.size, "entries");
+  }
+
+  async foldOfflineDeletions(categories: Set<ConfigCategoryId>): Promise<void> {
+    this.enabledCategories = new Set(categories);
+    for (const path of this.configFiles.keys()) {
+      if (
+        this.syncableCategory(path) === null ||
+        !this.localSyncState?.has(path) ||
+        (await this.plugin.app.vault.adapter.exists(path))
+      ) {
+        continue;
+      }
+      this.configFiles.delete(path);
+      this.localSyncState.remove(path);
+    }
   }
 
   start(categories: Set<ConfigCategoryId>): void {
@@ -210,6 +228,7 @@ export class ConfigSync {
     if (this.destroyed) return;
     const local = await this.localInfo(path);
     if (local === undefined || this.destroyed) return;
+    if (local) this.localSyncState?.mark(path, "config");
     const remote = this.configFiles.get(path) ?? null;
     const base = this.lastSyncedHash.get(path) ?? null;
 
@@ -279,8 +298,8 @@ export class ConfigSync {
     if (this.destroyed) return;
     const finalMeta =
       meta && hash === meta.hash ? meta : { hash, size: bytes.byteLength, mtime: Date.now() };
-    if (!(await this.plugin.auth.blobExists(this.vaultId, finalMeta.hash))) {
-      await this.plugin.auth.putBlob(this.vaultId, finalMeta.hash, bytes);
+    if (!(await this.plugin.auth.blobExists(this.vaultId, path, finalMeta.hash))) {
+      await this.plugin.auth.putBlob(this.vaultId, path, finalMeta.hash, bytes);
     }
     if (this.destroyed) return;
     this.indexDoc.transact(() => this.configFiles.set(path, finalMeta));
@@ -291,7 +310,7 @@ export class ConfigSync {
   private async download(path: string, meta: ConfigMeta): Promise<void> {
     let bytes: ArrayBuffer;
     try {
-      bytes = await this.plugin.auth.getBlob(this.vaultId, meta.hash);
+      bytes = await this.plugin.auth.getBlob(this.vaultId, path, meta.hash);
     } catch (e) {
       if (this.destroyed) return;
       console.error(`[Realtime] config blob download failed for ${path}`, e);
@@ -304,6 +323,7 @@ export class ConfigSync {
       await this.ensureParentFolders(path);
       await this.plugin.app.vault.adapter.writeBinary(path, bytes);
       this.lastSyncedHash.set(path, meta.hash);
+      this.localSyncState?.mark(path, "config");
       this.noteDownloaded(path);
       dbg("config downloaded", path, meta.hash, bytes.byteLength);
     } finally {
@@ -320,7 +340,7 @@ export class ConfigSync {
   private async mergeConflict(path: string, local: ConfigMeta, remote: ConfigMeta): Promise<void> {
     let remoteBytes: ArrayBuffer;
     try {
-      remoteBytes = await this.plugin.auth.getBlob(this.vaultId, remote.hash);
+      remoteBytes = await this.plugin.auth.getBlob(this.vaultId, path, remote.hash);
     } catch (e) {
       if (this.destroyed) return;
       console.error(`[Realtime] config blob download failed for ${path}`, e);
@@ -362,6 +382,7 @@ export class ConfigSync {
         await this.plugin.app.vault.adapter.remove(path);
       }
       this.lastSyncedHash.delete(path);
+      this.localSyncState?.remove(path);
       this.noteDownloaded(path);
     } finally {
       window.setTimeout(() => this.writing.delete(path), 0);
@@ -371,6 +392,7 @@ export class ConfigSync {
   private publishDelete(path: string): void {
     this.indexDoc.transact(() => this.configFiles.delete(path));
     this.lastSyncedHash.delete(path);
+    this.localSyncState?.remove(path);
     dbg("config delete published", path);
   }
 

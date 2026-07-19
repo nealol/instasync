@@ -12,6 +12,55 @@ export interface ReconcileOptions {
   textKeys?: Set<string>;
 }
 
+/**
+ * Apply only the local changes made from `baseline` while retaining unrelated
+ * remote changes. Concurrent edits to the same scalar/array prefer local;
+ * a local deletion does not erase a concurrently changed remote value.
+ */
+export function mergeStructuredStartup(
+  baseline: JsonValue,
+  local: JsonValue,
+  remote: JsonValue,
+): JsonValue {
+  if (jsonEqual(local, baseline)) return remote;
+  if (jsonEqual(remote, baseline) || jsonEqual(local, remote)) return local;
+  if (!isRecord(local) || !isRecord(remote)) return local;
+
+  const base = isRecord(baseline) ? baseline : {};
+  const merged = Object.create(null) as Record<string, JsonValue>;
+  const keys = new Set([...Object.keys(base), ...Object.keys(local), ...Object.keys(remote)]);
+  for (const key of keys) {
+    const baseHas = key in base;
+    const localHas = key in local;
+    const remoteHas = key in remote;
+
+    if (!localHas) {
+      if (!baseHas) {
+        if (remoteHas) merged[key] = remote[key];
+        continue;
+      }
+      if (!remoteHas) continue;
+      // Local deleted the baseline key. Keep a concurrent remote edit, but
+      // honor the deletion when remote still equals the baseline.
+      if (!jsonEqual(remote[key], base[key])) merged[key] = remote[key];
+      continue;
+    }
+    if (!remoteHas) {
+      if (!baseHas || !jsonEqual(local[key], base[key])) merged[key] = local[key];
+      continue;
+    }
+    if (!baseHas) {
+      merged[key] =
+        isRecord(local[key]) && isRecord(remote[key])
+          ? mergeStructuredStartup({}, local[key], remote[key])
+          : local[key];
+      continue;
+    }
+    merged[key] = mergeStructuredStartup(base[key], local[key], remote[key]);
+  }
+  return merged;
+}
+
 const DEFAULT_TEXT_KEYS = new Set([
   "text",
   "label",
@@ -142,4 +191,21 @@ function applyStringToYText(ytext: Y.Text, next: string): void {
 
 function isRecord(value: unknown): value is Record<string, JsonValue> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function jsonEqual(left: JsonValue, right: JsonValue): boolean {
+  if (left === right) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+      return false;
+    }
+    return left.every((value, index) => jsonEqual(value, right[index]));
+  }
+  if (!isRecord(left) || !isRecord(right)) return false;
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  return (
+    leftKeys.length === rightKeys.length &&
+    leftKeys.every((key) => key in right && jsonEqual(left[key], right[key]))
+  );
 }

@@ -315,6 +315,7 @@ class MuxConnection {
       channel.deliverError();
       channel.deliverClose(CLOSE_CODE_TRANSPORT);
     }
+    this.release();
   }
 
   /** Close the idle real socket without failing channels (there are none). */
@@ -330,6 +331,11 @@ class MuxConnection {
         /* ignore */
       }
     }
+    this.release();
+  }
+
+  private release(): void {
+    if (connections.get(this.url) === this) connections.delete(this.url);
   }
 
   destroyForTests(): void {

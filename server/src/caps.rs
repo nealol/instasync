@@ -15,7 +15,7 @@
 /// the plugin now requires: every Yjs document is multiplexed over a single
 /// `/dmux` WebSocket, so a client on this cap will not connect to a server that
 /// lacks that route.
-pub const REST_API: &str = "2";
+pub const REST_API: &str = "3";
 
 /// OAuth 2.1 server metadata + token endpoint shape, as consumed by the
 /// Obsidian plugin's own OAuth flow. External MCP clients consume the OAuth

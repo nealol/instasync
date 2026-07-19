@@ -5,15 +5,16 @@
 //! mapping through the index doc and stores the bytes here, keyed by their hash.
 //!
 //! Blobs live on the filesystem under `{blob_dir}/{vault_id}/{hash}`, alongside
-//! the y-sweet data. Access is vault-scoped: any member of the vault may read or
-//! write any blob in it (matching the current allow-all-within-vault ACL posture).
+//! the y-sweet data. Access is authorized against the attachment/config path
+//! supplied by the client. Legacy unscoped requests are accepted only when the
+//! principal has one uniform permission level across the entire vault.
 //! Uploads are content-verified — the streamed bytes must hash to the claimed
 //! `hash` — so a member cannot poison a hash with mismatched content.
 
 use std::path::{Path as FsPath, PathBuf};
 
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
@@ -22,9 +23,10 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
 use crate::error::{AppError, AppResult};
-use crate::routes::require_member;
+use crate::routes::{authorize_path, authorize_uniform_vault, require_member};
 use crate::session::{now_millis, AuthUser};
 use crate::state::{AppState, Principal, PrincipalActor};
+use crate::ysweet::Level;
 
 pub const MAX_BLOB_BYTES: u64 = 100 * 1024 * 1024;
 
@@ -60,14 +62,57 @@ fn blob_path(state: &AppState, vault_id: &str, hash: &str) -> AppResult<PathBuf>
     blob_fs_path(&state.config.blob_dir, vault_id, hash).map_err(AppError::BadRequest)
 }
 
+#[derive(Default, serde::Deserialize)]
+pub struct BlobQuery {
+    path: Option<String>,
+}
+
+async fn authorize_blob(
+    state: &AppState,
+    user: &crate::entities::users::Model,
+    vault_id: &str,
+    path: Option<&str>,
+    write: bool,
+) -> AppResult<()> {
+    require_member(state, &user.id, vault_id).await?;
+    let level = match path {
+        Some(path) if !path.is_empty() => authorize_path(state, user, vault_id, path).await?,
+        Some(_) => return Err(AppError::BadRequest("blob path must not be empty".into())),
+        None => authorize_uniform_vault(state, user, vault_id).await?,
+    };
+    if write && level != Level::Full {
+        return Err(AppError::Forbidden);
+    }
+    Ok(())
+}
+
+async fn blob_matches_path(
+    state: &AppState,
+    vault_id: &str,
+    path: &str,
+    hash: &str,
+) -> AppResult<bool> {
+    let update = crate::ydoc::read_update(state, vault_id).await?;
+    let mut entries = crate::ydoc::decode_binaries_entries(&update)
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    entries.extend(
+        crate::ydoc::decode_config_entries(&update)
+            .map_err(|error| AppError::Internal(error.to_string()))?,
+    );
+    Ok(entries
+        .iter()
+        .any(|entry| entry.path == path && entry.hash == hash))
+}
+
 /// `HEAD /api/vaults/{id}/blobs/{hash}` — 200 if present, 404 otherwise. Lets the
 /// client skip an upload when the server already has the content (dedup).
 pub async fn head_blob(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     Path((vault_id, hash)): Path<(String, String)>,
+    Query(query): Query<BlobQuery>,
 ) -> AppResult<StatusCode> {
-    require_member(&state, &user.id, &vault_id).await?;
+    authorize_blob(&state, &user, &vault_id, query.path.as_deref(), false).await?;
     let path = blob_path(&state, &vault_id, &hash)?;
     match tokio::fs::metadata(&path).await {
         Ok(_) => Ok(StatusCode::OK),
@@ -80,8 +125,14 @@ pub async fn get_blob(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     Path((vault_id, hash)): Path<(String, String)>,
+    Query(query): Query<BlobQuery>,
 ) -> AppResult<Response> {
-    require_member(&state, &user.id, &vault_id).await?;
+    authorize_blob(&state, &user, &vault_id, query.path.as_deref(), false).await?;
+    if let Some(path) = query.path.as_deref() {
+        if !blob_matches_path(&state, &vault_id, path, &hash).await? {
+            return Err(AppError::NotFound);
+        }
+    }
     let path = blob_path(&state, &vault_id, &hash)?;
 
     let file = tokio::fs::File::open(&path)
@@ -103,9 +154,10 @@ pub async fn put_blob(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     Path((vault_id, hash)): Path<(String, String)>,
+    Query(query): Query<BlobQuery>,
     body: Body,
 ) -> AppResult<StatusCode> {
-    require_member(&state, &user.id, &vault_id).await?;
+    authorize_blob(&state, &user, &vault_id, query.path.as_deref(), true).await?;
     let path = blob_path(&state, &vault_id, &hash)?;
 
     // Already stored: short-circuit. Content addressing makes this safe.

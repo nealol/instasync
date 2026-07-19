@@ -151,6 +151,50 @@ describe("BinarySync", () => {
     }
   });
 
+  it("retries a failed remote disk write without advancing the baseline", async () => {
+    const A = makeDevice("A");
+    const B = makeDevice("B");
+    try {
+      await synced(A.provider);
+      await synced(B.provider);
+
+      A.vault.binaries.set("retry.png", bytes([8, 6, 7, 5, 3, 0, 9]));
+      A.bs.seedBaseline();
+      await A.bs.reconcileAll(["retry.png"]);
+      await waitFor(() => B.binaries.has("retry.png"), { label: "B received retry metadata" });
+
+      const originalCreate = B.plugin.app.vault.createBinary.bind(B.plugin.app.vault);
+      let failedRetryWrite = false;
+      const create = vi
+        .spyOn(B.plugin.app.vault, "createBinary")
+        .mockImplementation(async (path, data) => {
+          if (path === "retry.png" && !failedRetryWrite) {
+            failedRetryWrite = true;
+            throw new Error("simulated disk failure");
+          }
+          return originalCreate(path, data);
+        });
+      B.bs.seedBaseline();
+      await B.bs.reconcileAll([]);
+      expect(B.vault.binaries.has("retry.png")).toBe(false);
+      expect(B.binaries.has("retry.png")).toBe(true);
+
+      await waitFor(() => B.vault.binaries.has("retry.png"), {
+        timeout: 10_000,
+        label: "failed write retried",
+      });
+      expect(create.mock.calls.filter(([path]) => path === "retry.png")).toHaveLength(2);
+      expect(asArray(B.vault.binaries.get("retry.png"))).toEqual([8, 6, 7, 5, 3, 0, 9]);
+    } finally {
+      A.bs.destroy();
+      A.provider.destroy();
+      A.indexDoc.destroy();
+      B.bs.destroy();
+      B.provider.destroy();
+      B.indexDoc.destroy();
+    }
+  });
+
   it("reports a large deferred file as pending while text sync is busy", async () => {
     const A = makeDevice("A");
     try {

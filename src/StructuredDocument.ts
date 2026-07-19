@@ -3,7 +3,12 @@ import { Notice, normalizePath, TFile } from "obsidian";
 import type RealtimePlugin from "./main";
 import { SyncedDoc } from "./SyncedDoc";
 import { ensureParentFolder, getFileByPath, isOpenInWorkspace } from "./vaultHelpers";
-import { reconcileInto, toValue, type JsonValue } from "./structured/reconcile";
+import {
+  mergeStructuredStartup,
+  reconcileInto,
+  toValue,
+  type JsonValue,
+} from "./structured/reconcile";
 
 export const DISK_ORIGIN = Symbol("realtime-structured-disk");
 
@@ -14,7 +19,8 @@ export abstract class StructuredDocument extends SyncedDoc {
   private writingTextToDisk: string | null = null;
   private writeTimer: number | null = null;
   private startupReconciled = false;
-  private baselineAtStartup = "";
+  private baselineAtStartup: JsonValue = {};
+  private baselineTextAtStartup = "";
   private diskAtStartup: JsonValue | null = null;
   private localChangedAtStartup = false;
 
@@ -59,10 +65,12 @@ export abstract class StructuredDocument extends SyncedDoc {
   }
 
   protected async afterPersistenceSynced(): Promise<void> {
-    this.baselineAtStartup = this.serialize(this.value);
+    this.baselineAtStartup = this.value;
+    this.baselineTextAtStartup = this.serialize(this.baselineAtStartup);
     const disk = await this.readParsedFromDisk();
     this.diskAtStartup = disk;
-    this.localChangedAtStartup = disk !== null && this.serialize(disk) !== this.baselineAtStartup;
+    this.localChangedAtStartup =
+      disk !== null && this.serialize(disk) !== this.baselineTextAtStartup;
   }
 
   protected async finishStartupReconcile(): Promise<void> {
@@ -70,7 +78,10 @@ export abstract class StructuredDocument extends SyncedDoc {
     this.startupReconciled = true;
     try {
       if (this.localChangedAtStartup && this.diskAtStartup !== null) {
-        this.applyValue(this.diskAtStartup, DISK_ORIGIN);
+        this.applyValue(
+          mergeStructuredStartup(this.baselineAtStartup, this.diskAtStartup, this.value),
+          DISK_ORIGIN,
+        );
       }
       if (!this.suppressedWhileOpen()) await this.writeToDisk(this.serialize(this.value));
     } catch (e) {
@@ -152,6 +163,10 @@ export abstract class StructuredDocument extends SyncedDoc {
         if (this.serialize(this.value) !== text) return;
         await this.plugin.app.vault.create(path, text);
       }
+      this.plugin.vaultSync?.noteMaterialized(
+        this.path,
+        this.path.endsWith(".canvas") ? "canvas" : "base",
+      );
     } catch (e) {
       console.error(`[Realtime] structured writeToDisk failed for ${this.path}`, e);
     } finally {

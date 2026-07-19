@@ -644,6 +644,19 @@ async fn test_app(ysweet_url: &str, ysweet_public_url: &str) -> Router {
     .await
 }
 
+async fn test_app_with_state(
+    ysweet_url: &str,
+    ysweet_public_url: &str,
+) -> (Router, realtime_server::state::AppState) {
+    let config = test_config(
+        ysweet_url,
+        ysweet_public_url,
+        realtime_server::blobs::MAX_BLOB_BYTES,
+    );
+    let state = build_state(config).await.unwrap();
+    (app(state.clone()), state)
+}
+
 async fn test_app_with_attachment_max(
     ysweet_url: &str,
     ysweet_public_url: &str,
@@ -1182,7 +1195,7 @@ async fn server_info_returns_stable_id_without_auth() {
 
     // Named capability versions are advertised for client-side gating.
     let caps = info["caps"].as_object().expect("caps object");
-    assert_eq!(caps["restApi"].as_str(), Some("2"));
+    assert_eq!(caps["restApi"].as_str(), Some("3"));
     assert_eq!(caps["oauth"].as_str(), Some("1"));
     assert_eq!(caps["pluginDbSync"].as_str(), Some("crsqlite-1"));
     assert_eq!(
@@ -2548,9 +2561,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[tokio::test]
 async fn blob_put_head_get_roundtrip() {
     let ys = fake_ysweet().await;
-    let app = test_app(&ys, &ys).await;
+    let (app, state) = test_app_with_state(&ys, &ys).await;
     let alice = login(&app, "alice").await;
     let bob = login(&app, "bob").await;
+    let carol = login(&app, "carol").await;
 
     let (_, vault) = send(
         &app,
@@ -2589,6 +2603,43 @@ async fn blob_put_head_get_roundtrip() {
 
     // A non-member of the vault is refused.
     let (status, _) = send_raw(&app, "GET", &uri, Some(&bob), vec![]).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A member with any path-specific ACL cannot safely receive an unscoped
+    // content-addressed blob: the route carries no path proving authorization.
+    let (_, invite) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/invites"),
+        Some(&alice),
+        Some(json!({})),
+    )
+    .await;
+    send(
+        &app,
+        "POST",
+        "/api/invites/redeem",
+        Some(&carol),
+        Some(json!({"code": invite["code"]})),
+    )
+    .await;
+    let carol_id = send(&app, "GET", "/api/me", Some(&carol), None).await.1["userId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    use realtime_server::entities::permissions;
+    use sea_orm::{ActiveModelTrait, Set};
+    permissions::ActiveModel {
+        id: Set(uuid::Uuid::new_v4().to_string()),
+        vault_id: Set(vault_id.clone()),
+        principal_user_id: Set(Some(carol_id)),
+        path_prefix: Set("private".to_string()),
+        level: Set("read-only".to_string()),
+    }
+    .insert(&state.db)
+    .await
+    .unwrap();
+    let (status, _) = send_raw(&app, "GET", &uri, Some(&carol), vec![]).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
@@ -2994,7 +3045,7 @@ async fn git_backup_routes_admin_only_and_secrets_never_leak() {
 async fn doc_token_scopes_and_mints() {
     let ys = fake_ysweet().await;
     let public = "http://public.example:9999";
-    let app = test_app(&ys, public).await;
+    let (app, state) = test_app_with_state(&ys, public).await;
     let alice = login(&app, "alice").await;
     let bob = login(&app, "bob").await;
 
@@ -3048,6 +3099,82 @@ async fn doc_token_scopes_and_mints() {
         "host should be rewritten to public url, got {}",
         token["url"]
     );
+
+    // Once a member has path ACLs, both token minting and registry rewrites
+    // must authorize the registered/requested paths rather than falling back
+    // to vault-level membership.
+    let (_, invite) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/invites"),
+        Some(&alice),
+        Some(json!({})),
+    )
+    .await;
+    send(
+        &app,
+        "POST",
+        "/api/invites/redeem",
+        Some(&bob),
+        Some(json!({"code": invite["code"]})),
+    )
+    .await;
+    let bob_id = send(&app, "GET", "/api/me", Some(&bob), None).await.1["userId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/files"),
+        Some(&alice),
+        Some(json!({"guid": "secret-guid", "path": "secret.md"})),
+    )
+    .await;
+    use realtime_server::entities::permissions;
+    use sea_orm::{ActiveModelTrait, Set};
+    permissions::ActiveModel {
+        id: Set(uuid::Uuid::new_v4().to_string()),
+        vault_id: Set(vault_id.clone()),
+        principal_user_id: Set(Some(bob_id)),
+        path_prefix: Set("secret.md".to_string()),
+        level: Set("deny".to_string()),
+    }
+    .insert(&state.db)
+    .await
+    .unwrap();
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/doc-token",
+        Some(&bob),
+        Some(json!({
+            "vaultId": vault_id,
+            "docId": format!("{vault_id}__secret-guid")
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/files"),
+        Some(&bob),
+        Some(json!({"guid": "secret-guid", "path": "allowed.md"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/files"),
+        Some(&bob),
+        Some(json!({"guid": "new-guid", "path": "secret.md"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

@@ -20,7 +20,10 @@ export type {
 /** Current sync wire/format version. Must match the server extension's major. */
 export const SYNC_FORMAT = "crsqlite-1";
 
-/** Maximum change rows per published batch (Y.Array message-size cap). */
+/**
+ * Target change rows per published batch. Rows sharing one db_version remain
+ * atomic and may exceed this target because cursors advance by db_version.
+ */
 export const MAX_BATCH_ROWS = 500;
 
 /** `[A-Za-z0-9_-]{1,80}` — the validation rule for pluginId / name. */

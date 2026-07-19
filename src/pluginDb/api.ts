@@ -23,6 +23,7 @@ import {
 import { PluginDbSync } from "./PluginDbSync";
 import { buildEngineDeps } from "./obsidianDeps";
 import { isValidId } from "./types";
+import { CompatibilityError } from "../caps";
 
 // Public interfaces live in the published types package; re-export for
 // internal callers and docs links.
@@ -31,6 +32,7 @@ export type { OpenOptions, DeleteOrRestoreOptions, DatabaseHandle };
 export class RealtimeSqlAPI implements RealtimeSql {
   private plugin: RealtimePlugin;
   private engines = new Map<string, SyncedPluginDatabase>();
+  private activeScope: string | null = null;
 
   constructor(plugin: RealtimePlugin) {
     this.plugin = plugin;
@@ -45,30 +47,33 @@ export class RealtimeSqlAPI implements RealtimeSql {
    * to stop waiting early. Plugin unload rejects all pending waiters.
    */
   async whenAvailable(opts?: { signal?: AbortSignal }): Promise<void> {
-    if (this.available()) return;
-    if (opts?.signal?.aborted) throw new Error("whenAvailable aborted");
-    await new Promise<void>((resolve, reject) => {
-      const timer = setInterval(() => {
-        if (this.available()) {
+    if (!this.basicAvailable()) {
+      if (opts?.signal?.aborted) throw new Error("whenAvailable aborted");
+      await new Promise<void>((resolve, reject) => {
+        const timer = setInterval(() => {
+          if (this.basicAvailable()) {
+            cleanup();
+            resolve();
+          }
+        }, 200);
+        const cancel = () => {
           cleanup();
-          resolve();
-        }
-      }, 200);
-      const cancel = () => {
-        cleanup();
-        reject(new Error("whenAvailable aborted"));
-      };
-      const cleanup = () => {
-        clearInterval(timer);
-        this.availabilityCancels.delete(cancel);
-        opts?.signal?.removeEventListener("abort", cancel);
-      };
-      this.availabilityCancels.add(cancel);
-      opts?.signal?.addEventListener("abort", cancel, { once: true });
-    });
+          reject(new Error("whenAvailable aborted"));
+        };
+        const cleanup = () => {
+          clearInterval(timer);
+          this.availabilityCancels.delete(cancel);
+          opts?.signal?.removeEventListener("abort", cancel);
+        };
+        this.availabilityCancels.add(cancel);
+        opts?.signal?.addEventListener("abort", cancel, { once: true });
+      });
+    }
+    await this.ensureCompatible();
+    await this.prepareScope();
   }
 
-  private available(): boolean {
+  private basicAvailable(): boolean {
     return (
       this.plugin.settings.enabled &&
       this.plugin.auth.isLoggedIn &&
@@ -82,8 +87,74 @@ export class RealtimeSqlAPI implements RealtimeSql {
     if (!this.plugin.settings.activeVaultId) throw new Error("Realtime has no active vault.");
   }
 
-  private key(pluginId: string, name: string): string {
-    return `${pluginId}__${name}`;
+  private async ensureCompatible(): Promise<void> {
+    try {
+      await this.plugin.auth.ensureServerId();
+    } catch (error) {
+      if (error instanceof CompatibilityError) throw error;
+      // Match the vault sync lifecycle: a network failure must not disable
+      // already-persisted offline work.
+    }
+    const incompatible = this.plugin.lastCompatibilityError;
+    if (incompatible) {
+      throw new CompatibilityError(
+        incompatible.reason,
+        incompatible.detail,
+        incompatible.serverVersion,
+      );
+    }
+  }
+
+  private scope(): string {
+    return JSON.stringify([
+      this.plugin.settings.authServerUrl,
+      this.plugin.settings.authServerId,
+      this.plugin.settings.userId,
+      this.plugin.settings.activeVaultId,
+    ]);
+  }
+
+  private key(scope: string, pluginId: string, name: string): string {
+    return JSON.stringify([scope, pluginId, name]);
+  }
+
+  private async prepareScope(): Promise<string> {
+    const scope = this.scope();
+    if (this.activeScope !== null && this.activeScope !== scope) {
+      await this.closeEngines();
+    }
+    this.activeScope = scope;
+    return scope;
+  }
+
+  private assertHandleScope(scope: string): void {
+    if (!this.basicAvailable() || this.scope() !== scope || this.plugin.lastCompatibilityError) {
+      throw new Error("Realtime database handle is no longer valid for the active session.");
+    }
+  }
+
+  private async closeEngines(): Promise<void> {
+    const engines = [...this.engines.values()];
+    this.engines.clear();
+    await Promise.all(engines.map((engine) => engine.close().catch(() => {})));
+  }
+
+  /** Close engines when settings/auth moved to another synchronization scope. */
+  async reconcileLifecycle(): Promise<void> {
+    if (
+      !this.basicAvailable() ||
+      this.plugin.lastCompatibilityError ||
+      (this.activeScope !== null && this.activeScope !== this.scope())
+    ) {
+      this.activeScope = null;
+      await this.closeEngines();
+    }
+  }
+
+  /** Invalidate every handle before logout or an explicit vault replacement. */
+  async resetForLifecycle(): Promise<void> {
+    this.activeScope = null;
+    await this.closeEngines();
   }
 
   async open(opts: OpenOptions): Promise<DatabaseHandle> {
@@ -92,9 +163,11 @@ export class RealtimeSqlAPI implements RealtimeSql {
       throw new Error("schemaVersion must be a positive integer.");
     }
     this.requireAvailable();
+    await this.ensureCompatible();
+    const scope = await this.prepareScope();
     await layoutReady(this.plugin);
 
-    const key = this.key(opts.pluginId, opts.name);
+    const key = this.key(scope, opts.pluginId, opts.name);
     let engine = this.engines.get(key);
     if (engine && engine.state === "error") {
       // A tombstoned/failed engine cannot be reused — rebuild from scratch
@@ -128,33 +201,48 @@ export class RealtimeSqlAPI implements RealtimeSql {
     } catch (e) {
       engine.refcount--;
       if (engine.refcount <= 0) {
-        this.engines.delete(key);
+        if (this.engines.get(key) === engine) this.engines.delete(key);
         await engine.close().catch(() => {});
       }
       throw e;
     }
-    return this.makeHandle(key, engine);
+    return this.makeHandle(key, scope, engine);
   }
 
-  private makeHandle(key: string, engine: SyncedPluginDatabase): DatabaseHandle {
+  private makeHandle(key: string, scope: string, engine: SyncedPluginDatabase): DatabaseHandle {
     let closed = false;
     return {
-      exec: (sql, bind) => engine.exec(sql, bind),
-      query: (sql, bind) => engine.query(sql, bind),
-      transaction: (cb) => engine.transaction(cb),
+      exec: (sql, bind) => {
+        this.assertHandleScope(scope);
+        return engine.exec(sql, bind);
+      },
+      query: (sql, bind) => {
+        this.assertHandleScope(scope);
+        return engine.query(sql, bind);
+      },
+      transaction: (cb) => {
+        this.assertHandleScope(scope);
+        return engine.transaction(cb);
+      },
       onRemoteChange: (cb) => engine.onRemoteChange(cb),
       onStateChange: (cb) => engine.onStateChange(cb),
       get state() {
         return engine.state;
       },
-      whenLive: () => engine.whenLive(),
-      rebaseFromServer: () => engine.rebaseFromServer(),
+      whenLive: () => {
+        this.assertHandleScope(scope);
+        return engine.whenLive();
+      },
+      rebaseFromServer: () => {
+        this.assertHandleScope(scope);
+        return engine.rebaseFromServer();
+      },
       close: async () => {
         if (closed) return;
         closed = true;
         engine.refcount--;
         if (engine.refcount <= 0) {
-          this.engines.delete(key);
+          if (this.engines.get(key) === engine) this.engines.delete(key);
           await engine.close();
         }
       },
@@ -165,7 +253,9 @@ export class RealtimeSqlAPI implements RealtimeSql {
   async delete(opts: DeleteOrRestoreOptions): Promise<void> {
     validateIds(opts.pluginId, opts.name);
     this.requireAvailable();
-    const key = this.key(opts.pluginId, opts.name);
+    await this.ensureCompatible();
+    const scope = await this.prepareScope();
+    const key = this.key(scope, opts.pluginId, opts.name);
     const engine = this.engines.get(key);
     if (engine) {
       engine.markDeleted();
@@ -189,7 +279,9 @@ export class RealtimeSqlAPI implements RealtimeSql {
   async restore(opts: DeleteOrRestoreOptions): Promise<void> {
     validateIds(opts.pluginId, opts.name);
     this.requireAvailable();
-    const key = this.key(opts.pluginId, opts.name);
+    await this.ensureCompatible();
+    const scope = await this.prepareScope();
+    const key = this.key(scope, opts.pluginId, opts.name);
     const engine = this.engines.get(key);
     if (engine) {
       // The engine is likely in the terminal `deleted` error state; clear the
@@ -206,7 +298,11 @@ export class RealtimeSqlAPI implements RealtimeSql {
 
   /** True when a non-tombstoned database with this id currently exists. */
   async isLive(opts: DeleteOrRestoreOptions): Promise<boolean> {
-    const key = this.key(opts.pluginId, opts.name);
+    validateIds(opts.pluginId, opts.name);
+    this.requireAvailable();
+    await this.ensureCompatible();
+    const scope = await this.prepareScope();
+    const key = this.key(scope, opts.pluginId, opts.name);
     const engine = this.engines.get(key);
     if (engine) return engine.isLive();
     return this.withTransientDoc(opts.pluginId, opts.name, (sync) => {
@@ -240,6 +336,9 @@ export class RealtimeSqlAPI implements RealtimeSql {
 
   /** Escape hatch: rebuild every currently-open database from the server replica. */
   async rebaseAll(): Promise<number> {
+    this.requireAvailable();
+    await this.ensureCompatible();
+    await this.prepareScope();
     const engines = [...this.engines.values()];
     for (const engine of engines) await engine.rebaseFromServer().catch(() => {});
     return engines.length;
@@ -249,9 +348,8 @@ export class RealtimeSqlAPI implements RealtimeSql {
   async destroy(): Promise<void> {
     for (const cancel of [...this.availabilityCancels]) cancel();
     this.availabilityCancels.clear();
-    const engines = [...this.engines.values()];
-    this.engines.clear();
-    for (const engine of engines) await engine.close().catch(() => {});
+    this.activeScope = null;
+    await this.closeEngines();
   }
 }
 

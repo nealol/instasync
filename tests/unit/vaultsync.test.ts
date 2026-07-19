@@ -128,7 +128,9 @@ describe("VaultSync index", () => {
       await waitFor(() => files.has("c.md") && !files.has("a.md"), { label: "a.md -> c.md" });
 
       expect(
-        events.some((event) => event.length === 1 && event[0].path === "a.md" && event[0].action === "delete"),
+        events.some(
+          (event) => event.length === 1 && event[0].path === "a.md" && event[0].action === "delete",
+        ),
       ).toBe(false);
       expect(
         events.some(
@@ -139,6 +141,48 @@ describe("VaultSync index", () => {
       ).toBe(true);
     } finally {
       sync.destroy();
+    }
+  });
+
+  it("propagates deletes and renames made while sync is stopped", async () => {
+    const vault = await harness.createVault(aliceToken, "offline-path-changes");
+    const vaultId = vault.id;
+    const { plugin, vault: localVault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vaultId,
+    });
+    localVault.files.set("delete.md", "delete me");
+    localVault.files.set("rename.md", "rename me");
+    const peer = makeIndexPeer(plugin, vaultId);
+    let sync: VaultSync | null = new VaultSync(plugin as any);
+    try {
+      await waitFor(() => peer.files.has("delete.md") && peer.files.has("rename.md"), {
+        timeout: 20_000,
+        label: "initial paths indexed",
+      });
+      // Let the device-local materialization manifest persist alongside the
+      // index before simulating Obsidian being fully stopped.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      sync.destroy();
+      sync = null;
+
+      await localVault.delete(localVault.getAbstractFileByPath("delete.md")!);
+      localVault.rename("rename.md", "renamed.md");
+      expect(peer.files.has("delete.md")).toBe(true);
+      expect(peer.files.has("rename.md")).toBe(true);
+
+      sync = new VaultSync(plugin as any);
+      await waitFor(
+        () =>
+          !peer.files.has("delete.md") &&
+          !peer.files.has("rename.md") &&
+          peer.files.has("renamed.md"),
+        { timeout: 20_000, label: "offline path changes propagated" },
+      );
+    } finally {
+      sync?.destroy();
+      peer.provider.destroy();
+      peer.doc.destroy();
     }
   });
 

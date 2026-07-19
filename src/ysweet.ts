@@ -49,7 +49,11 @@ async function waitForTokenAttemptSlot(): Promise<() => void> {
  * `docId` is the *namespaced* id (`{vaultId}` for the index, `{vaultId}__{guid}`
  * for a file); the vault is always the active vault.
  */
-export async function getClientToken(plugin: RealtimePlugin, docId: string): Promise<ClientToken> {
+export async function getClientToken(
+  plugin: RealtimePlugin,
+  docId: string,
+  path?: string,
+): Promise<ClientToken> {
   const vaultId = plugin.settings.activeVaultId;
   if (!vaultId) {
     throw new Error("Realtime: no active vault; sign in and set up a vault before syncing.");
@@ -60,7 +64,7 @@ export async function getClientToken(plugin: RealtimePlugin, docId: string): Pro
     const waitMs = nextTokenAttemptAt - Date.now();
     if (waitMs > 0) await delay(waitMs);
 
-    const token = await plugin.auth.docToken(vaultId, docId);
+    const token = await plugin.auth.docToken(vaultId, docId, path);
     nextTokenAttemptAt = 0;
     if (!token || !token.url) {
       throw new Error(`Realtime: auth server returned an invalid token for "${docId}".`);
