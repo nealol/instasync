@@ -53,6 +53,62 @@ async fn fake_ysweet() -> String {
     format!("http://{addr}")
 }
 
+/// Minimal y-sweet fake whose token advertises a different public origin.
+/// The bundled production process does this through `--url-prefix`.
+async fn fake_ysweet_advertising(
+    advertised_origin: String,
+) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use axum::extract::{Path, State};
+    use axum::routing::{get, post};
+    use axum::Json;
+
+    #[derive(Clone)]
+    struct AdvertisedState {
+        origin: String,
+        writes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn auth_doc(
+        State(state): State<AdvertisedState>,
+        Path(doc_id): Path<String>,
+    ) -> Json<Value> {
+        Json(json!({
+            "url": format!("{}/d/{doc_id}/ws", state.origin),
+            "baseUrl": format!("{}/d/{doc_id}", state.origin),
+            "docId": doc_id,
+            "token": "fake-token",
+            "authorization": "read-only",
+        }))
+    }
+
+    async fn as_update() -> Vec<u8> {
+        text_update("contents", "internal route reached")
+    }
+
+    async fn update(State(state): State<AdvertisedState>) -> Json<Value> {
+        state
+            .writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Json(json!({ "ok": true }))
+    }
+
+    let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let router = Router::new()
+        .route("/doc/{doc_id}/auth", post(auth_doc))
+        .route("/d/{doc_id}/as-update", get(as_update))
+        .route("/d/{doc_id}/update", post(update))
+        .with_state(AdvertisedState {
+            origin: advertised_origin,
+            writes: writes.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    (format!("http://{addr}"), writes)
+}
+
 // ---------- fake y-sweet that also serves /as-update (for the git audit test) ----------
 
 fn text_update(name: &str, value: &str) -> Vec<u8> {
@@ -997,6 +1053,49 @@ async fn oauth_token(app: &Router, owner_sub: &str, verifier: &str) -> (String, 
 }
 
 // ---------- tests ----------
+
+#[tokio::test]
+async fn internal_ydoc_reads_and_writes_ignore_public_token_origin() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let public_origin = format!("http://{}", listener.local_addr().unwrap());
+    let (ys, writes) = fake_ysweet_advertising(public_origin).await;
+
+    // Mirrors the bundled container: YSWEET_URL is internal,
+    // YSWEET_PUBLIC_URL is unset and therefore defaults to that same internal
+    // URL, while y-sweet advertises PUBLIC_BASE_URL through --url-prefix.
+    let config = test_config(&ys, &ys, realtime_server::blobs::MAX_BLOB_BYTES);
+    let state = build_state(config).await.unwrap();
+    let router = app(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let update = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        realtime_server::ydoc::read_update(&state, "vault__note"),
+    )
+    .await
+    .expect("internal read must not loop through /d and deadlock")
+    .unwrap();
+    assert_eq!(
+        realtime_server::ydoc::decode_text(&update, "contents").unwrap(),
+        "internal route reached"
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        realtime_server::ydoc::write_update(
+            &state,
+            "vault__note",
+            text_update("contents", "MCP create body"),
+        ),
+    )
+    .await
+    .expect("internal write must not loop through /d and deadlock")
+    .unwrap();
+    assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    server.abort();
+}
 
 #[tokio::test]
 async fn login_creates_session_and_me_works() {

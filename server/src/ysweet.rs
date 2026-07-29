@@ -82,6 +82,24 @@ fn rewrite_host(value: &mut Value, key: &str, internal: &str, public: &str) {
     }
 }
 
+/// Rewrite an advertised URL to a target origin while preserving its path,
+/// query, and fragment.
+fn rewrite_origin(value: &mut Value, key: &str, target: &str) -> Result<(), String> {
+    let Some(advertised) = value.get(key).and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let mut url = Url::parse(advertised).map_err(|e| format!("invalid {key}: {e}"))?;
+    let target = Url::parse(target).map_err(|e| format!("invalid target URL: {e}"))?;
+    url.set_scheme(target.scheme())
+        .map_err(|_| format!("invalid target URL scheme: {}", target.scheme()))?;
+    url.set_host(target.host_str())
+        .map_err(|e| format!("invalid target URL host: {e}"))?;
+    url.set_port(target.port())
+        .map_err(|_| format!("invalid target URL port: {:?}", target.port()))?;
+    value[key] = Value::String(url.to_string());
+    Ok(())
+}
+
 /// Ensure the doc exists on y-sweet (idempotent), authenticating with the server token.
 pub async fn ensure_doc(state: &AppState, doc_id: &str) -> AppResult<()> {
     let _load_guard = lock_doc_load(doc_id).await;
@@ -190,19 +208,14 @@ pub async fn mint_internal_token_with(
         .json()
         .await
         .map_err(|e| AppError::Internal(format!("y-sweet auth body: {e}")))?;
-    // y-sweet advertises its configured `--public` URL as `baseUrl`, which in
-    // deployments fronted by this auth server is the *public* HTTPS URL
-    // (`https://host/d/{docId}`). Server-to-y-sweet calls must not loop back
-    // out through the public reverse proxy — that turns a transient proxy
-    // hiccup into a hard failure of git audit, search reindex, and public
-    // share rendering. Rewrite the public authority back to the internal one
-    // (the inverse of `mint_client_token`) so these calls hit y-sweet
-    // directly over the internal network.
-    let internal = authority(&config.ysweet_url)
-        .ok_or_else(|| AppError::Internal("invalid YSWEET_URL".into()))?;
-    let public = authority(&config.ysweet_public_url)
-        .ok_or_else(|| AppError::Internal("invalid YSWEET_PUBLIC_URL".into()))?;
-    rewrite_host(&mut token, "baseUrl", &public, &internal);
+    // y-sweet advertises its configured `--url-prefix` in `baseUrl`. Internal
+    // calls must replace that entire origin with YSWEET_URL. Replacing only a
+    // configured public host is insufficient: the bundled deployment does not
+    // set YSWEET_PUBLIC_URL, and preserving an HTTPS scheme for loopback would
+    // also fail. A public `/d` loopback deadlocks with the per-document load
+    // lock because the proxy tries to acquire the guard already held here.
+    rewrite_origin(&mut token, "baseUrl", &config.ysweet_url)
+        .map_err(|e| AppError::Internal(format!("y-sweet auth baseUrl: {e}")))?;
     let base_url = token
         .get("baseUrl")
         .and_then(Value::as_str)
@@ -237,5 +250,17 @@ mod tests {
         rewrite_host(&mut v, "baseUrl", "127.0.0.1:8080", "sync.example.com");
         assert_eq!(v["url"], "ws://sync.example.com/d/abc");
         assert_eq!(v["baseUrl"], "http://sync.example.com/d/abc");
+    }
+
+    #[test]
+    fn rewrite_origin_internalizes_public_https_url() {
+        let mut value = json!({
+            "baseUrl": "https://realtime.example/d/vault__guid?token=ignored"
+        });
+        rewrite_origin(&mut value, "baseUrl", "http://127.0.0.1:8080").unwrap();
+        assert_eq!(
+            value["baseUrl"],
+            "http://127.0.0.1:8080/d/vault__guid?token=ignored"
+        );
     }
 }
