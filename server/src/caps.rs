@@ -12,8 +12,8 @@
 //! clients). See `AGENTS.md` "Compatibility & versioning" for the full rules.
 
 /// REST API surface (`/api/*` request/response shapes), plus the sync transport
-/// the plugin now requires: every Yjs document is multiplexed over a single
-/// `/dmux` WebSocket, so a client on this cap will not connect to a server that
+/// the plugin now requires: Yjs documents are multiplexed over bounded `/dmux`
+/// WebSocket shards, so a client on this cap will not connect to a server that
 /// lacks that route.
 pub const REST_API: &str = "3";
 

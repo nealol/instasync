@@ -1,10 +1,11 @@
-//! Single-socket multiplexing endpoint for y-sweet sync (prototype "Option A").
+//! Bounded multiplexing endpoint for y-sweet sync.
 //!
 //! `/d/*` opens one upstream y-sweet socket per *client* socket, so a client
 //! syncing a whole vault opens one socket per document. `/dmux` lets a client
-//! carry every document over a **single** socket: the client tags each frame
-//! with a channel id, and this handler demultiplexes — dialing one upstream
-//! y-sweet socket per channel and pumping frames between them.
+//! carry a bounded shard of documents over one socket: the client tags each
+//! frame with a channel id, and this handler demultiplexes — dialing one
+//! upstream y-sweet socket per channel and pumping frames between them. Clients
+//! open additional `/dmux` sockets before reaching this handler's hard limit.
 //!
 //! Auth/attribution are unchanged from [`crate::proxy`]: each `OPEN` frame
 //! carries the per-doc path+query (`/d/{docId}/ws/{docId}?token=…`) the client
@@ -108,14 +109,14 @@ impl OpenLimiter {
             self.window_started = now;
             self.opens_in_window = 0;
         }
-        self.opens_in_window += 1;
         if channel == CONTROL_CHANNEL
             || self.seen_channels.contains(&channel)
             || active_channels >= MAX_CHANNELS
-            || self.opens_in_window > MAX_OPENS_PER_WINDOW
+            || self.opens_in_window >= MAX_OPENS_PER_WINDOW
         {
             return false;
         }
+        self.opens_in_window += 1;
         self.seen_channels.insert(channel);
         true
     }
@@ -263,6 +264,14 @@ async fn open_and_pump(
     };
 
     let target = format!("ws://{authority}{path_and_query}");
+    let doc_id = path_and_query
+        .split('?')
+        .next()
+        .and_then(crate::ysweet::doc_id_from_path);
+    let load_guard = match doc_id {
+        Some(doc_id) => Some(crate::ysweet::lock_doc_load(doc_id).await),
+        None => None,
+    };
     let upstream = match dial_upstream(&target).await {
         Ok(ws) => ws,
         Err(e) => {
@@ -271,6 +280,7 @@ async fn open_and_pump(
             return;
         }
     };
+    drop(load_guard);
     let _guard = UpstreamGuard::new();
 
     if out_tx
@@ -520,6 +530,18 @@ mod tests {
             assert!(rate_limiter.admit(channel, 0, start));
         }
         assert!(!rate_limiter.admit((MAX_OPENS_PER_WINDOW + 1) as u64, 0, start));
+        for channel in (MAX_OPENS_PER_WINDOW + 2)..=(MAX_OPENS_PER_WINDOW + 100) {
+            assert!(!rate_limiter.admit(channel as u64, 0, start));
+        }
+        assert_eq!(
+            rate_limiter.opens_in_window, MAX_OPENS_PER_WINDOW,
+            "rejected retries must not consume admission slots"
+        );
+        assert!(rate_limiter.admit(
+            (MAX_OPENS_PER_WINDOW + 101) as u64,
+            0,
+            start + OPEN_RATE_WINDOW
+        ));
 
         let mut fanout_limiter = OpenLimiter::new(start);
         let mut now = start;

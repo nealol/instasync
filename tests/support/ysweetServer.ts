@@ -82,6 +82,8 @@ export async function startYSweetServer(
 
     try {
       await waitForReady(child);
+      child.stdout?.resume();
+      child.stderr?.resume();
       lastError = undefined;
       break;
     } catch (err) {

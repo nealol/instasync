@@ -1,11 +1,46 @@
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::{OnceLock, Weak};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use url::Url;
 use y_sweet_core::auth::Authenticator;
 
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
+
+static DOC_LOAD_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
+
+/// Serialize requests that can cold-load the same y-sweet document.
+///
+/// y-sweet 0.9.1 checks its live map before an awaited load without locking by
+/// doc id. Two cold requests can therefore load independent snapshots and the
+/// later insert replaces an already-updated document. Every production path to
+/// the bundled y-sweet process goes through this server, so holding this guard
+/// through the upstream HTTP response or WebSocket handshake closes that race.
+pub(crate) async fn lock_doc_load(doc_id: &str) -> OwnedMutexGuard<()> {
+    let locks = DOC_LOAD_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let lock = {
+        let mut locks = locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks.get(doc_id).and_then(Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(doc_id.to_string(), Arc::downgrade(&lock));
+                lock
+            }
+        }
+    };
+    lock.lock_owned().await
+}
+
+/// Extract the document id from a y-sweet `/d/{docId}/...` path.
+pub(crate) fn doc_id_from_path(path: &str) -> Option<&str> {
+    let doc_id = path.strip_prefix("/d/")?.split('/').next()?;
+    (!doc_id.is_empty()).then_some(doc_id)
+}
 
 /// "full" | "read-only", matching y-sweet's `Authorization` serde encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +84,7 @@ fn rewrite_host(value: &mut Value, key: &str, internal: &str, public: &str) {
 
 /// Ensure the doc exists on y-sweet (idempotent), authenticating with the server token.
 pub async fn ensure_doc(state: &AppState, doc_id: &str) -> AppResult<()> {
+    let _load_guard = lock_doc_load(doc_id).await;
     let url = format!("{}/doc/new", state.config.ysweet_url.trim_end_matches('/'));
     let res = state
         .http

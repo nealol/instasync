@@ -600,8 +600,8 @@ export async function setNetworkOffline(b: any, offline: boolean): Promise<void>
 
 /**
  * URLs of the device's currently-OPEN WebSockets, read from the shim's live set
- * (requires installNetworkShim). Used to assert the single-socket mux invariant:
- * however many documents are open, exactly one socket should target `/dmux`.
+ * (requires installNetworkShim). Used to inspect the bounded `/dmux` socket
+ * shards held by the plugin.
  */
 export async function liveSocketUrls(b: any): Promise<string[]> {
   return b.executeObsidian(() => {

@@ -107,7 +107,7 @@ export const config: WebdriverIO.Config = {
       port: AUTH_PORT,
       ysweetUrl: ysweet.url,
       // Route the plugin through this server's `/d` + `/dmux` (production
-      // topology); the always-on single-socket mux dials `{host}/dmux`.
+      // topology); each bounded mux shard dials `{host}/dmux`.
       ysweetPublicUrl: `http://127.0.0.1:${AUTH_PORT}`,
       authKey,
       ysweetStoreDir,

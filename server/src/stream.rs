@@ -367,6 +367,7 @@ async fn flush(
 /// doc-scoped (`{ysweet}/d/{docId}`) and the WS route hangs off its `/ws`
 /// child with the doc id repeated (`{ysweet}/d/{docId}/ws/{docId}?token=…`).
 async fn connect_ysweet(state: &AppState, doc_id: &str) -> anyhow::Result<Upstream> {
+    let _load_guard = ysweet::lock_doc_load(doc_id).await;
     let (base_url, token) = ysweet::mint_internal_token(state, doc_id, Level::Full)
         .await
         .map_err(|e| anyhow::anyhow!("mint token: {e}"))?;

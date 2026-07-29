@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import * as Y from "yjs";
 import { YSweetProvider } from "@y-sweet/client";
 import { VaultSync, shouldSyncCanvasBinaryPath } from "../../src/VaultSync";
@@ -9,14 +12,67 @@ import { waitFor } from "../support/util";
 
 let harness: AuthHarness;
 let aliceToken: string;
+let storageDir: string;
+
+type NoteResponse = {
+  path: string;
+  guid: string;
+  content: string;
+};
+
+async function createNote(vaultId: string, path: string, content: string): Promise<NoteResponse> {
+  const response = await fetch(`${harness.authUrl}/api/vaults/${vaultId}/notes`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${aliceToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ path, content }),
+  });
+  expect(response.status).toBe(200);
+  return (await response.json()) as NoteResponse;
+}
+
+async function listNotes(vaultId: string): Promise<NoteResponse[]> {
+  const response = await fetch(`${harness.authUrl}/api/vaults/${vaultId}/notes`, {
+    headers: { Authorization: `Bearer ${aliceToken}` },
+  });
+  expect(response.status).toBe(200);
+  return (await response.json()) as NoteResponse[];
+}
+
+async function readNoteStatus(vaultId: string, path: string): Promise<number> {
+  const response = await fetch(
+    `${harness.authUrl}/api/vaults/${vaultId}/notes/${path
+      .split("/")
+      .map(encodeURIComponent)
+      .join("/")}`,
+    { headers: { Authorization: `Bearer ${aliceToken}` } },
+  );
+  return response.status;
+}
+
+async function readNote(vaultId: string, path: string): Promise<NoteResponse> {
+  const response = await fetch(
+    `${harness.authUrl}/api/vaults/${vaultId}/notes/${path
+      .split("/")
+      .map(encodeURIComponent)
+      .join("/")}`,
+    { headers: { Authorization: `Bearer ${aliceToken}` } },
+  );
+  expect(response.status).toBe(200);
+  return (await response.json()) as NoteResponse;
+}
 
 beforeAll(async () => {
-  harness = await startAuthHarness();
+  storageDir = mkdtempSync(join(tmpdir(), "realtime-vaultsync-"));
+  harness = await startAuthHarness({ ysweetStorageDir: storageDir });
   aliceToken = await harness.loginUser("alice");
 }, 180_000);
 
 afterAll(async () => {
   await harness?.stop();
+  if (storageDir) rmSync(storageDir, { recursive: true, force: true });
 });
 
 /** A bare peer onto the shared vault index (the path -> guid `files` map). */
@@ -32,6 +88,139 @@ function makeIndexPeer(plugin: FakePlugin, vaultId: string) {
 }
 
 describe("VaultSync index", () => {
+  it("keeps a remote-created note across client restart when it never existed locally", async () => {
+    const vault = await harness.createVault(aliceToken, "remote-restart");
+    const created = await createNote(vault.id, "Servant42/remote.md", "remote content");
+    const first = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    const firstSync = new VaultSync(first.plugin as any);
+    (first.plugin as any).vaultSync = firstSync;
+
+    firstSync.destroy();
+
+    const second = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    const secondSync = new VaultSync(second.plugin as any);
+    (second.plugin as any).vaultSync = secondSync;
+    try {
+      await waitFor(() => second.vault.files.get(created.path) === created.content, {
+        timeout: 20_000,
+        label: "remote note materialized after restart",
+      });
+      expect((await listNotes(vault.id)).map((note) => note.guid)).toContain(created.guid);
+      expect(await readNoteStatus(vault.id, created.path)).toBe(200);
+    } finally {
+      secondSync.destroy();
+    }
+  });
+
+  it("reproduces acknowledged-note loss after an offline local deletion", async () => {
+    const vault = await harness.createVault(aliceToken, "offline-delete");
+    const local = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    const sync = new VaultSync(local.plugin as any);
+    (local.plugin as any).vaultSync = sync;
+    const created = await createNote(vault.id, "Servant42/lost.md", "acknowledged content");
+
+    await waitFor(() => local.vault.files.get(created.path) === created.content, {
+      timeout: 20_000,
+      label: "remote note materialized",
+    });
+    sync.destroy();
+
+    // The file disappears while the plugin is stopped, so no live delete event
+    // publishes a tombstone. Startup folds the absence into the persisted index.
+    local.vault.files.delete(created.path);
+    const restarted = new VaultSync(local.plugin as any);
+    (local.plugin as any).vaultSync = restarted;
+    try {
+      await waitFor(
+        async () => !(await listNotes(vault.id)).some((note) => note.guid === created.guid),
+        { timeout: 20_000, label: "registry row pruned after offline delete" },
+      );
+      expect(await readNoteStatus(vault.id, created.path)).toBe(404);
+    } finally {
+      restarted.destroy();
+    }
+  });
+
+  it("does not lose concurrent remote creates during list reconciliation", async () => {
+    const vault = await harness.createVault(aliceToken, "concurrent-create");
+    const paths = Array.from({ length: 40 }, (_, index) => `Servant42/concurrent-${index}.md`);
+
+    const creations = Promise.all(
+      paths.map((path, index) => createNote(vault.id, path, `content ${index}`)),
+    );
+    await Promise.all(Array.from({ length: 20 }, () => listNotes(vault.id)));
+    const created = await creations;
+    const listed = await listNotes(vault.id);
+    const listedGuids = new Set(listed.map((note) => note.guid));
+
+    expect(created.every((note) => listedGuids.has(note.guid))).toBe(true);
+    expect(await Promise.all(paths.map((path) => readNoteStatus(vault.id, path)))).toEqual(
+      Array(paths.length).fill(200),
+    );
+  });
+
+  it("preserves unmaterialized notes through a high-fanout client restart", async () => {
+    const vault = await harness.createVault(aliceToken, "high-fanout-restart");
+    const paths = Array.from({ length: 180 }, (_, index) => `Fanout/remote-${index}.md`);
+    const created = await Promise.all(
+      paths.map((path, index) => createNote(vault.id, path, `remote ${index}`)),
+    );
+    const local = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+
+    const firstSync = new VaultSync(local.plugin as any);
+    (local.plugin as any).vaultSync = firstSync;
+    await waitFor(
+      () => created.every((note) => (firstSync as any).files.get(note.path) === note.guid),
+      { timeout: 20_000, label: "all remote index entries merged" },
+    );
+    firstSync.destroy();
+
+    const restarted = new VaultSync(local.plugin as any);
+    (local.plugin as any).vaultSync = restarted;
+    try {
+      let materialized = 0;
+      try {
+        await waitFor(
+          () => {
+            materialized = created.filter(
+              (note) => local.vault.files.get(note.path) === note.content,
+            ).length;
+            return materialized === created.length;
+          },
+          { timeout: 60_000, label: "all remote notes materialized after restart" },
+        );
+      } catch (error) {
+        const listed = await listNotes(vault.id);
+        const remotelyReadable = (
+          await Promise.all(paths.map((path) => readNote(vault.id, path)))
+        ).filter((note, index) => note.content === created[index].content).length;
+        const state = restarted as any;
+        throw new Error(
+          `${String(error)} (${materialized}/${created.length} materialized; ` +
+            `${remotelyReadable}/${created.length} remotely readable; ${listed.length} listed; ` +
+            `${state.documents.size} documents; ` +
+            `${state.docQueue.size} queued; ${state.activeDocConnections} active)`,
+        );
+      }
+      const listedGuids = new Set((await listNotes(vault.id)).map((note) => note.guid));
+      expect(created.every((note) => listedGuids.has(note.guid))).toBe(true);
+    } finally {
+      restarted.destroy();
+    }
+  }, 90_000);
+
   it("respects binary settings for missing Canvas attachments", () => {
     expect(shouldSyncCanvasBinaryPath("image.png", false, "")).toBe(false);
     expect(shouldSyncCanvasBinaryPath("private/image.png", true, "private/**")).toBe(false);

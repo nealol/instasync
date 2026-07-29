@@ -1,6 +1,6 @@
 [package]
 name = "realtime-server"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 
 [dependencies]
@@ -48,6 +48,8 @@ rusqlite = { version = "0.32", features = ["bundled", "load_extension"] }
 ssh-key = { version = "0.6.7", features = ["ed25519"] }
 
 [dev-dependencies]
+async-trait = "0.1"
+y-sweet = "0.9.1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 rusqlite = { version = "0.32", features = ["bundled", "load_extension"] }

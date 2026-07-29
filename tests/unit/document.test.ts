@@ -742,11 +742,32 @@ describe("Document sync", () => {
       activeVaultId: vaultId,
     });
     (plugin.app.vault as FakeVault).files = a1.vault.files;
-    const a2 = new Document(plugin as any, "note.md", guid, docId(guid), false);
+    let releasePersistence!: () => void;
+    const persistenceGate = new Promise<void>((resolve) => {
+      releasePersistence = resolve;
+    });
+    class GatedDocument extends Document {
+      protected override async afterPersistenceSynced(): Promise<void> {
+        await persistenceGate;
+        await super.afterPersistenceSynced();
+      }
+    }
+    // VaultSync constructs queued documents disconnected, then may request a
+    // connection immediately. The request must wait for IndexedDB replay.
+    const a2 = new GatedDocument(plugin as any, "note.md", guid, docId(guid), false, {
+      autoConnect: false,
+    });
+    const connectSpy = vi.spyOn(a2.provider, "connect");
+    a2.connect();
     try {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(connectSpy).not.toHaveBeenCalled();
+      releasePersistence();
       await a2.whenReady();
+      expect(connectSpy).toHaveBeenCalledTimes(1);
       expect(a2.content).toBe("written while offline");
     } finally {
+      releasePersistence();
       a2.destroy();
     }
   });

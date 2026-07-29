@@ -41,7 +41,7 @@ generalize that pattern.
 
 | Cap | Current value | Bumps when |
 |---|---|---|
-| `restApi` | `"3"` | Any `/api/*` request/response body changes in a breaking way, or a change to the sync transport the plugin requires (e.g. the single-socket `/dmux` multiplexer) |
+| `restApi` | `"3"` | Any `/api/*` request/response body changes in a breaking way, or a change to the sync transport the plugin requires (e.g. the `/dmux` multiplexer) |
 | `oauth` | `"1"` | OAuth 2.1 server metadata or token endpoint shape changes (plugin's own OAuth flow only — see "External MCP clients" below) |
 | `pluginDbSync` | `"crsqlite-1"` | The cr-sqlite `crsql_changes` wire encoding changes |
 | `attachmentShim` | `"https://realtime.md/attachment-shim/v1"` | The text shim format committed into git backups for oversized blobs changes |

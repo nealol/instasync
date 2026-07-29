@@ -569,6 +569,7 @@ impl PluginDbService {
     }
 
     async fn write_doc(&self, doc_id: &str, update: Vec<u8>) -> Result<()> {
+        let _load_guard = crate::ysweet::lock_doc_load(doc_id).await;
         let (base_url, token) = crate::ysweet::mint_internal_token_with(
             &self.0.config,
             &self.0.http,

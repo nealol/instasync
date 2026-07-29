@@ -271,11 +271,10 @@ describe("Realtime — two isolated Obsidian devices", function () {
     });
   });
 
-  describe("single-socket multiplexing", function () {
-    // The point of Option A: no matter how many documents are open, the client
-    // holds exactly one real WebSocket (to `/dmux`) for all of them. Device A's
+  describe("multiplexed sync", function () {
+    // A sub-cap document set shares one real WebSocket to `/dmux`. Device A's
     // sockets are tracked by the shim installed in `before`.
-    it("carries every open document over a single /dmux socket", async function () {
+    it("carries a small document set over one /dmux socket", async function () {
       // Open several distinct docs at once (index + plugin DB are already live),
       // so multiple Yjs providers are active simultaneously.
       await writeNote(A, "Mux1.md", "one");

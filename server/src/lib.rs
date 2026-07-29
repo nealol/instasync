@@ -437,8 +437,8 @@ pub fn app(state: AppState) -> Router {
         )
         // Reverse-proxy the bundled y-sweet so clients need only this server's URL.
         .route("/d/{*rest}", any(proxy::proxy))
-        // Single-socket multiplexing: one client socket fans out to per-doc
-        // upstream y-sweet sockets (see src/sync/mux.ts).
+        // Bounded multiplexing: each client shard fans out to per-doc upstream
+        // y-sweet sockets (see src/sync/mux.ts).
         .route("/dmux", any(dmux::dmux))
         .layer(cors)
         .with_state(state)

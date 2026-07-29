@@ -113,6 +113,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         .map(|pq| pq.as_str())
         .unwrap_or_else(|| parts.uri.path())
         .to_string();
+    let doc_id = crate::ysweet::doc_id_from_path(parts.uri.path()).map(str::to_string);
 
     if is_websocket_upgrade(&parts.headers) {
         // Resolve who is on this connection before consuming the request parts, so
@@ -124,7 +125,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         };
         let target = format!("ws://{authority}{path_and_query}");
         return ws.on_upgrade(move |client| async move {
-            if let Err(e) = relay_ws(client, target, attribution).await {
+            if let Err(e) = relay_ws(client, target, attribution, doc_id).await {
                 tracing::debug!("y-sweet ws proxy closed: {e}");
             }
         });
@@ -135,6 +136,10 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         Err(_) => return (StatusCode::BAD_REQUEST, "request body too large").into_response(),
     };
 
+    let _load_guard = match doc_id {
+        Some(doc_id) => Some(crate::ysweet::lock_doc_load(&doc_id).await),
+        None => None,
+    };
     match proxy_http(
         &state,
         &parts.method,
@@ -255,7 +260,12 @@ async fn relay_ws(
     client: WebSocket,
     target: String,
     attribution: Option<Attribution>,
+    doc_id: Option<String>,
 ) -> anyhow::Result<()> {
+    let load_guard = match doc_id {
+        Some(doc_id) => Some(crate::ysweet::lock_doc_load(&doc_id).await),
+        None => None,
+    };
     // Connect over plain TCP (y-sweet is internal, no TLS) using the target's authority.
     let request = target.as_str().into_client_request()?;
     let host = request
@@ -269,6 +279,7 @@ async fn relay_ws(
         tokio_tungstenite::client_async(request, tcp),
     )
     .await??;
+    drop(load_guard);
 
     let (mut up_tx, mut up_rx) = upstream.split();
     let (mut cl_tx, mut cl_rx) = client.split();

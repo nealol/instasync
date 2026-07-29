@@ -29,6 +29,7 @@ pub async fn read_update_with(
     authenticator: &Arc<Authenticator>,
     doc_id: &str,
 ) -> AppResult<Vec<u8>> {
+    let _load_guard = crate::ysweet::lock_doc_load(doc_id).await;
     let (base_url, token) =
         ysweet::mint_internal_token_with(config, http, authenticator, doc_id, Level::ReadOnly)
             .await?;
@@ -74,6 +75,7 @@ pub async fn read_update_with(
 }
 
 pub async fn write_update(state: &AppState, doc_id: &str, update: Vec<u8>) -> AppResult<()> {
+    let _load_guard = crate::ysweet::lock_doc_load(doc_id).await;
     let (base_url, token) = ysweet::mint_internal_token(state, doc_id, Level::Full).await?;
     let url = format!("{}/update", base_url.trim_end_matches('/'));
     let res = state
@@ -1032,7 +1034,53 @@ pub(crate) fn any_to_json(value: &Any) -> JsonValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::{Mutex, Notify};
+    use tokio_util::sync::CancellationToken;
+    use y_sweet::server::Server;
+    use y_sweet_core::doc_sync::DocWithSyncKv;
+    use y_sweet_core::store::{Result as StoreResult, Store};
     use yrs::{Map, Text};
+
+    #[derive(Clone, Default)]
+    struct BlockingStore {
+        data: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+        block_next_set: Arc<AtomicBool>,
+        set_started: Arc<Notify>,
+        release_set: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Store for BlockingStore {
+        async fn init(&self) -> StoreResult<()> {
+            Ok(())
+        }
+
+        async fn get(&self, key: &str) -> StoreResult<Option<Vec<u8>>> {
+            Ok(self.data.lock().await.get(key).cloned())
+        }
+
+        async fn set(&self, key: &str, value: Vec<u8>) -> StoreResult<()> {
+            if self.block_next_set.swap(false, Ordering::SeqCst) {
+                self.set_started.notify_one();
+                self.release_set.notified().await;
+            }
+            self.data.lock().await.insert(key.to_string(), value);
+            Ok(())
+        }
+
+        async fn remove(&self, key: &str) -> StoreResult<()> {
+            self.data.lock().await.remove(key);
+            Ok(())
+        }
+
+        async fn exists(&self, key: &str) -> StoreResult<bool> {
+            Ok(self.data.lock().await.contains_key(key))
+        }
+    }
 
     fn text_update(name: &str, value: &str) -> Vec<u8> {
         let doc = Doc::new();
@@ -1106,6 +1154,164 @@ mod tests {
             .transact()
             .encode_state_as_update_v1(&yrs::StateVector::default());
         out
+    }
+
+    #[tokio::test]
+    async fn ysweet_shutdown_second_persist_recovers_update_from_first_persist_race() {
+        let store = BlockingStore::default();
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let callback_count = callbacks.clone();
+        let doc = DocWithSyncKv::new("race", Some(Arc::new(Box::new(store.clone()))), move || {
+            callback_count.fetch_add(1, Ordering::SeqCst);
+        })
+        .await
+        .unwrap();
+
+        doc.apply_update(&files_update(&[("kept.md", "guid-kept")]))
+            .unwrap();
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+        doc.sync_kv().persist().await.unwrap();
+
+        // y-sweet's GC worker calls shutdown(), whose callback wakes the
+        // persistence worker for one final persist. The worker exits after that
+        // call. An HTTP update that already holds the document can still land
+        // while the store write is in flight.
+        store.block_next_set.store(true, Ordering::SeqCst);
+        doc.sync_kv().shutdown();
+        assert_eq!(callbacks.load(Ordering::SeqCst), 2);
+        let sync_kv = doc.sync_kv();
+        let final_persist = tokio::spawn(async move { sync_kv.persist().await.unwrap() });
+        store.set_started.notified().await;
+
+        doc.apply_update(&files_update(&[("lost.md", "guid-lost")]))
+            .unwrap();
+        assert_eq!(
+            callbacks.load(Ordering::SeqCst),
+            2,
+            "shutdown suppresses the callback that would schedule another persist"
+        );
+        let live = decode_files_map(&doc.as_update()).unwrap();
+        assert!(live.iter().any(|(path, _)| path == "lost.md"));
+
+        store.release_set.notify_one();
+        final_persist.await.unwrap();
+
+        // The real y-sweet worker loops once more: its next checkpoint observes
+        // shutdown=true, persists again with is_done=true, and only then exits.
+        doc.sync_kv().persist().await.unwrap();
+        drop(doc);
+
+        let reloaded = DocWithSyncKv::new("race", Some(Arc::new(Box::new(store))), || ())
+            .await
+            .unwrap();
+        let persisted = decode_files_map(&reloaded.as_update()).unwrap();
+        assert!(persisted.iter().any(|(path, _)| path == "kept.md"));
+        assert!(
+            persisted.iter().any(|(path, _)| path == "lost.md"),
+            "the worker's second shutdown persist must capture the late update"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "reproduces concurrent cold-load update loss in y-sweet 0.9.1"]
+    async fn ysweet_concurrent_cold_load_replaces_an_acknowledged_document() {
+        let store = BlockingStore::default();
+        store.block_next_set.store(true, Ordering::SeqCst);
+        let cancellation = CancellationToken::new();
+        let server = Arc::new(
+            Server::new(
+                Some(Box::new(store.clone())),
+                Duration::from_millis(100),
+                None,
+                None,
+                cancellation.clone(),
+                false,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let first_server = server.clone();
+        let first = tokio::spawn(async move {
+            let doc = first_server.get_or_create_doc("cold-race").await.unwrap();
+            doc.apply_update(&files_update(&[("first.md", "guid-first")]))
+                .unwrap();
+        });
+        store.set_started.notified().await;
+
+        // The first load has read storage but has not inserted its document.
+        // A second request therefore cold-loads an independent copy, inserts it,
+        // applies its update, and returns success.
+        let second_server = server.clone();
+        let second = tokio::spawn(async move {
+            let doc = second_server.get_or_create_doc("cold-race").await.unwrap();
+            doc.apply_update(&files_update(&[("second.md", "guid-second")]))
+                .unwrap();
+        });
+        second.await.unwrap();
+
+        // Completing the first load replaces the second request's live document
+        // with its independently loaded copy.
+        store.release_set.notify_one();
+        first.await.unwrap();
+
+        let live = server.get_or_create_doc("cold-race").await.unwrap();
+        let files = decode_files_map(&live.as_update()).unwrap();
+        assert!(files.iter().any(|(path, _)| path == "first.md"));
+        assert!(
+            !files.iter().any(|(path, _)| path == "second.md"),
+            "the second request was acknowledged, then replaced in memory"
+        );
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn doc_load_lock_preserves_concurrent_cold_updates() {
+        let store = BlockingStore::default();
+        store.block_next_set.store(true, Ordering::SeqCst);
+        let cancellation = CancellationToken::new();
+        let server = Arc::new(
+            Server::new(
+                Some(Box::new(store.clone())),
+                Duration::from_millis(100),
+                None,
+                None,
+                cancellation.clone(),
+                false,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let doc_id = "cold-race-locked";
+
+        let first_server = server.clone();
+        let first = tokio::spawn(async move {
+            let _load_guard = crate::ysweet::lock_doc_load(doc_id).await;
+            let doc = first_server.get_or_create_doc(doc_id).await.unwrap();
+            doc.apply_update(&files_update(&[("first.md", "guid-first")]))
+                .unwrap();
+        });
+        store.set_started.notified().await;
+
+        let second_server = server.clone();
+        let second = tokio::spawn(async move {
+            let _load_guard = crate::ysweet::lock_doc_load(doc_id).await;
+            let doc = second_server.get_or_create_doc(doc_id).await.unwrap();
+            doc.apply_update(&files_update(&[("second.md", "guid-second")]))
+                .unwrap();
+        });
+
+        store.release_set.notify_one();
+        first.await.unwrap();
+        second.await.unwrap();
+
+        let live = server.get_or_create_doc(doc_id).await.unwrap();
+        let files = decode_files_map(&live.as_update()).unwrap();
+        assert!(files.iter().any(|(path, _)| path == "first.md"));
+        assert!(files.iter().any(|(path, _)| path == "second.md"));
+        cancellation.cancel();
     }
 
     #[test]

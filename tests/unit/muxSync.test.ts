@@ -1,4 +1,4 @@
-// Tier-2 end-to-end coverage for single-socket sync ("Option A"): real Rust
+// Tier-2 end-to-end coverage for sub-cap mux sync: real Rust
 // server (with the `/dmux` route) + real y-sweet, driving the actual
 // `MuxWebSocket` polyfill through `YSweetProvider`.
 //
@@ -6,8 +6,8 @@
 // (the plugin project is disabled there); run it locally via `bun run test:unit`.
 //
 // The two scenarios here are the ones unit tests with a fake socket can't reach:
-//   1. N documents collapse to ONE real socket and sync both directions.
-//   2. When that single socket drops, every provider reconnects and resyncs.
+//   1. A small document set shares one real socket and syncs both directions.
+//   2. When that shared socket drops, every provider reconnects and resyncs.
 //
 // Write attribution through the demux (git/search/plugin-db) is exercised by the
 // wdio Obsidian e2e (it has the git/cr-sqlite infra); the demux reuses the same
@@ -62,7 +62,7 @@ afterEach(() => {
   resetMuxForTests();
 });
 
-/** A provider for `serverDocId` routed through the always-on single-socket mux. */
+/** A provider for `serverDocId` routed through the mux. */
 function muxProvider(serverDocId: string): {
   doc: Y.Doc;
   text: Y.Text;
@@ -90,7 +90,7 @@ function muxProvider(serverDocId: string): {
 
 const fileDocId = (guid: string) => `${vaultId}__${guid}`;
 
-describe("single-socket sync (tier-2)", () => {
+describe("sub-cap mux sync (tier-2)", () => {
   it("carries multiple docs over one real socket and syncs both directions", async () => {
     opened = [];
     CountingWebSocket.instances = [];
@@ -110,7 +110,7 @@ describe("single-socket sync (tier-2)", () => {
       await peerA.whenSynced();
       await peerB.whenSynced();
 
-      // The core claim of Option A: N documents → ONE client socket to /dmux.
+      // An ordinary sub-cap document set shares one client socket to /dmux.
       expect(opened).toHaveLength(1);
       expect(opened[0]).toMatch(/\/dmux$/);
 

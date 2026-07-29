@@ -183,6 +183,8 @@ export async function startAuthServer(opts: {
       if (buf.toString().includes("listening on")) {
         clearTimeout(timer);
         detach();
+        child.stdout?.resume();
+        child.stderr?.resume();
         resolve();
       }
     };
@@ -233,13 +235,13 @@ export interface AuthHarness {
 }
 
 export async function startAuthHarness(
-  opts: { allowedLoginRedirects?: string[] } = {},
+  opts: { allowedLoginRedirects?: string[]; ysweetStorageDir?: string } = {},
 ): Promise<AuthHarness> {
   const authKey = await genAuthKey();
-  const ysweet = await startYSweetServer(undefined, authKey);
+  const ysweet = await startYSweetServer(undefined, authKey, opts.ysweetStorageDir);
   // Bake the auth server's own URL into tokens so clients connect through its
   // `/d` proxy and `/dmux` multiplexer — the production topology, and the only
-  // one where the always-on single-socket mux (`{host}/dmux`) has a route.
+  // one where the bounded mux shards (`{host}/dmux`) have a route.
   const port = await freePort();
   const authUrl = `http://127.0.0.1:${port}`;
   const server = await startAuthServer({

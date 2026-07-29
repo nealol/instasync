@@ -1,7 +1,7 @@
-# Evaluation: combining sync into a single WebSocket to optimize the client
+# Evaluation: multiplexing sync WebSockets to optimize the client
 
-Goal: have the Obsidian client open **one** WebSocket for vault sync regardless of
-how many files the vault contains, instead of one socket per Yjs document.
+Goal: have the Obsidian client pack vault sync into bounded WebSocket shards instead
+of opening one socket per Yjs document.
 
 ## 1. Current architecture (the problem)
 
@@ -49,15 +49,15 @@ WebSocket surface: `send`, `onopen`/`onmessage`/`onclose`/`onerror`, `binaryType
 `clientToken.url + "/" + docId + "?token=..."` (`generateUrl`).
 
 **Implication:** we can give every provider a *virtual* WebSocket that multiplexes over
-one shared real socket, **without forking y-sweet or changing any provider sync /
-awareness / persistence / conflict logic.** This is the cleanest lever and is exactly
-the kind of "reuse existing Yjs/sync abstractions" the repo guidelines ask for.
+bounded shared sockets, **without forking y-sweet or changing any provider sync /
+awareness / persistence / conflict logic.**
 
 ## 3. Options
 
-### Option A — Client-side multiplex over one real socket  *(recommended)*
+### Option A — Client-side multiplex over bounded socket shards  *(recommended)*
 
-- One real WS (`MuxConnection`) to a new server route, e.g. `/dmux?token=...`.
+- Each `MuxConnection` carries at most 512 channels to `/dmux`; larger vaults open
+  another connection before reaching the server's 1,024-channel hard limit.
 - A `VirtualWebSocket` class implements the WS interface. On construction it parses the
   docId from the url, registers a channel, and:
   - `send(payload)` → writes `frame(channelId, payload)` on the shared socket;
@@ -73,8 +73,8 @@ the kind of "reuse existing Yjs/sync abstractions" the repo guidelines ask for.
   upstream y-sweet WS for that docId — essentially the current `relay_ws` keyed by
   channel and fanned out, keeping the per-channel `is_content_write` git/search/plugindb
   tap intact.
-- **Net effect: client sockets N → 1.** Server↔y-sweet sockets stay at N, which is fine —
-  y-sweet is internal/loopback; the stated goal is to optimize the *client*.
+- **Net effect: client sockets N → ceil(N / 512).** Server↔y-sweet sockets stay at N;
+  y-sweet is internal/loopback.
 
 Token model (decide here):
 - *Minimal:* keep per-doc tokens, sent inside each `OPEN` control frame; the server
@@ -82,8 +82,8 @@ Token model (decide here):
 - *Later:* mint a single vault-scoped sync token (the index token already is
   vault-scoped, docId == vaultId) and authorize all channels from it.
 
-Pros: one client socket; no y-sweet fork; CRDT/offline/conflict/awareness behavior
-untouched (per-file Y.Docs unchanged); incremental and unit/integration testable.
+Pros: few client sockets with no hard vault-size ceiling; no y-sweet fork;
+CRDT/offline/conflict/awareness behavior unchanged (per-file Y.Docs remain).
 
 Cons / must-handle: a new framing protocol + server demux to build and test; shared
 fate (a mux drop must re-`OPEN` all active channels on reconnect — though today all
@@ -118,9 +118,9 @@ client-side optimization. **Not recommended.**
 
 ## 4. Recommendation
 
-1. **Option A** as the primary path: it directly delivers a single client socket with the
-   smallest change to the proven y-sweet/CRDT/persistence stack, because
-   `WebSocketPolyfill` lets us virtualize the transport without touching provider logic.
+1. **Option A** as the primary path: it reduces the client to a few bounded socket shards
+   with a small change to the y-sweet/CRDT/persistence stack, because
+   `WebSocketPolyfill` virtualizes the transport without touching provider logic.
 2. Ship/keep **Option C** as a quick win and fallback (and to cap server→y-sweet fan-out).
 3. Token model: start with per-doc tokens in `OPEN` frames (smallest auth change), move to
    a vault-scoped token later if desired.

@@ -24,7 +24,9 @@ export abstract class SyncedDoc {
   private resolveReady!: () => void;
   private ready = false;
   private syncedListener: (synced: boolean) => void;
-  private autoConnect: boolean;
+  private readonly autoConnect: boolean;
+  private persistenceReady = false;
+  private connectRequested = false;
   /** True once the provider has reported a successful server sync at least once. */
   private syncedOnce = false;
 
@@ -97,6 +99,12 @@ export abstract class SyncedDoc {
 
   ensureConnected(): void {
     if (this.destroyed) return;
+    this.connectRequested = true;
+    if (!this.persistenceReady) return;
+    this.connectProvider();
+  }
+
+  private connectProvider(): void {
     const status = this.provider.status;
     if (status === STATUS_OFFLINE || status === STATUS_ERROR) {
       void connectYSweetProvider(this.provider);
@@ -122,7 +130,10 @@ export abstract class SyncedDoc {
       this.resolveWhenReady();
     }
 
-    if (!this.destroyed && this.autoConnect) void connectYSweetProvider(this.provider);
+    this.persistenceReady = true;
+    if (!this.destroyed && (this.autoConnect || this.connectRequested)) {
+      this.connectProvider();
+    }
   }
 
   protected abstract afterPersistenceSynced(): Promise<void> | void;

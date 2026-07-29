@@ -2,18 +2,18 @@ import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
 
 /**
- * Single-WebSocket multiplexing for y-sweet sync (prototype of "Option A").
+ * Bounded WebSocket multiplexing for y-sweet sync.
  *
  * Each Yjs document normally opens its own `YSweetProvider`, and each provider
  * opens its own WebSocket. With the whole vault synced that is one socket per
- * file. This module collapses them onto **one real socket per server origin**:
+ * file. This module packs them into bounded real-socket shards per server origin:
  *
  *  - {@link MuxWebSocket} implements just enough of the `WebSocket` surface for
  *    `YSweetProvider` (it is passed via the provider's `WebSocketPolyfill`
  *    option), but instead of opening a socket it registers a *channel* on a
  *    shared {@link MuxConnection}.
- *  - {@link MuxConnection} owns the one real socket to `wss://{host}/dmux` and
- *    routes framed messages to/from the right channel.
+ *  - Each {@link MuxConnection} owns one real socket to `wss://{host}/dmux`,
+ *    carries at most 512 channels, and routes frames for that shard.
  *
  * The server (`server/src/dmux.rs`) demultiplexes: it dials one upstream
  * y-sweet socket per channel, so the existing y-sweet protocol, auth, and
@@ -56,6 +56,15 @@ const CONTROL_CHANNEL = 0;
 const HEARTBEAT_INTERVAL_MS = 5_000;
 /** Tear the socket down if no PONG (or any frame) arrives within this window. */
 const HEARTBEAT_TIMEOUT_MS = 12_000;
+/** Back off virtual reconnects after the server rejects an OPEN. */
+const OPEN_RETRY_INITIAL_MS = 1_000;
+const OPEN_RETRY_MAX_MS = 10_000;
+/** Stay below the server's 128 OPENs / 10s admission window. */
+const OPEN_BURST_SIZE = 8;
+const OPEN_PACE_INTERVAL_MS = 100;
+const OPEN_PACE_JITTER_MS = 25;
+/** Keep each client shard comfortably below the server's 1,024-channel ceiling. */
+const MAX_CHANNELS_PER_CONNECTION = 512;
 
 /** Close code reported to providers when the shared socket drops. */
 const CLOSE_CODE_TRANSPORT = 1006;
@@ -149,15 +158,17 @@ export function setMuxWebSocketCtor(ctor: WebSocketCtor): void {
   webSocketCtor = ctor;
 }
 
-const connections = new Map<string, MuxConnection>();
+const connectionPools = new Map<string, MuxConnection[]>();
 
 /** Test-only: tear down all shared connections and registries. */
 export function resetMuxForTests(): void {
-  for (const conn of connections.values()) conn.destroyForTests();
-  connections.clear();
+  for (const pool of connectionPools.values()) {
+    for (const conn of [...pool]) conn.destroyForTests();
+  }
+  connectionPools.clear();
 }
 
-/** One real socket to a single server origin, shared by every channel on it. */
+/** One bounded real-socket shard for a server origin. */
 class MuxConnection {
   private ws: WebSocket | null = null;
   private readonly channels = new Map<number, MuxWebSocket>();
@@ -165,16 +176,26 @@ class MuxConnection {
   private readonly pendingOpens = new Map<number, string>();
   private nextChannelId = 1;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private openRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private openPaceTimer: ReturnType<typeof setTimeout> | null = null;
+  private openRetryMs = 0;
+  private openBlockedUntil = 0;
+  private openBurstRemaining = OPEN_BURST_SIZE;
   /** Timestamp of the last frame received on the real socket. */
   private lastActivity = 0;
 
   constructor(private readonly url: string) {}
 
-  static for(url: string): MuxConnection {
-    let conn = connections.get(url);
+  static acquire(url: string): MuxConnection {
+    let pool = connectionPools.get(url);
+    if (!pool) {
+      pool = [];
+      connectionPools.set(url, pool);
+    }
+    let conn = pool.find((candidate) => candidate.channels.size < MAX_CHANNELS_PER_CONNECTION);
     if (!conn) {
       conn = new MuxConnection(url);
-      connections.set(url, conn);
+      pool.push(conn);
     }
     return conn;
   }
@@ -218,6 +239,7 @@ class MuxConnection {
     this.ws = ws;
     ws.onopen = () => {
       this.lastActivity = Date.now();
+      this.openBurstRemaining = OPEN_BURST_SIZE;
       this.startHeartbeat();
       this.flushOpens();
     };
@@ -228,10 +250,78 @@ class MuxConnection {
 
   private flushOpens(): void {
     if (!this.ws || this.ws.readyState !== WS_OPEN) return;
-    for (const [channelId, pathAndQuery] of this.pendingOpens) {
-      this.ws.send(encodeOpen(channelId, pathAndQuery));
+    const waitMs = this.openBlockedUntil - Date.now();
+    if (waitMs > 0) {
+      this.scheduleOpenRetry(waitMs);
+      return;
     }
-    this.pendingOpens.clear();
+    this.clearOpenRetryTimer();
+    if (this.openPaceTimer !== null) return;
+
+    while (this.openBurstRemaining > 0 && this.sendNextOpen()) {
+      this.openBurstRemaining--;
+    }
+    if (this.pendingOpens.size > 0) this.schedulePacedOpen();
+  }
+
+  private sendNextOpen(): boolean {
+    if (!this.ws || this.ws.readyState !== WS_OPEN) return false;
+    const next = this.pendingOpens.entries().next();
+    if (next.done) return false;
+    const [channelId, pathAndQuery] = next.value;
+    this.pendingOpens.delete(channelId);
+    this.ws.send(encodeOpen(channelId, pathAndQuery));
+    return true;
+  }
+
+  private schedulePacedOpen(): void {
+    if (this.openPaceTimer !== null) return;
+    const jitter = Math.floor(Math.random() * (OPEN_PACE_JITTER_MS + 1));
+    this.openPaceTimer = setTimeout(() => {
+      this.openPaceTimer = null;
+      if (Date.now() < this.openBlockedUntil) {
+        this.flushOpens();
+        return;
+      }
+      this.sendNextOpen();
+      if (this.pendingOpens.size > 0) this.schedulePacedOpen();
+    }, OPEN_PACE_INTERVAL_MS + jitter);
+  }
+
+  private scheduleOpenRetry(waitMs: number): void {
+    if (this.openRetryTimer !== null) return;
+    this.openRetryTimer = setTimeout(() => {
+      this.openRetryTimer = null;
+      this.flushOpens();
+    }, waitMs);
+  }
+
+  private clearOpenRetryTimer(): void {
+    if (this.openRetryTimer !== null) {
+      clearTimeout(this.openRetryTimer);
+      this.openRetryTimer = null;
+    }
+  }
+
+  private clearOpenPaceTimer(): void {
+    if (this.openPaceTimer !== null) {
+      clearTimeout(this.openPaceTimer);
+      this.openPaceTimer = null;
+    }
+  }
+
+  private backOffOpens(): void {
+    this.openRetryMs =
+      this.openRetryMs === 0
+        ? OPEN_RETRY_INITIAL_MS
+        : Math.min(this.openRetryMs * 2, OPEN_RETRY_MAX_MS);
+    this.openBlockedUntil = Date.now() + this.openRetryMs;
+  }
+
+  private resetOpenBackoff(): void {
+    this.openRetryMs = 0;
+    this.openBlockedUntil = 0;
+    this.clearOpenRetryTimer();
   }
 
   private receive(buf: Uint8Array): void {
@@ -247,9 +337,17 @@ class MuxConnection {
         this.channels.get(frame.channelId)?.deliverData(frame.payload);
         break;
       case "open_ok":
+        // OPEN_OK for an earlier admitted channel can arrive after a later
+        // OPEN_ERR because upstream dials complete out of order. Only a success
+        // after the current cooldown proves the server is admitting opens again.
+        if (Date.now() >= this.openBlockedUntil) {
+          this.resetOpenBackoff();
+          this.flushOpens();
+        }
         this.channels.get(frame.channelId)?.deliverOpen();
         break;
       case "open_err": {
+        this.backOffOpens();
         const channel = this.channels.get(frame.channelId);
         this.channels.delete(frame.channelId);
         channel?.deliverError();
@@ -298,6 +396,8 @@ class MuxConnection {
    * recreates a channel and reopens the shared socket). */
   private handleDown(): void {
     this.stopHeartbeat();
+    this.resetOpenBackoff();
+    this.clearOpenPaceTimer();
     const channels = [...this.channels.values()];
     this.channels.clear();
     this.pendingOpens.clear();
@@ -321,6 +421,8 @@ class MuxConnection {
   /** Close the idle real socket without failing channels (there are none). */
   private teardown(): void {
     this.stopHeartbeat();
+    this.resetOpenBackoff();
+    this.clearOpenPaceTimer();
     const ws = this.ws;
     this.ws = null;
     if (ws) {
@@ -335,7 +437,14 @@ class MuxConnection {
   }
 
   private release(): void {
-    if (connections.get(this.url) === this) connections.delete(this.url);
+    // A provider close callback can synchronously allocate a replacement
+    // channel on this connection. Do not unpublish a shard that was reused.
+    if (this.channels.size > 0 || this.pendingOpens.size > 0) return;
+    const pool = connectionPools.get(this.url);
+    if (!pool) return;
+    const index = pool.indexOf(this);
+    if (index !== -1) pool.splice(index, 1);
+    if (pool.length === 0) connectionPools.delete(this.url);
   }
 
   destroyForTests(): void {
@@ -378,7 +487,7 @@ export class MuxWebSocket {
     const parsed = new URL(url);
     const pathAndQuery = parsed.pathname + parsed.search;
     const muxUrl = `${parsed.protocol}//${parsed.host}/dmux`;
-    this.conn = MuxConnection.for(muxUrl);
+    this.conn = MuxConnection.acquire(muxUrl);
     this.channelId = this.conn.register(this);
     this.conn.openChannel(this.channelId, pathAndQuery);
   }

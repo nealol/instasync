@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import * as encoding from "lib0/encoding";
 import {
   MuxWebSocket,
   decodeFrame,
@@ -60,6 +61,11 @@ beforeEach(() => {
   setMuxWebSocketCtor(FakeServerSocket as unknown as { new (url: string): WebSocket });
 });
 
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
+
 describe("mux framing", () => {
   it("round-trips OPEN/DATA/CLOSE frames", () => {
     expect(decodeFrame(encodeOpen(3, "/d/x/ws/x?token=q"))).toEqual({
@@ -104,6 +110,55 @@ describe("MuxWebSocket", () => {
 
     expect(a.readyState).toBe(MuxWebSocket.CONNECTING);
     expect(b.readyState).toBe(MuxWebSocket.CONNECTING);
+  });
+
+  it("shards channels before reaching the server's per-connection ceiling", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.spyOn(Math, "random").mockReturnValue(0);
+
+    const channels = Array.from(
+      { length: 1_025 },
+      (_, index) =>
+        new MuxWebSocket(
+          `wss://sync.example.com/d/vault__${index}/ws/vault__${index}?token=t-${index}`,
+        ),
+    );
+
+    expect(FakeServerSocket.instances).toHaveLength(3);
+    for (const server of FakeServerSocket.instances) server.open();
+
+    const cursors = FakeServerSocket.instances.map(() => 0);
+    const opensByServer = FakeServerSocket.instances.map(() => 0);
+    let opened = 0;
+    for (let tick = 0; tick < 600 && opened < channels.length; tick++) {
+      FakeServerSocket.instances.forEach((server, serverIndex) => {
+        const frames = server.frames();
+        while (cursors[serverIndex] < frames.length) {
+          const frame = frames[cursors[serverIndex]++];
+          if (frame?.type === "open") {
+            opensByServer[serverIndex]++;
+            opened++;
+            server.deliver(simpleFrame(2 /* OPEN_OK */, frame.channelId));
+          } else if (frame?.type === "ping") {
+            server.deliver(simpleFrame(7 /* PONG */, 0));
+          }
+        }
+      });
+      vi.advanceTimersByTime(100);
+    }
+
+    expect(opened).toBe(channels.length);
+    expect(opensByServer).toEqual([512, 512, 1]);
+    expect(
+      channels.reduce<Record<number, number>>((counts, channel) => {
+        counts[channel.readyState] = (counts[channel.readyState] ?? 0) + 1;
+        return counts;
+      }, {}),
+    ).toEqual({ [MuxWebSocket.OPEN]: channels.length });
+
+    resetMuxForTests();
+    expect(FakeServerSocket.instances.every((server) => server.readyState === 3)).toBe(true);
   });
 
   it("fires onopen on OPEN_OK and routes DATA to the right channel", () => {
@@ -179,6 +234,113 @@ describe("MuxWebSocket", () => {
     expect(a.readyState).toBe(MuxWebSocket.CLOSED);
   });
 
+  it("backs off replacement channels after OPEN_ERR", () => {
+    vi.useFakeTimers();
+    const first = new MuxWebSocket(DOC_URL);
+    const server = FakeServerSocket.instances[0];
+    server.open();
+    const firstChannel = openChannelId(server, "/d/vault__abc/ws/vault__abc?token=t-abc");
+    const firstClose = vi.fn();
+    first.onclose = firstClose;
+
+    server.deliver(simpleFrame(3 /* OPEN_ERR */, firstChannel));
+    expect(firstClose).toHaveBeenCalledOnce();
+
+    new MuxWebSocket(DOC_URL);
+    expect(server.frames().filter((frame) => frame?.type === "open")).toHaveLength(1);
+    vi.advanceTimersByTime(999);
+    expect(server.frames().filter((frame) => frame?.type === "open")).toHaveLength(1);
+    vi.advanceTimersByTime(1);
+    expect(server.frames().filter((frame) => frame?.type === "open")).toHaveLength(2);
+
+    const secondChannel = server
+      .frames()
+      .filter((frame) => frame?.type === "open")
+      .at(-1)?.channelId;
+    expect(secondChannel).toBeDefined();
+    server.deliver(simpleFrame(3, secondChannel!));
+
+    new MuxWebSocket(DOC_URL);
+    vi.advanceTimersByTime(1_999);
+    expect(server.frames().filter((frame) => frame?.type === "open")).toHaveLength(2);
+    vi.advanceTimersByTime(1);
+    expect(server.frames().filter((frame) => frame?.type === "open")).toHaveLength(3);
+
+    const thirdChannel = server
+      .frames()
+      .filter((frame) => frame?.type === "open")
+      .at(-1)?.channelId;
+    expect(thirdChannel).toBeDefined();
+    server.deliver(simpleFrame(2 /* OPEN_OK */, thirdChannel!));
+
+    new MuxWebSocket(DOC2_URL);
+    expect(server.frames().filter((frame) => frame?.type === "open")).toHaveLength(4);
+  });
+
+  it("flushes queued retries when an older OPEN succeeds after cooldown", () => {
+    vi.useFakeTimers();
+    const first = new MuxWebSocket(DOC_URL);
+    new MuxWebSocket(DOC2_URL);
+    const server = FakeServerSocket.instances[0];
+    server.open();
+    const firstChannel = openChannelId(server, "/d/vault__abc/ws/vault__abc?token=t-abc");
+    const secondChannel = openChannelId(server, "/d/vault__def/ws/vault__def?token=t-def");
+
+    server.deliver(simpleFrame(3 /* OPEN_ERR */, secondChannel));
+    new MuxWebSocket(DOC2_URL);
+    expect(server.frames().filter((frame) => frame?.type === "open")).toHaveLength(2);
+
+    vi.setSystemTime(Date.now() + 1_000);
+    server.deliver(simpleFrame(2 /* OPEN_OK */, firstChannel));
+    expect(first.readyState).toBe(MuxWebSocket.OPEN);
+    expect(server.frames().filter((frame) => frame?.type === "open")).toHaveLength(3);
+  });
+
+  it("paces a high-fanout queue below the server admission limit", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    for (let index = 0; index < 180; index++) {
+      new MuxWebSocket(
+        `wss://sync.example.com/d/vault__${index}/ws/vault__${index}?token=t-${index}`,
+      );
+    }
+    const server = FakeServerSocket.instances[0];
+    server.open();
+
+    let processed = 0;
+    let accepted = 0;
+    let rejected = 0;
+    let windowStarted = Date.now();
+    let opensInWindow = 0;
+
+    for (let tick = 0; tick < 250 && processed < 180; tick++) {
+      const opens = server.frames().filter((frame) => frame?.type === "open");
+      while (processed < opens.length) {
+        const frame = opens[processed++];
+        if (!frame || frame.type !== "open") throw new Error("expected OPEN frame");
+        if (Date.now() - windowStarted >= 10_000) {
+          windowStarted = Date.now();
+          opensInWindow = 0;
+        }
+        if (opensInWindow >= 128) {
+          rejected++;
+          server.deliver(simpleFrame(3 /* OPEN_ERR */, frame.channelId));
+        } else {
+          opensInWindow++;
+          accepted++;
+          server.deliver(simpleFrame(2 /* OPEN_OK */, frame.channelId));
+        }
+      }
+      vi.advanceTimersByTime(100);
+    }
+
+    expect(processed).toBe(180);
+    expect(accepted).toBe(180);
+    expect(rejected).toBe(0);
+    expect(Date.now()).toBeLessThan(20_000);
+  });
+
   it("close() sends a CLOSE frame and stops sending", () => {
     const a = new MuxWebSocket(DOC_URL);
     const server = FakeServerSocket.instances[0];
@@ -209,10 +371,10 @@ function openChannelId(server: FakeServerSocket, pathAndQuery: string): number {
   throw new Error(`no OPEN frame for ${pathAndQuery}`);
 }
 
-/**
- * Build a `[type][channel]` control frame the way the server would. Test ids are
- * small (< 128), so type and channel each encode to one var-uint byte.
- */
+/** Build a `[type][channel]` control frame the way the server would. */
 function simpleFrame(type: number, channel: number): Uint8Array {
-  return new Uint8Array([type, channel]);
+  const encoder = encoding.createEncoder();
+  encoding.writeVarUint(encoder, type);
+  encoding.writeVarUint(encoder, channel);
+  return encoding.toUint8Array(encoder);
 }
