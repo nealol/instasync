@@ -25,6 +25,7 @@ const cacheDir = path.resolve(repoRoot, ".obsidian-cache");
 const SECONDS = 1000;
 const AUTH_PORT = Number(process.env.AUTH_PORT ?? 8081);
 const authUrl = `http://127.0.0.1:${AUTH_PORT}`;
+const OBSIDIAN_E2E_VERSION = process.env.OBSIDIAN_E2E_VERSION ?? "latest";
 
 // Config sync mirrors Obsidian Sync's selective settings sync. These tests
 // drive the real two-instance flow: device A is the wdio session (vault A) and
@@ -84,7 +85,7 @@ describe("Realtime — config-folder sync across two devices", function () {
     B = await startWdioSession({
       capabilities: {
         browserName: "obsidian",
-        browserVersion: "latest",
+        browserVersion: OBSIDIAN_E2E_VERSION,
         "wdio:obsidianOptions": {
           installerVersion: "earliest",
           plugins: [repoRoot],

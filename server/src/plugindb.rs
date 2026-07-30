@@ -666,7 +666,7 @@ impl PluginDbService {
         )
         .await
         .map_err(|e| anyhow!(e.to_string()))?;
-        if let Ok(trim) = build_compaction_update(&update, drop_count, &safe) {
+        if let Ok(trim) = build_compaction_update(&update, drop_count) {
             if !trim.is_empty() {
                 let _ = self.write_doc(&doc_id, trim).await;
             }
@@ -1353,8 +1353,18 @@ fn build_purge_update(current: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Build an update that drops the first `drop_count` batches and records the
-/// new `compactedThrough` high-water marks.
-fn build_compaction_update(current: &[u8], drop_count: usize, safe: &Cursor) -> Result<Vec<u8>> {
+/// new `compactedThrough` high-water marks. Marks are computed from the
+/// batches actually dropped and max-merged into any existing marks, so a site
+/// whose batches have all been trimmed keeps its record — clients rely on the
+/// mark to detect that a range they still need can no longer arrive via the
+/// log and must be rebuilt from the server.
+fn build_compaction_update(current: &[u8], drop_count: usize) -> Result<Vec<u8>> {
+    let view = decode_doc(current)?;
+    let mut marks = view.compacted_through.clone();
+    for b in view.batches.iter().take(drop_count) {
+        let entry = marks.entry(b.site_id.clone()).or_insert(0);
+        *entry = (*entry).max(b.to_db_version);
+    }
     let doc = doc_from_update(current)?;
     let before = doc.transact().state_vector();
     let batches = doc.get_or_insert_array("batches");
@@ -1366,7 +1376,7 @@ fn build_compaction_update(current: &[u8], drop_count: usize, safe: &Cursor) -> 
         if n > 0 {
             batches.remove_range(&mut txn, 0, n);
         }
-        let map: HashMap<String, Any> = safe
+        let map: HashMap<String, Any> = marks
             .iter()
             .map(|(k, v)| (k.clone(), Any::BigInt(*v)))
             .collect();
@@ -2797,6 +2807,83 @@ mod tests {
             cl: 1,
             seq: 0,
         }
+    }
+
+    fn sample_batch(id: &str, site: &str, to_db_version: i64) -> JsonValue {
+        serde_json::json!({
+            "id": id,
+            "siteId": site,
+            "fromDbVersion": 0,
+            "toDbVersion": to_db_version,
+            "schemaVersion": 1,
+            "changes": [],
+            "format": "crsqlite-1",
+        })
+    }
+
+    /// Build a plugin-db doc update holding `batches` in the log and
+    /// `compacted` as the pre-existing `compactedThrough` marks.
+    fn doc_update_with(batches: &[JsonValue], compacted: &[(&str, i64)]) -> Vec<u8> {
+        let doc = Doc::new();
+        let arr = doc.get_or_insert_array("batches");
+        let meta = doc.get_or_insert_map("meta");
+        let before = doc.transact().state_vector();
+        {
+            let mut txn = doc.transact_mut();
+            for (i, b) in batches.iter().enumerate() {
+                arr.insert(&mut txn, i as u32, crate::ydoc::json_to_any(b));
+            }
+            let map: HashMap<String, Any> = compacted
+                .iter()
+                .map(|(k, v)| (k.to_string(), Any::BigInt(*v)))
+                .collect();
+            meta.insert(
+                &mut txn,
+                "compactedThrough".to_string(),
+                Any::Map(map.into()),
+            );
+        }
+        let update = doc.transact().encode_state_as_update_v1(&before);
+        update
+    }
+
+    /// Apply a delta update onto `base` and re-encode the full merged state,
+    /// mirroring how y-sweet merges the server-posted trim into the live doc.
+    fn apply_delta(base: &[u8], delta: &[u8]) -> Vec<u8> {
+        let doc = doc_from_update(base).unwrap();
+        let upd = Update::decode_v1(delta).unwrap();
+        doc.transact_mut().apply_update(upd);
+        let sv = yrs::StateVector::default();
+        let update = doc.transact().encode_state_as_update_v1(&sv);
+        update
+    }
+
+    #[test]
+    fn compaction_merges_marks_and_keeps_absent_sites() {
+        let update = doc_update_with(
+            &[
+                sample_batch("b1", "siteA", 5),
+                sample_batch("b2", "siteB", 3),
+                sample_batch("b3", "siteA", 8),
+            ],
+            &[("siteC", 9)],
+        );
+        // Drop the first two batches: marks are recorded for the dropped
+        // sites, and siteC's mark survives even though siteC has no batches.
+        let trimmed = apply_delta(&update, &build_compaction_update(&update, 2).unwrap());
+        let view = decode_doc(&trimmed).unwrap();
+        assert_eq!(view.batches.len(), 1);
+        assert_eq!(view.compacted_through.get("siteA"), Some(&5));
+        assert_eq!(view.compacted_through.get("siteB"), Some(&3));
+        assert_eq!(view.compacted_through.get("siteC"), Some(&9));
+
+        // Drop the rest: siteA's mark advances; untouched sites keep theirs.
+        let trimmed = apply_delta(&trimmed, &build_compaction_update(&trimmed, 1).unwrap());
+        let view = decode_doc(&trimmed).unwrap();
+        assert!(view.batches.is_empty());
+        assert_eq!(view.compacted_through.get("siteA"), Some(&8));
+        assert_eq!(view.compacted_through.get("siteB"), Some(&3));
+        assert_eq!(view.compacted_through.get("siteC"), Some(&9));
     }
 
     #[test]

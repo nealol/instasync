@@ -226,6 +226,162 @@ describe("SyncedPluginDatabase", () => {
     }
   });
 
+  it("stalls on a gapped batch instead of jumping the cursor, and recovers when the gap arrives", async () => {
+    _resetSqliteForTests();
+    const producerDoc = new Y.Doc();
+    const producer = makeEngine({ doc: producerDoc, snap: newSnapStore() });
+    const consumerDoc = new Y.Doc();
+    const consumer = makeEngine({ doc: consumerDoc, snap: newSnapStore() });
+    try {
+      await producer.start();
+      await producer.whenLive();
+      await producer.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["r1", "first"]);
+      await new Promise((r) => setTimeout(r, 400));
+      await producer.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["r2", "second"]);
+      await new Promise((r) => setTimeout(r, 400));
+
+      const batches = producerDoc.getArray<any>("batches").toArray();
+      expect(batches.length).toBeGreaterThanOrEqual(2);
+      const first = batches[0];
+      const later = batches[batches.length - 1];
+      expect(later.fromDbVersion).toBeGreaterThan(0);
+
+      // Deliver ONLY the later batch: applying it would jump the cursor past
+      // the missing range and silently drop "first" forever.
+      consumerDoc.getArray<any>("batches").push([later]);
+      await consumer.start();
+      await consumer.whenLive();
+      await new Promise((r) => setTimeout(r, 300));
+      expect(await titles(consumer)).toEqual([]);
+
+      // The missing batch arrives out of order (appended at the end of the
+      // log): the consumer must apply it and then the stalled later batch.
+      consumerDoc.getArray<any>("batches").push([first]);
+      await waitFor(async () => (await titles(consumer)).length === 2, {
+        label: "consumer recovered once the gap arrived",
+      });
+      expect(await titles(consumer)).toEqual(["first", "second"]);
+    } finally {
+      await producer.close();
+      await consumer.close();
+    }
+  });
+
+  it("does not jump the cursor past a buffered newer-schema batch", async () => {
+    _resetSqliteForTests();
+    const doc = new Y.Doc();
+    const newer = makeEngine({ doc, snap: newSnapStore(), schemaVersion: 2 });
+    const older = makeEngine({ doc, snap: newSnapStore(), schemaVersion: 1 });
+    try {
+      await newer.start();
+      await newer.whenLive();
+      await newer.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["b1", "buffered"]);
+      await new Promise((r) => setTimeout(r, 400));
+      await newer.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["b2", "behind-buffer"]);
+      await new Promise((r) => setTimeout(r, 400));
+
+      // Simulate a later same-site batch authored at an older schema version
+      // (e.g. republished by a downgraded client): the consumer must not let
+      // it advance the cursor past the buffered batch's range.
+      const arr = doc.getArray<any>("batches");
+      const list = arr.toArray();
+      expect(list.length).toBeGreaterThanOrEqual(2);
+      arr.delete(list.length - 1, 1);
+      arr.insert(list.length - 1, [{ ...list[list.length - 1], schemaVersion: 1 }]);
+
+      await older.start();
+      await waitFor(() => older.state === "needs-migration", {
+        label: "older enters needs-migration",
+      });
+      await new Promise((r) => setTimeout(r, 300));
+      expect(await titles(older)).toEqual([]);
+
+      await older.upgradeSchema(2, async (_tx, _from) => {
+        /* schema unchanged between v1 and v2 in this test */
+      });
+      await waitFor(() => older.state === "live", { label: "older back to live" });
+      await waitFor(async () => (await titles(older)).length === 2, {
+        label: "older applied the buffered batch and the one stalled behind it",
+      });
+      expect(await titles(older)).toEqual(["buffered", "behind-buffer"]);
+    } finally {
+      await newer.close();
+      await older.close();
+    }
+  });
+
+  it("rebases on startup when the log was compacted past the snapshot cursor", async () => {
+    _resetSqliteForTests();
+    const doc = new Y.Doc();
+    const snap = newSnapStore();
+    const producer = makeEngine({ doc, snap: newSnapStore() });
+    const first = makeEngine({ doc, snap });
+    await producer.start();
+    await first.start();
+    await producer.whenLive();
+    await first.whenLive();
+
+    await producer.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["early", "early-row"]);
+    await waitFor(async () => (await titles(first)).includes("early-row"), {
+      label: "first consumer caught up",
+    });
+    await first.close(); // snapshot records the cursor at the early batch
+
+    await producer.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["late", "late-row"]);
+    await new Promise((r) => setTimeout(r, 400));
+    const serverRows = await readAllChanges((producer as any).db);
+
+    // Simulate the server compacting the whole log while the consumer was
+    // away: every batch dropped, only the high-water mark remains.
+    const arr = doc.getArray<any>("batches");
+    const marks: Record<string, number> = {};
+    for (const b of arr.toArray()) {
+      marks[b.siteId] = Math.max(marks[b.siteId] ?? 0, b.toDbVersion);
+    }
+    arr.delete(0, arr.length);
+    doc.getMap("meta").set("compactedThrough", marks);
+
+    const second = makeEngine({ doc, snap, bootstrap: async () => serverRows });
+    try {
+      await second.start();
+      await second.whenLive();
+      await waitFor(async () => (await titles(second)).length === 2, {
+        label: "rebased from server on startup",
+      });
+      expect(await titles(second)).toEqual(["early-row", "late-row"]);
+    } finally {
+      await producer.close();
+      await second.close();
+    }
+  });
+
+  it("republishes rows whose batches were lost with the local doc store", async () => {
+    _resetSqliteForTests();
+    const snap = newSnapStore();
+    const doc1 = new Y.Doc();
+    const first = makeEngine({ doc: doc1, snap });
+    await first.start();
+    await first.whenLive();
+    await first.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["lost-doc", "republished"]);
+    await first.close(); // snapshot records published=V; the batch only lives in doc1
+
+    // Simulate loss of the Y.Doc store (e.g. IndexedDB eviction): the
+    // snapshot survives but no batch ever reached the server. The restored
+    // published watermark must not skip the re-publish.
+    const doc2 = new Y.Doc();
+    const second = makeEngine({ doc: doc2, snap, bootstrap: async () => [] });
+    try {
+      await second.start();
+      await second.whenLive();
+      expect(await titles(second)).toEqual(["republished"]);
+      await waitFor(() => doc2.getArray("batches").length > 0, {
+        label: "lost range republished after doc-store loss",
+      });
+    } finally {
+      await second.close();
+    }
+  });
+
   it("flushes unpublished local edits before rebaseFromServer resets the DB", async () => {
     const doc = new Y.Doc();
     const db = makeEngine({ doc, snap: newSnapStore(), bootstrap: async () => [] });
@@ -389,6 +545,56 @@ describe("SyncedPluginDatabase", () => {
       await waitFor(async () => (await titles(consumer)).includes("own-newer"), {
         label: "own newer batch applied",
       });
+    } finally {
+      await producer.close();
+      await consumer.close();
+    }
+  });
+
+  it("does not stall on own-site batches with fromDbVersion > 0 (crash-recovery)", async () => {
+    // Crash-recovery scenario: an own-site batch with fromDbVersion > 0
+    // arrives (e.g. a second publish from before a restart). The applied
+    // cursor doesn't track own-site progress, so the gap check would
+    // false-fire and stall with a warning on every observer callback.
+    const producerDoc = new Y.Doc();
+    const producer = makeEngine({ doc: producerDoc, snap: newSnapStore() });
+    const consumerDoc = new Y.Doc();
+    const consumer = makeEngine({ doc: consumerDoc, snap: newSnapStore() });
+    try {
+      await producer.start();
+      await producer.whenLive();
+      await producer.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["a", "row-a"]);
+      await new Promise((r) => setTimeout(r, 400));
+      await producer.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["b", "row-b"]);
+      await new Promise((r) => setTimeout(r, 400));
+
+      await consumer.start();
+      await consumer.whenLive();
+      const site = (consumer as any).siteHex as string;
+      const changes = await readAllChanges((producer as any).db);
+      const last = changes[changes.length - 1].db_version;
+
+      // Inject an own-site batch with fromDbVersion > 0 (simulating a
+      // crash-recovery republish). Set published to the first batch's
+      // watermark so the second batch is "past published" but contiguous.
+      (consumer as any).published = { [site]: changes[0].db_version };
+      consumerDoc.getArray("batches").push([
+        {
+          id: "own-gap-batch",
+          siteId: site,
+          fromDbVersion: changes[0].db_version,
+          toDbVersion: last,
+          schemaVersion: 1,
+          changes: changes.slice(0, MAX_BATCH_ROWS),
+          createdAt: Date.now(),
+          format: SYNC_FORMAT,
+        },
+      ]);
+
+      await waitFor(async () => (await titles(consumer)).includes("row-b"), {
+        label: "own-site batch with fromDbVersion > 0 applied without stalling",
+      });
+      expect((consumer as any).published[site]).toBeGreaterThanOrEqual(last);
     } finally {
       await producer.close();
       await consumer.close();

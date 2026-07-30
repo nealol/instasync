@@ -82,6 +82,7 @@ const cacheDir = path.resolve(repoRoot, ".obsidian-cache");
 const SECONDS = 1000;
 const AUTH_PORT = Number(process.env.AUTH_PORT ?? 8081);
 const authUrl = `http://127.0.0.1:${AUTH_PORT}`;
+const OBSIDIAN_E2E_VERSION = process.env.OBSIDIAN_E2E_VERSION ?? "latest";
 
 /** A JSON Canvas text node with the required geometry fields. */
 const canvasNode = (id: string, text: string, x = 0) => ({
@@ -124,7 +125,7 @@ describe("Realtime — two isolated Obsidian devices", function () {
     B = await startWdioSession({
       capabilities: {
         browserName: "obsidian",
-        browserVersion: "latest",
+        browserVersion: OBSIDIAN_E2E_VERSION,
         "wdio:obsidianOptions": {
           installerVersion: "earliest",
           plugins: [repoRoot],
@@ -590,12 +591,33 @@ describe("Realtime — two isolated Obsidian devices", function () {
       const a = await enableCorePlugin(A, "canvas");
       const b = await enableCorePlugin(B, "canvas");
       if (!a || !b) this.skip();
+    });
 
-      await writeNote(A, "Board.canvas", canvasJson([canvasNode("n1", "hello")]));
-      await B.waitUntil(async () => !!(await readNote(B, "Board.canvas"))?.includes("hello"), {
-        timeout: 60 * SECONDS,
-        timeoutMsg: "B never received the seeded canvas",
-      });
+    beforeEach(async function () {
+      await detachLeaves(A, "canvas");
+      await detachLeaves(B, "canvas");
+      const baseline = canvasJson([canvasNode("n1", "hello")]);
+      await writeNote(A, "Board.canvas", baseline);
+      await B.waitUntil(
+        async () => {
+          const disk = await readNote(B, "Board.canvas");
+          if (!disk) return false;
+          const data = JSON.parse(disk) as {
+            nodes?: Array<{ id?: string; text?: string }>;
+            edges?: unknown[];
+          };
+          return (
+            data.nodes?.length === 1 &&
+            data.nodes[0]?.id === "n1" &&
+            data.nodes[0]?.text === "hello" &&
+            data.edges?.length === 0
+          );
+        },
+        {
+          timeout: 60 * SECONDS,
+          timeoutMsg: "B never received the seeded canvas",
+        },
+      );
 
       await openFileInLeaf(A, "Board.canvas");
       await A.pause(SECONDS); // let the canvas view mount
@@ -605,6 +627,7 @@ describe("Realtime — two isolated Obsidian devices", function () {
 
     after(async function () {
       await detachLeaves(A, "canvas");
+      await detachLeaves(B, "canvas");
       await deleteNote(A, "Board.canvas").catch(() => {});
     });
 

@@ -98,6 +98,8 @@ export class SyncedPluginDatabase {
   private unobserveMeta: (() => void) | null = null;
   private startPromise: Promise<void> | null = null;
   private closed = false;
+  /** Set once the engine first reaches `live`: the local DB is authoritative. */
+  private becameLive = false;
 
   constructor(opts: SyncedPluginDatabaseOptions) {
     if (!isValidId(opts.pluginId)) throw new Error(`invalid pluginId: ${opts.pluginId}`);
@@ -131,6 +133,7 @@ export class SyncedPluginDatabase {
       }
     }
     if (state === "live") {
+      this.becameLive = true;
       const waiters = this.liveWaiters;
       this.liveWaiters = [];
       for (const w of waiters) w.resolve();
@@ -203,14 +206,26 @@ export class SyncedPluginDatabase {
       this.setState("syncing");
       // Publish the CRR schema so the server can build a replica + git dump.
       await this.publishSchema();
-      // Catch up on any batches already present, then start observing.
-      await this.enqueueApply(this.sync.listBatches());
+      // Register the observers BEFORE the initial catch-up: the list covers
+      // batches already present, the observer covers later arrivals — a batch
+      // landing between the two would otherwise never be applied.
       this.unobserveBatches = this.sync.observeBatches((batches) => this.applyBatches(batches));
       this.unobserveMeta = this.sync.observeMeta(() => this.onMetaChanged());
-
-      // Crash recovery: republish anything we produced (migrate/local edits)
-      // that never made it into the log.
-      await this.publishNow();
+      const initialBatches = this.sync.listBatches();
+      await this.enqueueApply(initialBatches);
+      // Clamp the restored published watermarks to what is actually durable
+      // (in the log, or proven compacted), so the publish below re-reads any
+      // range a stale snapshot claims was published but nobody received.
+      this.reconcilePublished(initialBatches);
+      // The log may have been compacted past our snapshot cursor while we were
+      // away; a quiescent database gives no other trigger to catch up.
+      if (this.needsServerRebase()) {
+        await this.rebaseFromServer();
+      } else {
+        // Crash recovery: republish anything we produced (migrate/local
+        // edits) that never made it into the log.
+        await this.publishNow();
+      }
 
       // The catch-up pass may have parked us in needs-migration; don't
       // override that (whenLive resolves only after the schema upgrade).
@@ -254,6 +269,7 @@ export class SyncedPluginDatabase {
     this.cursor = {};
     this.published = {};
     this.appliedBatchIds.clear();
+    this.bufferedBatches = [];
   }
 
   private async runMigrate(fromVersion: number): Promise<void> {
@@ -297,13 +313,14 @@ export class SyncedPluginDatabase {
    * engine leaves `needs-migration`.
    */
   private async drainBuffered(): Promise<void> {
-    const buffered = this.bufferedBatches;
-    if (buffered.length === 0) {
+    if (this.bufferedBatches.length === 0) {
       if (this._state === "needs-migration") this.setState("live");
       return;
     }
     this.bufferedBatches = [];
-    await this.enqueueApply(buffered);
+    // Re-run a full pass, not just the buffered batches: batches that stalled
+    // behind a buffered one (same site, later range) become applicable too.
+    await this.enqueueApply(this.sync?.listBatches() ?? []);
     if (this.bufferedBatches.length === 0 && this._state === "needs-migration") {
       this.setState("live");
     }
@@ -341,7 +358,49 @@ export class SyncedPluginDatabase {
     if (this.closed || !this.sync) return;
     if (this.sync.getDeletedAt() !== null && this._state !== "error") {
       void this.handleTombstoned();
+      return;
     }
+    // Compaction can trim away batches we still need without leaving any
+    // batch from that site in the log to trip the per-batch gap check.
+    if (this._state === "live" && this.needsServerRebase()) void this.rebaseFromServer();
+  }
+
+  /**
+   * Clamp the persisted `published` watermarks to what is actually durable:
+   * batches present in the log, or ranges the server compacted (which proves
+   * they reached the replica). The snapshot file and the Y.Doc's IndexedDB
+   * persistence are separate stores — if the doc store was lost (cleared,
+   * evicted) after the snapshot recorded a publish, the watermark would
+   * otherwise skip re-publishing rows nobody ever received.
+   */
+  private reconcilePublished(batches: Batch[]): void {
+    if (!this.sync) return;
+    const compacted = this.sync.getCompactedThrough();
+    const inLog: Cursor = {};
+    for (const b of batches) {
+      inLog[b.siteId] = Math.max(inLog[b.siteId] ?? 0, b.toDbVersion);
+    }
+    for (const site of Object.keys(this.published)) {
+      const durable = Math.max(compacted[site] ?? 0, inLog[site] ?? 0);
+      if ((this.published[site] ?? 0) > durable) this.published[site] = durable;
+    }
+  }
+
+  /**
+   * True when the server compacted the log past our applied cursor for a
+   * remote site: the missing range can no longer arrive through the batch
+   * log, so the only way forward is a full server rebase. Own sites are
+   * exempt — their rows live in our local crsql_changes by definition.
+   */
+  private needsServerRebase(): boolean {
+    if (!this.sync || !this.opts.bootstrap) return false;
+    const compacted = this.sync.getCompactedThrough();
+    const ownSites = new Set<string>([this.siteHex, ...Object.keys(this.published)]);
+    for (const [site, v] of Object.entries(compacted)) {
+      if (ownSites.has(site)) continue;
+      if (v > (this.cursor[site] ?? 0)) return true;
+    }
+    return false;
   }
 
   // --- queries ---------------------------------------------------------------
@@ -538,55 +597,104 @@ export class SyncedPluginDatabase {
     const compacted = this.sync.getCompactedThrough();
     const touchedTables = new Set<string>();
     let cursorChanged = false;
+    let needsRebase = false;
 
+    // Group by origin site and apply each site's batches in causal order.
+    // The log is an append-only array, but republish-after-restore and lost
+    // updates can leave a site's batches out of db_version order; applying
+    // them in array order could advance the cursor past a range that then
+    // never arrives (the `toDbVersion <= applied` check would skip it
+    // forever). Cross-site order is irrelevant — cr-sqlite merge is a CRDT.
+    const bySite = new Map<string, Batch[]>();
     for (const batch of batches) {
-      if (this.appliedBatchIds.has(batch.id)) continue;
-      if (batch.siteId === this.siteHex) {
-        const published = this.published[batch.siteId] ?? 0;
-        if (batch.toDbVersion <= published) {
+      const list = bySite.get(batch.siteId);
+      if (list) list.push(batch);
+      else bySite.set(batch.siteId, [batch]);
+    }
+    for (const list of bySite.values()) {
+      list.sort((x, y) => x.fromDbVersion - y.fromDbVersion || x.toDbVersion - y.toDbVersion);
+    }
+
+    for (const siteBatches of bySite.values()) {
+      // A stall (gap, apply failure, or a buffered newer-schema batch) ends
+      // this site's pass: the stalled batch stays unapplied and unmarked so
+      // the next pass retries it, and later batches must not jump the cursor
+      // past it.
+      for (const batch of siteBatches) {
+        if (this.appliedBatchIds.has(batch.id)) continue;
+        // Own-site batches: the applied cursor doesn't track our own site
+        // (it only records *remote* progress), so use `published` as the
+        // contiguity baseline instead. Without this, any own-site batch with
+        // fromDbVersion > 0 (common after a crash-recovery restart) would
+        // false-fire the gap check and stall with a warning on every pass.
+        const ownSite = batch.siteId === this.siteHex;
+        const applied = ownSite
+          ? (this.published[batch.siteId] ?? 0)
+          : (this.cursor[batch.siteId] ?? 0);
+        if (batch.toDbVersion <= applied) {
           this.appliedBatchIds.add(batch.id);
           continue;
         }
-      }
-      if (batch.format !== SYNC_FORMAT) {
-        // Unknown wire format: refuse rather than corrupt.
-        this.appliedBatchIds.add(batch.id);
-        continue;
-      }
-      const applied = this.cursor[batch.siteId] ?? 0;
-      if (batch.toDbVersion <= applied) {
-        this.appliedBatchIds.add(batch.id);
-        continue;
-      }
-      // Schema too new for us: buffer and surface needs-migration.
-      if (batch.schemaVersion > this.schemaVersion) {
-        if (!this.bufferedBatches.some((b) => b.id === batch.id)) this.bufferedBatches.push(batch);
-        if (this._state !== "needs-migration") this.setState("needs-migration");
-        continue;
-      }
-      // Gap detection: a needed range was compacted away → rebuild from server.
-      if (batch.fromDbVersion > applied && (compacted[batch.siteId] ?? 0) >= batch.fromDbVersion) {
-        void this.rebaseFromServer();
-        return;
-      }
+        if (batch.format !== SYNC_FORMAT) {
+          // Unknown wire format: refuse rather than corrupt.
+          this.appliedBatchIds.add(batch.id);
+          continue;
+        }
+        // Schema too new for us: buffer and surface needs-migration.
+        // drainBuffered() re-runs a full pass after the schema upgrade.
+        if (batch.schemaVersion > this.schemaVersion) {
+          if (!this.bufferedBatches.some((b) => b.id === batch.id))
+            this.bufferedBatches.push(batch);
+          if (this._state !== "needs-migration") this.setState("needs-migration");
+          break;
+        }
+        // Contiguity: a batch may only apply on top of everything before it.
+        if (batch.fromDbVersion > applied) {
+          // The missing range was compacted away → rebuild from server.
+          if ((compacted[batch.siteId] ?? 0) >= batch.fromDbVersion) {
+            needsRebase = true;
+            break;
+          }
+          // Not compacted, so the missing batches may still arrive
+          // (out-of-order publish, lost update). Retry on the next pass.
+          console.warn(
+            `[Realtime] gap in batch log for ${this.docId}: site ${batch.siteId} applied to ` +
+              `${applied}, batch starts at ${batch.fromDbVersion}; waiting for the missing range`,
+          );
+          break;
+        }
 
-      try {
-        await this.db.tx(async (tx) => {
-          await applyChanges(tx as unknown as DB, batch.changes);
-        });
-      } catch (e) {
-        console.error(`[Realtime] failed to apply batch ${batch.id} for ${this.docId}`, e);
-        continue;
+        try {
+          await this.db.tx(async (tx) => {
+            await applyChanges(tx as unknown as DB, batch.changes);
+          });
+        } catch (e) {
+          // Stall rather than skip: the batch stays unapplied and unmarked,
+          // so the next pass retries it instead of jumping the cursor past it.
+          console.error(`[Realtime] failed to apply batch ${batch.id} for ${this.docId}`, e);
+          break;
+        }
+        for (const c of batch.changes) touchedTables.add(c.table);
+        if (ownSite) {
+          // Advance the published watermark so publishNow doesn't republish
+          // this range (the rows are now either local or idempotently merged).
+          this.published[batch.siteId] = Math.max(applied, batch.toDbVersion);
+        } else {
+          this.cursor[batch.siteId] = batch.toDbVersion;
+        }
+        this.appliedBatchIds.add(batch.id);
+        cursorChanged = true;
       }
-      for (const c of batch.changes) touchedTables.add(c.table);
-      this.cursor[batch.siteId] = Math.max(applied, batch.toDbVersion);
-      this.appliedBatchIds.add(batch.id);
-      cursorChanged = true;
+      if (needsRebase) break;
     }
 
     if (cursorChanged) {
       this.sync.setCursor(this.siteHex, this.cursor);
       this.scheduleSnapshot();
+    }
+    if (needsRebase) {
+      void this.rebaseFromServer();
+      return;
     }
     if (touchedTables.size > 0) {
       const tables = [...touchedTables];
@@ -678,6 +786,7 @@ export class SyncedPluginDatabase {
     this.cursor = replacementCursor;
     this.published = {};
     this.appliedBatchIds.clear();
+    this.bufferedBatches = [];
     await previous?.close().catch(() => {});
 
     // Re-apply the log on top of the fresh bootstrap.
@@ -712,12 +821,16 @@ export class SyncedPluginDatabase {
       clearTimeout(this.publishTimer);
       this.publishTimer = null;
     }
-    if (!failed) await this.publishNow();
+    // Best effort even after a post-live failure: unpublished local edits
+    // and the snapshot are the only copies of those rows. An engine that
+    // failed BEFORE going live (e.g. bootstrap failed) must not persist —
+    // restoring that snapshot later would skip the bootstrap entirely.
+    if (!failed || this.becameLive) await this.publishNow().catch(() => {});
     this.closed = true;
     if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
     this.unobserveBatches?.();
     this.unobserveMeta?.();
-    if (!failed) {
+    if (!failed || this.becameLive) {
       try {
         await this.persistSnapshot();
       } catch {

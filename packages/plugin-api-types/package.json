@@ -1,6 +1,6 @@
 {
   "name": "@realtime-md/plugin-api-types",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "TypeScript type definitions for the Realtime.md Obsidian plugin API (app.plugins.plugins[\"realtime\"]).",
   "type": "module",
   "main": "./dist/index.js",
