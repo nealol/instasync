@@ -35,6 +35,12 @@ pub(crate) struct Attribution {
     /// content writes also arm the plugin-db replication debounce (a safety net
     /// for clients whose explicit `/touch` call is lost — e.g. dropped offline).
     plugin_db: Option<(String, String)>,
+    search_target: Option<SearchTarget>,
+}
+
+enum SearchTarget {
+    Vault,
+    Note(String),
 }
 
 impl Attribution {
@@ -45,10 +51,21 @@ impl Attribution {
             .git
             .mark_write(&self.vault_id, &self.principal)
             .await;
-        self.state
-            .search
-            .mark_write(self.state.clone(), &self.vault_id, &self.principal)
-            .await;
+        match &self.search_target {
+            Some(SearchTarget::Vault) => {
+                self.state
+                    .search
+                    .mark_vault_write(self.state.clone(), &self.vault_id)
+                    .await;
+            }
+            Some(SearchTarget::Note(guid)) => {
+                self.state
+                    .search
+                    .mark_note_write(self.state.clone(), &self.vault_id, guid)
+                    .await;
+            }
+            None => {}
+        }
         if let Some((plugin, name)) = &self.plugin_db {
             self.state
                 .plugindb
@@ -217,11 +234,22 @@ pub(crate) async fn resolve_attribution(
     let vault_id = doc_id.split("__").next().unwrap_or(doc_id).to_string();
     let plugin_db =
         crate::plugindb::parse_doc_id(doc_id).map(|(_vault, plugin, name)| (plugin, name));
+    let search_target = if plugin_db.is_some() {
+        None
+    } else if doc_id == vault_id {
+        Some(SearchTarget::Vault)
+    } else {
+        doc_id
+            .strip_prefix(vault_id.as_str())
+            .and_then(|suffix| suffix.strip_prefix("__"))
+            .map(|guid| SearchTarget::Note(guid.to_string()))
+    };
     Some(Attribution {
         vault_id,
         principal,
         state: state.clone(),
         plugin_db,
+        search_target,
     })
 }
 

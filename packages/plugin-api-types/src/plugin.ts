@@ -1,5 +1,6 @@
 import type { RealtimeSql } from "./sql";
 import type { RealtimeCursors } from "./cursors";
+import type { RealtimeShares } from "./shares";
 
 /**
  * The public API surface of the Realtime plugin, as exposed to other Obsidian
@@ -22,4 +23,6 @@ export interface RealtimePluginApi {
   readonly sql: RealtimeSql;
   /** Plugin-managed remote cursors. See {@link RealtimeCursors}. */
   readonly cursors: RealtimeCursors;
+  /** Public links for notes and binary attachments. See {@link RealtimeShares}. */
+  readonly shares: RealtimeShares;
 }

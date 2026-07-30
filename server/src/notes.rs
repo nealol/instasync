@@ -502,6 +502,7 @@ pub(crate) async fn delete_note_inner(
     ydoc::index_remove_file(state, vault_id, &file.path).await?;
     if let Err(e) = crate::search::remove_note(state, vault_id, &file.guid).await {
         tracing::warn!("search remove failed for {}: {e}", file.path);
+        state.search.mark_vault_write(state.clone(), vault_id).await;
     }
     mark_note_write(state, vault_id, principal).await;
     if let Some(before) = before {
@@ -519,10 +520,6 @@ pub(crate) async fn delete_note_inner(
 pub(crate) async fn mark_note_write(state: &AppState, vault_id: &str, principal: &ApiPrincipal) {
     let git_principal = principal.to_git_principal(now_millis() + 24 * 60 * 60 * 1000);
     state.git.mark_write(vault_id, &git_principal).await;
-    state
-        .search
-        .mark_write(state.clone(), vault_id, &git_principal)
-        .await;
 }
 
 pub(crate) async fn best_effort_index(
@@ -534,6 +531,7 @@ pub(crate) async fn best_effort_index(
 ) {
     if let Err(e) = crate::search::index_note(state, vault_id, guid, path, content).await {
         tracing::warn!("search index failed for {path}: {e}");
+        state.search.mark_vault_write(state.clone(), vault_id).await;
     }
 }
 

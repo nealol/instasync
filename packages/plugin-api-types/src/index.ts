@@ -24,4 +24,5 @@ export type {
   RemoteCursorHandle,
   RealtimeCursors,
 } from "./cursors";
+export type { RealtimeShares } from "./shares";
 export type { RealtimePluginApi } from "./plugin";

@@ -19,10 +19,12 @@ import { FILE_HISTORY_VIEW_TYPE, FileHistoryView } from "./history/FileHistoryVi
 import { openTimelineModal } from "./history/TimelineModal";
 import { RealtimeSqlAPI } from "./pluginDb/api";
 import { RealtimeCursorsAPI } from "./cursors/api";
+import { RealtimeSharesAPI } from "./shares/api";
 import { SQL_QUERY_VIEW_TYPE, SqlQueryView } from "./sql/SqlQueryView";
 import type {
   RealtimeCursors,
   RealtimePluginApi,
+  RealtimeShares,
   RealtimeSql,
 } from "@realtime-md/plugin-api-types";
 
@@ -63,6 +65,12 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
   get cursors(): RealtimeCursors {
     return this.cursorsApi;
   }
+  /** Note and attachment sharing API for third-party plugins. */
+  sharesApi!: RealtimeSharesAPI;
+  /** Public handle: `app.plugins.plugins["realtime"].shares`. */
+  get shares(): RealtimeShares {
+    return this.sharesApi;
+  }
   private statusBarEl!: HTMLElement;
   private statusRoot: Root | null = null;
   private status: ConnectionStatus = "offline";
@@ -74,6 +82,7 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
     this.auth = new AuthClient(this);
     this.sqlApi = new RealtimeSqlAPI(this);
     this.cursorsApi = new RealtimeCursorsAPI(this);
+    this.sharesApi = new RealtimeSharesAPI(this);
 
     this.addSettingTab(new RealtimeSettingTab(this.app, this));
 

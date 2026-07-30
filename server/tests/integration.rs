@@ -597,6 +597,14 @@ async fn git_state_ext(
     ysweet_url: &str,
     crsqlite_ext_path: Option<String>,
 ) -> (realtime_server::state::AppState, std::path::PathBuf, String) {
+    git_state_ext_with_debounce(ysweet_url, crsqlite_ext_path, 50).await
+}
+
+async fn git_state_ext_with_debounce(
+    ysweet_url: &str,
+    crsqlite_ext_path: Option<String>,
+    git_debounce_ms: u64,
+) -> (realtime_server::state::AppState, std::path::PathBuf, String) {
     let mut db_path = std::env::temp_dir();
     db_path.push(format!("realtime-test-{}.db", uuid::Uuid::new_v4()));
     let mut git_dir = std::env::temp_dir();
@@ -620,7 +628,7 @@ async fn git_state_ext(
         cors_allowed_origins: vec![],
         git_data_dir: git_dir.display().to_string(),
         git_enabled: true,
-        git_debounce_ms: 50,
+        git_debounce_ms,
         git_bot_name: "Realtime".into(),
         git_bot_email: "realtime@localhost".into(),
         git_inline_attachment_max_bytes: 5 * 1024 * 1024,
@@ -3419,6 +3427,99 @@ async fn search_tags_backlinks_reindex_and_rename_rewrite() {
         "expected rewritten link, got {}",
         alpha["content"]
     );
+}
+
+#[tokio::test]
+async fn search_refreshes_one_modified_note_without_waiting_for_git_debounce() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let (ys, docs) = fake_ysweet_store_with_docs().await;
+    let (state, _git_dir, vault_id) = git_state_ext_with_debounce(&ys, None, 5_000).await;
+    docs.lock().await.insert(
+        vault_id.clone(),
+        files_update(&[("one.md", "g1"), ("two.md", "g2")]),
+    );
+    docs.lock().await.insert(
+        format!("{vault_id}__g1"),
+        text_update("contents", "old search content"),
+    );
+    docs.lock().await.insert(
+        format!("{vault_id}__g2"),
+        text_update("contents", "unchanged content"),
+    );
+    realtime_server::search::reindex_vault(&state, &vault_id)
+        .await
+        .unwrap();
+    let backend = state.db.get_database_backend();
+    let unchanged_updated_at = state
+        .db
+        .query_one(Statement::from_sql_and_values(
+            backend,
+            "SELECT updated_at FROM note_search WHERE vault_id = ? AND guid = ?",
+            [
+                sea_orm::Value::from(vault_id.as_str()),
+                sea_orm::Value::from("g2"),
+            ],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "updated_at")
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    docs.lock().await.insert(
+        format!("{vault_id}__g1"),
+        text_update("contents", "new searchable content"),
+    );
+    let started = std::time::Instant::now();
+    state
+        .search
+        .mark_note_write(state.clone(), &vault_id, "g1")
+        .await;
+
+    let mut updated = false;
+    for _ in 0..40 {
+        let row = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                backend,
+                "SELECT body FROM note_fts WHERE vault_id = ? AND guid = ?",
+                [
+                    sea_orm::Value::from(vault_id.as_str()),
+                    sea_orm::Value::from("g1"),
+                ],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        if row.try_get::<String>("", "body").unwrap() == "new searchable content" {
+            updated = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(updated, "search index did not refresh within two seconds");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "search refresh followed the five-second git debounce"
+    );
+    let still_unchanged = state
+        .db
+        .query_one(Statement::from_sql_and_values(
+            backend,
+            "SELECT updated_at FROM note_search WHERE vault_id = ? AND guid = ?",
+            [
+                sea_orm::Value::from(vault_id.as_str()),
+                sea_orm::Value::from("g2"),
+            ],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "updated_at")
+        .unwrap();
+    assert_eq!(still_unchanged, unchanged_updated_at);
 }
 
 #[tokio::test]

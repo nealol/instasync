@@ -15,7 +15,7 @@ use crate::entities::{memberships, note_search, vaults};
 use crate::error::{AppError, AppResult};
 use crate::routes::require_member;
 use crate::session::{now_millis, ApiPrincipal};
-use crate::state::{AppState, Principal};
+use crate::state::AppState;
 use crate::ydoc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -554,36 +554,55 @@ pub async fn clear_fts_and_reindex(
 }
 
 struct VaultState {
-    dirty: bool,
+    full_reindex: bool,
+    dirty_guids: HashSet<String>,
     deadline: Instant,
     running: bool,
 }
 struct Inner {
-    config: Arc<Config>,
     vaults: Mutex<HashMap<String, VaultState>>,
 }
 
 #[derive(Clone)]
 pub struct SearchService(Arc<Inner>);
 
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
+
 impl SearchService {
-    pub fn new(config: Arc<Config>) -> Self {
+    pub fn new(_config: Arc<Config>) -> Self {
         Self(Arc::new(Inner {
-            config,
             vaults: Mutex::new(HashMap::new()),
         }))
     }
-    pub async fn mark_write(&self, state: AppState, vault_id: &str, _who: &Principal) {
+    /// Reconcile the whole vault after its path-to-guid index changes.
+    pub async fn mark_vault_write(&self, state: AppState, vault_id: &str) {
+        self.mark_write(state, vault_id, None).await;
+    }
+
+    /// Refresh one changed note without rereading every document in the vault.
+    pub async fn mark_note_write(&self, state: AppState, vault_id: &str, guid: &str) {
+        self.mark_write(state, vault_id, Some(guid)).await;
+    }
+
+    async fn mark_write(&self, state: AppState, vault_id: &str, guid: Option<&str>) {
         let mut vaults = self.0.vaults.lock().await;
         let entry = vaults
             .entry(vault_id.to_string())
             .or_insert_with(|| VaultState {
-                dirty: false,
+                full_reindex: false,
+                dirty_guids: HashSet::new(),
                 deadline: Instant::now(),
                 running: false,
             });
-        entry.dirty = true;
-        entry.deadline = Instant::now() + Duration::from_millis(self.0.config.git_debounce_ms);
+        if let Some(guid) = guid {
+            if !entry.full_reindex {
+                entry.dirty_guids.insert(guid.to_string());
+            }
+        } else {
+            entry.full_reindex = true;
+            entry.dirty_guids.clear();
+        }
+        entry.deadline = Instant::now() + SEARCH_DEBOUNCE;
         if !entry.running {
             entry.running = true;
             let svc = self.clone();
@@ -607,25 +626,37 @@ impl SearchService {
                     None => break,
                 }
             }
-            {
+            let (full_reindex, dirty_guids) = {
                 let mut vaults = self.0.vaults.lock().await;
                 if let Some(s) = vaults.get_mut(&vault_id) {
-                    if !s.dirty {
+                    if !s.full_reindex && s.dirty_guids.is_empty() {
                         s.running = false;
                         return;
                     }
-                    s.dirty = false;
+                    let full_reindex = std::mem::take(&mut s.full_reindex);
+                    let dirty_guids = std::mem::take(&mut s.dirty_guids);
+                    (full_reindex, dirty_guids)
                 } else {
                     return;
                 }
-            }
-            if let Err(e) = reindex_vault(&state, &vault_id).await {
-                tracing::error!("search reindex for vault {vault_id} failed: {e}");
+            };
+            if full_reindex {
+                if let Err(e) = reindex_vault(&state, &vault_id).await {
+                    tracing::error!("search reindex for vault {vault_id} failed: {e}");
+                }
+            } else {
+                for guid in dirty_guids {
+                    if let Err(e) = reindex_note(&state, &vault_id, &guid).await {
+                        tracing::error!(
+                            "search index refresh for vault {vault_id} note {guid} failed: {e}"
+                        );
+                    }
+                }
             }
             {
                 let mut vaults = self.0.vaults.lock().await;
                 if let Some(s) = vaults.get_mut(&vault_id) {
-                    if !s.dirty {
+                    if !s.full_reindex && s.dirty_guids.is_empty() {
                         s.running = false;
                         return;
                     }
@@ -635,6 +666,29 @@ impl SearchService {
             }
         }
     }
+}
+
+async fn reindex_note(state: &AppState, vault_id: &str, guid: &str) -> AppResult<()> {
+    let indexed = note_search::Entity::find()
+        .filter(note_search::Column::VaultId.eq(vault_id))
+        .filter(note_search::Column::Guid.eq(guid))
+        .one(&state.db)
+        .await?;
+    let path = if let Some(indexed) = indexed {
+        indexed.path
+    } else {
+        let update = ydoc::read_update(state, vault_id).await?;
+        let files =
+            ydoc::decode_files_map(&update).map_err(|e| AppError::Internal(e.to_string()))?;
+        let Some((path, _)) = files.into_iter().find(|(_, candidate)| candidate == guid) else {
+            return remove_note(state, vault_id, guid).await;
+        };
+        path
+    };
+    let update = ydoc::read_update(state, &format!("{vault_id}__{guid}")).await?;
+    let content =
+        ydoc::decode_text(&update, "contents").map_err(|e| AppError::Internal(e.to_string()))?;
+    index_note(state, vault_id, guid, &path, &content).await
 }
 
 pub fn spawn_startup_backfill(state: AppState) {

@@ -35,13 +35,18 @@ const db = await realtime.sql.open({
 // Remote cursors (robot identities with audited, Git-attributed edits):
 const cursor = await realtime.cursors.acquire({ pluginId: "my-plugin" });
 await cursor.notes.append("Log.md", "- did a thing");
+
+// Public URLs for a note and the current version of an attachment:
+const noteUrl = await realtime.shares.getNoteUrl("Reports/July.md");
+const attachmentUrl = await realtime.shares.getAttachmentUrl("assets/report.pdf");
 ```
 
 ## What's exported
 
-- `RealtimePluginApi` — the root surface (`sql`, `cursors`)
+- `RealtimePluginApi` — the root surface (`sql`, `cursors`, `shares`)
 - SQL: `RealtimeSql`, `OpenOptions`, `DatabaseHandle`, `SqlTx`, `MigrateFn`, `DbState`, `SqlValue`, `RemoteChange`, …
 - Cursors: `RealtimeCursors`, `RemoteCursorHandle`, `CursorNotesApi`, `CursorNote`, …
+- Public sharing: `RealtimeShares`
 - Replication wire format: `Batch`, `ChangeRow`, `Cursor`, `EncodedVal`
 
 For driving the Realtime *server* (REST, OAuth, streaming) from outside Obsidian, see [`@realtime-md/sdk`](https://www.npmjs.com/package/@realtime-md/sdk).
