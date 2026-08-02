@@ -19,6 +19,7 @@ import {
   type SyncFileState,
   type Workspace,
 } from "./config";
+import { forgetIgnoredAttachments, shouldSyncFile } from "./attachmentFilter";
 import { isExcluded, kindForPath } from "./kinds";
 
 export function hashBytes(bytes: Uint8Array): string {
@@ -65,6 +66,7 @@ export interface LocalEntry {
 export function scanLocal(
   dir: string,
   snapshot: Record<string, SyncFileState>,
+  config?: RtmdConfig,
 ): Map<string, LocalEntry> {
   const out = new Map<string, LocalEntry>();
   const walk = (sub: string) => {
@@ -77,9 +79,10 @@ export function scanLocal(
         continue;
       }
       if (!entry.isFile()) continue;
+      const kind = kindForPath(rel);
+      if (config && !shouldSyncFile(config, rel, kind)) continue;
       const abs = path.join(dir, rel);
       const stat = fs.statSync(abs);
-      const kind = kindForPath(rel);
       const snap = snapshot[rel];
       const hash =
         snap && snap.size === stat.size && snap.mtimeMs === stat.mtimeMs
@@ -101,16 +104,23 @@ export interface RemoteEntry {
   guid?: string;
 }
 
-export async function listRemote(vault: VaultHandle): Promise<Map<string, RemoteEntry>> {
+export async function listRemote(
+  vault: VaultHandle,
+  config?: RtmdConfig,
+): Promise<Map<string, RemoteEntry>> {
   const [notes, attachments, canvases, bases] = await Promise.all([
     vault.notes.list(),
-    vault.attachments.list(),
+    config?.attachmentSync?.enabled === false ? Promise.resolve([]) : vault.attachments.list(),
     vault.canvases.list(),
     vault.bases.list(),
   ]);
   const out = new Map<string, RemoteEntry>();
   for (const n of notes) out.set(n.path, { kind: "note", guid: n.guid });
-  for (const a of attachments) out.set(a.path, { kind: "attachment", hash: a.hash });
+  for (const a of attachments) {
+    if (!config || shouldSyncFile(config, a.path, "attachment")) {
+      out.set(a.path, { kind: "attachment", hash: a.hash });
+    }
+  }
   for (const c of canvases) out.set(c.path, { kind: "canvas", guid: c.guid });
   for (const b of bases) out.set(b.path, { kind: "base", guid: b.guid });
   return out;
@@ -228,8 +238,9 @@ export async function pull(
 ): Promise<SyncReport> {
   const sync = ensureSync(ws.config);
   const snapshot = sync.files;
-  const local = scanLocal(ws.dir, snapshot);
-  const remote = await listRemote(vault);
+  forgetIgnoredAttachments(ws.config, snapshot);
+  const local = scanLocal(ws.dir, snapshot, ws.config);
+  const remote = await listRemote(vault, ws.config);
   const report: SyncReport = { applied: [], conflicts: [] };
 
   for (const [relPath, r] of remote) {
@@ -334,8 +345,9 @@ export async function push(
 ): Promise<SyncReport> {
   const sync = ensureSync(ws.config);
   const snapshot = sync.files;
-  const local = scanLocal(ws.dir, snapshot);
-  const remote = await listRemote(vault);
+  forgetIgnoredAttachments(ws.config, snapshot);
+  const local = scanLocal(ws.dir, snapshot, ws.config);
+  const remote = await listRemote(vault, ws.config);
   const report: SyncReport = { applied: [], conflicts: [] };
 
   for (const [relPath, l] of local) {

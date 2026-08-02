@@ -5,13 +5,13 @@ import { CliError } from "../config";
 import { ctxFrom, out, vaultClients } from "../context";
 
 function readStdin(): Promise<string> {
-  const { promise, resolve, reject } = Promise.withResolvers<string>();
-  let value = "";
-  process.stdin.setEncoding("utf8");
-  process.stdin.on("data", (chunk) => (value += chunk));
-  process.stdin.on("end", () => resolve(value));
-  process.stdin.on("error", reject);
-  return promise;
+  return new Promise((resolve, reject) => {
+    let value = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => (value += chunk));
+    process.stdin.on("end", () => resolve(value));
+    process.stdin.on("error", reject);
+  });
 }
 
 function parseBatch(text: string, mutationId?: string): CanvasOperationBatch {

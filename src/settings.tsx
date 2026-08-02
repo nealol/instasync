@@ -32,6 +32,7 @@ import {
   defaultConfigSyncCategories,
   type ConfigSyncCategories,
 } from "./configCategories";
+import { TechnicalDetails } from "./TechnicalDetails";
 
 export interface RealtimeSettings {
   /** Base URL of the Realtime auth server, e.g. http://127.0.0.1:8081 */
@@ -572,7 +573,36 @@ function FullSettings({
       <DeviceSection plugin={plugin} />
       <VaultDetails app={app} plugin={plugin} />
       <AdvancedSettings app={app} plugin={plugin} refresh={refresh} />
+      <SettingsTechnicalDetails plugin={plugin} />
     </>
+  );
+}
+
+function SettingsTechnicalDetails({ plugin }: { plugin: RealtimePlugin }) {
+  const [serverVersion, setServerVersion] = useState("Checking…");
+  useEffect(() => {
+    let cancelled = false;
+    void plugin.auth
+      .serverInfoChecked(plugin.settings.authServerUrl)
+      .then((info) => {
+        if (!cancelled) setServerVersion(info.version ?? "Not reported");
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setServerVersion(plugin.lastCompatibilityError?.serverVersion ?? "Unavailable");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [plugin, plugin.settings.authServerUrl]);
+
+  return (
+    <TechnicalDetails
+      clientVersion={plugin.manifest.version}
+      serverVersion={serverVersion}
+      vaultId={plugin.settings.activeVaultId}
+    />
   );
 }
 
@@ -586,9 +616,7 @@ function initials(name: string): string {
 function AccountSection({ plugin, refresh }: { plugin: RealtimePlugin; refresh: () => void }) {
   const [gitEmail, setGitEmail] = useState(plugin.settings.gitEmail || "");
   const [emailError, setEmailError] = useState("");
-  const [avatarOverride, setAvatarOverride] = useState(
-    plugin.settings.userAvatarUrlOverride || "",
-  );
+  const [avatarOverride, setAvatarOverride] = useState(plugin.settings.userAvatarUrlOverride || "");
   const [avatarError, setAvatarError] = useState("");
   return (
     <>
@@ -611,11 +639,7 @@ function AccountSection({ plugin, refresh }: { plugin: RealtimePlugin; refresh: 
         }
       />
       {plugin.settings.userAvatarUrl ? (
-        <img
-          className="realtime-account-avatar"
-          src={plugin.settings.userAvatarUrl}
-          alt=""
-        />
+        <img className="realtime-account-avatar" src={plugin.settings.userAvatarUrl} alt="" />
       ) : (
         <div className="realtime-account-avatar is-fallback">
           {initials(plugin.settings.userDisplayName || plugin.settings.userEmail)}

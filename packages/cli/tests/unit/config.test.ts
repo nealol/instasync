@@ -44,6 +44,11 @@ describe(".rtmd round-trip", () => {
     fs.writeFileSync(path.join(dir, ".rtmd"), JSON.stringify({ version: 1 }));
     expect(() => readRtmd(dir)).toThrow(/required fields/);
   });
+
+  it("rejects malformed attachment sync settings", () => {
+    fs.writeFileSync(path.join(dir, ".rtmd"), JSON.stringify({ ...config, attachmentSync: null }));
+    expect(() => readRtmd(dir)).toThrow(/invalid attachmentSync settings/);
+  });
 });
 
 describe("findRtmdDir / requireWorkspace", () => {

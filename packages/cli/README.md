@@ -17,6 +17,10 @@ Commands locate it by walking up parent directories, like a git root. The file
 is never synced (along with all dot-files/dot-directories and symlinks), and it
 contains tokens — add it to `.gitignore` if the folder is also a git repo.
 
+To find the bound vault ID, run `rtmd whoami`; its human and `--json` output
+include the ID. It is also stored as `vaultId` in `.rtmd`. In Obsidian, open
+**Settings → Realtime → Technical details** at the bottom of the settings page.
+
 ## Getting a folder
 
 ```sh
@@ -52,6 +56,21 @@ listings. `.md` files sync as notes, `.canvas`/`.base` as structured JSON docs,
 everything else as binary attachments. `status` cannot see remote edits to
 notes/canvases/bases (only attachments carry a listing hash); `pull` detects
 them by fetching content.
+
+Attachment sync is configured per bound folder:
+
+```sh
+rtmd config attachments off
+rtmd config attachments on --include "assets/**,**/*.pdf"
+rtmd config attachments on --all
+rtmd config attachments             # show the current policy
+```
+
+Include globs match vault-relative paths. Non-matching attachments are ignored
+locally and remotely: sync commands do not upload, download, or delete them.
+Turning attachment sync off ignores every attachment while notes, Canvases,
+and Bases continue to sync. Use `clone` or `init` with `--no-attachments` or
+`--attachment-filter <globs>` to apply the setting before the first sync.
 
 ## Everything else
 

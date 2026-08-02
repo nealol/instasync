@@ -13,6 +13,7 @@ import {
 } from "../config";
 import { ctxFrom, out, vaultClients, type Ctx } from "../context";
 import { ask } from "../prompt";
+import { filteredSnapshot, parseAttachmentGlobs } from "../attachmentFilter";
 import { classifyStatus, listRemote, pull, push, scanLocal, type SyncReport } from "../sync";
 
 function reportSync(ctx: Ctx, report: SyncReport, direction: "pull" | "push"): void {
@@ -43,10 +44,21 @@ export function registerWorkspaceCommands(program: Command): void {
     .option("--name <name>", "vault name (defaults to the folder name)")
     .option("--base-url <url>", "server origin")
     .option("--paste", "paste a session token instead of using the browser")
+    .option("--no-attachments", "ignore all non-Markdown attachments")
+    .option(
+      "--attachment-filter <globs>",
+      "comma-separated attachment include globs; non-matches are ignored",
+    )
     .action(
       async (
         dirArg: string | undefined,
-        opts: { name?: string; baseUrl?: string; paste?: boolean },
+        opts: {
+          name?: string;
+          baseUrl?: string;
+          paste?: boolean;
+          attachments: boolean;
+          attachmentFilter?: string;
+        },
       ) => {
         const ctx = ctxFrom(program);
         const dir = path.resolve(ctx.startDir, dirArg ?? ".");
@@ -64,6 +76,10 @@ export function registerWorkspaceCommands(program: Command): void {
           vaultId: vault.id,
           vaultName: vault.name,
           auth,
+          attachmentSync: {
+            enabled: opts.attachments,
+            includeGlobs: parseAttachmentGlobs(opts.attachmentFilter ?? ""),
+          },
         };
         writeRtmd(dir, config);
         process.stderr.write(
@@ -81,6 +97,11 @@ export function registerWorkspaceCommands(program: Command): void {
     .description("download a vault into a new folder and bind it")
     .option("--base-url <url>", "server origin")
     .option("--paste", "paste a session token instead of using the browser")
+    .option("--no-attachments", "ignore all non-Markdown attachments")
+    .option(
+      "--attachment-filter <globs>",
+      "comma-separated attachment include globs; non-matches are ignored",
+    )
     .option(
       "--cursor-token <token>",
       "authenticate as a remote cursor (vault must be an id; no browser login)",
@@ -93,7 +114,14 @@ export function registerWorkspaceCommands(program: Command): void {
       async (
         vaultArg: string,
         dirArg: string | undefined,
-        opts: { baseUrl?: string; paste?: boolean; cursorToken?: string; cursorOauth?: string },
+        opts: {
+          baseUrl?: string;
+          paste?: boolean;
+          cursorToken?: string;
+          cursorOauth?: string;
+          attachments: boolean;
+          attachmentFilter?: string;
+        },
       ) => {
         const ctx = ctxFrom(program);
         let baseUrl = opts.baseUrl;
@@ -128,7 +156,17 @@ export function registerWorkspaceCommands(program: Command): void {
         fs.mkdirSync(dir, { recursive: true });
         ensureUnbound(dir);
 
-        const config: RtmdConfig = { version: 1, baseUrl: baseUrl!, vaultId, vaultName, auth };
+        const config: RtmdConfig = {
+          version: 1,
+          baseUrl: baseUrl!,
+          vaultId,
+          vaultName,
+          auth,
+          attachmentSync: {
+            enabled: opts.attachments,
+            includeGlobs: parseAttachmentGlobs(opts.attachmentFilter ?? ""),
+          },
+        };
         writeRtmd(dir, config);
         process.stderr.write(`Cloning into ${dir}…\n`);
 
@@ -144,9 +182,9 @@ export function registerWorkspaceCommands(program: Command): void {
     .action(async () => {
       const ctx = ctxFrom(program);
       const { ws, vault } = vaultClients(ctx);
-      const snapshot = ws.config.sync?.files ?? {};
-      const local = scanLocal(ws.dir, snapshot);
-      const remote = await listRemote(vault);
+      const snapshot = filteredSnapshot(ws.config, ws.config.sync?.files ?? {});
+      const local = scanLocal(ws.dir, snapshot, ws.config);
+      const remote = await listRemote(vault, ws.config);
       const entries = classifyStatus(local, snapshot, remote);
       out(ctx, entries, () => {
         if (entries.length === 0) {

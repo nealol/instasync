@@ -1298,7 +1298,7 @@ async fn server_info_returns_stable_id_without_auth() {
 
     // Release version is advertised (operator-facing; not used for gating).
     let version = info["version"].as_str().expect("version string");
-    assert!(!version.is_empty());
+    assert_eq!(version, env!("CARGO_PKG_VERSION"));
 
     // Named capability versions are advertised for client-side gating.
     let caps = info["caps"].as_object().expect("caps object");
@@ -2223,6 +2223,37 @@ async fn attachment_upload_list_read_delete_roundtrip() {
     let (status, list) = send(&app, "GET", &list_url, Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(list.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn authenticated_attachment_upload_accepts_arbitrary_vault_files() {
+    let ys = fake_ysweet_store().await;
+    let app = test_app(&ys, &ys).await;
+    let token = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&token),
+        Some(json!({"name": "Notes"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap();
+
+    for (path, payload) in [
+        ("data/config.json", b"{\"enabled\":true}".as_slice()),
+        ("archives/backup.zip", b"zip bytes".as_slice()),
+        ("LICENSE", b"license text".as_slice()),
+    ] {
+        let url = format!("/api/vaults/{vault_id}/attachments/{path}");
+        let (status, _) = send_raw(&app, "PUT", &url, Some(&token), payload.to_vec()).await;
+        assert_eq!(status, StatusCode::OK, "failed to upload {path}");
+    }
+
+    let list_url = format!("/api/vaults/{vault_id}/attachments");
+    let (status, list) = send(&app, "GET", &list_url, Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list.as_array().unwrap().len(), 3);
 }
 
 #[tokio::test]

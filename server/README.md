@@ -130,7 +130,7 @@ in the Obsidian plugin's **Auth server URL** and you're done.
 | `DAILY_NOTE_PATH_TEMPLATE` | `Daily Notes/{{YYYY-MM-DD}}.md` | Daily periodic note template |
 | `WEEKLY_NOTE_PATH_TEMPLATE` / `MONTHLY_NOTE_PATH_TEMPLATE` / `QUARTERLY_NOTE_PATH_TEMPLATE` / `YEARLY_NOTE_PATH_TEMPLATE` | — | Optional periodic note templates |
 | `ATTACHMENT_FETCH_HOST_ALLOWLIST` | — | Comma-separated hostnames allowed for server-side attachment fetches from URL |
-| `ATTACHMENT_ALLOWED_EXTENSIONS` | common images, `pdf`, `txt` | Comma-separated allowed attachment extensions |
+| `ATTACHMENT_ALLOWED_EXTENSIONS` | common images, `pdf`, `txt` | Comma-separated extensions allowed for signed and server-fetched uploads; `*` allows every extension and extensionless files |
 | `ATTACHMENT_MAX_BYTES` | raw blob max | Per-attachment upload/fetch size cap |
 | `ATTACHMENTS_PATH_MODE` | `relative` | `relative` or `subfolder`; `subfolder` requires attachment paths under `ATTACHMENTS_SUBFOLDER` |
 | `ATTACHMENTS_SUBFOLDER` | — | Required for subfolder path mode and used as the default signed-upload landing directory |

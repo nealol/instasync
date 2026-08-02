@@ -41,12 +41,20 @@ export interface SyncState {
   files: Record<string, SyncFileState>;
 }
 
+export interface AttachmentSyncSettings {
+  /** False means sync commands ignore every attachment locally and remotely. */
+  enabled: boolean;
+  /** Empty means every attachment; otherwise only matching vault-relative paths sync. */
+  includeGlobs: string[];
+}
+
 export interface RtmdConfig {
   version: 1;
   baseUrl: string;
   vaultId: string;
   vaultName?: string;
   auth?: AuthConfig;
+  attachmentSync?: AttachmentSyncSettings;
   sync?: SyncState;
 }
 
@@ -78,6 +86,16 @@ export function readRtmd(dir: string): RtmdConfig {
   const cfg = parsed as RtmdConfig;
   if (cfg.version !== 1 || typeof cfg.baseUrl !== "string" || typeof cfg.vaultId !== "string") {
     throw new CliError(`${file} is missing required fields (version, baseUrl, vaultId)`);
+  }
+  if (
+    cfg.attachmentSync !== undefined &&
+    (cfg.attachmentSync === null ||
+      typeof cfg.attachmentSync !== "object" ||
+      typeof cfg.attachmentSync.enabled !== "boolean" ||
+      !Array.isArray(cfg.attachmentSync.includeGlobs) ||
+      !cfg.attachmentSync.includeGlobs.every((glob) => typeof glob === "string"))
+  ) {
+    throw new CliError(`${file} has invalid attachmentSync settings`);
   }
   return cfg;
 }

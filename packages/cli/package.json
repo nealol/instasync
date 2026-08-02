@@ -27,10 +27,11 @@
 		"release": "npm publish --access public"
 	},
 	"dependencies": {
-		"@realtime-md/sdk": "workspace:*",
-		"commander": "^14.0.0"
+		"commander": "^14.0.0",
+		"picomatch": "^4.0.3"
 	},
 	"devDependencies": {
+		"@realtime-md/sdk": "workspace:*",
 		"@types/node": "^20.11.0",
 		"tsup": "^8.5.0",
 		"typescript": "^5.4.5"

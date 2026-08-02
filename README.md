@@ -78,7 +78,7 @@ The SQLite database **and** the y-sweet document store both live under the
 | `BIND_ADDR` | `0.0.0.0:8081` | Listen address inside the container |
 | `DATABASE_URL` | `sqlite:///data/realtime.db?mode=rwc` | SeaORM SQLite URL |
 | `UPLOAD_TOKEN` | `dev-upload-token-change-me` | HMAC key for signed single-use browser upload links; set a long random secret in production |
-| `ATTACHMENT_ALLOWED_EXTENSIONS` | common images, `pdf`, `txt` | Comma-separated allowed attachment extensions, without or with leading dots |
+| `ATTACHMENT_ALLOWED_EXTENSIONS` | common images, `pdf`, `txt` | Comma-separated extensions allowed for signed and server-fetched uploads; `*` allows every extension and extensionless files |
 | `ATTACHMENT_MAX_BYTES` | raw blob max | Per-attachment upload/fetch size cap; separate from the raw content-addressed blob store cap |
 | `ATTACHMENTS_PATH_MODE` | `relative` | `relative` allows any valid vault-relative attachment path; `subfolder` requires paths under `ATTACHMENTS_SUBFOLDER` |
 | `ATTACHMENTS_SUBFOLDER` | — | Required when `ATTACHMENTS_PATH_MODE=subfolder`; also used as the default signed-upload landing directory |
@@ -113,11 +113,28 @@ and `/api/doc-token`.
 
 The status bar shows `Realtime: connecting… / live / error`.
 
+The plugin and server versions plus the active vault ID are under
+**Settings → Realtime → Technical details** at the bottom of the page.
+
 ### Working together in Canvas
 
 Open the same `.canvas` file on two joined devices. Durable edits sync during a drag instead of waiting for Obsidian's delayed save, while remote selections and drag outlines appear without writing transient data into the file. Click a collaborator label to follow their pan and zoom; any local pan, zoom, file change, or collaborator departure stops follow mode.
 
 If the plugin can't use the installed Obsidian version's private Canvas methods, editing still works through full Canvas imports or disk write-through. A small loading notice appears when a Canvas references a synced binary that hasn't arrived yet. Markdown links in file nodes don't enter binary sync.
+
+## CLI
+
+The [`rtmd` CLI](packages/cli/README.md) can bind a local folder to a vault and
+run explicit pull/push syncs. Attachment sync is configured per bound folder:
+
+```sh
+rtmd config attachments off
+rtmd config attachments on --include "assets/**,**/*.pdf"
+rtmd config attachments on --all
+```
+
+Non-matching attachments are ignored locally and remotely. Run `rtmd whoami`
+to see the bound vault ID.
 
 ## Plugin SQL API for developers
 

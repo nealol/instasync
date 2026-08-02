@@ -410,7 +410,7 @@ pub(crate) async fn upload_attachment_url_inner(
 ) -> AppResult<UploadAttachmentResponse> {
     principal.require_vault(vault_id)?;
     require_member(state, &principal.user.id, vault_id).await?;
-    validate_attachment_path(state, &body.path)?;
+    validate_external_upload_path(state, &body.path)?;
     let url = validate_source_url(state, &body.source_url)?;
     let res = state
         .http
@@ -578,7 +578,7 @@ async fn public_upload_inner(
         requested_path.as_deref(),
         file_name.as_deref(),
     )?;
-    validate_attachment_path(state, &path)?;
+    validate_external_upload_path(state, &path)?;
     validate_magic_for_path(&path, &bytes)?;
 
     upload_jtis::ActiveModel {
@@ -771,23 +771,30 @@ fn validate_attachment_path(state: &AppState, path: &str) -> AppResult<()> {
             ));
         }
     }
-    let ext = path
-        .rsplit('.')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if ext.is_empty()
-        || !state
-            .config
-            .attachment_allowed_extensions
-            .iter()
-            .any(|allowed| allowed == &ext)
-    {
+    Ok(())
+}
+
+fn validate_external_upload_path(state: &AppState, path: &str) -> AppResult<()> {
+    validate_attachment_path(state, path)?;
+    if !attachment_extension_allowed(&state.config.attachment_allowed_extensions, path) {
         return Err(AppError::BadRequest(
             "attachment extension not allowed".into(),
         ));
     }
     Ok(())
+}
+
+fn attachment_extension_allowed(allowed_extensions: &[String], path: &str) -> bool {
+    if allowed_extensions.iter().any(|allowed| allowed == "*") {
+        return true;
+    }
+    let Some((_, ext)) = path.rsplit_once('.') else {
+        return false;
+    };
+    !ext.is_empty()
+        && allowed_extensions
+            .iter()
+            .any(|allowed| allowed == &ext.to_ascii_lowercase())
 }
 
 fn blob_path(state: &AppState, vault_id: &str, hash: &str) -> AppResult<PathBuf> {
@@ -1004,4 +1011,25 @@ fn hex_lower(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::attachment_extension_allowed;
+
+    #[test]
+    fn wildcard_allows_arbitrary_and_extensionless_vault_files() {
+        let allowed = vec!["*".to_string()];
+        assert!(attachment_extension_allowed(&allowed, "data/config.json"));
+        assert!(attachment_extension_allowed(&allowed, "assets/archive.zip"));
+        assert!(attachment_extension_allowed(&allowed, "LICENSE"));
+    }
+
+    #[test]
+    fn explicit_extension_allowlist_remains_restrictive() {
+        let allowed = vec!["png".to_string(), "pdf".to_string()];
+        assert!(attachment_extension_allowed(&allowed, "image.PNG"));
+        assert!(!attachment_extension_allowed(&allowed, "data.json"));
+        assert!(!attachment_extension_allowed(&allowed, "LICENSE"));
+    }
 }

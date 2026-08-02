@@ -7,6 +7,19 @@ import { readRtmd, writeRtmd, type RtmdConfig } from "../config";
 import { ctxFrom, out, workspace } from "../context";
 import { ask } from "../prompt";
 
+export function configAfterLogin(
+  existing: RtmdConfig | undefined,
+  next: Omit<RtmdConfig, "version" | "sync" | "attachmentSync">,
+): RtmdConfig {
+  const sameVault = existing?.vaultId === next.vaultId;
+  return {
+    version: 1,
+    ...next,
+    ...(existing?.attachmentSync ? { attachmentSync: existing.attachmentSync } : {}),
+    ...(sameVault && existing.sync ? { sync: existing.sync } : {}),
+  };
+}
+
 export function registerAuthCommands(program: Command): void {
   program
     .command("login [dir]")
@@ -34,15 +47,12 @@ export function registerAuthCommands(program: Command): void {
         const vault = await chooseVault(session.client, opts.vault ?? existing?.vaultId);
         const auth = await settleFolderAuth(session, vault, dir);
 
-        const config: RtmdConfig = {
-          version: 1,
+        const config = configAfterLogin(existing, {
           baseUrl: session.baseUrl,
           vaultId: vault.id,
           vaultName: vault.name,
           auth,
-          // Keep the snapshot only when the folder stays bound to the same vault.
-          sync: existing && existing.vaultId === vault.id ? existing.sync : undefined,
-        };
+        });
         writeRtmd(dir, config);
         process.stderr.write(
           `Logged in. ${dir} is bound to vault "${vault.name}" (${auth.mode} auth). Run \`rtmd pull\` to download it.\n`,
@@ -93,11 +103,12 @@ export function registerAuthCommands(program: Command): void {
         vaultName: ws.config.vaultName,
         authMode: auth?.mode ?? null,
       };
+      const vaultLabel = base.vaultName ? `${base.vaultName} (${base.vaultId})` : base.vaultId;
       if (auth?.mode === "user") {
         const me = await requireUserClient(ws).me();
         out(ctx, { ...base, ...me }, () => {
           process.stdout.write(`${me.displayName} <${me.email}> (user session)\n`);
-          process.stdout.write(`vault: ${base.vaultName ?? base.vaultId} @ ${base.baseUrl}\n`);
+          process.stdout.write(`vault: ${vaultLabel} @ ${base.baseUrl}\n`);
         });
       } else if (auth) {
         const cursorName = "cursorName" in auth ? auth.cursorName : undefined;
@@ -105,13 +116,11 @@ export function registerAuthCommands(program: Command): void {
           process.stdout.write(
             `remote cursor${cursorName ? ` "${cursorName}"` : ""} (${auth.mode} auth)\n`,
           );
-          process.stdout.write(`vault: ${base.vaultName ?? base.vaultId} @ ${base.baseUrl}\n`);
+          process.stdout.write(`vault: ${vaultLabel} @ ${base.baseUrl}\n`);
         });
       } else {
         out(ctx, base, () => {
-          process.stdout.write(
-            `not logged in (vault binding: ${base.vaultName ?? base.vaultId} @ ${base.baseUrl})\n`,
-          );
+          process.stdout.write(`not logged in (vault binding: ${vaultLabel} @ ${base.baseUrl})\n`);
         });
       }
     });
