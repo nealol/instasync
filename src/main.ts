@@ -8,7 +8,7 @@ import type { UploadStatus } from "./BinarySync";
 import { matchesAnyGlob, parseGlobs } from "./glob";
 import type { SyncedDoc } from "./SyncedDoc";
 import { AuthClient, AuthError, normalizeServerUrl } from "./auth";
-import { CompatibilityError } from "./caps";
+
 import { PLUGIN_NAME } from "./brand";
 import { liveEdit } from "./editor/LiveEdit";
 import { yRemoteSelections, yRemoteSelectionsTheme } from "./editor/RemoteSelections";
@@ -22,6 +22,7 @@ import { RealtimeCursorsAPI } from "./cursors/api";
 import { RealtimeSharesAPI } from "./shares/api";
 import { SQL_QUERY_VIEW_TYPE, SqlQueryView } from "./sql/SqlQueryView";
 import { setDocumentEpoch, setEpochProposalHandler } from "./documentEpoch";
+import { CompatibilityError } from "./caps";
 import type {
   RealtimeCursors,
   RealtimePluginApi,
@@ -295,22 +296,19 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
       this.setStatus("signin");
       return;
     }
-    // Resolve this server's stable id and migrate any legacy token into the
-    // per-server SecretStorage key. Best-effort for network/offline errors
-    // (tolerate offline startups, where the legacy key keeps working until we
-    // can reach the server), but hard-block on compatibility failures: a cap
-    // mismatch means continuing would corrupt state or hit immediate API
-    // errors, so do not proceed to me()/startSync().
+    // Resolve this server's stable id and prove its mandatory capabilities
+    // before any provider is constructed. Offline local use remains available,
+    // and later lifecycle calls retry this prerequisite.
     try {
       await this.auth.ensureServerId();
-    } catch (e) {
-      if (e instanceof CompatibilityError) {
-        // lastCompatibilityError is already set by serverInfoChecked; surface
-        // it as the sync status and stop. Do not fall through to me().
+    } catch (error) {
+      if (error instanceof CompatibilityError) {
         this.setStatus("offline");
         return;
       }
-      // Other errors (network/offline) are tolerated as before.
+      // Network failures still permit the persisted offline vault to load.
+      // VaultSync independently gates every provider connection on a
+      // successful server-info capability check.
     }
     // Validate the session; a 401 clears it. Other (network) errors are
     // tolerated so we can still start and let the providers retry.

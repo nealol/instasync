@@ -106,7 +106,7 @@ export class ConfigSync {
   private localSyncState?: LocalSyncState;
   private enabledCategories = new Set<ConfigCategoryId>();
   private lastSyncedHash = new Map<string, string>();
-  private chains = new Map<string, Promise<void>>();
+  private chains = new Map<string, Promise<boolean>>();
   private writing = new Set<string>();
   private pollTimer: number | null = null;
   private started = false;
@@ -213,24 +213,28 @@ export class ConfigSync {
     if (this.paused) return;
     this.initialPull = true;
     try {
-      await this.reconcileAll();
-      if (!this.paused && !this.destroyed) this.initialPullComplete = true;
+      const complete = await this.reconcileAll();
+      if (complete && !this.paused && !this.destroyed) this.initialPullComplete = true;
     } finally {
       this.initialPull = !this.initialPullComplete;
     }
   }
 
-  async reconcileAll(): Promise<void> {
-    if (this.destroyed || !this.started || this.paused) return;
+  async reconcileAll(): Promise<boolean> {
+    if (this.destroyed || !this.started || this.paused) return false;
     const paths = new Set<string>();
     for (const path of this.configFiles.keys()) {
       if (!this.isHardExcluded(path)) paths.add(path);
     }
-    for (const path of await this.localConfigPaths()) paths.add(path);
+    const localPaths = await this.localConfigPaths();
+    if (localPaths === undefined) return false;
+    for (const path of localPaths) paths.add(path);
+    let complete = true;
     for (const path of paths) {
-      await this.reconcile(path);
-      if (this.destroyed) return;
+      complete = (await this.reconcile(path)) && complete;
+      if (this.destroyed) return false;
     }
+    return complete;
   }
 
   private onConfigFilesChanged(event: Y.YMapEvent<ConfigMeta>): void {
@@ -240,14 +244,15 @@ export class ConfigSync {
     });
   }
 
-  private reconcile(path: string): Promise<void> {
-    if (this.syncableCategory(path) === null) return Promise.resolve();
-    if (this.writing.has(path)) return Promise.resolve();
-    const prev = this.chains.get(path) ?? Promise.resolve();
+  private reconcile(path: string): Promise<boolean> {
+    if (this.syncableCategory(path) === null) return Promise.resolve(true);
+    if (this.writing.has(path)) return Promise.resolve(true);
+    const prev = this.chains.get(path) ?? Promise.resolve(true);
     const next = prev
       .then(() => this.reconcileNow(path))
       .catch((e) => {
         console.error(`[Realtime] config reconcile failed for ${path}`, e);
+        return false;
       });
     this.chains.set(path, next);
     void next.finally(() => {
@@ -256,14 +261,14 @@ export class ConfigSync {
     return next;
   }
 
-  private async reconcileNow(path: string): Promise<void> {
-    if (this.destroyed || this.paused) return;
+  private async reconcileNow(path: string): Promise<boolean> {
+    if (this.destroyed || this.paused) return false;
     const generation = this.pauseGeneration;
     const local = await this.localInfo(path);
-    if (local === undefined || !this.canApply(generation)) {
-      if (!this.destroyed) void this.reconcile(path);
-      return;
-    }
+    // Adapter failures are retried by the bounded poll/focus/resume lifecycle.
+    // Re-enqueueing here resolves the current chain and immediately starts a
+    // new one, producing an unbounded microtask + adapter-I/O loop.
+    if (local === undefined || !this.canApply(generation)) return false;
     if (local && !this.localSyncState?.has(path)) {
       this.localSyncState?.beginCandidate(path, "config", local.hash, local.hash);
     }
@@ -281,7 +286,7 @@ export class ConfigSync {
       const localBytes = await this.plugin.app.vault.adapter.readBinary(path);
       if (!this.canApply(generation)) {
         void this.reconcile(path);
-        return;
+        return false;
       }
       const preservedPath = await preserveAdapterConflict(this.plugin, path, localBytes, "local");
       new Notice(
@@ -289,16 +294,16 @@ export class ConfigSync {
       );
       if (!(await this.configStateMatches(path, local.hash, remote.hash))) {
         void this.reconcile(path);
-        return;
+        return false;
       }
       await this.download(path, remote, local.hash, generation);
-      return;
+      return this.canApply(generation);
     }
     if (local && !remote && base !== null && base !== local.hash) {
       const localBytes = await this.plugin.app.vault.adapter.readBinary(path);
       if (!this.canApply(generation)) {
         void this.reconcile(path);
-        return;
+        return false;
       }
       const preservedPath = await preserveAdapterConflict(this.plugin, path, localBytes, "local");
       new Notice(
@@ -306,10 +311,10 @@ export class ConfigSync {
       );
       if (!(await this.configStateMatches(path, local.hash, null))) {
         void this.reconcile(path);
-        return;
+        return false;
       }
       await this.deleteLocal(path, generation);
-      return;
+      return this.canApply(generation);
     }
 
     const action = decideConfigReconcile(local, remote, base, {
@@ -321,7 +326,7 @@ export class ConfigSync {
         this.lastSyncedHash.set(path, remote.hash);
         this.localSyncState?.markSynced(path, "config", remote.hash, remote.hash);
       } else this.lastSyncedHash.delete(path);
-      return;
+      return true;
     }
     if (action === "upload" && local) {
       await this.upload(path, local, remote?.hash ?? null, generation);
@@ -331,26 +336,28 @@ export class ConfigSync {
     else if (action === "deleteRemote") this.publishDelete(path, generation);
     else if (action === "merge" && local && remote)
       await this.mergeConflict(path, local, remote, generation);
+    return this.canApply(generation);
   }
 
-  private async localConfigPaths(): Promise<string[]> {
+  private async localConfigPaths(): Promise<string[] | undefined> {
     const paths: string[] = [];
-    await this.walk(this.configRoot, paths);
+    if (!(await this.walk(this.configRoot, paths))) return undefined;
     return paths.filter((path) => this.syncableCategory(path) !== null);
   }
 
-  private async walk(folder: string, paths: string[]): Promise<void> {
+  private async walk(folder: string, paths: string[]): Promise<boolean> {
     let listed: { files: string[]; folders: string[] };
     try {
       listed = await this.plugin.app.vault.adapter.list(folder);
     } catch {
-      return;
+      return false;
     }
     for (const file of listed.files) paths.push(file);
     for (const child of listed.folders) {
       if (this.isHardExcluded(child)) continue;
-      await this.walk(child, paths);
+      if (!(await this.walk(child, paths))) return false;
     }
+    return true;
   }
 
   private async localInfo(path: string): Promise<ConfigMeta | null | undefined> {

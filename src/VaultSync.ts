@@ -26,7 +26,7 @@ import { LocalSyncState, shouldFoldOfflineDeletion, type MaterializedKind } from
 import { isConflictCopy, preserveTextConflict } from "./conflictRecovery";
 export { isConflictCopy } from "./conflictRecovery";
 import { sha256Text } from "./hash";
-import { CompatibilityError } from "./caps";
+
 
 type FileKind = "text" | "structured" | "binary" | "ignore";
 type StructuredKind = "canvas" | "base";
@@ -263,16 +263,12 @@ export class VaultSync {
       if (this.destroyed || this.mobileSuspended) return;
       this.scheduleMobileWorkingSetTrim();
       await this.indexProvider.connect();
-    } catch (error) {
+    } catch {
       if (this.destroyed) return;
-      if (error instanceof CompatibilityError) {
-        this.indexProvider.disconnect();
-        this.plugin.setStatus("offline");
-        return;
-      }
-      // The client remains usable offline and retries through its normal
-      // lifecycle; only a verified incompatibility may hard-block syncing.
-      await this.indexProvider.connect();
+      // Local documents remain available offline, but no provider may open
+      // until this server has proved the mandatory capability contract.
+      this.indexProvider.disconnect();
+      this.plugin.setStatus("offline");
     }
   }
 
@@ -887,11 +883,15 @@ export class VaultSync {
   }
 
   private queueMobileReconnects(): void {
-    for (const [path, guid] of this.files.entries()) {
-      this.enqueueReconnect({ path, guid, kind: "text" });
+    // Catch up only the resident working set. Walking the full index here
+    // recreates every hibernated document and defeats mobileMaxResidentDocs.
+    for (const [path, doc] of this.documents.entries()) {
+      const guid = this.files.get(path);
+      if (guid === doc.guid) this.enqueueReconnect({ path, guid, kind: "text" });
     }
-    for (const [path, meta] of this.structured.entries()) {
-      if (isStructuredMeta(meta)) {
+    for (const [path, doc] of this.structuredDocuments.entries()) {
+      const meta = this.structured.get(path);
+      if (isStructuredMeta(meta) && meta.guid === doc.guid) {
         this.enqueueReconnect({ path, guid: meta.guid, kind: meta.kind });
       }
     }

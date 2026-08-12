@@ -15,6 +15,49 @@ const local: ConfigMeta = { hash: "local", size: 1, mtime: 200 };
 const remote: ConfigMeta = { hash: "remote", size: 1, mtime: 100 };
 
 describe("ConfigSync reconcile decisions", () => {
+  it("does not spin when the adapter persistently fails to read local config", async () => {
+    vi.useFakeTimers();
+    const { plugin } = makeFakePlugin("https://sync.example.com", {
+      sessionToken: "token",
+      activeVaultId: "vault",
+    });
+    const indexDoc = new Y.Doc();
+    const readBinary = vi.fn(async () => {
+      throw new Error("adapter unavailable");
+    });
+    (plugin.app.vault as any).adapter = {
+      exists: vi.fn(async () => true),
+      readBinary,
+      stat: vi.fn(async () => null),
+      list: vi.fn(async () => ({
+        files: [".obsidian/appearance.json"],
+        folders: [],
+      })),
+    };
+    (plugin.app.vault as any).configDir = ".obsidian";
+    const sync = new ConfigSync(plugin as any, indexDoc);
+    try {
+      (sync as any).started = true;
+      (sync as any).enabledCategories = new Set(["appearance"]);
+      await (sync as any).reconcile(".obsidian/appearance.json");
+      expect(readBinary).toHaveBeenCalledTimes(1);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(readBinary).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(readBinary.mock.calls.length).toBeLessThanOrEqual(2);
+      sync.setPaused(true);
+      const callsAtPause = readBinary.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(readBinary).toHaveBeenCalledTimes(callsAtPause);
+    } finally {
+      sync.destroy();
+      indexDoc.destroy();
+      vi.useRealTimers();
+    }
+  });
+
   it("resumes an interrupted first pull without publishing a remote delete", async () => {
     const { plugin } = makeFakePlugin("https://sync.example.com", {
       sessionToken: "token",

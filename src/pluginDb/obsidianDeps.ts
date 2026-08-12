@@ -134,7 +134,15 @@ function makeDocHandle(plugin: RealtimePlugin, docId: string): PluginDbDocHandle
 
   const whenSynced = persistence.whenSynced
     .catch(() => {})
-    .then(() => {
+    .then(async () => {
+      try {
+        await plugin.auth.serverInfoChecked(plugin.settings.authServerUrl);
+      } catch {
+        // The local database stays usable offline. A later API lifecycle call
+        // rebuilds/rechecks this handle; never open a transport before the
+        // mandatory capability contract has been verified.
+        return;
+      }
       void provider.connect();
       return firstSyncedOrTimeout(provider, 3000);
     });

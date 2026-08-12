@@ -33,6 +33,8 @@ use crate::state::{AppState, Principal};
 
 /// Largest accepted wire update and persisted document snapshot.
 pub const MAX_UPDATE_BYTES: usize = 64 * 1024 * 1024;
+/// Presence is ephemeral JSON and must never consume the document-update budget.
+pub const MAX_AWARENESS_BYTES: usize = 64 * 1024;
 const CONNECTION_CAPACITY: usize = 256;
 const BROADCAST_CAPACITY: usize = 512;
 pub(crate) const SYNC_STATUS_MESSAGE: u8 = 102;
@@ -137,6 +139,8 @@ struct StoreInner {
     #[cfg(test)]
     write_pauses: Mutex<HashMap<String, WritePause>>,
     #[cfg(test)]
+    connection_write_pauses: Mutex<HashMap<String, WritePause>>,
+    #[cfg(test)]
     connection_pauses: Mutex<HashMap<String, ConnectionPause>>,
 }
 
@@ -200,6 +204,8 @@ impl DocumentStore {
             sync_metrics: SyncMetrics::default(),
             #[cfg(test)]
             write_pauses: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            connection_write_pauses: Mutex::new(HashMap::new()),
             #[cfg(test)]
             connection_pauses: Mutex::new(HashMap::new()),
         })))
@@ -728,6 +734,33 @@ impl DocumentStore {
         Ok(())
     }
 
+    async fn apply_connection_update(
+        &self,
+        document_id: &str,
+        connection_id: u64,
+        epoch: u64,
+        document: &Arc<PersistentDocument>,
+        update: &[u8],
+    ) -> Result<(), CrdtError> {
+        let write_gate = self.write_gate(document_id).await?;
+        let _write_guard = write_gate.lock().await;
+        self.connection_can_write(document_id, connection_id, epoch)
+            .await?;
+        #[cfg(test)]
+        let write_pause = self
+            .0
+            .connection_write_pauses
+            .lock()
+            .await
+            .remove(document_id);
+        #[cfg(test)]
+        if let Some(pause) = write_pause {
+            let _ = pause.reached.send(());
+            let _ = pause.resume.await;
+        }
+        document.apply_update(update).await
+    }
+
     async fn acknowledge_epoch(
         &self,
         document_id: &str,
@@ -1047,6 +1080,26 @@ impl DocumentStore {
         let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
         let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
         self.0.write_pauses.lock().await.insert(
+            document_id.to_string(),
+            WritePause {
+                reached: reached_tx,
+                resume: resume_rx,
+            },
+        );
+        (reached_rx, resume_tx)
+    }
+
+    #[cfg(test)]
+    async fn pause_next_connection_write_after_check(
+        &self,
+        document_id: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        self.0.connection_write_pauses.lock().await.insert(
             document_id.to_string(),
             WritePause {
                 reached: reached_tx,
@@ -1428,23 +1481,39 @@ async fn run_connection(
                                 continue;
                             }
                             store
-                                .connection_can_write(&document_id, connection_id, epoch)
+                                .apply_connection_update(
+                                    &document_id,
+                                    connection_id,
+                                    epoch,
+                                    &document,
+                                    &update,
+                                )
                                 .await?;
-                            document.apply_update(&update).await?;
                             store.after_write(&document_id, epoch, &document).await?;
                             if let Some(attribution) = &attribution {
                                 attribution.mark_content_write().await;
                             }
                         }
                         Message::Awareness(update) => {
-                            // The provider echoes awareness entries it learned
-                            // from the server, so later messages can contain
-                            // another peer or several peers. The first
-                            // single-client update sent during WebSocket open is
-                            // this connection's own state and is the only entry
-                            // removed on disconnect.
-                            if awareness_client.is_none() && update.clients.len() == 1 {
-                                awareness_client = update.clients.keys().next().copied();
+                            if bytes.len() > MAX_AWARENESS_BYTES {
+                                return Err(CrdtError::Protocol(format!(
+                                    "awareness update exceeds {MAX_AWARENESS_BYTES} bytes"
+                                )));
+                            }
+                            if update.clients.len() != 1 {
+                                return Err(CrdtError::Protocol(
+                                    "awareness update must contain exactly one client".into(),
+                                ));
+                            }
+                            let client_id = *update.clients.keys().next().expect("one client");
+                            match awareness_client {
+                                Some(bound) if bound != client_id => {
+                                    return Err(CrdtError::Protocol(
+                                        "awareness client does not match this connection".into(),
+                                    ));
+                                }
+                                None => awareness_client = Some(client_id),
+                                _ => {}
                             }
                             document.apply_awareness(update)?;
                         }
@@ -2239,7 +2308,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_echo_of_multiple_awareness_entries_keeps_connection_open() {
+    async fn first_multi_client_awareness_update_is_rejected_without_publishing_ids() {
         let directory = temp_store();
         let store = DocumentStore::new(&directory).await.unwrap();
         let mut connection = store
@@ -2273,23 +2342,90 @@ mod tests {
             )
             .await
             .unwrap();
-        connection
-            .send(Message::Custom(SYNC_STATUS_MESSAGE, vec![9]).encode_v1())
+        timeout(Duration::from_secs(2), async {
+            while connection.recv().await.is_some() {}
+        })
+        .await
+        .unwrap();
+        let (_, document) = store.get_or_load("vault__document").await.unwrap();
+        let awareness = document.awareness.read().unwrap();
+        assert!(awareness.clients().is_empty());
+        drop(awareness);
+        let _ = tokio::fs::remove_dir_all(directory).await;
+    }
+
+    #[tokio::test]
+    async fn later_multi_client_awareness_update_cannot_inject_or_retain_an_id() {
+        let directory = temp_store();
+        let store = DocumentStore::new(&directory).await.unwrap();
+        let mut connection = store
+            .connect_internal("vault__document", Level::Full)
             .await
             .unwrap();
+        connection.recv().await.unwrap();
+        connection.recv().await.unwrap();
+        let entry = |name: &str| AwarenessUpdateEntry {
+            clock: 1,
+            json: format!(r#"{{"user":{{"name":"{name}"}}}}"#),
+        };
+        connection
+            .send(
+                Message::Awareness(AwarenessUpdate {
+                    clients: HashMap::from([(1, entry("one"))]),
+                })
+                .encode_v1(),
+            )
+            .await
+            .unwrap();
+        connection
+            .send(
+                Message::Awareness(AwarenessUpdate {
+                    clients: HashMap::from([(1, entry("one")), (2, entry("two"))]),
+                })
+                .encode_v1(),
+            )
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            while connection.recv().await.is_some() {}
+        })
+        .await
+        .unwrap();
+        let (_, document) = store.get_or_load("vault__document").await.unwrap();
+        let awareness = document.awareness.read().unwrap();
+        assert!(awareness.clients().is_empty());
+        drop(awareness);
+        let _ = tokio::fs::remove_dir_all(directory).await;
+    }
 
-        loop {
-            let bytes = timeout(Duration::from_secs(2), connection.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            if matches!(
-                crate::safe_yrs::decode_v1::<Message>(&bytes).unwrap(),
-                Message::Custom(SYNC_STATUS_MESSAGE, payload) if payload == vec![9]
-            ) {
-                break;
-            }
-        }
+    #[tokio::test]
+    async fn oversized_awareness_frame_is_rejected() {
+        let directory = temp_store();
+        let store = DocumentStore::new(&directory).await.unwrap();
+        let mut connection = store
+            .connect_internal("vault__document", Level::Full)
+            .await
+            .unwrap();
+        connection.recv().await.unwrap();
+        connection.recv().await.unwrap();
+        let oversized = Message::Awareness(AwarenessUpdate {
+            clients: HashMap::from([(
+                1,
+                AwarenessUpdateEntry {
+                    clock: 1,
+                    json: "x".repeat(MAX_AWARENESS_BYTES),
+                },
+            )]),
+        })
+        .encode_v1();
+        assert!(oversized.len() > MAX_AWARENESS_BYTES);
+        connection.send(oversized).await.unwrap();
+        assert!(timeout(Duration::from_secs(2), connection.recv())
+            .await
+            .unwrap()
+            .is_none());
+        let (_, document) = store.get_or_load("vault__document").await.unwrap();
+        assert!(document.awareness.read().unwrap().clients().is_empty());
         let _ = tokio::fs::remove_dir_all(directory).await;
     }
 
@@ -2358,6 +2494,85 @@ mod tests {
         writer.await.unwrap().unwrap();
         assert_eq!(rollover.await.unwrap().unwrap(), 1);
 
+        let update = store.read_update("vault__document").await.unwrap();
+        let doc = decode_document(&update).unwrap();
+        assert_eq!(
+            doc.get_or_insert_map("values")
+                .get(&doc.transact(), "raced")
+                .and_then(|value| value.cast::<String>().ok())
+                .as_deref(),
+            Some("preserved")
+        );
+        let _ = tokio::fs::remove_dir_all(directory).await;
+    }
+
+    #[tokio::test]
+    async fn epoch_activation_cannot_snapshot_between_connection_check_and_apply() {
+        let directory = temp_store();
+        let store = DocumentStore::new(&directory).await.unwrap();
+        let mut writer = store
+            .connect_internal("vault__document", Level::Full)
+            .await
+            .unwrap();
+        let mut acknowledger = store
+            .connect_internal("vault__document", Level::Full)
+            .await
+            .unwrap();
+        for connection in [&mut writer, &mut acknowledger] {
+            connection.recv().await.unwrap();
+            connection.recv().await.unwrap();
+        }
+        let (write_checked, resume_write) = store
+            .pause_next_connection_write_after_check("vault__document")
+            .await;
+        writer
+            .send(
+                Message::Sync(SyncMessage::Update(map_update("raced", "preserved"))).encode_v1(),
+            )
+            .await
+            .unwrap();
+        write_checked.await.unwrap();
+
+        let rollover = {
+            let store = store.clone();
+            tokio::spawn(async move { store.begin_epoch_transition("vault__document").await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !rollover.is_finished(),
+            "epoch transition must wait for the gated connection write"
+        );
+        resume_write.send(()).unwrap();
+        assert_eq!(rollover.await.unwrap().unwrap(), 1);
+        for connection in [&mut writer, &mut acknowledger] {
+            loop {
+                let bytes = connection.recv().await.unwrap();
+                if matches!(
+                    crate::safe_yrs::decode_v1::<Message>(&bytes).unwrap(),
+                    Message::Custom(EPOCH_PROPOSAL_MESSAGE, _)
+                ) {
+                    break;
+                }
+            }
+        }
+        acknowledger
+            .send(epoch_wire_message(EPOCH_ACK_MESSAGE, 1).unwrap())
+            .await
+            .unwrap();
+        writer
+            .send(epoch_wire_message(EPOCH_ACK_MESSAGE, 1).unwrap())
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(store.current_epoch("vault__document").await.unwrap(), 0);
+
+        timeout(Duration::from_secs(2), async {
+            while store.current_epoch("vault__document").await.unwrap() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         let update = store.read_update("vault__document").await.unwrap();
         let doc = decode_document(&update).unwrap();
         assert_eq!(

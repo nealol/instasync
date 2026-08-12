@@ -1158,7 +1158,7 @@ describe("VaultSync index", () => {
     }
   });
 
-  it("restores prioritized mobile documents first with one queued handshake", async () => {
+  it("reconnects resident and priority mobile documents without recreating an evicted index entry", async () => {
     (Platform as any).isMobile = true;
     const sync = Object.create(VaultSync.prototype) as any;
     const index = new Y.Doc();
@@ -1172,7 +1172,7 @@ describe("VaultSync index", () => {
       { promise: Promise<void>; resolve: () => void }
     >();
     const documents = new Map(
-      [...files.entries()].map(([path, guid]) => {
+      [...files.entries()].filter(([path]) => path !== "b.md").map(([path, guid]) => {
         let resolve!: () => void;
         const promise = new Promise<void>((done) => {
           resolve = done;
@@ -1215,7 +1215,7 @@ describe("VaultSync index", () => {
       sync.queueMobileReconnects();
       expect(connected).toEqual(["active.md"]);
       expect(sync.activeDocConnections).toBe(1);
-      expect(sync.docQueue.size).toBe(2);
+      expect(sync.docQueue.size).toBe(1);
 
       completions.get("active.md")!.resolve();
       await Promise.resolve();
@@ -1226,14 +1226,10 @@ describe("VaultSync index", () => {
       completions.get("a.md")!.resolve();
       await Promise.resolve();
       await Promise.resolve();
-      expect(connected).toEqual(["active.md", "a.md", "b.md"]);
-      expect(sync.activeDocConnections).toBe(1);
-
-      completions.get("b.md")!.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
+      expect(connected).toEqual(["active.md", "a.md"]);
       expect(sync.activeDocConnections).toBe(0);
       expect(sync.docQueue.size).toBe(0);
+      expect(documents.has("b.md")).toBe(false);
     } finally {
       index.destroy();
       (Platform as any).isMobile = false;
@@ -1361,6 +1357,36 @@ describe("VaultSync index", () => {
     expect(sync.indexProvider.connect).not.toHaveBeenCalled();
     expect(sync.indexProvider.disconnect).toHaveBeenCalledOnce();
     expect(sync.plugin.setStatus).toHaveBeenCalledWith("offline");
+  });
+
+  it("keeps the index disconnected after transient verification failure and connects on retry", async () => {
+    const sync = Object.create(VaultSync.prototype) as any;
+    const serverInfoChecked = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValueOnce({});
+    Object.assign(sync, {
+      destroyed: false,
+      mobileSuspended: false,
+      plugin: {
+        auth: { serverInfoChecked },
+        settings: { authServerUrl: "https://sync.example.com" },
+        setStatus: vi.fn(),
+      },
+      indexProvider: {
+        connect: vi.fn(async () => undefined),
+        disconnect: vi.fn(),
+      },
+      scheduleMobileWorkingSetTrim: vi.fn(),
+    });
+
+    await sync.connectIndexAfterCompatibilityCheck();
+    expect(sync.indexProvider.connect).not.toHaveBeenCalled();
+    expect(sync.indexProvider.disconnect).toHaveBeenCalledOnce();
+
+    await sync.connectIndexAfterCompatibilityCheck();
+    expect(serverInfoChecked).toHaveBeenCalledTimes(2);
+    expect(sync.indexProvider.connect).toHaveBeenCalledOnce();
   });
 
   it("replaces an existing queued document when the same path gets a new guid", () => {
