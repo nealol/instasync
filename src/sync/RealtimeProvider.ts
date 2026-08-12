@@ -118,6 +118,7 @@ export class RealtimeProvider {
       console.warn(
         "Realtime: a read-only document was changed locally; the server will not accept the change.",
       );
+      return;
     }
 
     const encoder = encoding.createEncoder();

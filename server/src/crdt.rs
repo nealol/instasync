@@ -384,7 +384,10 @@ impl DocumentStore {
             .map_err(epoch_error)?;
         Ok(manifests
             .iter()
-            .filter(|manifest| manifest.logical_document_id != vault_id)
+            .filter(|manifest| {
+                manifest.logical_document_id != vault_id
+                    && crate::plugindb::parse_doc_id(&manifest.logical_document_id).is_none()
+            })
             .count() as u64)
     }
 
@@ -1893,6 +1896,21 @@ mod tests {
 
     fn temp_store() -> PathBuf {
         std::env::temp_dir().join(format!("realtime-crdt-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn file_document_count_excludes_index_and_plugin_databases() {
+        let directory = temp_store();
+        let store = DocumentStore::new(&directory).await.unwrap();
+        store.read_update("vault").await.unwrap();
+        store.read_update("vault__note-guid").await.unwrap();
+        store
+            .read_update("vault__plugindb__tasks__main")
+            .await
+            .unwrap();
+
+        assert_eq!(store.document_count_for_vault("vault").await.unwrap(), 1);
+        let _ = tokio::fs::remove_dir_all(directory).await;
     }
 
     fn map_update(key: &str, value: &str) -> Vec<u8> {

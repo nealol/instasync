@@ -120,6 +120,7 @@ export class ConfigSync {
    * (mirrors BinarySync's `pullingMissingRemote`).
    */
   private initialPull = false;
+  private initialPullComplete = false;
   private reloadNoticeTimer: number | null = null;
   private observer: (event: Y.YMapEvent<ConfigMeta>) => void;
   private focusHandler = () => void this.reconcileAll();
@@ -213,8 +214,9 @@ export class ConfigSync {
     this.initialPull = true;
     try {
       await this.reconcileAll();
+      if (!this.paused && !this.destroyed) this.initialPullComplete = true;
     } finally {
-      this.initialPull = false;
+      this.initialPull = !this.initialPullComplete;
     }
   }
 
@@ -644,7 +646,8 @@ export class ConfigSync {
       window.clearTimeout(this.pollTimer);
       this.pollTimer = null;
     } else if (!paused && this.started) {
-      void this.reconcileAll();
+      if (this.initialPullComplete) void this.reconcileAll();
+      else void this.runInitialPull();
       this.schedulePoll();
     }
   }

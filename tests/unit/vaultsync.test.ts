@@ -11,6 +11,7 @@ import { sha256Hex } from "../../src/hash";
 import { startAuthHarness, type AuthHarness } from "../support/authServer";
 import { makeFakePlugin, type FakePlugin } from "../support/fakePlugin";
 import { waitFor } from "../support/util";
+import { CompatibilityError } from "../../src/caps";
 
 const bootstrapModal = vi.hoisted(() => ({
   choice: "local" as "local" | "remote",
@@ -1301,7 +1302,13 @@ describe("VaultSync index", () => {
       mobileSuspended: true,
       docConnectionGeneration: 4,
       indexProvider,
+      plugin: {
+        auth: { serverInfoChecked: vi.fn(async () => {}) },
+        settings: { authServerUrl: "https://sync.example.com" },
+      },
+      scheduleMobileWorkingSetTrim: vi.fn(),
       binarySync: { setPaused },
+      configSync: { setPaused },
       queueMobileReconnects: vi.fn(),
     });
 
@@ -1319,6 +1326,41 @@ describe("VaultSync index", () => {
       connected.resolve();
       (Platform as any).isMobile = false;
     }
+  });
+
+  it("checks server capabilities before opening the index and hard-blocks incompatibility", async () => {
+    const sync = Object.create(VaultSync.prototype) as any;
+    const order: string[] = [];
+    const incompatible = new CompatibilityError(
+      "server-incompatible",
+      "unsupported required capability",
+    );
+    Object.assign(sync, {
+      destroyed: false,
+      mobileSuspended: false,
+      plugin: {
+        auth: {
+          serverInfoChecked: vi.fn(async () => {
+            order.push("caps");
+            throw incompatible;
+          }),
+        },
+        settings: { authServerUrl: "https://sync.example.com" },
+        setStatus: vi.fn(),
+      },
+      indexProvider: {
+        connect: vi.fn(async () => order.push("connect")),
+        disconnect: vi.fn(),
+      },
+      scheduleMobileWorkingSetTrim: vi.fn(),
+    });
+
+    await sync.connectIndexAfterCompatibilityCheck();
+
+    expect(order).toEqual(["caps"]);
+    expect(sync.indexProvider.connect).not.toHaveBeenCalled();
+    expect(sync.indexProvider.disconnect).toHaveBeenCalledOnce();
+    expect(sync.plugin.setStatus).toHaveBeenCalledWith("offline");
   });
 
   it("replaces an existing queued document when the same path gets a new guid", () => {

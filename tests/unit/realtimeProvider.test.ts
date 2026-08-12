@@ -181,6 +181,25 @@ describe("RealtimeProvider", () => {
     }
   });
 
+  it("does not send or acknowledge local edits made through a read-only token", async () => {
+    const f = fixture(() => Promise.resolve({ ...TOKEN, authorization: "read-only" }));
+    try {
+      const socket = await openAndHandshake(f);
+      socket.deliver(syncAcknowledgement(0));
+      const before = socket.sent.length;
+      const localChanges: boolean[] = [];
+      f.provider.on(SYNC_EVENT_LOCAL_CHANGES, (pending) => localChanges.push(pending));
+
+      f.doc.getMap("values").set("local", "read-only edit");
+
+      expect(socket.sent).toHaveLength(before);
+      expect(f.provider.hasLocalChanges).toBe(false);
+      expect(localChanges).toEqual([]);
+    } finally {
+      f.destroy();
+    }
+  });
+
   it("coalesces connect calls and cannot reconnect after destroy", async () => {
     const token = Promise.withResolvers<ClientToken>();
     const f = fixture(() => token.promise);

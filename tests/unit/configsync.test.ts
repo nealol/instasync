@@ -15,6 +15,45 @@ const local: ConfigMeta = { hash: "local", size: 1, mtime: 200 };
 const remote: ConfigMeta = { hash: "remote", size: 1, mtime: 100 };
 
 describe("ConfigSync reconcile decisions", () => {
+  it("resumes an interrupted first pull without publishing a remote delete", async () => {
+    const { plugin } = makeFakePlugin("https://sync.example.com", {
+      sessionToken: "token",
+      activeVaultId: "vault",
+    });
+    const indexDoc = new Y.Doc();
+    const remote = { hash: "remote-hash", size: 1, mtime: 1 };
+    indexDoc.getMap<ConfigMeta>("configFiles").set(".obsidian/appearance.json", remote);
+    const sync = new ConfigSync(plugin as any, indexDoc);
+    (sync as any).lastSyncedHash.set(".obsidian/appearance.json", remote.hash);
+    let release!: () => void;
+    let passes = 0;
+    vi.spyOn(sync, "reconcileAll").mockImplementation(async () => {
+      passes += 1;
+      if (passes === 1) await new Promise<void>((resolve) => (release = resolve));
+      else {
+        const action = decideConfigReconcile(null, remote, remote.hash, {
+          initialPull: (sync as any).initialPull,
+        });
+        if (action === "deleteRemote") {
+          indexDoc.getMap("configFiles").delete(".obsidian/appearance.json");
+        }
+      }
+    });
+    try {
+      sync.start(new Set(["appearance"] as any));
+      await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+      sync.setPaused(true);
+      release();
+      await Promise.resolve();
+      sync.setPaused(false);
+      await vi.waitFor(() => expect(passes).toBe(2));
+      expect(indexDoc.getMap("configFiles").has(".obsidian/appearance.json")).toBe(true);
+    } finally {
+      sync.destroy();
+      indexDoc.destroy();
+    }
+  });
+
   it("defers config reconciliation while paused and scans on resume", async () => {
     const { plugin } = makeFakePlugin("https://sync.example.com", {
       sessionToken: "token",

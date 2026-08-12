@@ -192,7 +192,7 @@ filesystems. Initial alerting invariants:
 - alert when durable-update latency remains above twice the qualified soak
   baseline, then inspect disk latency and compaction activity;
 - alert on sustained connection/channel growth after client traffic falls, and
-  on a mean channel fan-out approaching the hard 1,024 channels per mux socket;
+  on a mean channel fan-out approaching the hard 512 channels per mux socket;
 - keep the persistent volume below the operator's normal disk-capacity alarm
   (80% is a conservative starting point) so append, compaction, and backup
   swaps retain headroom.

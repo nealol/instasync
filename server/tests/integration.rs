@@ -5026,6 +5026,51 @@ async fn concurrent_file_registry_upserts_for_same_guid_do_not_collide() {
     assert_eq!(status, StatusCode::OK);
 }
 
+#[tokio::test]
+async fn concurrent_new_file_registry_upserts_respect_vault_quota() {
+    let mut config = test_config(
+        "http://auth.test",
+        realtime_server::blobs::MAX_BLOB_BYTES,
+    );
+    config.crdt_max_documents_per_vault = 1;
+    let app = app_from_config(&config).await;
+    let token = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&token),
+        Some(json!({ "name": "Files" })),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+
+    let mut handles = Vec::new();
+    for i in 0..8 {
+        let app = app.clone();
+        let token = token.clone();
+        let vault_id = vault_id.clone();
+        handles.push(tokio::spawn(async move {
+            send(
+                &app,
+                "POST",
+                &format!("/api/vaults/{vault_id}/files"),
+                Some(&token),
+                Some(json!({ "guid": format!("guid-{i}"), "path": format!("file-{i}.md") })),
+            )
+            .await
+            .0
+        }));
+    }
+    let mut accepted = 0;
+    for handle in handles {
+        if handle.await.unwrap() == StatusCode::OK {
+            accepted += 1;
+        }
+    }
+    assert_eq!(accepted, 1);
+}
+
 // ---------- remote cursor streaming (WebSocket e2e) ----------
 
 type WsClient =

@@ -1346,6 +1346,9 @@ pub async fn upsert_file(
     if body.guid.is_empty() || body.guid.contains("__") || !safe_doc_id(&body.guid) {
         return Err(AppError::BadRequest("invalid file guid".into()));
     }
+    // Share the creation admission gate with direct CRDT document creation so
+    // count + insert is one process-wide critical section.
+    let _creation_guard = state.document_creation_lock.lock().await;
     let existing = vault_files::Entity::find()
         .filter(vault_files::Column::VaultId.eq(&vault_id))
         .filter(vault_files::Column::Guid.eq(&body.guid))

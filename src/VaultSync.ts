@@ -140,7 +140,6 @@ export class VaultSync {
   private filesObserver: (event: Y.YMapEvent<string>) => void;
   private structuredObserver: (event: Y.YMapEvent<StructuredMeta>) => void;
   private statusListener: (status: SyncStatus) => void;
-  private serverInfoRefreshPending = true;
   private vaultEvents: EventRef[] = [];
   private docQueue = new Map<string, QueueItem>();
   private activeDocConnections = 0;
@@ -208,20 +207,6 @@ export class VaultSync {
         return;
       }
       if (status === SYNC_STATUS_CONNECTED) {
-        if (this.serverInfoRefreshPending) {
-          this.serverInfoRefreshPending = false;
-          void this.plugin.auth
-            .serverInfoChecked(this.plugin.settings.authServerUrl)
-            .then(() => this.scheduleMobileWorkingSetTrim())
-            .catch((error) => {
-              if (error instanceof CompatibilityError) {
-                this.indexProvider.disconnect();
-                this.plugin.setStatus("offline");
-                return;
-              }
-              this.serverInfoRefreshPending = true;
-            });
-        }
         this.wasConnected = true;
         this.plugin.setStatus("connected");
         void this.runInitialSync();
@@ -233,12 +218,10 @@ export class VaultSync {
         this.notifyDisconnected();
         this.plugin.setStatus("connecting");
       } else if (status === "error") {
-        this.serverInfoRefreshPending = true;
         if (Platform?.isMobile && this.initialSynced) this.mobileCatchUpPending = true;
         this.notifyDisconnected();
         this.plugin.setStatus("error");
       } else {
-        this.serverInfoRefreshPending = true;
         if (Platform?.isMobile && this.initialSynced) this.mobileCatchUpPending = true;
         this.notifyDisconnected();
       }
@@ -271,7 +254,26 @@ export class VaultSync {
     // Capture the persisted (pre-remote-merge) binary baseline before connecting.
     this.binarySync.seedBaseline();
     this.configSync.seedBaseline();
-    if (!this.mobileSuspended) void this.indexProvider.connect();
+    if (!this.mobileSuspended) void this.connectIndexAfterCompatibilityCheck();
+  }
+
+  private async connectIndexAfterCompatibilityCheck(): Promise<void> {
+    try {
+      await this.plugin.auth.serverInfoChecked(this.plugin.settings.authServerUrl);
+      if (this.destroyed || this.mobileSuspended) return;
+      this.scheduleMobileWorkingSetTrim();
+      await this.indexProvider.connect();
+    } catch (error) {
+      if (this.destroyed) return;
+      if (error instanceof CompatibilityError) {
+        this.indexProvider.disconnect();
+        this.plugin.setStatus("offline");
+        return;
+      }
+      // The client remains usable offline and retries through its normal
+      // lifecycle; only a verified incompatibility may hard-block syncing.
+      await this.indexProvider.connect();
+    }
   }
 
   private migrateLegacyLocalState(): void {
@@ -350,12 +352,12 @@ export class VaultSync {
     if (Platform?.isMobile && status !== SYNC_STATUS_CONNECTED) {
       if (status === SYNC_STATUS_OFFLINE || status === SYNC_STATUS_ERROR) {
         if (this.initialSynced) this.mobileCatchUpPending = true;
-        void this.indexProvider.connect();
+        void this.connectIndexAfterCompatibilityCheck();
       }
       return;
     }
     if (status === SYNC_STATUS_OFFLINE || status === SYNC_STATUS_ERROR) {
-      void this.indexProvider.connect();
+      void this.connectIndexAfterCompatibilityCheck();
     }
     if (Platform?.isMobile) return;
     for (const doc of this.documents.values()) doc.ensureConnected();
@@ -395,7 +397,7 @@ export class VaultSync {
     this.mobileResumeInProgress = true;
     try {
       if (this.indexProvider.status !== SYNC_STATUS_CONNECTED) {
-        await this.indexProvider.connect();
+        await this.connectIndexAfterCompatibilityCheck();
       }
     } finally {
       this.mobileResumeInProgress = false;
