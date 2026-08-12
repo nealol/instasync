@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "producer": {
+    "serverVersion": "0.3.5",
+    "commit": "1b7d020135fa444579035ea5a3767ece280470f9",
+    "ySweetVersion": "0.9.1",
+    "yrsVersion": "0.19",
+    "format": "filesystem-data.ysweet"
+  },
+  "document": {
+    "id": "legacy-doc",
+    "dataYsWeetBase64": "AwAAAAAAAAAGAAAAAAAAAAAAZG9jAAQAAAAAAAAAAAAAAQcAAAAAAAAAAAEAAAABACEAAAAAAAAAAQH4rNGRAQAoAQZ2YWx1ZXMIaW1wb3J0ZWQBdwN5ZXMABwAAAAAAAAAAAQAAAAEBBwAAAAAAAAAB+KzRkQEB",
+    "expectedMap": "values",
+    "expectedKey": "imported",
+    "expectedValue": "yes"
+  }
+}

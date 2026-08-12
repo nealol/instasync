@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "producer": {
+    "pluginVersion": "0.4.3-alpha.7",
+    "commit": "1b7d020135fa444579035ea5a3767ece280470f9",
+    "yjsVersion": "13.6.31",
+    "yProtocolsVersion": "1.0.7",
+    "wireFormat": "yjs-v1"
+  },
+  "document": {
+    "updateV1Base64": "AQP4rNGRAQAEAQhjb250ZW50cw5oZWxsbyDOsQp3b3JsZCgBCG1ldGFkYXRhBGtpbmQBdwhtYXJrZG93bigBCG1ldGFkYXRhCHJldmlzaW9uAX0HAA==",
+    "syncUpdateMessageBase64": "AAJVAQP4rNGRAQAEAQhjb250ZW50cw5oZWxsbyDOsQp3b3JsZCgBCG1ldGFkYXRhBGtpbmQBdwhtYXJrZG93bigBCG1ldGFkYXRhCHJldmlzaW9uAX0HAA==",
+    "syncStep1MessageBase64": "AAAHAfis0ZEBDw==",
+    "expected": {
+      "contents": "hello α\nworld",
+      "metadata": {
+        "kind": "markdown",
+        "revision": 7
+      }
+    }
+  }
+}

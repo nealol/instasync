@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "cacheDirectory": ".compat-cache",
+  "baselines": [
+    {
+      "id": "pre-native-2026-08-02",
+      "commit": "1b7d020135fa444579035ea5a3767ece280470f9",
+      "plugin": {
+        "version": "0.4.3-alpha.7",
+        "artifacts": [
+          {
+            "path": "release/manifest.json",
+            "url": "https://github.com/nealol/realtime/releases/download/0.4.3-alpha.7/manifest.json",
+            "bytes": 289,
+            "sha256": "50335041d25509c17bb3646297ac837935d0602d575e22611b34ce89c6bbcfbd"
+          },
+          {
+            "path": "release/main.js",
+            "url": "https://github.com/nealol/realtime/releases/download/0.4.3-alpha.7/main.js",
+            "bytes": 13398142,
+            "sha256": "e7aba088b87bce8a13d6fe3f96d5b3b930c9d464b118ae57b1dd34444699e361"
+          },
+          {
+            "path": "src/caps.ts",
+            "url": "https://raw.githubusercontent.com/nealol/realtime/1b7d020135fa444579035ea5a3767ece280470f9/src/caps.ts",
+            "bytes": 5099,
+            "sha256": "e88e4d29e4612174f07b609dc3f1cb3ad855474fab624dd497321b3c3548ca1d"
+          },
+          {
+            "path": "src/pluginDb/types.ts",
+            "url": "https://raw.githubusercontent.com/nealol/realtime/1b7d020135fa444579035ea5a3767ece280470f9/src/pluginDb/types.ts",
+            "bytes": 1233,
+            "sha256": "f39b2d99eefb594b5d07920da1a934ce7387a1692a8175ce641d15680a4acfbc"
+          }
+        ]
+      },
+      "server": {
+        "version": "0.3.5",
+        "image": "ghcr.io/nealol/realtime-server@sha256:cca5c070a1c4054a9c1949e05c5875153a69c86db2a56d1baf267c4ad80f6636",
+        "platform": "linux/amd64",
+        "requiredCaps": [],
+        "artifacts": [
+          {
+            "path": "server/src/caps.rs",
+            "url": "https://raw.githubusercontent.com/nealol/realtime/1b7d020135fa444579035ea5a3767ece280470f9/server/src/caps.rs",
+            "bytes": 2039,
+            "sha256": "7073bab8351e050a5de37292cca0e830d1fa7be6c8486b29ddd5d05e5d2f8f64"
+          },
+          {
+            "path": "server/src/routes.rs",
+            "url": "https://raw.githubusercontent.com/nealol/realtime/1b7d020135fa444579035ea5a3767ece280470f9/server/src/routes.rs",
+            "bytes": 48444,
+            "sha256": "471ea37db887ae7ad8063fd4ab66369ee5cd12504d0704880ff94e60ec4b52d5"
+          }
+        ]
+      },
+      "expectations": {
+        "releasedClientReleasedServer": "ok",
+        "releasedClientCurrentServer": "client-too-old",
+        "currentClientReleasedServer": "server-incompatible",
+        "currentClientCurrentServer": "ok"
+      }
+    }
+  ]
+}
