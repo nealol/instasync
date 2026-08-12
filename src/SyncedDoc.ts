@@ -11,6 +11,7 @@ import {
 } from "./sync/RealtimeProvider";
 import { createMuxSocket } from "./sync/mux";
 import { epochPersistenceName } from "./documentEpoch";
+import { preserveTextConflict } from "./conflictRecovery";
 
 export abstract class SyncedDoc {
   readonly path: string;
@@ -36,6 +37,8 @@ export abstract class SyncedDoc {
   /** True once the provider has reported a successful server sync at least once. */
   private syncedOnce = false;
   private nextServerSyncWaiters = new Set<() => void>();
+  private readOnlyRecoveryPending = false;
+  private readOnlyRecoveryBaseline: string | null = null;
 
   protected constructor(
     plugin: RealtimePlugin,
@@ -61,13 +64,24 @@ export abstract class SyncedDoc {
       serverDocId,
       this.ydoc,
       () => getClientToken(plugin, serverDocId, path),
-      { connect: false, socketFactory: createMuxSocket },
+      {
+        connect: false,
+        socketFactory: createMuxSocket,
+        onReadOnlyUpdate: () => void this.preserveReadOnlyRecovery(),
+      },
     );
     this.awareness = this.provider.awareness;
     this.persistence = new IndexeddbPersistence(
       epochPersistenceName(plugin, serverDocId, serverDocId),
       this.ydoc,
     );
+    const storeUpdate = this.persistence._storeUpdate;
+    this.persistence._storeUpdate = (update, origin) => {
+      if (this.provider.clientToken?.authorization === "read-only" && origin !== this.provider) {
+        return;
+      }
+      storeUpdate(update, origin);
+    };
 
     this.syncedListener = (synced) => {
       if (synced) {
@@ -199,6 +213,25 @@ export abstract class SyncedDoc {
   protected abstract finishStartupReconcile(): Promise<void>;
   protected afterChangesSynced(): Promise<void> | void {}
   protected abstract destroySubclass(): void;
+
+  private async preserveReadOnlyRecovery(): Promise<void> {
+    if (this.destroyed || this.readOnlyRecoveryPending) return;
+    this.readOnlyRecoveryPending = true;
+    try {
+      const file = this.plugin.app.vault.getAbstractFileByPath(this.path);
+      if (!file) return;
+      const value = await this.plugin.app.vault.read(file as any);
+      if (value === this.readOnlyRecoveryBaseline) return;
+      if (!this.destroyed) {
+        await preserveTextConflict(this.plugin, this.path, value, "local");
+        this.readOnlyRecoveryBaseline = value;
+      }
+    } catch (error) {
+      console.warn(`[Realtime] failed to preserve read-only edit for ${this.path}`, error);
+    } finally {
+      this.readOnlyRecoveryPending = false;
+    }
+  }
 
   destroy(): void {
     if (this.destroyed) return;

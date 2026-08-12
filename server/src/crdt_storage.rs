@@ -1131,6 +1131,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn existing_epoch_manifest_with_missing_current_store_is_corrupt() {
+        let root = temp_store();
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        crate::crdt_epoch::load_or_create_manifest(&root, "doc")
+            .await
+            .unwrap();
+
+        let error = crate::crdt_epoch::validate_store_manifests(&root)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("missing current physical document"));
+        assert!(!root.join("doc.crdt").exists());
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
     async fn append_refuses_to_create_an_unreplayable_segment() {
         let root = temp_store();
         tokio::fs::create_dir_all(&root).await.unwrap();

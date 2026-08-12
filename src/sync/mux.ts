@@ -373,16 +373,28 @@ class MuxConnection {
         this.channels.delete(frame.channelId);
         channel?.deliverError();
         channel?.deliverClose(CLOSE_CODE_TRANSPORT);
+        this.teardownIfIdle();
         break;
       }
       case "close": {
         const channel = this.channels.get(frame.channelId);
         this.channels.delete(frame.channelId);
         channel?.deliverClose(CLOSE_CODE_TRANSPORT);
+        this.teardownIfIdle();
         break;
       }
       default:
         break;
+    }
+  }
+
+  private teardownIfIdle(): void {
+    if (
+      this.channels.size === 0 &&
+      this.pendingOpens.size === 0 &&
+      this.openBlockedUntil === 0
+    ) {
+      this.teardown();
     }
   }
 

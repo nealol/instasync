@@ -112,4 +112,24 @@ describe("document epochs", () => {
     expect(getDocumentEpoch(instance, "vault__note")).toBe(3);
     expect(instance.acceptDocumentEpoch).not.toHaveBeenCalled();
   });
+
+  it("does not globally back off unrelated documents while an epoch is pending", async () => {
+    resetTokenRetryStateForTests(30_000);
+    const instance = plugin();
+    setDocumentEpoch(instance, "vault__pending", 3);
+    instance.auth.docToken.mockImplementation(async (_vault: string, docId: string) => ({
+      url: `wss://sync.example.com/d/${docId}/ws`,
+      baseUrl: `https://sync.example.com/d/${docId}`,
+      docId,
+      token: "token",
+      epoch: docId === "vault__pending" ? 2 : 0,
+    }));
+
+    await expect(getClientToken(instance, "vault__pending")).rejects.toBeInstanceOf(
+      DocumentEpochPendingError,
+    );
+    await expect(getClientToken(instance, "vault__other")).resolves.toEqual(
+      expect.objectContaining({ docId: "vault__other" }),
+    );
+  });
 });

@@ -14,6 +14,9 @@
   "workspaces": [
     "packages/*"
   ],
+  "trustedDependencies": [
+    "y-sweet"
+  ],
   "main": "main.js",
   "scripts": {
     "postinstall": "bun run --filter @realtime-md/plugin-api-types build",

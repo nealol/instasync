@@ -311,7 +311,15 @@ impl DocumentStore {
         }
         document.apply_update(update).await?;
         drop(_write_guard);
-        self.after_write(document_id, epoch, &document).await
+        if let Err(error) = self.after_write(document_id, epoch, &document).await {
+            tracing::error!(
+                %error,
+                %document_id,
+                epoch,
+                "post-write CRDT maintenance failed"
+            );
+        }
+        Ok(())
     }
 
     /// Force a compacted generation for offline maintenance and benchmarks.
@@ -395,6 +403,13 @@ impl DocumentStore {
                     && crate::plugindb::parse_doc_id(&manifest.logical_document_id).is_none()
             })
             .count() as u64)
+    }
+
+    pub async fn document_exists(&self, document_id: &str) -> Result<bool, CrdtError> {
+        validate_document_id(document_id)?;
+        Ok(crdt_epoch::manifest_exists(&self.0.directory, document_id)
+            .await
+            .map_err(epoch_error)?)
     }
 
     pub(crate) async fn connect(
@@ -490,7 +505,7 @@ impl DocumentStore {
         validate_document_id(document_id)?;
         let load_lock = self.document_lock(document_id).await;
         let _load_guard = load_lock.lock().await;
-        let runtime = self.epoch_runtime(document_id).await?;
+        let runtime = self.epoch_runtime_initialized(document_id).await?;
         let (epoch, physical_document_id) = {
             let runtime = runtime.lock().await;
             (
@@ -550,9 +565,20 @@ impl DocumentStore {
         &self,
         document_id: &str,
     ) -> Result<Arc<Mutex<EpochRuntime>>, CrdtError> {
-        let mut epochs = self.0.epochs.lock().await;
-        if let Some(runtime) = epochs.get(document_id) {
-            return Ok(runtime.clone());
+        if let Some(runtime) = self.0.epochs.lock().await.get(document_id).cloned() {
+            return Ok(runtime);
+        }
+        let document_lock = self.document_lock(document_id).await;
+        let _initialization = document_lock.lock().await;
+        self.epoch_runtime_initialized(document_id).await
+    }
+
+    async fn epoch_runtime_initialized(
+        &self,
+        document_id: &str,
+    ) -> Result<Arc<Mutex<EpochRuntime>>, CrdtError> {
+        if let Some(runtime) = self.0.epochs.lock().await.get(document_id).cloned() {
+            return Ok(runtime);
         }
         let mut manifest = crdt_epoch::load_or_create_manifest(&self.0.directory, document_id)
             .await
@@ -574,8 +600,11 @@ impl DocumentStore {
             .iter()
             .map(|retired| retired.delete_after_ms)
             .min();
-        epochs.insert(document_id.to_string(), runtime.clone());
-        drop(epochs);
+        self.0
+            .epochs
+            .lock()
+            .await
+            .insert(document_id.to_string(), runtime.clone());
         if let Some(deadline) = retirement_deadline {
             self.schedule_retired_cleanup(document_id, deadline);
         }
@@ -1489,9 +1518,18 @@ async fn run_connection(
                                     &update,
                                 )
                                 .await?;
-                            store.after_write(&document_id, epoch, &document).await?;
                             if let Some(attribution) = &attribution {
                                 attribution.mark_content_write().await;
+                            }
+                            if let Err(error) =
+                                store.after_write(&document_id, epoch, &document).await
+                            {
+                                tracing::error!(
+                                    %error,
+                                    %document_id,
+                                    epoch,
+                                    "post-write CRDT maintenance failed"
+                                );
                             }
                         }
                         Message::Awareness(update) => {

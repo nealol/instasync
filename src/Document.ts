@@ -400,6 +400,7 @@ export class Document extends SyncedDoc {
         }
         if ((await this.plugin.app.vault.read(file)) === text) {
           this.plugin.vaultSync?.noteMaterialized(this.path, "text", this.guid);
+          if (!this.provider.hasLocalChanges) await this.recordAcknowledgedContent(true);
           return;
         }
         // Re-check destroyed after the await: a doc replaced mid-write (rename,
@@ -436,6 +437,7 @@ export class Document extends SyncedDoc {
         await this.plugin.app.vault.create(path, text);
       }
       this.plugin.vaultSync?.noteMaterialized(this.path, "text", this.guid);
+      if (!this.provider.hasLocalChanges) await this.recordAcknowledgedContent(true);
     } catch (e) {
       console.error(`[Realtime] writeToDisk failed for ${this.path}`, e);
       if (!this.destroyed) this.scheduleWriteToDisk(DISK_WRITE_RETRY_MS);

@@ -122,6 +122,8 @@ function makeDocHandle(plugin: RealtimePlugin, docId: string): PluginDbDocHandle
   );
 
   let connected = false;
+  let destroyed = false;
+  let reconnectTimer: number | null = null;
   const statusCbs = new Set<(c: boolean) => void>();
   const statusListener = (status: SyncStatus) => {
     const c = status === SYNC_STATUS_CONNECTED;
@@ -132,20 +134,26 @@ function makeDocHandle(plugin: RealtimePlugin, docId: string): PluginDbDocHandle
   };
   provider.on(SYNC_EVENT_STATUS, statusListener);
 
+  const connectAfterCapabilityCheck = async (): Promise<void> => {
+    if (destroyed) return;
+    try {
+      await plugin.auth.serverInfoChecked(plugin.settings.authServerUrl);
+      if (destroyed) return;
+      void provider.connect();
+      await firstSyncedOrTimeout(provider, 3000);
+    } catch {
+      if (!destroyed && reconnectTimer === null) {
+        reconnectTimer = window.setTimeout(() => {
+          reconnectTimer = null;
+          void connectAfterCapabilityCheck();
+        }, 3000);
+      }
+    }
+  };
+
   const whenSynced = persistence.whenSynced
     .catch(() => {})
-    .then(async () => {
-      try {
-        await plugin.auth.serverInfoChecked(plugin.settings.authServerUrl);
-      } catch {
-        // The local database stays usable offline. A later API lifecycle call
-        // rebuilds/rechecks this handle; never open a transport before the
-        // mandatory capability contract has been verified.
-        return;
-      }
-      void provider.connect();
-      return firstSyncedOrTimeout(provider, 3000);
-    });
+    .then(connectAfterCapabilityCheck);
 
   return {
     doc,
@@ -179,6 +187,9 @@ function makeDocHandle(plugin: RealtimePlugin, docId: string): PluginDbDocHandle
       return promise;
     },
     destroy: () => {
+      destroyed = true;
+      window.clearTimeout(reconnectTimer ?? undefined);
+      reconnectTimer = null;
       provider.off(SYNC_EVENT_STATUS, statusListener);
       provider.destroy();
       void persistence.destroy();

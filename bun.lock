@@ -4,6 +4,9 @@
   "workspaces": {
     "": {
       "name": "realtime",
+      "trustedDependencies": [
+        "y-sweet",
+      ],
       "dependencies": {
         "@pierre/diffs": "^1.2.7",
         "@pierre/trees": "^1.0.0-beta.4",

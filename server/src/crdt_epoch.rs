@@ -267,6 +267,10 @@ pub async fn load_or_create_manifest(
     Ok(manifest)
 }
 
+pub async fn manifest_exists(root: &Path, logical_document_id: &str) -> Result<bool, EpochError> {
+    Ok(tokio::fs::try_exists(manifest_path(root, logical_document_id)).await?)
+}
+
 pub async fn manifests_for_vault(
     root: &Path,
     vault_id: &str,
@@ -312,6 +316,14 @@ pub async fn validate_store_manifests(root: &Path) -> Result<(), EpochError> {
             return Err(EpochError::InvalidManifest(format!(
                 "{name} does not match logical document {}",
                 manifest.logical_document_id
+            )));
+        }
+        let current_directory =
+            root.join(format!("{}.crdt", manifest.current.physical_document_id));
+        if !tokio::fs::try_exists(current_directory.join("manifest.json")).await? {
+            return Err(EpochError::InvalidManifest(format!(
+                "{name} references missing current physical document {}",
+                manifest.current.physical_document_id
             )));
         }
     }

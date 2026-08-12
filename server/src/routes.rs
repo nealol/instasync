@@ -1439,13 +1439,17 @@ pub async fn doc_token(
         Some(_) => return Err(AppError::BadRequest("invalid authorization level".into())),
     };
 
-    if authorization.requires_creation_reservation {
+    let needs_physical_creation = !state.documents.document_exists(&body.doc_id).await?;
+    if needs_physical_creation {
         let _creation_guard = state.document_creation_lock.lock().await;
+        let needs_physical_creation = !state.documents.document_exists(&body.doc_id).await?;
         let document_count = state
             .documents
             .document_count_for_vault(&body.vault_id)
             .await?;
-        if document_count >= state.config.crdt_max_documents_per_vault {
+        if needs_physical_creation
+            && document_count >= state.config.crdt_max_documents_per_vault
+        {
             return Err(AppError::BadRequest(
                 "vault document limit reached".into(),
             ));
@@ -1568,6 +1572,13 @@ async fn authorize_doc_with_claim(
         .one(&state.db)
         .await?;
     if registered.is_none() {
+        if state.documents.document_exists(doc_id).await? {
+            return Ok(DocumentAuthorization {
+                level: authorize_uniform_vault(state, user, vault_id).await?,
+                path: String::new(),
+                requires_creation_reservation: false,
+            });
+        }
         let registered_count = vault_files::Entity::find()
             .filter(vault_files::Column::VaultId.eq(vault_id))
             .count(&state.db)

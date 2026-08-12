@@ -1409,6 +1409,62 @@ describe("VaultSync index", () => {
     });
   });
 
+  it("replays the latest vault event captured during both bootstrap passes", async () => {
+    const sync = Object.create(VaultSync.prototype) as any;
+    const created = { path: "created.md" };
+    const renamed = { path: "renamed.md" };
+    const order: string[] = [];
+    Object.assign(sync, {
+      destroyed: false,
+      initialSynced: false,
+      bootstrapVaultEvents: [
+        { type: "delete", file: renamed, version: 1 },
+      ],
+      pathVersions: new Map([
+        ["created.md", 1],
+        ["renamed.md", 1],
+      ]),
+      handleLocalCreate: vi.fn(async () => order.push("create")),
+      onLocalModify: vi.fn(() => order.push("modify")),
+      handleLocalRename: vi.fn(async () => order.push("rename")),
+      onLocalDelete: vi.fn(() => order.push("delete")),
+    });
+
+    await sync.replayBootstrapVaultEvents();
+
+    expect(order).toEqual(["delete"]);
+    expect(sync.bootstrapVaultEvents).toHaveLength(0);
+  });
+
+  it("reruns a coalesced remote delete after the active reconciliation", async () => {
+    const sync = Object.create(VaultSync.prototype) as any;
+    const index = new Y.Doc();
+    const first = Promise.withResolvers<void>();
+    const calls: Array<[string, string, string | null]> = [];
+    Object.assign(sync, {
+      destroyed: false,
+      files: index.getMap("files"),
+      structured: index.getMap("structured"),
+      remoteDeleteInFlight: new Set(),
+      remoteDeletePending: new Map(),
+      reconcileRemoteDelete: vi.fn(async (path: string, kind: string, identity: string | null) => {
+        calls.push([path, kind, identity]);
+        if (calls.length === 1) await first.promise;
+      }),
+    });
+
+    const active = sync.handleRemoteDelete("same.md", "text", "old");
+    await Promise.resolve();
+    await sync.handleRemoteDelete("same.md", "text", "final");
+    first.resolve();
+    await active;
+
+    expect(calls).toEqual([
+      ["same.md", "text", "old"],
+      ["same.md", "text", "final"],
+    ]);
+  });
+
   it("ignores malformed structured index entries when resolving paths", () => {
     const sync = Object.create(VaultSync.prototype) as any;
     const index = new Y.Doc();

@@ -20,7 +20,7 @@ import { BaseDocument } from "./BaseDocument";
 import type { StructuredDocument } from "./StructuredDocument";
 import { BinarySync } from "./BinarySync";
 import { ConfigSync } from "./ConfigSync";
-import { enabledConfigCategories } from "./configCategories";
+import { categoryForConfigPath, enabledConfigCategories } from "./configCategories";
 import { matchesAnyGlob, parseGlobs } from "./glob";
 import { LocalSyncState, shouldFoldOfflineDeletion, type MaterializedKind } from "./localSyncState";
 import { isConflictCopy, preserveTextConflict } from "./conflictRecovery";
@@ -150,7 +150,22 @@ export class VaultSync {
   private prioritizedGuids = new Set<string>();
   /** Monotonic per-path version used to abort stale async create/rename work. */
   private pathVersions = new Map<string, number>();
+  private bootstrapVaultEvents: Array<
+    | { type: "create" | "modify"; file: TAbstractFile; version: number }
+    | { type: "delete"; file: TAbstractFile; version: number }
+    | {
+        type: "rename";
+        file: TAbstractFile;
+        oldPath: string;
+        oldVersion: number;
+        newVersion: number;
+      }
+  > = [];
   private remoteDeleteInFlight = new Set<string>();
+  private remoteDeletePending = new Map<
+    string,
+    { kind: "text" | StructuredKind; deletedIdentity: string | null }
+  >();
   private remoteDeletePreserved = new Set<string>();
   private remoteDeletesApplying = new Set<string>();
   /** Last explicit user/local activity per path; used for mobile LRU eviction. */
@@ -279,6 +294,27 @@ export class VaultSync {
     for (const [path, meta] of this.structured.entries()) {
       if (isStructuredMeta(meta)) {
         this.localSyncState.migrateLegacyIdentity(path, meta.kind, meta.guid);
+      }
+    }
+    const binaries = this.indexDoc.getMap<{ hash?: string }>("binaries");
+    for (const [path, meta] of binaries.entries()) {
+      if (meta?.hash) this.localSyncState.migrateLegacyIdentity(path, "binary", meta.hash);
+    }
+    if (this.plugin.settings.syncConfigEnabled) {
+      const categories = enabledConfigCategories(this.plugin.settings.configSyncCategories);
+      const configFiles = this.indexDoc.getMap<{ hash?: string }>("configFiles");
+      for (const [path, meta] of configFiles.entries()) {
+        const prefix = `${this.plugin.app.vault.configDir}/`;
+        const category = path.startsWith(prefix)
+          ? categoryForConfigPath(path.slice(prefix.length))
+          : null;
+        if (
+          meta?.hash &&
+          category !== null &&
+          categories.has(category)
+        ) {
+          this.localSyncState.migrateLegacyIdentity(path, "config", meta.hash);
+        }
       }
     }
   }
@@ -573,6 +609,7 @@ export class VaultSync {
       await this.runInitialSyncPass();
       if (!this.destroyed) {
         await this.runInitialSyncPass();
+        await this.replayBootstrapVaultEvents();
         this.initialSynced = true;
         this.startBackgroundSyncAfterPriorityDrain();
       }
@@ -1059,8 +1096,42 @@ export class VaultSync {
     kind: "text" | StructuredKind,
     deletedIdentity: string | null,
   ): Promise<void> {
-    if (this.destroyed || this.remoteDeleteInFlight.has(path)) return;
+    if (this.destroyed) return;
+    if (this.remoteDeleteInFlight.has(path)) {
+      this.remoteDeletePending.set(path, { kind, deletedIdentity });
+      return;
+    }
     this.remoteDeleteInFlight.add(path);
+    let currentKind = kind;
+    let currentIdentity = deletedIdentity;
+    try {
+      do {
+        this.remoteDeletePending.delete(path);
+        await this.reconcileRemoteDelete(path, currentKind, currentIdentity);
+        const pending = this.remoteDeletePending.get(path);
+        if (pending) {
+          currentKind = pending.kind;
+          currentIdentity = pending.deletedIdentity;
+          continue;
+        }
+        const stillDeleted =
+          currentKind === "text" ? !this.files.has(path) : !this.structured.has(path);
+        if (!stillDeleted || this.destroyed) break;
+        // A delete may have landed while reconciliation was in flight without
+        // changing the coalesced payload. One final pass observes the current
+        // index and disk state.
+        break;
+      } while (true);
+    } finally {
+      this.remoteDeleteInFlight.delete(path);
+    }
+  }
+
+  private async reconcileRemoteDelete(
+    path: string,
+    kind: "text" | StructuredKind,
+    deletedIdentity: string | null,
+  ): Promise<void> {
     try {
       const wasReintroduced = () =>
         kind === "text" ? this.files.has(path) : this.structured.has(path);
@@ -1109,8 +1180,6 @@ export class VaultSync {
       if (!this.destroyed) {
         window.setTimeout(() => void this.handleRemoteDelete(path, kind, deletedIdentity), 2_000);
       }
-    } finally {
-      this.remoteDeleteInFlight.delete(path);
     }
   }
 
@@ -1338,7 +1407,12 @@ export class VaultSync {
   }
 
   private onLocalCreate(file: TAbstractFile): void {
-    if (!this.initialSynced) return;
+    if (this.destroyed) return;
+    if (!this.initialSynced) {
+      const version = this.bumpPathVersion(file.path);
+      this.bootstrapVaultEvents.push({ type: "create", file, version });
+      return;
+    }
     void this.handleLocalCreate(file);
   }
 
@@ -1423,7 +1497,12 @@ export class VaultSync {
   }
 
   private onLocalDelete(file: TAbstractFile): void {
-    if (this.destroyed || !this.initialSynced) return;
+    if (this.destroyed) return;
+    if (!this.initialSynced) {
+      const version = this.bumpPathVersion(file.path);
+      this.bootstrapVaultEvents.push({ type: "delete", file, version });
+      return;
+    }
     const path = file.path;
     if (this.remoteDeletesApplying.has(path)) return;
     this.localSyncState.remove(path);
@@ -1456,6 +1535,12 @@ export class VaultSync {
   }
 
   private onLocalRename(file: TAbstractFile, oldPath: string): void {
+    if (!this.initialSynced) {
+      const oldVersion = this.bumpPathVersion(oldPath);
+      const newVersion = this.bumpPathVersion(file.path);
+      this.bootstrapVaultEvents.push({ type: "rename", file, oldPath, oldVersion, newVersion });
+      return;
+    }
     void this.handleLocalRename(file, oldPath);
   }
 
@@ -1565,7 +1650,12 @@ export class VaultSync {
   }
 
   private onLocalModify(file: TAbstractFile): void {
-    if (this.destroyed || !this.initialSynced) return;
+    if (this.destroyed) return;
+    if (!this.initialSynced) {
+      const version = this.bumpPathVersion(file.path);
+      this.bootstrapVaultEvents.push({ type: "modify", file, version });
+      return;
+    }
     const kind = this.classify(file);
     if (kind === "binary") {
       this.binarySync.onLocalChanged(file.path);
@@ -1597,6 +1687,43 @@ export class VaultSync {
       if (existing) {
         if (!this.mobileSuspended) doc.ensureConnected();
         void doc.onDiskChanged();
+      }
+    }
+  }
+
+  private async replayBootstrapVaultEvents(): Promise<void> {
+    this.initialSynced = true;
+    while (!this.destroyed && this.bootstrapVaultEvents.length > 0) {
+      const events = this.bootstrapVaultEvents.splice(0);
+      for (const event of events) {
+        if (this.destroyed) return;
+        if (
+          event.type !== "rename" &&
+          this.currentPathVersion(event.file.path) !== event.version
+        ) {
+          continue;
+        }
+        if (
+          event.type === "rename" &&
+          (this.currentPathVersion(event.oldPath) !== event.oldVersion ||
+            this.currentPathVersion(event.file.path) !== event.newVersion)
+        ) {
+          continue;
+        }
+        switch (event.type) {
+          case "create":
+            await this.handleLocalCreate(event.file);
+            break;
+          case "delete":
+            this.onLocalDelete(event.file);
+            break;
+          case "rename":
+            await this.handleLocalRename(event.file, event.oldPath);
+            break;
+          case "modify":
+            this.onLocalModify(event.file);
+            break;
+        }
       }
     }
   }

@@ -182,7 +182,32 @@ describe("RealtimeProvider", () => {
   });
 
   it("does not send or acknowledge local edits made through a read-only token", async () => {
-    const f = fixture(() => Promise.resolve({ ...TOKEN, authorization: "read-only" }));
+    const recoveries: Uint8Array[] = [];
+    const doc = new Y.Doc();
+    const sockets: FakeSocket[] = [];
+    const provider = new RealtimeProvider(
+      "vault__doc",
+      doc,
+      () => Promise.resolve({ ...TOKEN, authorization: "read-only" }),
+      {
+        connect: false,
+        onReadOnlyUpdate: (update) => recoveries.push(update),
+        socketFactory: (url) => {
+          const socket = new FakeSocket(url);
+          sockets.push(socket);
+          return socket;
+        },
+      },
+    );
+    const f: ProviderFixture = {
+      doc,
+      provider,
+      sockets,
+      destroy: () => {
+        provider.destroy();
+        doc.destroy();
+      },
+    };
     try {
       const socket = await openAndHandshake(f);
       socket.deliver(syncAcknowledgement(0));
@@ -195,6 +220,7 @@ describe("RealtimeProvider", () => {
       expect(socket.sent).toHaveLength(before);
       expect(f.provider.hasLocalChanges).toBe(false);
       expect(localChanges).toEqual([]);
+      expect(recoveries).toHaveLength(1);
     } finally {
       f.destroy();
     }

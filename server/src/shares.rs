@@ -27,7 +27,7 @@ use crate::error::{AppError, AppResult};
 use crate::routes::require_member;
 use crate::session::{now_millis, ApiPrincipal};
 use crate::state::AppState;
-use crate::ydoc;
+
 
 /// How often an SSE connection polls the document store for changes.
 const POLL_INTERVAL: Duration = Duration::from_millis(1500);
@@ -68,6 +68,7 @@ pub struct SharePathQuery {
 pub struct ViewResponse {
     pub title: String,
     pub path: String,
+    pub epoch: u64,
     /// Full Yjs document state (base64, v1 encoding); the note text lives in
     /// the root `Y.Text("contents")`.
     pub update_b64: String,
@@ -383,9 +384,11 @@ pub async fn view_share(
     Path(share_id): Path<String>,
 ) -> AppResult<Json<ViewResponse>> {
     let (share, file) = resolve_share(&state, &share_id).await?;
-    let update = ydoc::read_update(&state, &doc_id(&share.vault_id, &share.guid)).await?;
+    let note_doc_id = doc_id(&share.vault_id, &share.guid);
+    let (epoch, update) = state.documents.read_update_with_epoch(&note_doc_id).await?;
     Ok(Json(ViewResponse {
         title: title_for_path(&file.path),
+        epoch,
         update_b64: base64::engine::general_purpose::STANDARD.encode(&update),
         path: file.path,
         updated_at: file.updated_at,
@@ -403,13 +406,17 @@ pub async fn view_events(
     // client's snapshot fetch. A change between the snapshot and this read is
     // folded into the baseline; the client tolerates that because Yjs updates
     // are idempotent and the next poll re-delivers anything newer.
-    let initial = ydoc::read_update(&state, &note_doc_id).await?;
+    let (initial_epoch, initial) = state
+        .documents
+        .read_update_with_epoch(&note_doc_id)
+        .await?;
     let last_sv = state_vector_of(&initial)?;
 
     struct Poller {
         state: AppState,
         share_id: String,
         note_doc_id: String,
+        epoch: u64,
         sv: StateVector,
         done: bool,
     }
@@ -418,6 +425,7 @@ pub async fn view_events(
         state,
         share_id,
         note_doc_id,
+        epoch: initial_epoch,
         sv: last_sv,
         done: false,
     };
@@ -442,9 +450,29 @@ pub async fn view_events(
             }
 
             // Transient document read failures just skip a tick.
-            let Ok(update) = ydoc::read_update(&p.state, &p.note_doc_id).await else {
+            let Ok((epoch, update)) = p
+                .state
+                .documents
+                .read_update_with_epoch(&p.note_doc_id)
+                .await
+            else {
                 continue;
             };
+            if epoch != p.epoch {
+                p.epoch = epoch;
+                let Ok(new_sv) = state_vector_of(&update) else {
+                    continue;
+                };
+                p.sv = new_sv;
+                let payload = serde_json::json!({
+                    "epoch": epoch,
+                    "update": base64::engine::general_purpose::STANDARD.encode(&update),
+                });
+                return Some((
+                    Ok(Event::default().event("snapshot").data(payload.to_string())),
+                    p,
+                ));
+            }
             let Ok((delta, new_sv)) = delta_since(&update, &p.sv) else {
                 continue;
             };
@@ -453,6 +481,7 @@ pub async fn view_events(
             }
             p.sv = new_sv;
             let payload = serde_json::json!({
+                "epoch": epoch,
                 "update": base64::engine::general_purpose::STANDARD.encode(&delta),
             });
             return Some((

@@ -233,6 +233,7 @@ export abstract class StructuredDocument extends SyncedDoc {
             this.path.endsWith(".canvas") ? "canvas" : "base",
             this.guid,
           );
+          if (!this.provider.hasLocalChanges) await this.recordAcknowledgedContent(true);
           return;
         }
         // Re-check destroyed after the await: a doc replaced mid-write (rename,
@@ -252,6 +253,7 @@ export abstract class StructuredDocument extends SyncedDoc {
         this.path.endsWith(".canvas") ? "canvas" : "base",
         this.guid,
       );
+      if (!this.provider.hasLocalChanges) await this.recordAcknowledgedContent(true);
     } catch (e) {
       console.error(`[Realtime] structured writeToDisk failed for ${this.path}`, e);
     } finally {

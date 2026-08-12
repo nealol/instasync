@@ -45,9 +45,11 @@ docker run -d \
 ```
 
 Put a TLS-terminating reverse proxy (Caddy, nginx, Traefik, …) in front and point
-it at port `8081`; it must forward **WebSocket upgrades** on `/d/*`. Set
+it at port `8081`; it must forward **WebSocket upgrades** on `/dmux` and on the
+still-supported `/d/*` transport. Set
 `PUBLIC_BASE_URL` to that public HTTPS URL; it is baked into client tokens
-(`wss://sync.example.com/d/{doc}/ws`) and is the only URL you
+(`wss://sync.example.com/dmux` for current clients; legacy per-document tokens
+use `wss://sync.example.com/d/{doc}/ws`) and is the only URL you
 enter in the plugin.
 
 The SQLite database and native CRDT snapshot/update generations live under

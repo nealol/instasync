@@ -1,6 +1,7 @@
 mod m20260810_000001_create_application_tables;
 mod m20260810_000002_upgrade_legacy_schema;
 mod m20260810_000003_create_indexes_and_search;
+mod m20260812_000004_preserve_job_contributions;
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, TransactionTrait};
 use sea_orm_migration::prelude::{MigrationTrait, MigratorTrait};
@@ -14,6 +15,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260810_000001_create_application_tables::Migration),
             Box::new(m20260810_000002_upgrade_legacy_schema::Migration),
             Box::new(m20260810_000003_create_indexes_and_search::Migration),
+            Box::new(m20260812_000004_preserve_job_contributions::Migration),
         ]
     }
 }

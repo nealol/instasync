@@ -10,6 +10,7 @@ export type SharedNoteState =
 interface ViewResponse {
   title: string;
   path: string;
+  epoch: number;
   updateB64: string;
   updatedAt: number;
 }
@@ -31,11 +32,12 @@ export function useSharedNote(shareId: string): SharedNoteState {
   const [state, setState] = useState<SharedNoteState>({ status: "loading" });
 
   useEffect(() => {
-    const doc = new Y.Doc();
+    let doc = new Y.Doc();
     let source: EventSource | null = null;
     let cancelled = false;
     let title = "";
     let path = "";
+    let epoch = 0;
 
     const render = () => {
       if (cancelled) return;
@@ -51,6 +53,7 @@ export function useSharedNote(shareId: string): SharedNoteState {
       const body = (await res.json()) as ViewResponse;
       title = body.title;
       path = body.path;
+      epoch = body.epoch;
       Y.applyUpdate(doc, b64ToBytes(body.updateB64));
       doc.getText("contents").observe(render);
       render();
@@ -59,10 +62,33 @@ export function useSharedNote(shareId: string): SharedNoteState {
       source.addEventListener("update", (event) => {
         if (cancelled) return;
         try {
-          const data = JSON.parse((event as MessageEvent).data) as { update: string };
+          const data = JSON.parse((event as MessageEvent).data) as {
+            epoch: number;
+            update: string;
+          };
+          if (data.epoch !== epoch) return;
           Y.applyUpdate(doc, b64ToBytes(data.update));
         } catch (e) {
           console.error("Failed to apply shared-note update event", e);
+        }
+      });
+      source.addEventListener("snapshot", (event) => {
+        if (cancelled) return;
+        try {
+          const data = JSON.parse((event as MessageEvent).data) as {
+            epoch: number;
+            update: string;
+          };
+          if (data.epoch <= epoch) return;
+          const previous = doc;
+          doc = new Y.Doc();
+          epoch = data.epoch;
+          Y.applyUpdate(doc, b64ToBytes(data.update));
+          doc.getText("contents").observe(render);
+          render();
+          previous.destroy();
+        } catch (e) {
+          console.error("Failed to apply shared-note snapshot event", e);
         }
       });
       source.addEventListener("revoked", () => {

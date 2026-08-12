@@ -471,8 +471,8 @@ impl JobQueue {
             sqlx::query(
                 "INSERT INTO background_job_contributors(\
                      intent_key,actor_key,principal_json,revision\
-                 ) VALUES(?,?,?,?) ON CONFLICT(intent_key,actor_key) DO UPDATE SET \
-                 principal_json=excluded.principal_json,revision=excluded.revision",
+                 ) VALUES(?,?,?,?) ON CONFLICT(intent_key,revision,actor_key) DO UPDATE SET \
+                 principal_json=excluded.principal_json",
             )
             .bind(&intent_key)
             .bind(principal.actor_key())
@@ -700,7 +700,8 @@ impl JobQueue {
         let mut transaction = self.0.pool.begin().await?;
         let rows = sqlx::query(
             "SELECT principal_json FROM background_job_contributors \
-             WHERE intent_key=? AND revision<=? ORDER BY actor_key",
+             WHERE intent_key=? AND revision<=? \
+             GROUP BY actor_key ORDER BY actor_key",
         )
         .bind(intent_key)
         .bind(revision)
@@ -917,6 +918,40 @@ mod tests {
         assert_eq!(
             queue.load_contributors(&key, 2).await.unwrap().1,
             vec![principal]
+        );
+    }
+
+    #[tokio::test]
+    async fn later_write_by_same_actor_does_not_steal_earlier_revision_attribution() {
+        let queue = queue().await;
+        let principal = Principal {
+            user_id: "user".into(),
+            display_name: "User".into(),
+            email: "user@example.com".into(),
+            git_email: None,
+            actor: crate::state::PrincipalActor::User,
+            expires_at_ms: i64::MAX,
+        };
+        queue
+            .enqueue_git("vault", &principal, Duration::ZERO)
+            .await
+            .unwrap();
+        let key = JobPayload::GitReconcile {
+            vault_id: "vault".into(),
+        }
+        .intent_key();
+
+        let claimed = queue.load_contributors(&key, 1).await.unwrap();
+        queue
+            .enqueue_git("vault", &principal, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert_eq!(claimed, (1, vec![principal.clone()]));
+        queue.clear_contributors(&key, claimed.0).await.unwrap();
+        assert_eq!(
+            queue.load_contributors(&key, 2).await.unwrap(),
+            (2, vec![principal])
         );
     }
 

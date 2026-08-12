@@ -123,7 +123,7 @@ export class ConfigSync {
   private initialPullComplete = false;
   private reloadNoticeTimer: number | null = null;
   private observer: (event: Y.YMapEvent<ConfigMeta>) => void;
-  private focusHandler = () => void this.reconcileAll();
+  private focusHandler = () => void this.retryInitialPullOrReconcile();
 
   constructor(plugin: RealtimePlugin, indexDoc: Y.Doc, localSyncState?: LocalSyncState) {
     this.plugin = plugin;
@@ -220,6 +220,14 @@ export class ConfigSync {
     }
   }
 
+  private async retryInitialPullOrReconcile(): Promise<void> {
+    if (this.initialPullComplete) {
+      await this.reconcileAll();
+    } else {
+      await this.runInitialPull();
+    }
+  }
+
   async reconcileAll(): Promise<boolean> {
     if (this.destroyed || !this.started || this.paused) return false;
     const paths = new Set<string>();
@@ -284,6 +292,15 @@ export class ConfigSync {
       localState.candidate
     ) {
       const localBytes = await this.plugin.app.vault.adapter.readBinary(path);
+      let remoteBytes: ArrayBuffer;
+      try {
+        remoteBytes = await this.plugin.auth.getBlob(this.vaultId, path, remote.hash);
+      } catch (e) {
+        if (this.destroyed) return false;
+        console.error(`[Realtime] config blob download failed for ${path}`, e);
+        window.setTimeout(() => void this.reconcile(path), RETRY_MS);
+        return false;
+      }
       if (!this.canApply(generation)) {
         void this.reconcile(path);
         return false;
@@ -296,7 +313,7 @@ export class ConfigSync {
         void this.reconcile(path);
         return false;
       }
-      await this.download(path, remote, local.hash, generation);
+      await this.materializeDownload(path, remote, remoteBytes, local.hash, generation);
       return this.canApply(generation);
     }
     if (local && !remote && base !== null && base !== local.hash) {
@@ -446,6 +463,16 @@ export class ConfigSync {
       window.setTimeout(() => void this.reconcile(path), RETRY_MS);
       return;
     }
+    await this.materializeDownload(path, meta, bytes, expectedLocalHash, generation);
+  }
+
+  private async materializeDownload(
+    path: string,
+    meta: ConfigMeta,
+    bytes: ArrayBuffer,
+    expectedLocalHash?: string | null,
+    generation = this.pauseGeneration,
+  ): Promise<void> {
     if (!this.canApply(generation)) {
       if (!this.destroyed) void this.reconcile(path);
       return;
@@ -641,7 +668,7 @@ export class ConfigSync {
     if (this.destroyed || this.paused || this.pollTimer !== null) return;
     this.pollTimer = window.setTimeout(() => {
       this.pollTimer = null;
-      void this.reconcileAll().finally(() => this.schedulePoll());
+      void this.retryInitialPullOrReconcile().finally(() => this.schedulePoll());
     }, POLL_MS);
   }
 

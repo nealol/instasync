@@ -3115,6 +3115,76 @@ async fn doc_token_bounds_unregistered_document_reservations() {
 }
 
 #[tokio::test]
+async fn preregistered_guid_cannot_bypass_physical_document_quota() {
+    let mut config = test_config(
+        "http://auth.test",
+        realtime_server::blobs::MAX_BLOB_BYTES,
+    );
+    config.crdt_max_documents_per_vault = 1;
+    let app = app_from_config(&config).await;
+    let alice = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&alice),
+        Some(json!({"name": "V"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap();
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/doc-token",
+        Some(&alice),
+        Some(json!({
+            "vaultId": vault_id,
+            "docId": format!("{vault_id}__first"),
+            "path": "first.md"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/files"),
+        Some(&alice),
+        Some(json!({"guid": "preregistered", "path": "preregistered.md"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/doc-token",
+        Some(&alice),
+        Some(json!({
+            "vaultId": vault_id,
+            "docId": format!("{vault_id}__preregistered")
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Minting another token for the already-physical creator document remains
+    // allowed even before its index registration is published.
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/doc-token",
+        Some(&alice),
+        Some(json!({
+            "vaultId": vault_id,
+            "docId": format!("{vault_id}__first")
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn search_tags_backlinks_reindex_and_rename_rewrite() {
     let app = test_app().await;
     let token = login(&app, "alice").await;
@@ -6661,6 +6731,7 @@ async fn public_share_lifecycle_create_view_and_revoke() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(view["title"], "Shared");
     assert_eq!(view["path"], "Folder/Shared.md");
+    assert_eq!(view["epoch"], 0);
     {
         use base64::Engine;
         use yrs::updates::decoder::Decode;

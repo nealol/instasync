@@ -59,6 +59,7 @@ export interface RealtimeProviderOptions {
   connect?: boolean;
   awareness?: awarenessProtocol.Awareness;
   socketFactory?: SyncSocketFactory;
+  onReadOnlyUpdate?: (update: Uint8Array) => void;
 }
 
 type TokenSource = () => Promise<ClientToken>;
@@ -95,8 +96,10 @@ export class RealtimeProvider {
 
   private readonly listeners = new Map<ProviderEvent, Set<AnyProviderListener>>();
   private readonly socketFactory: SyncSocketFactory;
+  private readonly onReadOnlyUpdate?: (update: Uint8Array) => void;
   private socket: SyncSocket | null = null;
   private connectTask: Promise<void> | null = null;
+  private connectTaskLifecycle = -1;
   private completeAttempt: ((connected: boolean) => void) | null = null;
   private lifecycle = 0;
   private shouldConnect = false;
@@ -115,6 +118,7 @@ export class RealtimeProvider {
   private readonly documentUpdateListener = (update: Uint8Array, origin: unknown): void => {
     if (origin === this || this.destroyed) return;
     if (this.clientToken?.authorization === "read-only") {
+      this.onReadOnlyUpdate?.(update.slice());
       console.warn(
         "Realtime: a read-only document was changed locally; the server will not accept the change.",
       );
@@ -152,6 +156,7 @@ export class RealtimeProvider {
   ) {
     this.awareness = options.awareness ?? new awarenessProtocol.Awareness(document);
     this.socketFactory = options.socketFactory ?? defaultSocketFactory;
+    this.onReadOnlyUpdate = options.onReadOnlyUpdate;
     this.document.on("update", this.documentUpdateListener);
     this.awareness.on("update", this.awarenessUpdateListener);
     if (options.connect !== false) void this.connect();
@@ -166,7 +171,7 @@ export class RealtimeProvider {
     if (this.destroyed || this.status === SYNC_STATUS_CONNECTED) return Promise.resolve();
     this.shouldConnect = true;
     this.wakeRetry?.();
-    if (this.connectTask) return this.connectTask;
+    if (this.connectTask && this.connectTaskLifecycle === this.lifecycle) return this.connectTask;
 
     const lifecycle = this.lifecycle;
     const task = this.runConnectLoop(lifecycle).finally(() => {
@@ -181,6 +186,7 @@ export class RealtimeProvider {
       }
     });
     this.connectTask = task;
+    this.connectTaskLifecycle = lifecycle;
     return task;
   }
 
