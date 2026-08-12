@@ -228,7 +228,7 @@ impl Config {
             bind_addr: String::new(),
             public_base_url: String::new(),
             crdt_store_dir: std::env::temp_dir()
-                .join(format!("realtime-crdt-test-{}", uuid::Uuid::new_v4()))
+                .join(format!("realtime-test-crdt-{}", nanoid::nanoid!()))
                 .display()
                 .to_string(),
             crdt_epoch_period_days: 365,

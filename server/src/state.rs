@@ -118,8 +118,7 @@ pub struct AppState {
     pub plugindb: PluginDbService,
     /// Persistent search reconciliation scheduler.
     pub search: SearchService,
-    /// Opaque, document-scoped sync tokens. Tokens are intentionally
-    /// process-local; clients refresh them after a server restart.
+    /// Opaque, document-scoped sync tokens cached by this process.
     pub sync_grants: Arc<Mutex<HashMap<String, SyncGrant>>>,
     /// Process-local sync counters exported through `/metrics`.
     pub sync_metrics: SyncMetrics,
@@ -161,4 +160,5 @@ impl AppState {
             .filter(|grant| grant.document_id == document_id)
             .cloned()
     }
+
 }

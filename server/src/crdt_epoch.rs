@@ -501,6 +501,7 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), EpochError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use yrs::types::ToJson;
     use yrs::{Any, Array, Map, MapPrelim, Text, TextPrelim};
 
@@ -691,5 +692,48 @@ mod tests {
             vec![0, 1]
         );
         tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn epoch_manifest_state_machine_preserves_successor_and_retirement_invariants(
+            actions in prop::collection::vec(0u8..4, 1..100),
+            recovery_window_ms in any::<u64>(),
+        ) {
+            let mut manifest = EpochManifest::initial("vault__doc", 0);
+            let mut now_ms = 0u64;
+            for action in actions {
+                now_ms = now_ms.saturating_add(1);
+                match action {
+                    0 => {
+                        let pending = manifest.begin(now_ms).unwrap();
+                        prop_assert_eq!(pending.epoch, manifest.current.epoch.saturating_add(1));
+                    }
+                    1 if manifest.pending.is_some() => {
+                        let previous = manifest.current.clone();
+                        manifest
+                            .activate(now_ms, recovery_window_ms, 1, 1)
+                            .unwrap();
+                        prop_assert_eq!(manifest.current.epoch, previous.epoch + 1);
+                        let previous_is_retained = manifest.retired.iter().any(|retired| {
+                            retired.epoch == previous.epoch
+                                && retired.physical_document_id == previous.physical_document_id
+                        });
+                        prop_assert!(previous_is_retained);
+                    }
+                    2 => {
+                        manifest.retired.retain(|retired| retired.delete_after_ms > now_ms);
+                    }
+                    _ => {}
+                }
+                prop_assert!(manifest.validate("vault__doc").is_ok());
+                prop_assert!(manifest
+                    .retired
+                    .windows(2)
+                    .all(|pair| pair[0].epoch < pair[1].epoch));
+            }
+        }
     }
 }

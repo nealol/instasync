@@ -4,6 +4,7 @@ pub mod blobs;
 pub mod caps;
 pub mod config;
 pub mod crdt;
+
 mod crdt_epoch;
 pub mod crdt_storage;
 pub mod db;
@@ -143,6 +144,7 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health/live", get(operations::live))
         .route("/health/ready", get(operations::ready))
+
         .route("/metrics", get(operations::metrics))
         .merge(SwaggerUi::new("/docs").url("/openapi.json", openapi::ApiDoc::openapi()))
         .merge(mcp::router(state.clone()))

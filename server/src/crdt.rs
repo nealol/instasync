@@ -205,6 +205,7 @@ impl DocumentStore {
         })))
     }
 
+
     pub fn directory(&self) -> &Path {
         &self.0.directory
     }

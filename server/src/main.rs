@@ -11,6 +11,7 @@ use realtime_server::{
     SERVER_NAME,
 };
 
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -163,9 +164,44 @@ async fn run_crdt_command(args: Vec<String>) -> anyhow::Result<()> {
                 anyhow::bail!("{} document(s) could not be imported", report.errors.len());
             }
         }
+        [command, source, destination, pid]
+            if command == "migrate-ysweet-cutover" =>
+        {
+            let pid: i32 = pid.parse()?;
+            #[cfg(unix)]
+            {
+                let status = std::process::Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status()?;
+                if !status.success() {
+                    anyhow::bail!("failed to signal y-sweet process {pid}");
+                }
+                loop {
+                    let status = std::process::Command::new("kill")
+                        .args(["-0", &pid.to_string()])
+                        .status()?;
+                    if !status.success() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+            #[cfg(not(unix))]
+            anyhow::bail!("live y-sweet migration requires Unix process signaling");
+            let report = import_ysweet_store(
+                PathBuf::from(source).as_path(),
+                PathBuf::from(destination).as_path(),
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if !report.errors.is_empty() {
+                anyhow::bail!("{} document(s) could not be imported", report.errors.len());
+            }
+        }
         _ => anyhow::bail!(
             "usage: realtime-server crdt inspect [STORE] | repair [STORE] | \
-             import-ysweet SOURCE [STORE]"
+             import-ysweet SOURCE [STORE] | \
+             migrate-ysweet-cutover SOURCE STORE YSWEET_PID"
         ),
     }
     Ok(())

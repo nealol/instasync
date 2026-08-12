@@ -1492,6 +1492,7 @@ fn sync_directory(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use yrs::{Doc, GetString, ReadTxn, Text, Transact};
 
     fn test_root(name: &str) -> PathBuf {
@@ -1847,5 +1848,72 @@ mod tests {
 
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(backup).unwrap();
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn restore_journal_swap_model_is_atomic(
+            had_original in prop::collection::vec(any::<bool>(), 1..12),
+            fail_after in 0usize..32,
+            committed in any::<bool>(),
+        ) {
+            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+            enum Slot {
+                Missing,
+                Old,
+                New,
+            }
+
+            let mut target = had_original
+                .iter()
+                .map(|present| if *present { Slot::Old } else { Slot::Missing })
+                .collect::<Vec<_>>();
+            let mut staged = vec![true; had_original.len()];
+            let mut old = vec![false; had_original.len()];
+            let mut actions = 0usize;
+            for index in 0..had_original.len() {
+                if had_original[index] {
+                    target[index] = Slot::Missing;
+                    old[index] = true;
+                    actions += 1;
+                    if actions == fail_after {
+                        break;
+                    }
+                }
+                target[index] = Slot::New;
+                staged[index] = false;
+                actions += 1;
+                if actions == fail_after {
+                    break;
+                }
+            }
+
+            let installation_finished = target.iter().all(|slot| *slot == Slot::New);
+            if committed && installation_finished {
+                old.fill(false);
+                staged.fill(false);
+                prop_assert!(target.iter().all(|slot| *slot == Slot::New));
+            } else {
+                for index in (0..had_original.len()).rev() {
+                    if old[index] {
+                        target[index] = Slot::Old;
+                        old[index] = false;
+                    } else if !had_original[index] && target[index] == Slot::New && !staged[index] {
+                        target[index] = Slot::Missing;
+                    }
+                    staged[index] = false;
+                }
+                for (index, had_original) in had_original.iter().copied().enumerate() {
+                    prop_assert_eq!(
+                        target[index],
+                        if had_original { Slot::Old } else { Slot::Missing }
+                    );
+                }
+            }
+            prop_assert!(old.iter().all(|present| !present));
+            prop_assert!(staged.iter().all(|present| !present));
+        }
     }
 }

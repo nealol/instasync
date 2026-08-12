@@ -48,6 +48,12 @@ The image runs one process and exposes one port. Mount `/data` so CRDT
 generations, blobs, the application database, and git repositories survive
 container replacement.
 
+Native CRDT storage is single-writer. Do not point multiple running replicas at
+different `CRDT_STORE` directories or a shared filesystem. Use one active
+writer until an authoritative object-store backend with conditional manifest
+writes is configured; load-balancer fan-out across independent stores is
+split-brain.
+
 ```sh
 docker run -p 8081:8081 -v realtime-data:/data \
   -e PUBLIC_BASE_URL=https://sync.example.com \
@@ -251,6 +257,8 @@ Stop the server before running maintenance commands:
 realtime-server crdt inspect /data/crdt
 realtime-server crdt repair /data/crdt
 realtime-server crdt import-ysweet /data/old-ysweet /data/crdt
+realtime-server crdt migrate-ysweet-cutover \
+  /data/old-ysweet /data/crdt 12345
 ```
 
 `inspect` only reads files and exits unsuccessfully when any document is
@@ -261,6 +269,15 @@ command reads y-sweet 0.9 filesystem entries (`{docId}/data.ysweet`) and skips
 document IDs already present in the destination. Old atomic `{docId}.yjs`
 snapshots from the first native store format migrate automatically on first
 load and remain as `{docId}.yjs.v1-migrated`.
+
+`migrate-ysweet-cutover` sends SIGTERM to the supplied y-sweet PID and waits for
+the process to exit, which closes active WebSockets and finishes the store's
+normal shutdown path before import starts. Remove y-sweet from the load
+balancer before invoking it. Start the native server at the same public URL
+afterward; clients obtain fresh document tokens and reconnect without changing
+plugin configuration. Keep the old y-sweet store intact until the native store
+passes `crdt inspect`. The destination must not contain documents from a prior
+partial import; the importer skips existing document IDs.
 
 Run the storage benchmark with `cargo bench --manifest-path server/Cargo.toml
 --bench crdt_storage`. It reports append acknowledgement percentiles, disk
