@@ -1573,6 +1573,32 @@ async fn authorize_doc_with_claim(
         .await?;
     if registered.is_none() {
         if state.documents.document_exists(doc_id).await? {
+            let now = now_millis();
+            let reservation = {
+                let mut reservations = state.pending_document_creations.lock().await;
+                reservations.retain(|_, reservation| reservation.expires_at_ms > now);
+                reservations.get(doc_id).cloned()
+            };
+            if let Some(reservation) = reservation {
+                let claimed_path_matches = match claimed_path {
+                    Some(path) => !path.is_empty() && path == reservation.path,
+                    None => true,
+                };
+                if reservation.user_id == user.id && claimed_path_matches {
+                    return Ok(DocumentAuthorization {
+                        level: authorize_path(
+                            state,
+                            user,
+                            vault_id,
+                            &reservation.path,
+                        )
+                        .await?,
+                        path: reservation.path,
+                        requires_creation_reservation: true,
+                    });
+                }
+                return Err(AppError::Forbidden);
+            }
             return Ok(DocumentAuthorization {
                 level: authorize_uniform_vault(state, user, vault_id).await?,
                 path: String::new(),

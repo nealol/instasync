@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { createServer } from "node:net";
-import { mkdtemp, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
-import { pathToFileURL } from "node:url";
+import { parse } from "acorn";
 import { checkServerCaps as checkCurrentServerCaps, serverSupportsCapability } from "../src/caps";
 
 type CompatibilityResult =
@@ -218,19 +218,44 @@ async function releasedClientChecker(
   baseline: Baseline,
   artifacts: Map<string, string>,
 ): Promise<(caps: unknown, requiredCaps?: unknown) => CompatibilityResult> {
-  const capsPath = artifacts.get("src/caps.ts");
-  invariant(capsPath, `${baseline.id}: client caps source was not acquired`);
-  const moduleUrl = `${pathToFileURL(capsPath).href}?sha=${baseline.commit}`;
-  // The module path belongs to the selected release fixture and only exists
-  // after acquisition, so it cannot be a static import.
-  const module = (await import(moduleUrl)) as {
-    checkServerCaps?: (caps: unknown, requiredCaps?: unknown) => CompatibilityResult;
+  const bundlePath = artifacts.get("release/main.js");
+  invariant(bundlePath, `${baseline.id}: release bundle was not acquired`);
+  const bundle = await readFile(bundlePath, "utf8");
+  const marker = "server did not advertise compatibility caps";
+  const markerOffset = bundle.indexOf(marker);
+  invariant(markerOffset >= 0, `${baseline.id}: released bundle has no cap checker`);
+
+  const program = parse(bundle, {
+    ecmaVersion: "latest",
+    sourceType: "script",
+  }) as unknown as {
+    body: Array<{ start: number; end: number }>;
   };
-  invariant(
-    typeof module.checkServerCaps === "function",
-    `${baseline.id}: released cap checker missing`,
+  const statement = program.body.find(
+    ({ start, end }) => start <= markerOffset && markerOffset < end,
   );
-  return module.checkServerCaps;
+  invariant(statement, `${baseline.id}: could not extract cap checker from released bundle`);
+
+  const dependencyStart = bundle.lastIndexOf("var ", statement.start - 1);
+  invariant(dependencyStart >= 0, `${baseline.id}: released cap checker constants are missing`);
+  let extracted = bundle.slice(dependencyStart, statement.end);
+  const syncReference = /pluginDbSync:\[([$A-Z_a-z][$\w]*)\]/.exec(extracted)?.[1];
+  invariant(syncReference, `${baseline.id}: released plugin DB cap is missing`);
+  const syncDefinition = new RegExp(`(?:var|let|const)\\s+${syncReference}=(["'][^"']+["'])`).exec(
+    bundle.slice(0, dependencyStart),
+  );
+  invariant(syncDefinition, `${baseline.id}: released plugin DB cap value is missing`);
+  extracted = `var ${syncReference}=${syncDefinition[1]};${extracted}`;
+  const functionMatch = /function\s+([$A-Z_a-z][$\w]*)\s*\([^)]*\)\s*\{/.exec(extracted);
+  invariant(functionMatch, `${baseline.id}: released bundle cap checker is not a function`);
+  const checkerName = functionMatch[1];
+  const helper = `${extracted}\nexport default ${checkerName};\n`;
+  const moduleUrl = `data:text/javascript;base64,${Buffer.from(helper).toString("base64")}`;
+  const module = (await import(moduleUrl)) as {
+    default?: (caps: unknown, requiredCaps?: unknown) => CompatibilityResult;
+  };
+  invariant(typeof module.default === "function", `${baseline.id}: released cap checker missing`);
+  return module.default;
 }
 
 function resultKind(result: CompatibilityResult): "ok" | "server-incompatible" | "client-too-old" {
@@ -342,12 +367,6 @@ async function main() {
       releasedManifest.version === baseline.plugin.version,
       `${baseline.id}: release manifest version ${releasedManifest.version} does not match ${baseline.plugin.version}`,
     );
-    const bundlePath = artifacts.get("release/main.js");
-    invariant(
-      bundlePath && (await stat(bundlePath)).size > 0,
-      `${baseline.id}: release bundle missing`,
-    );
-
     const checkReleased = await releasedClientChecker(baseline, artifacts);
     const sourceContract = await releasedServerCaps(baseline, artifacts);
     const releasedServer = runReleasedServer

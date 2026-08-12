@@ -5,6 +5,7 @@ import { notices } from "../support/obsidian-mock";
 import { Peer } from "../support/peer";
 import { startAuthHarness, type AuthHarness } from "../support/authServer";
 import { waitFor, freshGuid } from "../support/util";
+import { setDocumentEpoch } from "../../src/documentEpoch";
 
 const modalMock = vi.hoisted(() => ({
   choice: "local" as "local" | "remote",
@@ -176,6 +177,55 @@ describe("Document sync", () => {
     } finally {
       doc.destroy();
       peer.destroy();
+    }
+  });
+
+  it("preserves the latest in-memory text when read-only recovery overlaps a delayed save", async () => {
+    const guid = freshGuid();
+    const { doc, vault } = makeDoc(guid, {
+      file: { path: "note.md", content: "stale disk snapshot" },
+    });
+    try {
+      await doc.whenReady();
+      (doc.provider as any).clientToken = {
+        docId: docId(guid),
+        url: harness.authUrl,
+        authorization: "read-only",
+      };
+
+      const create = vault.create.bind(vault);
+      const firstSave = Promise.withResolvers<void>();
+      let releaseFirstSave!: () => void;
+      const firstSaveRelease = new Promise<void>((resolve) => {
+        releaseFirstSave = resolve;
+      });
+      let conflictSaves = 0;
+      vault.create = async (path, content) => {
+        if (/\(conflicted copy /.test(path)) {
+          conflictSaves += 1;
+          if (conflictSaves === 1) {
+            firstSave.resolve();
+            await firstSaveRelease;
+          }
+        }
+        return create(path, content);
+      };
+
+      doc.ytext.insert(doc.ytext.length, " first edit");
+      await firstSave.promise;
+      doc.ytext.insert(doc.ytext.length, " second edit");
+      doc.ytext.insert(doc.ytext.length, " third edit");
+      releaseFirstSave();
+
+      await waitFor(() => conflictFiles(vault).length === 2, {
+        label: "queued read-only recovery saved",
+      });
+      const copies = conflictFiles(vault).map((path) => vault.files.get(path));
+      expect(copies).toContain("stale disk snapshot first edit second edit third edit");
+      expect(copies).not.toContain("stale disk snapshot");
+      expect(vault.files.get("note.md")).toBe("stale disk snapshot");
+    } finally {
+      doc.destroy();
     }
   });
 
@@ -741,6 +791,44 @@ describe("Document sync", () => {
       expect(modalMock.calls).toHaveLength(0);
       expect(doc.content).toBe("draft completed locally");
       expect(vault.files.get("note.md")).toBe("draft completed locally");
+    } finally {
+      doc.destroy();
+      peer.destroy();
+    }
+  });
+
+  it("does not fast-forward stale prefix-extending disk text after an epoch rollover", async () => {
+    modalMock.choice = "remote";
+    const guid = freshGuid();
+    const serverDocId = docId(guid);
+    const peer = new Peer(memberPlugin, serverDocId);
+    await peer.whenSynced();
+    peer.setText("draft");
+    await peer.whenChangesSynced();
+
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    vault.files.set("note.md", "draft completed before remote deletion");
+    setDocumentEpoch(plugin as any, serverDocId, 1);
+    const doc = new Document(plugin as any, "note.md", guid, serverDocId, false);
+    try {
+      await doc.whenReady();
+
+      expect(modalMock.calls).toEqual([
+        {
+          path: "note.md",
+          localContent: "draft completed before remote deletion",
+          remoteContent: "draft",
+        },
+      ]);
+      expect(peer.getText()).toBe("draft");
+      expect(doc.content).toBe("draft");
+      expect(vault.files.get("note.md")).toBe("draft");
+      const conflicts = conflictFiles(vault);
+      expect(conflicts).toHaveLength(1);
+      expect(vault.files.get(conflicts[0])).toBe("draft completed before remote deletion");
     } finally {
       doc.destroy();
       peer.destroy();

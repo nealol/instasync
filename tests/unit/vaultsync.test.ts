@@ -822,6 +822,30 @@ describe("VaultSync index", () => {
     }
   });
 
+  it("preserves a bootstrap create when a newer modify exists for the same file", async () => {
+    const sync = Object.create(VaultSync.prototype) as any;
+    const file = { path: "created-and-modified.md" };
+    const order: string[] = [];
+    Object.assign(sync, {
+      destroyed: false,
+      initialSynced: false,
+      bootstrapVaultEvents: [
+        { type: "create", file, version: 1 },
+        { type: "modify", file, version: 2 },
+      ],
+      pathVersions: new Map([["created-and-modified.md", 2]]),
+      handleLocalCreate: vi.fn(async () => order.push("create")),
+      onLocalModify: vi.fn(() => order.push("modify")),
+      handleLocalRename: vi.fn(),
+      onLocalDelete: vi.fn(),
+    });
+
+    await sync.replayBootstrapVaultEvents();
+
+    expect(order).toEqual(["create", "modify"]);
+    expect(sync.bootstrapVaultEvents).toHaveLength(0);
+  });
+
   it("retries when the final bootstrap rescan fails", async () => {
     const vault = await harness.createVault(aliceToken, "initial-rescan-retry");
     const { plugin } = makeFakePlugin(harness.authUrl, {
@@ -1320,6 +1344,81 @@ describe("VaultSync index", () => {
       expect(sync.queueMobileReconnects).not.toHaveBeenCalled();
     } finally {
       connected.resolve();
+      (Platform as any).isMobile = false;
+    }
+  });
+
+  it("unpauses deferred mobile work when a later reconnect succeeds", async () => {
+    (Platform as any).isMobile = true;
+    const sync = Object.create(VaultSync.prototype) as any;
+    const setBinaryPaused = vi.fn();
+    const setConfigPaused = vi.fn();
+    const queueMobileReconnects = vi.fn();
+    const indexProvider = { status: "offline" };
+    Object.assign(sync, {
+      destroyed: false,
+      mobileSuspended: true,
+      mobileCatchUpPending: false,
+      mobileResumeInProgress: false,
+      docConnectionGeneration: 1,
+      indexProvider,
+      plugin: { setStatus: vi.fn() },
+      runInitialSync: vi.fn(async () => undefined),
+      binarySync: { setPaused: setBinaryPaused },
+      configSync: { setPaused: setConfigPaused },
+      queueMobileReconnects,
+      connectIndexAfterCompatibilityCheck: vi.fn(async () => undefined),
+    });
+
+    try {
+      await sync.resumeFromBackground();
+      expect(sync.mobileCatchUpPending).toBe(true);
+      expect(setBinaryPaused).not.toHaveBeenCalled();
+      expect(setConfigPaused).not.toHaveBeenCalled();
+
+      indexProvider.status = "connected";
+      sync.handleIndexStatus("connected");
+
+      expect(setBinaryPaused).toHaveBeenCalledWith(false);
+      expect(setConfigPaused).toHaveBeenCalledWith(false);
+      expect(queueMobileReconnects).toHaveBeenCalledOnce();
+      expect(sync.mobileCatchUpPending).toBe(false);
+    } finally {
+      (Platform as any).isMobile = false;
+    }
+  });
+
+  it("queues retained documents after a failed foreground reconnect later succeeds", async () => {
+    (Platform as any).isMobile = true;
+    const sync = Object.create(VaultSync.prototype) as any;
+    const queueMobileReconnects = vi.fn();
+    const indexProvider = { status: "offline" };
+    Object.assign(sync, {
+      destroyed: false,
+      mobileSuspended: true,
+      mobileCatchUpPending: false,
+      mobileResumeInProgress: false,
+      docConnectionGeneration: 3,
+      indexProvider,
+      plugin: { setStatus: vi.fn() },
+      runInitialSync: vi.fn(async () => undefined),
+      binarySync: { setPaused: vi.fn() },
+      configSync: { setPaused: vi.fn() },
+      queueMobileReconnects,
+      connectIndexAfterCompatibilityCheck: vi.fn(async () => undefined),
+    });
+
+    try {
+      await sync.resumeFromBackground();
+      expect(sync.mobileCatchUpPending).toBe(true);
+      expect(queueMobileReconnects).not.toHaveBeenCalled();
+
+      indexProvider.status = "connected";
+      sync.handleIndexStatus("connected");
+
+      expect(queueMobileReconnects).toHaveBeenCalledOnce();
+      expect(sync.mobileCatchUpPending).toBe(false);
+    } finally {
       (Platform as any).isMobile = false;
     }
   });

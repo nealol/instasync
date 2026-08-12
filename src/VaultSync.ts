@@ -213,7 +213,16 @@ export class VaultSync {
     this.structuredObserver = this.onStructuredChanged.bind(this);
     this.structured.observe(this.structuredObserver);
 
-    this.statusListener = (status) => {
+    this.statusListener = this.handleIndexStatus.bind(this);
+    this.indexProvider.on(SYNC_EVENT_STATUS, this.statusListener);
+    this.invalidationListener = (documentId) => this.onDocumentInvalidated(documentId);
+    this.indexProvider.on(SYNC_EVENT_DOCUMENT_INVALIDATED, this.invalidationListener);
+
+    this.registerVaultEvents();
+    void this.init();
+  }
+
+  private handleIndexStatus(status: SyncStatus): void {
       if (this.mobileSuspended) {
         if (status === SYNC_STATUS_OFFLINE) {
           this.wasConnected = false;
@@ -227,6 +236,8 @@ export class VaultSync {
         void this.runInitialSync();
         if (Platform?.isMobile && this.mobileCatchUpPending && !this.mobileResumeInProgress) {
           this.mobileCatchUpPending = false;
+          this.binarySync.setPaused(false);
+          this.configSync.setPaused(false);
           this.queueMobileReconnects();
         }
       } else if (status === "connecting" || status === "handshaking") {
@@ -240,13 +251,6 @@ export class VaultSync {
         if (Platform?.isMobile && this.initialSynced) this.mobileCatchUpPending = true;
         this.notifyDisconnected();
       }
-    };
-    this.indexProvider.on(SYNC_EVENT_STATUS, this.statusListener);
-    this.invalidationListener = (documentId) => this.onDocumentInvalidated(documentId);
-    this.indexProvider.on(SYNC_EVENT_DOCUMENT_INVALIDATED, this.invalidationListener);
-
-    this.registerVaultEvents();
-    void this.init();
   }
 
   /** Load the persisted index, then connect so local offline changes sync. */
@@ -440,6 +444,9 @@ export class VaultSync {
       generation !== this.docConnectionGeneration ||
       this.indexProvider.status !== SYNC_STATUS_CONNECTED
     ) {
+      if (!this.destroyed && !this.mobileSuspended && generation === this.docConnectionGeneration) {
+        this.mobileCatchUpPending = true;
+      }
       return;
     }
     this.binarySync.setPaused(false);
@@ -1699,7 +1706,8 @@ export class VaultSync {
         if (this.destroyed) return;
         if (
           event.type !== "rename" &&
-          this.currentPathVersion(event.file.path) !== event.version
+          this.currentPathVersion(event.file.path) !== event.version &&
+          event.type !== "create"
         ) {
           continue;
         }

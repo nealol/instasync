@@ -17,6 +17,7 @@ use axum::response::Response;
 use axum::Json;
 use base64::Engine;
 use futures_util::stream::Stream;
+use futures_util::StreamExt;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
@@ -61,6 +62,27 @@ pub struct CreateShareBody {
 #[derive(Deserialize)]
 pub struct SharePathQuery {
     pub path: String,
+}
+
+#[derive(Deserialize)]
+pub struct ViewEventsQuery {
+    pub epoch: Option<u64>,
+}
+
+fn snapshot_event_if_epoch_changed(
+    client_epoch: Option<u64>,
+    stream_epoch: u64,
+    update: &[u8],
+) -> Option<Result<Event, Infallible>> {
+    client_epoch
+        .filter(|epoch| *epoch != stream_epoch)
+        .map(|_| {
+            let payload = serde_json::json!({
+                "epoch": stream_epoch,
+                "update": base64::engine::general_purpose::STANDARD.encode(update),
+            });
+            Ok(Event::default().event("snapshot").data(payload.to_string()))
+        })
 }
 
 #[derive(Serialize)]
@@ -398,6 +420,7 @@ pub async fn view_share(
 pub async fn view_events(
     State(state): State<AppState>,
     Path(share_id): Path<String>,
+    Query(query): Query<ViewEventsQuery>,
 ) -> AppResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let (share, _) = resolve_share(&state, &share_id).await?;
     let note_doc_id = doc_id(&share.vault_id, &share.guid);
@@ -490,6 +513,9 @@ pub async fn view_events(
             ));
         }
     });
+
+    let initial_snapshot = snapshot_event_if_epoch_changed(query.epoch, initial_epoch, &initial);
+    let stream = futures_util::stream::iter(initial_snapshot).chain(stream);
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(25))))
 }
@@ -630,6 +656,14 @@ mod tests {
         let sv = state_vector_of(&base).unwrap();
         let (_, new_sv) = delta_since(&base, &sv).unwrap();
         assert_eq!(new_sv, sv);
+    }
+
+    #[test]
+    fn stale_client_epoch_gets_immediate_snapshot_for_stream_baseline() {
+        let update = full_update(&text_doc("replacement"));
+        assert!(snapshot_event_if_epoch_changed(Some(7), 8, &update).is_some());
+        assert!(snapshot_event_if_epoch_changed(Some(8), 8, &update).is_none());
+        assert!(snapshot_event_if_epoch_changed(None, 8, &update).is_none());
     }
 
     #[test]

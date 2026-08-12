@@ -179,6 +179,16 @@ struct PendingPublish {
     post: i64,
 }
 
+const PUBLISH_OUTBOX_SCHEMA: &str =
+    "CREATE TABLE IF NOT EXISTS realtime_server.publish_outbox (\
+         sequence INTEGER PRIMARY KEY AUTOINCREMENT,\
+         batch_id TEXT NOT NULL UNIQUE,\
+         rows_json TEXT NOT NULL,\
+         site_hex TEXT NOT NULL,\
+         site_b64 TEXT NOT NULL,\
+         post_db_version INTEGER NOT NULL\
+     )";
+
 /// Cursor: origin site hex -> highest applied db_version.
 type Cursor = HashMap<String, i64>;
 
@@ -1347,7 +1357,6 @@ fn schema_matches(
         let mut stmt = conn.prepare(
             "SELECT sql FROM sqlite_master WHERE type='table' \
              AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'crsql_%' \
-             AND name NOT LIKE 'realtime_internal_%' \
              AND name NOT LIKE '%__crsql_clock' AND name NOT LIKE '%__crsql_pks' \
              ORDER BY name",
         )?;
@@ -1361,17 +1370,13 @@ fn schema_matches(
     Ok(replica_creates == dump_create_statements(dump))
 }
 
-fn ensure_publish_outbox(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS realtime_internal_publish_outbox (\
-             sequence INTEGER PRIMARY KEY AUTOINCREMENT,\
-             batch_id TEXT NOT NULL UNIQUE,\
-             rows_json TEXT NOT NULL,\
-             site_hex TEXT NOT NULL,\
-             site_b64 TEXT NOT NULL,\
-             post_db_version INTEGER NOT NULL\
-         )",
+fn attach_publish_outbox(conn: &Connection, replica_path: &Path) -> Result<()> {
+    let outbox_path = replica_path.with_extension("outbox.sqlite");
+    conn.execute(
+        "ATTACH DATABASE ?1 AS realtime_server",
+        [outbox_path.to_string_lossy().as_ref()],
     )?;
+    conn.execute_batch(PUBLISH_OUTBOX_SCHEMA)?;
     Ok(())
 }
 
@@ -1415,7 +1420,7 @@ fn insert_pending_publish(
     let batch_id = uuid::Uuid::new_v4().to_string();
     let rows_json = serde_json::to_string(&rows)?;
     tx.execute(
-        "INSERT INTO realtime_internal_publish_outbox \
+        "INSERT INTO realtime_server.publish_outbox \
          (batch_id,rows_json,site_hex,site_b64,post_db_version) VALUES (?1,?2,?3,?4,?5)",
         rusqlite::params![batch_id, rows_json, site_hex, site_b64, post],
     )?;
@@ -1431,10 +1436,10 @@ fn insert_pending_publish(
 
 fn load_pending_publishes(config: &Config, path: &Path) -> Result<Vec<PendingPublish>> {
     let (conn, _is_new) = open_replica(config, path)?;
-    ensure_publish_outbox(&conn)?;
+    attach_publish_outbox(&conn, path)?;
     let mut stmt = conn.prepare(
         "SELECT sequence,batch_id,rows_json,site_hex,site_b64,post_db_version \
-         FROM realtime_internal_publish_outbox ORDER BY sequence",
+         FROM realtime_server.publish_outbox ORDER BY sequence",
     )?;
     let mapped = stmt.query_map([], |row| {
         Ok((
@@ -1469,9 +1474,9 @@ fn delete_pending_publish(
     batch_id: &str,
 ) -> Result<()> {
     let (conn, _is_new) = open_replica(config, path)?;
-    ensure_publish_outbox(&conn)?;
+    attach_publish_outbox(&conn, path)?;
     conn.execute(
-        "DELETE FROM realtime_internal_publish_outbox WHERE sequence=?1 AND batch_id=?2",
+        "DELETE FROM realtime_server.publish_outbox WHERE sequence=?1 AND batch_id=?2",
         rusqlite::params![sequence, batch_id],
     )?;
     let _ = conn.query_row("SELECT crsql_finalize()", [], |_| Ok(()));
@@ -1495,7 +1500,7 @@ fn apply_dump_rollback(
         return Err(anyhow!("no server replica for this database"));
     }
     let (mut conn, _is_new) = open_replica(config, &path)?;
-    ensure_publish_outbox(&conn)?;
+    attach_publish_outbox(&conn, &path)?;
 
     // Materialize the dump into a plain temporary database.
     let temp = Connection::open_in_memory()?;
@@ -1541,7 +1546,7 @@ fn execute_against_replica(
         return Err(anyhow!("no server replica for this database"));
     }
     let (mut conn, _is_new) = open_replica(config, &path)?;
-    ensure_publish_outbox(&conn)?;
+    attach_publish_outbox(&conn, &path)?;
     let pre: i64 = conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
     let site_bytes: Vec<u8> = conn.query_row("SELECT crsql_site_id()", [], |row| row.get(0))?;
     let site_hex = bytes_to_hex(&site_bytes);
@@ -2177,7 +2182,6 @@ fn dump_replica(config: &Config, vault: &str, plugin: &str, name: &str) -> Resul
         let mut stmt = conn.prepare(
             "SELECT name, sql FROM sqlite_master WHERE type='table' \
              AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'crsql_%' \
-             AND name NOT LIKE 'realtime_internal_%' \
              AND name NOT LIKE '%__crsql_clock' AND name NOT LIKE '%__crsql_pks' \
              ORDER BY name",
         )?;
@@ -2368,9 +2372,9 @@ fn json_to_sql(v: &JsonValue) -> SqlValue {
 /// Reject SQL touching cr-sqlite/SQLite internals. Mirrors the client lint
 /// (`src/pluginDb/SyncedPluginDatabase.ts`). Token-aware: single-quoted string
 /// literals and comments are ignored (so `WHERE t = 'my_sqlite_note'` is
-/// fine), while bare identifiers and quoted identifiers (`"…"`, `` `…` ``,
-/// `[…]`) starting with `crsql_`, `sqlite_`, or `realtime_internal_` are
-/// rejected because those names belong to the database engine or server.
+/// fine), while bare identifiers and quoted identifiers (`"…"`, `` `…` ``, or
+/// `[…]`) starting with `crsql_` or `sqlite_` are rejected because those names
+/// belong to the database engine.
 fn lint_sql(sql: &str) -> std::result::Result<(), String> {
     for ident in sql_identifiers(sql) {
         let lower = ident.to_ascii_lowercase();
@@ -2382,11 +2386,6 @@ fn lint_sql(sql: &str) -> std::result::Result<(), String> {
         if lower.starts_with("sqlite_") {
             return Err(format!(
                 "SQL references SQLite internals ({ident}); those are not accessible from here"
-            ));
-        }
-        if lower.starts_with("realtime_internal_") {
-            return Err(format!(
-                "SQL references Realtime internals ({ident}); those are not accessible from here"
             ));
         }
     }
@@ -2908,7 +2907,82 @@ mod tests {
         assert_eq!(d1, d2, "dump must be byte-identical across runs");
         assert!(d1.contains("-- crr: tasks"));
         assert!(d1.contains("INSERT INTO \"tasks\""));
-        assert!(!d1.contains("realtime_internal_publish_outbox"));
+        assert!(!d1.contains("publish_outbox"));
+    }
+
+    #[test]
+    fn formerly_reserved_user_tables_survive_dump_and_rollback() {
+        let Some(config) = ext_config() else {
+            eprintln!("skipping compatibility test: CRSQLITE_EXT_PATH not set");
+            return;
+        };
+        let path = replica_path(&config, "vcompat", "p", "n");
+        {
+            let (conn, _new) = open_replica(&config, &path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE realtime_internal_notes (id PRIMARY KEY NOT NULL, value);\
+                 CREATE TABLE realtime_internal_publish_outbox (id PRIMARY KEY NOT NULL, value);\
+                 SELECT crsql_as_crr('realtime_internal_notes');\
+                 SELECT crsql_as_crr('realtime_internal_publish_outbox');\
+                 INSERT INTO realtime_internal_notes VALUES ('n', 'before');\
+                 INSERT INTO realtime_internal_publish_outbox VALUES ('o', 'user data');",
+            )
+            .unwrap();
+            conn.execute("SELECT crsql_finalize()", []).ok();
+        }
+
+        let target = dump_replica(&config, "vcompat", "p", "n")
+            .unwrap()
+            .unwrap();
+        assert!(target.contains("CREATE TABLE realtime_internal_notes"));
+        assert!(target.contains("CREATE TABLE realtime_internal_publish_outbox"));
+        assert!(target.contains("'user data'"));
+
+        execute_against_replica(
+            &config,
+            "vcompat",
+            "p",
+            "n",
+            &[
+                (
+                    "UPDATE realtime_internal_notes SET value = ? WHERE id = ?".into(),
+                    vec![
+                        JsonValue::String("changed".into()),
+                        JsonValue::String("n".into()),
+                    ],
+                ),
+                (
+                    "UPDATE realtime_internal_publish_outbox SET value = ? WHERE id = ?".into(),
+                    vec![
+                        JsonValue::String("changed".into()),
+                        JsonValue::String("o".into()),
+                    ],
+                ),
+            ],
+        )
+        .unwrap();
+
+        apply_dump_rollback(&config, "vcompat", "p", "n", &target)
+            .unwrap()
+            .unwrap();
+        let after = dump_replica(&config, "vcompat", "p", "n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, target);
+
+        let (conn, _new) = open_replica(&config, &path).unwrap();
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM realtime_internal_publish_outbox WHERE id = 'o'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "user data");
+        assert!(
+            path.with_extension("outbox.sqlite").exists(),
+            "server publication storage must live outside the user database"
+        );
     }
 
     #[test]
@@ -3621,7 +3695,7 @@ mod tests {
         // Quoted identifiers are identifiers, not strings - still rejected.
         assert!(lint_sql("SELECT * FROM \"sqlite_master\"").is_err());
         assert!(lint_sql("SELECT * FROM `crsql_changes`").is_err());
-        assert!(lint_sql("SELECT * FROM realtime_internal_publish_outbox").is_err());
+        assert!(lint_sql("SELECT * FROM realtime_internal_publish_outbox").is_ok());
         assert!(lint_sql("SELECT * FROM [sqlite_master]").is_err());
         // Only identifiers *starting with* the reserved prefixes match.
         assert!(lint_sql("SELECT my_sqlite_col FROM tasks").is_ok());

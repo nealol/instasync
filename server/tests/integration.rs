@@ -3115,6 +3115,149 @@ async fn doc_token_bounds_unregistered_document_reservations() {
 }
 
 #[tokio::test]
+async fn doc_token_reconnect_honors_only_matching_live_creation_reservation() {
+    let (app, state) = test_app_with_state().await;
+    let alice = login(&app, "alice").await;
+    let bob = login(&app, "bob").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&alice),
+        Some(json!({"name": "V"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+    let (_, invite) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/invites"),
+        Some(&alice),
+        Some(json!({})),
+    )
+    .await;
+    send(
+        &app,
+        "POST",
+        "/api/invites/redeem",
+        Some(&bob),
+        Some(json!({"code": invite["code"]})),
+    )
+    .await;
+    let bob_id = send(&app, "GET", "/api/me", Some(&bob), None).await.1["userId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    use realtime_server::entities::permissions;
+    use sea_orm::{ActiveModelTrait, Set};
+    permissions::ActiveModel {
+        id: Set(uuid::Uuid::new_v4().to_string()),
+        vault_id: Set(vault_id.clone()),
+        principal_user_id: Set(Some(bob_id)),
+        path_prefix: Set("private".to_string()),
+        level: Set("deny".to_string()),
+    }
+    .insert(&state.db)
+    .await
+    .unwrap();
+
+    let document_id = format!("{vault_id}__race");
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/doc-token",
+        Some(&bob),
+        Some(json!({
+            "vaultId": vault_id,
+            "docId": document_id,
+            "path": "shared/race.md"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The first token request has physically created the document, but its
+    // registry entry has not arrived yet. The same creator can reconnect using
+    // the reservation's path even though their vault policy is not uniform.
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/doc-token",
+        Some(&bob),
+        Some(json!({
+            "vaultId": vault_id,
+            "docId": document_id
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/doc-token",
+        Some(&alice),
+        Some(json!({
+            "vaultId": vault_id,
+            "docId": document_id,
+            "path": "shared/race.md"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/doc-token",
+        Some(&bob),
+        Some(json!({
+            "vaultId": vault_id,
+            "docId": document_id,
+            "path": "shared/other.md"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    state
+        .pending_document_creations
+        .lock()
+        .await
+        .get_mut(&document_id)
+        .unwrap()
+        .expires_at_ms = 0;
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/doc-token",
+        Some(&bob),
+        Some(json!({
+            "vaultId": vault_id,
+            "docId": document_id,
+            "path": "shared/race.md"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let legacy_document_id = format!("{vault_id}__legacy");
+    state.documents.ensure_document(&legacy_document_id).await.unwrap();
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/doc-token",
+        Some(&bob),
+        Some(json!({
+            "vaultId": vault_id,
+            "docId": legacy_document_id,
+            "path": "shared/legacy.md"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn preregistered_guid_cannot_bypass_physical_document_quota() {
     let mut config = test_config(
         "http://auth.test",

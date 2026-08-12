@@ -25,6 +25,19 @@ export class TFile extends TAbstractFile {
 /** Placeholder for Obsidian's App; tests pass a fake plugin's `app` in practice. */
 export class App {}
 
+export class PluginSettingTab {
+  app: unknown;
+  containerEl: HTMLElement;
+  constructor(app: unknown, _plugin: unknown) {
+    this.app = app;
+    this.containerEl = document.createElement("div");
+  }
+}
+
+export class ExtraButtonComponent {}
+
+export class ToggleComponent {}
+
 /** Mutable so tests can exercise Obsidian's mobile-only lifecycle paths. */
 export const Platform = {
   isMobile: false,

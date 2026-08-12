@@ -2068,7 +2068,14 @@ function AdvancedSettings({
   );
 }
 
-function MobileWorkingSetSettings({ plugin }: { plugin: RealtimePlugin }) {
+export function MobileWorkingSetSettings({ plugin }: { plugin: RealtimePlugin }) {
+  const [maxResidentDocs, setMaxResidentDocs] = useState(
+    String(plugin.settings.mobileMaxResidentDocs),
+  );
+  const [recentResidentDocs, setRecentResidentDocs] = useState(
+    String(plugin.settings.mobileRecentResidentDocs),
+  );
+
   const saveNumber = async (
     field: "mobileMaxResidentDocs" | "mobileRecentResidentDocs",
     raw: string,
@@ -2094,6 +2101,8 @@ function MobileWorkingSetSettings({ plugin }: { plugin: RealtimePlugin }) {
         plugin.settings.mobileMaxResidentDocs,
       );
     }
+    setMaxResidentDocs(String(plugin.settings.mobileMaxResidentDocs));
+    setRecentResidentDocs(String(plugin.settings.mobileRecentResidentDocs));
     if (
       previousMax === plugin.settings.mobileMaxResidentDocs &&
       previousRecent === plugin.settings.mobileRecentResidentDocs
@@ -2115,7 +2124,8 @@ function MobileWorkingSetSettings({ plugin }: { plugin: RealtimePlugin }) {
             type="number"
             min={4}
             max={64}
-            defaultValue={plugin.settings.mobileMaxResidentDocs}
+            value={maxResidentDocs}
+            onChange={(event) => setMaxResidentDocs(event.currentTarget.value)}
             onBlur={(event) =>
               void saveNumber("mobileMaxResidentDocs", event.currentTarget.value, 4, 64)
             }
@@ -2131,7 +2141,8 @@ function MobileWorkingSetSettings({ plugin }: { plugin: RealtimePlugin }) {
             type="number"
             min={0}
             max={32}
-            defaultValue={plugin.settings.mobileRecentResidentDocs}
+            value={recentResidentDocs}
+            onChange={(event) => setRecentResidentDocs(event.currentTarget.value)}
             onBlur={(event) =>
               void saveNumber("mobileRecentResidentDocs", event.currentTarget.value, 0, 32)
             }

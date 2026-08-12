@@ -58,7 +58,9 @@ export function useSharedNote(shareId: string): SharedNoteState {
       doc.getText("contents").observe(render);
       render();
 
-      source = new EventSource(`/api/view/${encodeURIComponent(shareId)}/events`);
+      source = new EventSource(
+        `/api/view/${encodeURIComponent(shareId)}/events?epoch=${encodeURIComponent(epoch)}`,
+      );
       source.addEventListener("update", (event) => {
         if (cancelled) return;
         try {

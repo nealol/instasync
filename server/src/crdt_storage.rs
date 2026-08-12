@@ -279,7 +279,10 @@ pub(crate) async fn load_or_create(
     }
 
     if tokio::fs::try_exists(&directory).await? {
-        return corrupt(document_id, "document directory has no committed manifest");
+        // The manifest is the creation commit point. Anything in a directory
+        // without one is debris from an interrupted first-time create.
+        tokio::fs::remove_dir_all(&directory).await?;
+        sync_directory(root).await?;
     }
     create_document(root, document_id, Doc::new()).await
 }
@@ -319,26 +322,39 @@ async fn create_document(
     doc: Doc,
 ) -> Result<LoadedDocument, StorageError> {
     let directory = document_directory(root, document_id);
-    tokio::fs::create_dir_all(&directory).await?;
+    tokio::fs::create_dir_all(root).await?;
+    let temporary =
+        root.join(format!(".{document_id}.crdt.tmp-{}", nanoid::nanoid!(12)));
+    tokio::fs::create_dir(&temporary).await?;
     sync_directory(root).await?;
-    let snapshot = doc
-        .transact()
-        .encode_state_as_update_v1(&StateVector::default());
-    if snapshot.len() > MAX_SNAPSHOT_BYTES {
-        return corrupt(
-            document_id,
-            format!("snapshot exceeds {MAX_SNAPSHOT_BYTES} bytes"),
-        );
+    let result = async {
+        let snapshot = doc
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default());
+        if snapshot.len() > MAX_SNAPSHOT_BYTES {
+            return corrupt(
+                document_id,
+                format!("snapshot exceeds {MAX_SNAPSHOT_BYTES} bytes"),
+            );
+        }
+        atomic_write(
+            &temporary.join(snapshot_name(0)),
+            &encode_snapshot(&snapshot),
+        )
+        .await?;
+        atomic_write(&temporary.join(log_name(0)), LOG_MAGIC).await?;
+        let manifest = serde_json::to_vec_pretty(&Manifest::new(0, 0))
+            .map_err(|error| corruption(document_id, error.to_string()))?;
+        atomic_write(&temporary.join(MANIFEST_FILE), &manifest).await?;
+        tokio::fs::rename(&temporary, &directory).await?;
+        sync_directory(root).await?;
+        Ok::<(), StorageError>(())
     }
-    atomic_write(
-        &directory.join(snapshot_name(0)),
-        &encode_snapshot(&snapshot),
-    )
-    .await?;
-    atomic_write(&directory.join(log_name(0)), LOG_MAGIC).await?;
-    let manifest = serde_json::to_vec_pretty(&Manifest::new(0, 0))
-        .map_err(|error| corruption(document_id, error.to_string()))?;
-    atomic_write(&directory.join(MANIFEST_FILE), &manifest).await?;
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_dir_all(&temporary).await;
+    }
+    result?;
     Ok(LoadedDocument {
         doc,
         persistence: DocumentPersistence {
@@ -1100,6 +1116,51 @@ mod tests {
             );
             let _ = tokio::fs::remove_dir_all(root).await;
         }
+    }
+
+    #[tokio::test]
+    async fn interrupted_first_creation_without_manifest_is_recreated() {
+        let root = temp_store();
+        let directory = root.join("doc.crdt");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        tokio::fs::write(
+            directory.join("snapshot-0.bin"),
+            encode_snapshot(&map_update("uncommitted", "discarded")),
+        )
+        .await
+        .unwrap();
+
+        let loaded = load_or_create(&root, "doc").await.unwrap();
+
+        assert_eq!(map_value(&loaded.doc, "uncommitted"), None);
+        assert!(tokio::fs::try_exists(directory.join("manifest.json"))
+            .await
+            .unwrap());
+        drop(loaded);
+        load_or_create(&root, "doc").await.unwrap();
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn corrupt_committed_first_generation_still_fails_closed() {
+        let root = temp_store();
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        drop(load_or_create(&root, "doc").await.unwrap());
+        tokio::fs::write(root.join("doc.crdt/snapshot-0.bin"), b"corrupt")
+            .await
+            .unwrap();
+
+        let error = match load_or_create(&root, "doc").await {
+            Ok(_) => panic!("committed corruption must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, StorageError::Corrupt { .. }));
+        assert!(error.to_string().contains("invalid snapshot header"));
+        assert!(tokio::fs::try_exists(root.join("doc.crdt/manifest.json"))
+            .await
+            .unwrap());
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 
     #[tokio::test]

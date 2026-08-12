@@ -9,6 +9,7 @@ import { SyncedDoc } from "./SyncedDoc";
 import { preserveTextConflict } from "./conflictRecovery";
 import { mergeText } from "./textMerge";
 import { sha256Text } from "./hash";
+import { getDocumentEpoch } from "./documentEpoch";
 
 /**
  * Origin tag used on Yjs transactions that originate from this Document writing
@@ -157,6 +158,7 @@ export class Document extends SyncedDoc {
       const sameDevicePrefixFastForward =
         isConflict &&
         !this.forceBootstrapConflict &&
+        getDocumentEpoch(this.plugin, this.serverDocId) === 0 &&
         baseline.length === 0 &&
         localDisk !== null &&
         localDisk.length > remote.length &&

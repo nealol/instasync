@@ -38,6 +38,7 @@ export abstract class SyncedDoc {
   private syncedOnce = false;
   private nextServerSyncWaiters = new Set<() => void>();
   private readOnlyRecoveryPending = false;
+  private readOnlyRecoveryRequested = false;
   private readOnlyRecoveryBaseline: string | null = null;
 
   protected constructor(
@@ -215,16 +216,19 @@ export abstract class SyncedDoc {
   protected abstract destroySubclass(): void;
 
   private async preserveReadOnlyRecovery(): Promise<void> {
-    if (this.destroyed || this.readOnlyRecoveryPending) return;
+    if (this.destroyed) return;
+    this.readOnlyRecoveryRequested = true;
+    if (this.readOnlyRecoveryPending) return;
     this.readOnlyRecoveryPending = true;
     try {
-      const file = this.plugin.app.vault.getAbstractFileByPath(this.path);
-      if (!file) return;
-      const value = await this.plugin.app.vault.read(file as any);
-      if (value === this.readOnlyRecoveryBaseline) return;
-      if (!this.destroyed) {
+      while (this.readOnlyRecoveryRequested && !this.destroyed) {
+        this.readOnlyRecoveryRequested = false;
+        const value = this.ydoc.getText("contents").toString();
+        if (value === this.readOnlyRecoveryBaseline) continue;
         await preserveTextConflict(this.plugin, this.path, value, "local");
-        this.readOnlyRecoveryBaseline = value;
+        if (!this.destroyed) {
+          this.readOnlyRecoveryBaseline = value;
+        }
       }
     } catch (error) {
       console.warn(`[Realtime] failed to preserve read-only edit for ${this.path}`, error);
