@@ -1,10 +1,39 @@
 import { describe, expect, it } from "vitest";
-import { decideConfigReconcile, mergeJsonSettings, type ConfigMeta } from "../../src/ConfigSync";
+import * as Y from "yjs";
+import {
+  ConfigSync,
+  decideConfigReconcile,
+  mergeJsonSettings,
+  type ConfigMeta,
+} from "../../src/ConfigSync";
+import { LocalSyncState } from "../../src/localSyncState";
+import { makeFakePlugin } from "../support/fakePlugin";
+import { freshGuid } from "../support/util";
 
 const local: ConfigMeta = { hash: "local", size: 1, mtime: 200 };
 const remote: ConfigMeta = { hash: "remote", size: 1, mtime: 100 };
 
 describe("ConfigSync reconcile decisions", () => {
+  it("retains a durable config baseline after the remote map deletion has persisted", async () => {
+    const { plugin } = makeFakePlugin("https://sync.example.com", {
+      sessionToken: "token",
+      activeVaultId: "vault",
+    });
+    const localState = new LocalSyncState(`config-delete:${freshGuid()}`);
+    await localState.whenSynced;
+    localState.markSynced(".obsidian/appearance.json", "config", "old-hash", "old-hash");
+    const indexDoc = new Y.Doc();
+    const sync = new ConfigSync(plugin as any, indexDoc, localState);
+    try {
+      sync.seedBaseline();
+      expect((sync as any).lastSyncedHash.get(".obsidian/appearance.json")).toBe("old-hash");
+    } finally {
+      sync.destroy();
+      indexDoc.destroy();
+      localState.destroy();
+    }
+  });
+
   it("downloads remote config on a fresh device when both sides exist", () => {
     expect(decideConfigReconcile(local, remote, null)).toBe("download");
   });

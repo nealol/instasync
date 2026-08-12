@@ -547,7 +547,7 @@ export async function setPluginEnabled(b: any, enabled: boolean): Promise<void> 
 // Network cut at the WebSocket layer.
 //
 // Chromium's CDP network emulation (setOfflineMode) does NOT intercept loopback
-// (127.0.0.1) traffic, so it can't sever the y-sweet WebSocket in these tests.
+// (127.0.0.1) traffic, so it can't sever the Yjs WebSocket in these tests.
 // Instead we shim `window.WebSocket`: while "offline" it redirects new sockets to
 // a dead port and closes live ones — a real connection failure that exercises the
 // provider's own reconnect path (backoff + watchdog), isolated to this device.

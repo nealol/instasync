@@ -10,7 +10,7 @@ use utoipa::{Modify, OpenApi};
     info(
         title = "Realtime API",
         version = env!("CARGO_PKG_VERSION"),
-        description = "REST, OAuth, auth, permalink, and public upload surfaces for Realtime. MCP JSON-RPC, y-sweet proxy, raw blob store, and doc-token endpoints are intentionally excluded."
+        description = "REST, OAuth, auth, permalink, and public upload surfaces for Realtime. MCP JSON-RPC, native Yjs sync, raw blob store, and doc-token endpoints are intentionally excluded."
     ),
     modifiers(&SecurityAddon),
     components(schemas(
@@ -101,6 +101,9 @@ use utoipa::{Modify, OpenApi};
         plugin_db_list,
         plugin_db_query,
         plugin_db_execute,
+        list_jobs,
+        retry_job,
+        cancel_job,
         history_list_commits,
         history_get_commit,
         history_get_tree,
@@ -120,6 +123,7 @@ use utoipa::{Modify, OpenApi};
         (name = "attachments", description = "Vault-scoped attachment APIs and signed uploads"),
         (name = "shares", description = "Authenticated share management and public file delivery"),
         (name = "plugin-dbs", description = "Synced plugin database (cr-sqlite) bootstrap, replication, and purge APIs"),
+        (name = "jobs", description = "Vault-admin background job inspection and control"),
         (name = "permalinks", description = "Public note redirect endpoints"),
         (name = "history", description = "Vault git history browsing and admin rollback")
     )
@@ -380,7 +384,7 @@ async fn public_upload() {}
 #[utoipa::path(get, path = "/api/vaults/{id}/plugin-dbs/{plugin}/{name}/changes", tag = "plugin-dbs", security(("bearerAuth" = [])), params(("id" = String, Path), ("plugin" = String, Path), ("name" = String, Path), ("since" = Option<String>, Query, description = "JSON cursor {siteHex: dbVersion}")), responses((status = 200, description = "Bootstrap changeset (crsql_changes rows past the cursor)"), (status = 400, description = "Invalid plugin db id")))]
 async fn plugin_db_changes() {}
 
-#[utoipa::path(post, path = "/api/vaults/{id}/plugin-dbs/{plugin}/{name}/touch", tag = "plugin-dbs", security(("bearerAuth" = [])), params(("id" = String, Path), ("plugin" = String, Path), ("name" = String, Path)), responses((status = 200, description = "Replication and git commit debounces armed"), (status = 400, description = "Invalid plugin db id")))]
+#[utoipa::path(post, path = "/api/vaults/{id}/plugin-dbs/{plugin}/{name}/touch", tag = "plugin-dbs", security(("bearerAuth" = [])), params(("id" = String, Path), ("plugin" = String, Path), ("name" = String, Path)), responses((status = 200, description = "Replication and git reconciliation queued"), (status = 400, description = "Invalid plugin db id")))]
 async fn plugin_db_touch() {}
 
 #[utoipa::path(delete, path = "/api/vaults/{id}/plugin-dbs/{plugin}/{name}", tag = "plugin-dbs", security(("bearerAuth" = [])), params(("id" = String, Path), ("plugin" = String, Path), ("name" = String, Path)), responses((status = 200, description = "Database purged: replica, git dump, and batch log removed (irreversible)"), (status = 400, description = "Invalid plugin db id")))]
@@ -393,6 +397,15 @@ async fn plugin_db_query() {}
 
 #[utoipa::path(post, path = "/api/vaults/{id}/plugin-dbs/{plugin}/{name}/execute", tag = "plugin-dbs", security(("bearerAuth" = [])), params(("id" = String, Path), ("plugin" = String, Path), ("name" = String, Path)), request_body = Object, responses((status = 200, description = "Write committed to the server replica ({ rowsAffected, dbVersion }); publication to clients is immediate, or queued and retried if the doc write transiently fails"), (status = 400, description = "Invalid SQL or extension unavailable"), (status = 403, description = "Read-only ACL"), (status = 404, description = "Unknown database")))]
 async fn plugin_db_execute() {}
+
+#[utoipa::path(get, path = "/api/vaults/{id}/jobs", tag = "jobs", security(("bearerAuth" = [])), params(("id" = String, Path)), responses((status = 200, description = "Persistent background job intents"), (status = 403, description = "Vault admin required")))]
+async fn list_jobs() {}
+
+#[utoipa::path(post, path = "/api/vaults/{id}/jobs/retry", tag = "jobs", security(("bearerAuth" = [])), params(("id" = String, Path)), request_body = Object, responses((status = 200, description = "Terminal job queued for another attempt"), (status = 409, description = "Job is not in terminal failure")))]
+async fn retry_job() {}
+
+#[utoipa::path(post, path = "/api/vaults/{id}/jobs/cancel", tag = "jobs", security(("bearerAuth" = [])), params(("id" = String, Path)), request_body = Object, responses((status = 200, description = "Pending desired work canceled"), (status = 404, description = "Unknown job intent")))]
+async fn cancel_job() {}
 
 #[utoipa::path(get, path = "/api/vaults/{id}/history/commits", tag = "history", security(("bearerAuth" = [])), params(("id" = String, Path), ("limit" = Option<u64>, Query), ("before" = Option<String>, Query, description = "Keyset cursor: commits strictly before this hash"), ("path" = Option<String>, Query, description = "Restrict to one file's history (--follow); when set, each commit includes pathAtCommit (the followed file's path at that commit, for single-file rollback across renames)")), responses((status = 200, description = "Commit list with hasMore")))]
 async fn history_list_commits() {}

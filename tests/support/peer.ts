@@ -1,16 +1,21 @@
-// A bare "second device": a Y.Doc + y-sweet provider with NO local persistence.
+// A bare second device: a Y.Doc + native provider with no local persistence.
 // Keeping the peer non-persistent sidesteps the single process-global
 // `fake-indexeddb` store, so only the unit under test owns IndexedDB.
 
 import * as Y from "yjs";
-import { YSweetProvider } from "@y-sweet/client";
-import { getClientToken } from "../../src/ysweet";
+import {
+  RealtimeProvider,
+  SYNC_EVENT_STATUS,
+  type SyncStatus,
+} from "../../src/sync/RealtimeProvider";
+import { getClientToken } from "../../src/sync/clientToken";
 import { waitFor } from "./util";
 
 export class Peer {
   readonly doc: Y.Doc;
   readonly text: Y.Text;
-  readonly provider: YSweetProvider;
+  readonly provider: RealtimeProvider;
+  private readonly statuses: SyncStatus[] = [];
 
   /**
    * A second device, minting tokens through the auth server like the real
@@ -21,12 +26,10 @@ export class Peer {
   constructor(plugin: unknown, serverDocId: string) {
     this.doc = new Y.Doc();
     this.text = this.doc.getText("contents");
-    this.provider = new YSweetProvider(
-      () => getClientToken(plugin as any, serverDocId) as any,
-      serverDocId,
-      this.doc,
-      { connect: true, showDebuggerLink: false },
+    this.provider = new RealtimeProvider(serverDocId, this.doc, () =>
+      getClientToken(plugin as any, serverDocId),
     );
+    this.provider.on(SYNC_EVENT_STATUS, (status) => this.statuses.push(status));
   }
 
   setText(value: string): void {
@@ -41,7 +44,20 @@ export class Peer {
   }
 
   whenSynced(): Promise<void> {
-    return waitFor(() => this.provider.status === "connected");
+    return waitFor(() => this.provider.status === "connected").catch((error: unknown) => {
+      throw new Error(
+        `peer did not sync; provider states: ${[...this.statuses, this.provider.status].join(
+          " → ",
+        )}; last error: ${this.provider.lastConnectionError ?? "none"}`,
+        { cause: error },
+      );
+    });
+  }
+
+  whenChangesSynced(): Promise<void> {
+    return waitFor(() => !this.provider.hasLocalChanges, {
+      label: "peer changes acknowledged",
+    });
   }
 
   destroy(): void {

@@ -78,7 +78,7 @@ function BinaryConflictView({
 }) {
   const remoteDesc = info.remoteDeleted
     ? `"${info.path}" was deleted on another device, but you changed it here.`
-    : `"${info.path}" was changed both here and on another device. Binary files can't be merged — pick one.`;
+    : `"${info.path}" was changed both here and on another device. Binary files can't be merged — pick one. Realtime will preserve the other version as an unsynced conflicted copy.`;
   return (
     <>
       <h3>Binary file conflict</h3>

@@ -21,6 +21,7 @@ import { RealtimeSqlAPI } from "./pluginDb/api";
 import { RealtimeCursorsAPI } from "./cursors/api";
 import { RealtimeSharesAPI } from "./shares/api";
 import { SQL_QUERY_VIEW_TYPE, SqlQueryView } from "./sql/SqlQueryView";
+import { setDocumentEpoch, setEpochProposalHandler } from "./documentEpoch";
 import type {
   RealtimeCursors,
   RealtimePluginApi,
@@ -76,6 +77,9 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
   private status: ConnectionStatus = "offline";
   /** Attachment upload activity; overrides the "live" label when connected. */
   private uploadStatus: UploadStatus = "idle";
+  private epochRestartQueued = false;
+  private epochRestartRequested = false;
+  private unloading = false;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -83,6 +87,9 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
     this.sqlApi = new RealtimeSqlAPI(this);
     this.cursorsApi = new RealtimeCursorsAPI(this);
     this.sharesApi = new RealtimeSharesAPI(this);
+    setEpochProposalHandler((documentId, epoch) => {
+      this.acceptDocumentEpoch(documentId, epoch);
+    });
 
     this.addSettingTab(new RealtimeSettingTab(this.app, this));
 
@@ -185,7 +192,11 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
     this.registerInterval(window.setInterval(() => this.vaultSync?.reconnectAll(), 10_000));
     this.registerDomEvent(window, "online", () => this.vaultSync?.reconnectAll());
     this.registerDomEvent(document, "visibilitychange", () => {
-      if (document.visibilityState === "visible") this.vaultSync?.reconnectAll();
+      if (document.visibilityState === "hidden") {
+        this.vaultSync?.suspendForBackground();
+      } else {
+        void this.vaultSync?.resumeFromBackground();
+      }
     });
     this.registerEvent(
       this.app.workspace.on("active-leaf-change", () => {
@@ -262,6 +273,8 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
   }
 
   onunload(): void {
+    this.unloading = true;
+    setEpochProposalHandler(null);
     this.cursorsApi?.destroy();
     void this.sqlApi?.destroy();
     this.stopSync();
@@ -333,6 +346,40 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
     this.vaultSync = null;
     this.uploadStatus = "idle";
     this.setStatus("offline");
+  }
+
+  /**
+   * Persist a server-proposed document epoch before the transport acknowledges
+   * it, then rebuild every Y.Doc transport against epoch-scoped IndexedDB.
+   */
+  acceptDocumentEpoch(documentId: string, epoch: number): void {
+    const changed = setDocumentEpoch(this, documentId, epoch);
+    if (!changed) return;
+    if (this.epochRestartQueued) {
+      this.epochRestartRequested = true;
+      return;
+    }
+    if (this.unloading) return;
+    this.epochRestartQueued = true;
+    queueMicrotask(() => void this.restartForDocumentEpoch());
+  }
+
+  private async restartForDocumentEpoch(): Promise<void> {
+    try {
+      this.stopSync();
+      await this.sqlApi.destroy();
+      if (this.unloading) return;
+      this.sqlApi = new RealtimeSqlAPI(this);
+      await this.maybeStartSync();
+      new Notice(`${PLUGIN_NAME}: document history was compacted; sync reconnected.`);
+    } finally {
+      this.epochRestartQueued = false;
+      if (this.epochRestartRequested && !this.unloading) {
+        this.epochRestartRequested = false;
+        this.epochRestartQueued = true;
+        queueMicrotask(() => void this.restartForDocumentEpoch());
+      }
+    }
   }
 
   /** Reveal (or create) the file-history leaf in the right sidebar. */
@@ -789,11 +836,26 @@ function sanitizeSettings(raw: unknown): RealtimeSettings {
   settings.configSyncCategories = sanitizeConfigSyncCategories(data.configSyncCategories);
   settings.diagnosticLogging =
     typeof data.diagnosticLogging === "boolean" ? data.diagnosticLogging : false;
+  settings.mobileMaxResidentDocs = sanitizeInteger(
+    data.mobileMaxResidentDocs,
+    defaults.mobileMaxResidentDocs,
+    4,
+    64,
+  );
+  settings.mobileRecentResidentDocs = Math.min(
+    settings.mobileMaxResidentDocs,
+    sanitizeInteger(data.mobileRecentResidentDocs, defaults.mobileRecentResidentDocs, 0, 32),
+  );
   settings.recentPaths = Array.isArray(data.recentPaths)
     ? data.recentPaths.filter((path): path is string => typeof path === "string").slice(0, 25)
     : [];
 
   return settings;
+}
+
+function sanitizeInteger(value: unknown, fallback: number, min: number, max: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(value)));
 }
 
 function sanitizeUrl(value: unknown, fallback: string): string {

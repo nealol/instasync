@@ -28,7 +28,7 @@ export class CanvasDocument extends StructuredDocument {
     guid: string,
     serverDocId: string,
     isCreator: boolean,
-    opts: { autoConnect?: boolean } = {},
+    opts: { autoConnect?: boolean; forceBootstrapConflict?: boolean } = {},
   ) {
     super(plugin, path, guid, serverDocId, isCreator, opts);
     this.binding = new CanvasBinding(plugin, this);

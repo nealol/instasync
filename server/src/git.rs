@@ -5,12 +5,11 @@
 //! are coalesced with a debounce (default 5s) into a single commit, **attributed
 //! to the authenticated principal** that made them.
 //!
-//! How attribution works: the auth server is both the minter of every per-user
-//! connection token and the reverse proxy in y-sweet's WebSocket data path
-//! (`proxy.rs`). When a content write is seen on a connection, the proxy calls
+//! How attribution works: the server mints every per-user connection token and
+//! terminates the native Yjs WebSocket data path. When a content write is seen
+//! on a connection, the document engine calls
 //! [`GitService::mark_write`] with the resolved [`Principal`]. Content itself is
-//! pulled authoritatively from y-sweet via `GET /doc/{id}/as-update` (we mint a
-//! read-only doc token in-process with the shared key), so the client can never
+//! pulled authoritatively from the native document store, so the client can never
 //! forge file contents — only its own already-authenticated identity.
 //!
 //! The commit is a full-tree materialization from the *authoritative* CRDT state
@@ -25,7 +24,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
@@ -33,10 +32,11 @@ use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
 use serde_json::json;
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
-use y_sweet_core::auth::Authenticator;
 
 use crate::config::Config;
+use crate::crdt::DocumentStore;
 use crate::entities::git_backups;
+use crate::jobs::JobQueue;
 use crate::plugindb::PluginDbService;
 use crate::session::now_millis;
 use crate::state::{Principal, PrincipalActor};
@@ -82,14 +82,6 @@ fn attachment_shim(public_base_url: &str, vault_id: &str, hash: &str, size: u64)
 }
 
 struct VaultState {
-    /// A content write has landed since the last commit.
-    dirty: bool,
-    /// Distinct contributors this window, in first-seen order.
-    contributors: Vec<Contributor>,
-    /// Commit fires once `Instant::now()` reaches this; pushed out on each write.
-    deadline: Instant,
-    /// A debounce/commit task is already running for this vault.
-    running: bool,
     /// Serializes actual commit work per vault, including out-of-band
     /// [`GitService::commit_now`] calls (rollback), so two materializations
     /// never interleave.
@@ -99,10 +91,6 @@ struct VaultState {
 impl VaultState {
     fn new() -> Self {
         VaultState {
-            dirty: false,
-            contributors: Vec::new(),
-            deadline: Instant::now(),
-            running: false,
             commit_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -118,11 +106,10 @@ pub struct CommitOverride {
 
 struct Inner {
     config: Arc<Config>,
-    #[allow(dead_code)]
-    http: reqwest::Client,
     db: DatabaseConnection,
-    authenticator: Arc<Authenticator>,
+    documents: DocumentStore,
     plugindb: PluginDbService,
+    jobs: JobQueue,
     vaults: Mutex<HashMap<String, VaultState>>,
 }
 
@@ -132,17 +119,17 @@ pub struct GitService(Arc<Inner>);
 impl GitService {
     pub fn new(
         config: Arc<Config>,
-        http: reqwest::Client,
         db: DatabaseConnection,
-        authenticator: Arc<Authenticator>,
+        documents: DocumentStore,
         plugindb: PluginDbService,
+        jobs: JobQueue,
     ) -> Self {
         GitService(Arc::new(Inner {
             config,
-            http,
             db,
-            authenticator,
+            documents,
             plugindb,
+            jobs,
             vaults: Mutex::new(HashMap::new()),
         }))
     }
@@ -151,93 +138,41 @@ impl GitService {
         Duration::from_millis(self.0.config.git_debounce_ms)
     }
 
-    /// Record a content write by `who` to `vault_id` and (re)arm the debounce.
-    /// No-op when the audit log is disabled. Cheap and non-blocking.
+    /// Persist a content reconciliation attributed to `who`.
     pub async fn mark_write(&self, vault_id: &str, who: &Principal) {
         if !self.0.config.git_enabled {
             return;
         }
-        let mut vaults = self.0.vaults.lock().await;
-        let entry = vaults
-            .entry(vault_id.to_string())
-            .or_insert_with(VaultState::new);
-        entry.dirty = true;
-        let actor_key = who.actor_key();
-        if !entry
-            .contributors
-            .iter()
-            .any(|c| c.actor_key() == actor_key)
+        if let Err(error) = self
+            .0
+            .jobs
+            .enqueue_git(vault_id, who, self.debounce())
+            .await
         {
-            entry.contributors.push(who.clone());
-        }
-        entry.deadline = Instant::now() + self.debounce();
-        if !entry.running {
-            entry.running = true;
-            let svc = self.clone();
-            let vault_id = vault_id.to_string();
-            tokio::spawn(async move { svc.run_vault(vault_id).await });
+            tracing::error!("queue git reconciliation for vault {vault_id} failed: {error:#}");
         }
     }
 
-    /// Trailing-debounce loop for a single vault. Serializes commits per vault:
-    /// only one of these runs at a time per `vault_id` (guarded by `running`).
-    async fn run_vault(self, vault_id: String) {
-        loop {
-            // Wait out the (possibly extended) debounce window.
-            loop {
-                let remaining = {
-                    let vaults = self.0.vaults.lock().await;
-                    match vaults.get(&vault_id) {
-                        Some(s) => s.deadline.checked_duration_since(Instant::now()),
-                        None => return,
-                    }
-                };
-                match remaining {
-                    Some(d) => tokio::time::sleep(d).await,
-                    None => break, // deadline reached
-                }
-            }
-
-            // Claim the pending work.
-            let (contributors, commit_lock) = {
-                let mut vaults = self.0.vaults.lock().await;
-                let Some(s) = vaults.get_mut(&vault_id) else {
-                    return;
-                };
-                if !s.dirty {
-                    s.running = false;
-                    return;
-                }
-                s.dirty = false;
-                (std::mem::take(&mut s.contributors), s.commit_lock.clone())
-            };
-
-            {
-                let _guard = commit_lock.lock().await;
-                if let Err(e) = self.commit_once(&vault_id, &contributors, None).await {
-                    tracing::error!("git audit commit for vault {vault_id} failed: {e:#}");
-                }
-            }
-
-            // More writes during the commit? Loop and wait again; otherwise stop.
-            {
-                let mut vaults = self.0.vaults.lock().await;
-                let Some(s) = vaults.get_mut(&vault_id) else {
-                    return;
-                };
-                if !s.dirty {
-                    s.running = false;
-                    return;
-                }
-            }
+    pub(crate) async fn reconcile(&self, vault_id: &str, contributors: &[Principal]) -> Result<()> {
+        if !self.0.config.git_enabled {
+            return Ok(());
         }
+        let commit_lock = self.commit_lock(vault_id).await;
+        let committed = {
+            let _guard = commit_lock.lock().await;
+            self.commit_once(vault_id, contributors, None).await?
+        };
+        if committed {
+            self.0.jobs.enqueue_backup(vault_id).await?;
+        }
+        Ok(())
     }
 
-    /// Commit the vault's current state immediately, bypassing the debounce.
-    /// Holds the per-vault commit lock and claims any pending debounce window
-    /// (so it won't double-commit), then returns the new HEAD hash if a commit
-    /// was made. Used by rollback so the "Rollback to …" commit's tree matches
-    /// the rollback target instead of coalescing later edits.
+    /// Commit the vault's current state immediately, bypassing the queue delay.
+    /// Holds the per-vault commit lock, then returns the new HEAD hash if a
+    /// commit was made. A queued reconciliation later observes a clean tree.
+    /// Used by rollback so the "Rollback to …" commit's tree matches the
+    /// rollback target instead of coalescing later edits.
     pub async fn commit_now(
         &self,
         vault_id: &str,
@@ -247,22 +182,17 @@ impl GitService {
         if !self.0.config.git_enabled {
             return Ok(None);
         }
-        let commit_lock = {
-            let mut vaults = self.0.vaults.lock().await;
-            let entry = vaults
-                .entry(vault_id.to_string())
-                .or_insert_with(VaultState::new);
-            // Claim pending debounce work: this commit covers it.
-            entry.dirty = false;
-            entry.contributors.clear();
-            entry.commit_lock.clone()
+        let commit_lock = self.commit_lock(vault_id).await;
+        let committed = {
+            let _guard = commit_lock.lock().await;
+            self.commit_once(vault_id, std::slice::from_ref(who), Some(&ov))
+                .await?
         };
-        let _guard = commit_lock.lock().await;
-        let committed = self
-            .commit_once(vault_id, std::slice::from_ref(who), Some(&ov))
-            .await?;
         if !committed {
             return Ok(None);
+        }
+        if let Err(error) = self.0.jobs.enqueue_backup(vault_id).await {
+            tracing::error!("queue backup push for vault {vault_id} failed: {error:#}");
         }
         let repo = self.repo_path(vault_id)?;
         let out = self.git_raw(&repo, &["rev-parse", "HEAD"]).await?;
@@ -272,6 +202,17 @@ impl GitService {
         Ok(Some(
             String::from_utf8_lossy(&out.stdout).trim().to_string(),
         ))
+    }
+
+    async fn commit_lock(&self, vault_id: &str) -> Arc<Mutex<()>> {
+        self.0
+            .vaults
+            .lock()
+            .await
+            .entry(vault_id.to_string())
+            .or_insert_with(VaultState::new)
+            .commit_lock
+            .clone()
     }
 
     /// The vault repo's directory, if the repo has been initialized.
@@ -286,7 +227,7 @@ impl GitService {
         self.git_raw(&repo, args).await
     }
 
-    /// Materialize the vault's current state from y-sweet and commit the diff.
+    /// Materialize the vault's current CRDT state and commit the diff.
     /// Returns whether a commit was actually made.
     async fn commit_once(
         &self,
@@ -294,6 +235,7 @@ impl GitService {
         contributors: &[Contributor],
         ov: Option<&CommitOverride>,
     ) -> Result<bool> {
+        self.0.plugindb.reconcile_vault(vault_id).await?;
         let repo = self.ensure_repo(vault_id).await?;
 
         // 1. Authoritative file set from the vault index doc's `files` map.
@@ -434,10 +376,9 @@ impl GitService {
         Ok(PathBuf::from(&self.0.config.git_data_dir).join(vault_id))
     }
 
-    /// Fetch a document's full state as a Yjs v1 update, authorizing with an
-    /// in-process read-only doc token signed by the shared y-sweet key.
+    /// Fetch a document's full state from the native document engine.
     async fn fetch_as_update(&self, doc_id: &str) -> Result<Vec<u8>> {
-        crate::ydoc::read_update_with(&self.0.config, &self.0.http, &self.0.authenticator, doc_id)
+        crate::ydoc::read_update_with(&self.0.documents, doc_id)
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
     }
@@ -505,9 +446,6 @@ impl GitService {
         )
         .await?;
 
-        if let Err(e) = self.push(vault_id, repo).await {
-            tracing::warn!("git audit: push for vault {vault_id} failed: {e}");
-        }
         Ok(true)
     }
 
@@ -572,6 +510,13 @@ impl GitService {
         active.updated_at = Set(now_millis());
         active.update(&self.0.db).await?;
         result
+    }
+
+    pub(crate) async fn push_backup(&self, vault_id: &str) -> Result<()> {
+        let Some(repo) = self.repo_dir(vault_id)? else {
+            return Ok(());
+        };
+        self.push(vault_id, &repo).await
     }
 
     /// Validate a backup config by listing the remote's refs with the same
@@ -1732,13 +1677,25 @@ diff --git a/ref.md b/ref.md
     fn test_config() -> Config {
         Config {
             database_url: String::new(),
+            background_jobs_enabled: true,
+            background_job_concurrency: 4,
+            background_job_max_attempts: 25,
+            background_job_retry_min_ms: 250,
+            background_job_retry_max_ms: 30_000,
+            background_job_shutdown_timeout_ms: 30_000,
+            server_shutdown_timeout_ms: 30_000,
             bind_addr: String::new(),
             public_base_url: String::new(),
-            ysweet_url: String::new(),
+            crdt_store_dir: std::env::temp_dir()
+                .join(format!("realtime-git-test-{}", uuid::Uuid::new_v4()))
+                .display()
+                .to_string(),
+            crdt_epoch_period_days: 365,
+            crdt_epoch_recovery_days: 30,
+            crdt_epoch_max_updates: 100_000,
+            crdt_epoch_max_state_bytes: 32 * 1024 * 1024,
+            crdt_epoch_max_delete_set_bytes: 8 * 1024 * 1024,
             blob_dir: String::new(),
-            ysweet_store_dir: None,
-            ysweet_public_url: String::new(),
-            ysweet_auth_key: String::new(),
             oidc_mode: crate::config::OidcMode::Mock,
             oidc_issuer: None,
             oidc_client_id: None,

@@ -1,18 +1,17 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use regex::Regex;
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Statement, Value};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Statement, TransactionTrait, Value,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
 
-use crate::config::Config;
-use crate::entities::{memberships, note_search, vaults};
+use crate::entities::{memberships, note_search};
 use crate::error::{AppError, AppResult};
+use crate::jobs::JobQueue;
 use crate::routes::require_member;
 use crate::session::{now_millis, ApiPrincipal};
 use crate::state::AppState;
@@ -196,8 +195,8 @@ pub async fn index_note(
     let now = now_millis();
     let tag_text = parsed.tags.join(" ");
     let backend = state.db.get_database_backend();
-    state
-        .db
+    let transaction = state.db.begin().await?;
+    transaction
         .execute(Statement::from_sql_and_values(
             backend,
             "INSERT INTO note_search(id,vault_id,guid,path,title,tags,links,updated_at) \
@@ -218,16 +217,14 @@ pub async fn index_note(
         ))
         .await?;
     let fts_rowid = note_fts_rowid(vault_id, guid);
-    state
-        .db
+    transaction
         .execute(Statement::from_sql_and_values(
             backend,
             "DELETE FROM note_fts WHERE rowid = ?",
             [Value::from(fts_rowid)],
         ))
         .await?;
-    state
-        .db
+    transaction
         .execute(Statement::from_sql_and_values(
             backend,
             "INSERT INTO note_fts(rowid,vault_id,guid,path,title,tags,body) VALUES (?,?,?,?,?,?,?)",
@@ -242,6 +239,7 @@ pub async fn index_note(
             ],
         ))
         .await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -553,118 +551,41 @@ pub async fn clear_fts_and_reindex(
     Ok(Json(clear_fts_and_reindex_inner(&state, &principal).await?))
 }
 
-struct VaultState {
-    full_reindex: bool,
-    dirty_guids: HashSet<String>,
-    deadline: Instant,
-    running: bool,
-}
-struct Inner {
-    vaults: Mutex<HashMap<String, VaultState>>,
-}
-
 #[derive(Clone)]
-pub struct SearchService(Arc<Inner>);
-
-const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
+pub struct SearchService(JobQueue);
 
 impl SearchService {
-    pub fn new(_config: Arc<Config>) -> Self {
-        Self(Arc::new(Inner {
-            vaults: Mutex::new(HashMap::new()),
-        }))
-    }
-    /// Reconcile the whole vault after its path-to-guid index changes.
-    pub async fn mark_vault_write(&self, state: AppState, vault_id: &str) {
-        self.mark_write(state, vault_id, None).await;
+    pub fn new(jobs: JobQueue) -> Self {
+        Self(jobs)
     }
 
-    /// Refresh one changed note without rereading every document in the vault.
-    pub async fn mark_note_write(&self, state: AppState, vault_id: &str, guid: &str) {
-        self.mark_write(state, vault_id, Some(guid)).await;
+    /// Persist a whole-vault reconciliation after its path index changes.
+    pub async fn mark_vault_write(&self, vault_id: &str) {
+        if let Err(error) = self.0.enqueue_search_vault(vault_id).await {
+            tracing::error!("queue search reindex for vault {vault_id} failed: {error:#}");
+        }
     }
 
-    async fn mark_write(&self, state: AppState, vault_id: &str, guid: Option<&str>) {
-        let mut vaults = self.0.vaults.lock().await;
-        let entry = vaults
-            .entry(vault_id.to_string())
-            .or_insert_with(|| VaultState {
-                full_reindex: false,
-                dirty_guids: HashSet::new(),
-                deadline: Instant::now(),
-                running: false,
-            });
-        if let Some(guid) = guid {
-            if !entry.full_reindex {
-                entry.dirty_guids.insert(guid.to_string());
-            }
-        } else {
-            entry.full_reindex = true;
-            entry.dirty_guids.clear();
-        }
-        entry.deadline = Instant::now() + SEARCH_DEBOUNCE;
-        if !entry.running {
-            entry.running = true;
-            let svc = self.clone();
-            let vault_id = vault_id.to_string();
-            tokio::spawn(async move { svc.run_vault(state, vault_id).await });
+    /// Persist a focused note reconciliation.
+    pub async fn mark_note_write(&self, vault_id: &str, guid: &str) {
+        if let Err(error) = self.0.enqueue_search_note(vault_id, guid).await {
+            tracing::error!(
+                "queue search refresh for vault {vault_id} note {guid} failed: {error:#}"
+            );
         }
     }
-    async fn run_vault(self, state: AppState, vault_id: String) {
-        loop {
-            loop {
-                let remaining = {
-                    self.0
-                        .vaults
-                        .lock()
-                        .await
-                        .get(&vault_id)
-                        .and_then(|s| s.deadline.checked_duration_since(Instant::now()))
-                };
-                match remaining {
-                    Some(d) => tokio::time::sleep(d).await,
-                    None => break,
-                }
-            }
-            let (full_reindex, dirty_guids) = {
-                let mut vaults = self.0.vaults.lock().await;
-                if let Some(s) = vaults.get_mut(&vault_id) {
-                    if !s.full_reindex && s.dirty_guids.is_empty() {
-                        s.running = false;
-                        return;
-                    }
-                    let full_reindex = std::mem::take(&mut s.full_reindex);
-                    let dirty_guids = std::mem::take(&mut s.dirty_guids);
-                    (full_reindex, dirty_guids)
-                } else {
-                    return;
-                }
-            };
-            if full_reindex {
-                if let Err(e) = reindex_vault(&state, &vault_id).await {
-                    tracing::error!("search reindex for vault {vault_id} failed: {e}");
-                }
-            } else {
-                for guid in dirty_guids {
-                    if let Err(e) = reindex_note(&state, &vault_id, &guid).await {
-                        tracing::error!(
-                            "search index refresh for vault {vault_id} note {guid} failed: {e}"
-                        );
-                    }
-                }
-            }
-            {
-                let mut vaults = self.0.vaults.lock().await;
-                if let Some(s) = vaults.get_mut(&vault_id) {
-                    if !s.full_reindex && s.dirty_guids.is_empty() {
-                        s.running = false;
-                        return;
-                    }
-                } else {
-                    return;
-                }
-            }
-        }
+
+    pub(crate) async fn reconcile_vault(&self, state: &AppState, vault_id: &str) -> AppResult<()> {
+        reindex_vault(state, vault_id).await.map(|_| ())
+    }
+
+    pub(crate) async fn reconcile_note(
+        &self,
+        state: &AppState,
+        vault_id: &str,
+        guid: &str,
+    ) -> AppResult<()> {
+        reindex_note(state, vault_id, guid).await
     }
 }
 
@@ -689,48 +610,6 @@ async fn reindex_note(state: &AppState, vault_id: &str, guid: &str) -> AppResult
     let content =
         ydoc::decode_text(&update, "contents").map_err(|e| AppError::Internal(e.to_string()))?;
     index_note(state, vault_id, guid, &path, &content).await
-}
-
-pub fn spawn_startup_backfill(state: AppState) {
-    tokio::spawn(async move {
-        match vaults::Entity::find().all(&state.db).await {
-            Ok(vaults) => {
-                let mut failed = 0usize;
-                for v in vaults {
-                    if let Err(e) = reindex_vault_with_startup_retries(&state, &v.id).await {
-                        failed += 1;
-                        tracing::debug!("startup search reindex {} skipped: {e}", v.id);
-                    }
-                }
-                if failed > 0 {
-                    tracing::warn!(
-                        "startup search reindex skipped {failed} vault(s); they will reindex on the next change or manual reindex"
-                    );
-                }
-            }
-            Err(e) => tracing::warn!("startup search vault scan failed: {e}"),
-        }
-    });
-}
-
-async fn reindex_vault_with_startup_retries(state: &AppState, vault_id: &str) -> AppResult<usize> {
-    let mut last_err = None;
-    for delay in [
-        Duration::from_secs(2),
-        Duration::from_secs(5),
-        Duration::from_secs(10),
-    ] {
-        match reindex_vault(state, vault_id).await {
-            Ok(count) => return Ok(count),
-            Err(e) => {
-                last_err = Some(e);
-                tokio::time::sleep(delay).await;
-            }
-        }
-    }
-    reindex_vault(state, vault_id)
-        .await
-        .map_err(|e| last_err.unwrap_or(e))
 }
 
 fn frontmatter_value(content: &str) -> Option<serde_json::Value> {

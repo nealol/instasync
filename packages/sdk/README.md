@@ -77,14 +77,16 @@ Non-2xx responses throw `ApiError` (`status`, `message`); 400 → `ValidationErr
 
 `serverInfo()` returns `{ serverId, version?, caps?, requiredCaps? }`. The
 optional `caps` map carries named capability versions per surface
-(`restApi`, `oauth`, `pluginDbSync`, `attachmentShim`). The SDK mirrors these
-fields so consumers can self-gate, but **does not enforce caps itself** —
-only the Obsidian plugin does. See
+(`restApi`, `oauth`, `pluginDbSync`, `attachmentShim`, `documentEpoch`,
+`documentInvalidation`). The
+SDK also mirrors `epoch` on document-token responses. Consumers must create a
+fresh local Y.Doc when that value changes; the SDK does not do this or enforce
+caps itself. Only the Obsidian plugin performs that lifecycle automatically. See
 **[../../docs/versioning.md](../../docs/versioning.md)** for the cap names,
 bump rules, and gating behavior.
 
 ## Coverage
 
-Vaults · invites · members · remote cursors + audit log (list/undo) · notes (CRUD, patch, move, permalinks, frontmatter, periodic) · attachments + content-addressed blobs · canvases (nodes/edges) · bases (views/filters/formulas/properties) · search/tags/backlinks · storage + blob GC · git backup config · plugin-db replication + server-side SQL (list/query/execute) · y-sweet doc tokens · OAuth 2.1 (discovery, dynamic registration, PKCE, refresh) · streaming WebSocket API.
+Vaults · invites · members · remote cursors + audit log (list/undo) · notes (CRUD, patch, move, permalinks, frontmatter, periodic) · attachments + content-addressed blobs · canvases (nodes/edges) · bases (views/filters/formulas/properties) · search/tags/backlinks · storage + blob GC · git backup config · plugin-db replication + server-side SQL (list/query/execute) · native Yjs document tokens · OAuth 2.1 (discovery, dynamic registration, PKCE, refresh) · streaming WebSocket API.
 
 Everything the MCP server's tools can do is covered via the same underlying REST endpoints.

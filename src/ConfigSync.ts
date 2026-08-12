@@ -8,7 +8,8 @@ import {
   type ConfigCategoryId,
 } from "./configCategories";
 import { dbg } from "./debug";
-import type { LocalSyncState } from "./localSyncState";
+import { shouldFoldOfflineDeletion, type LocalSyncState } from "./localSyncState";
+import { isConflictCopy, preserveAdapterConflict } from "./conflictRecovery";
 
 export interface ConfigMeta {
   hash: string;
@@ -146,23 +147,51 @@ export class ConfigSync {
 
   seedBaseline(): void {
     for (const [path, meta] of this.configFiles.entries()) {
-      if (meta?.hash) this.lastSyncedHash.set(path, meta.hash);
+      if (!meta?.hash) continue;
+      if (!this.localSyncState) {
+        this.lastSyncedHash.set(path, meta.hash);
+        continue;
+      }
+      this.localSyncState.migrateLegacyIdentity(path, "config", meta.hash);
+      const state = this.localSyncState.get(path);
+      if (
+        state?.kind === "config" &&
+        !state.candidate &&
+        state.identity === meta.hash &&
+        state.fingerprint === meta.hash
+      ) {
+        this.lastSyncedHash.set(path, meta.hash);
+      }
+    }
+    for (const [path, state] of this.localSyncState?.entries() ?? []) {
+      if (
+        state.kind === "config" &&
+        !state.candidate &&
+        state.identity &&
+        state.fingerprint === state.identity
+      ) {
+        this.lastSyncedHash.set(path, state.identity);
+      }
     }
     dbg("ConfigSync seedBaseline", this.lastSyncedHash.size, "entries");
   }
 
   async foldOfflineDeletions(categories: Set<ConfigCategoryId>): Promise<void> {
     this.enabledCategories = new Set(categories);
-    for (const path of this.configFiles.keys()) {
+    for (const [path, meta] of this.configFiles.entries()) {
+      const state = this.localSyncState?.get(path);
       if (
         this.syncableCategory(path) === null ||
-        !this.localSyncState?.has(path) ||
-        (await this.plugin.app.vault.adapter.exists(path))
+        !shouldFoldOfflineDeletion(
+          state,
+          meta.hash,
+          await this.plugin.app.vault.adapter.exists(path),
+        )
       ) {
         continue;
       }
       this.configFiles.delete(path);
-      this.localSyncState.remove(path);
+      this.localSyncState?.remove(path);
     }
   }
 
@@ -228,22 +257,62 @@ export class ConfigSync {
     if (this.destroyed) return;
     const local = await this.localInfo(path);
     if (local === undefined || this.destroyed) return;
-    if (local) this.localSyncState?.mark(path, "config");
+    if (local && !this.localSyncState?.has(path)) {
+      this.localSyncState?.beginCandidate(path, "config", local.hash, local.hash);
+    }
     const remote = this.configFiles.get(path) ?? null;
     const base = this.lastSyncedHash.get(path) ?? null;
+    const localState = this.localSyncState?.get(path);
+
+    if (
+      local &&
+      remote &&
+      local.hash !== remote.hash &&
+      localState?.kind === "config" &&
+      localState.candidate
+    ) {
+      const localBytes = await this.plugin.app.vault.adapter.readBinary(path);
+      const preservedPath = await preserveAdapterConflict(this.plugin, path, localBytes, "local");
+      new Notice(
+        `Realtime: kept the remote settings at "${path}" and preserved this device's unrelated file as "${preservedPath}".`,
+      );
+      if (!(await this.configStateMatches(path, local.hash, remote.hash))) {
+        void this.reconcile(path);
+        return;
+      }
+      await this.download(path, remote, local.hash);
+      return;
+    }
+    if (local && !remote && base !== null && base !== local.hash) {
+      const localBytes = await this.plugin.app.vault.adapter.readBinary(path);
+      const preservedPath = await preserveAdapterConflict(this.plugin, path, localBytes, "local");
+      new Notice(
+        `Realtime: "${path}" was deleted remotely; preserved this device's edited settings as "${preservedPath}".`,
+      );
+      if (!(await this.configStateMatches(path, local.hash, null))) {
+        void this.reconcile(path);
+        return;
+      }
+      await this.deleteLocal(path);
+      return;
+    }
 
     const action = decideConfigReconcile(local, remote, base, {
       initialPull: this.initialPull,
       canMerge: path.endsWith(".json"),
     });
     if (action === "none") {
-      if (remote?.hash) this.lastSyncedHash.set(path, remote.hash);
-      else this.lastSyncedHash.delete(path);
+      if (remote?.hash) {
+        this.lastSyncedHash.set(path, remote.hash);
+        this.localSyncState?.markSynced(path, "config", remote.hash, remote.hash);
+      } else this.lastSyncedHash.delete(path);
       return;
     }
-    if (action === "upload" && local) await this.upload(path, local);
-    else if (action === "download" && remote) await this.download(path, remote);
-    else if (action === "deleteLocal") await this.deleteLocal(path);
+    if (action === "upload" && local) {
+      await this.upload(path, local, remote?.hash ?? null);
+    } else if (action === "download" && remote) {
+      await this.download(path, remote, local?.hash ?? null);
+    } else if (action === "deleteLocal") await this.deleteLocal(path);
     else if (action === "deleteRemote") this.publishDelete(path);
     else if (action === "merge" && local && remote) await this.mergeConflict(path, local, remote);
   }
@@ -284,15 +353,20 @@ export class ConfigSync {
     }
   }
 
-  private async upload(path: string, meta: ConfigMeta): Promise<void> {
+  private async upload(
+    path: string,
+    meta: ConfigMeta,
+    expectedRemoteHash: string | null,
+  ): Promise<void> {
     const bytes = await this.plugin.app.vault.adapter.readBinary(path);
-    await this.uploadBytes(path, bytes, meta);
+    await this.uploadBytes(path, bytes, meta, expectedRemoteHash);
   }
 
   private async uploadBytes(
     path: string,
     bytes: ArrayBuffer,
     meta: ConfigMeta | null,
+    expectedRemoteHash: string | null,
   ): Promise<void> {
     const hash = await sha256Hex(bytes);
     if (this.destroyed) return;
@@ -302,12 +376,27 @@ export class ConfigSync {
       await this.plugin.auth.putBlob(this.vaultId, path, finalMeta.hash, bytes);
     }
     if (this.destroyed) return;
+    const currentLocal = await this.localInfo(path);
+    if (
+      this.destroyed ||
+      !currentLocal ||
+      currentLocal.hash !== finalMeta.hash ||
+      (this.configFiles.get(path)?.hash ?? null) !== expectedRemoteHash
+    ) {
+      void this.reconcile(path);
+      return;
+    }
     this.indexDoc.transact(() => this.configFiles.set(path, finalMeta));
     this.lastSyncedHash.set(path, finalMeta.hash);
+    this.localSyncState?.markSynced(path, "config", finalMeta.hash, finalMeta.hash, true);
     dbg("config uploaded+published", path, finalMeta.hash, finalMeta.size);
   }
 
-  private async download(path: string, meta: ConfigMeta): Promise<void> {
+  private async download(
+    path: string,
+    meta: ConfigMeta,
+    expectedLocalHash?: string | null,
+  ): Promise<void> {
     let bytes: ArrayBuffer;
     try {
       bytes = await this.plugin.auth.getBlob(this.vaultId, path, meta.hash);
@@ -318,12 +407,21 @@ export class ConfigSync {
       return;
     }
     if (this.destroyed) return;
+    const currentLocal = await this.localInfo(path);
+    if (
+      this.destroyed ||
+      (this.configFiles.get(path)?.hash ?? null) !== meta.hash ||
+      (expectedLocalHash !== undefined && (currentLocal?.hash ?? null) !== expectedLocalHash)
+    ) {
+      void this.reconcile(path);
+      return;
+    }
     this.writing.add(path);
     try {
       await this.ensureParentFolders(path);
       await this.plugin.app.vault.adapter.writeBinary(path, bytes);
       this.lastSyncedHash.set(path, meta.hash);
-      this.localSyncState?.mark(path, "config");
+      this.localSyncState?.markSynced(path, "config", meta.hash, meta.hash, true);
       this.noteDownloaded(path);
       dbg("config downloaded", path, meta.hash, bytes.byteLength);
     } finally {
@@ -349,13 +447,39 @@ export class ConfigSync {
     }
     const localBytes = await this.plugin.app.vault.adapter.readBinary(path);
     if (this.destroyed) return;
+    if (!(await this.configStateMatches(path, local.hash, remote.hash))) {
+      void this.reconcile(path);
+      return;
+    }
 
     const decoder = new TextDecoder();
     const merged = mergeJsonSettings(decoder.decode(remoteBytes), decoder.decode(localBytes));
     if (merged === null) {
       // Not mergeable JSON → newest modified version wins.
-      if (local.mtime >= remote.mtime) await this.uploadBytes(path, localBytes, local);
-      else await this.download(path, remote);
+      if (local.mtime >= remote.mtime) {
+        await preserveAdapterConflict(this.plugin, path, remoteBytes, "remote");
+        if (!(await this.configStateMatches(path, local.hash, remote.hash))) {
+          void this.reconcile(path);
+          return;
+        }
+        await this.uploadBytes(path, localBytes, local, remote.hash);
+      } else {
+        await preserveAdapterConflict(this.plugin, path, localBytes, "local");
+        if (!(await this.configStateMatches(path, local.hash, remote.hash))) {
+          void this.reconcile(path);
+          return;
+        }
+        await this.download(path, remote, local.hash);
+      }
+      return;
+    }
+
+    const preservedPath = await preserveAdapterConflict(this.plugin, path, remoteBytes, "remote");
+    new Notice(
+      `Realtime: merged settings at "${path}" and preserved the conflicting remote version as "${preservedPath}".`,
+    );
+    if (!(await this.configStateMatches(path, local.hash, remote.hash))) {
+      void this.reconcile(path);
       return;
     }
 
@@ -371,8 +495,21 @@ export class ConfigSync {
       window.setTimeout(() => this.writing.delete(path), 0);
     }
     if (this.destroyed) return;
-    await this.uploadBytes(path, buffer, null);
+    await this.uploadBytes(path, buffer, null, remote.hash);
     dbg("config merged", path);
+  }
+
+  private async configStateMatches(
+    path: string,
+    localHash: string,
+    remoteHash: string | null,
+  ): Promise<boolean> {
+    const currentLocal = await this.localInfo(path);
+    return (
+      !this.destroyed &&
+      currentLocal?.hash === localHash &&
+      (this.configFiles.get(path)?.hash ?? null) === remoteHash
+    );
   }
 
   private async deleteLocal(path: string): Promise<void> {
@@ -443,7 +580,7 @@ export class ConfigSync {
    * other devices' business), unclassifiable, or in a disabled category.
    */
   private syncableCategory(path: string): ConfigCategoryId | null {
-    if (this.isHardExcluded(path)) return null;
+    if (this.isHardExcluded(path) || isConflictCopy(path)) return null;
     const category = categoryForVaultPath(path, this.configRoot);
     if (category === null || !this.enabledCategories.has(category)) return null;
     return category;

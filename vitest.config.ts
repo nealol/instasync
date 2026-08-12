@@ -18,8 +18,8 @@ export default defineConfig({
           // opaque vitest "Test timed out" instead of the labeled waitFor error.
           testTimeout: 90_000,
           hookTimeout: 120_000,
-          // One y-sweet server is spawned per test file; serialise files so we never
-          // run a swarm of `npx y-sweet` processes (and to keep ports/logs sane).
+          // Several files spawn the Rust server; serialize them to keep process,
+          // port, and log pressure bounded.
           fileParallelism: false,
         },
         resolve: {
@@ -60,8 +60,16 @@ export default defineConfig({
           include: ["packages/sdk/tests/e2e/**/*.test.ts"],
           testTimeout: 90_000,
           hookTimeout: 180_000,
-          // The e2e harness spawns the Rust server + y-sweet per file.
+          // The end-to-end harness spawns one Rust server per file.
           fileParallelism: false,
+        },
+      },
+      {
+        test: {
+          name: "compat",
+          environment: "node",
+          include: ["tests/compat/**/*.test.ts"],
+          testTimeout: 30_000,
         },
       },
     ],

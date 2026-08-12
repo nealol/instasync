@@ -28,7 +28,7 @@ use crate::ydoc::{
     decode_text, IndexOp,
 };
 
-/// Bound on concurrent y-sweet document fetches while planning.
+/// Bound on concurrent CRDT document reads while planning.
 const PLAN_FETCH_CONCURRENCY: usize = 8;
 
 // ---------- plan shapes ----------
@@ -576,7 +576,7 @@ async fn execute_rollback(
                     }
                 };
                 let doc_id = format!("{vault_id}__{guid}");
-                crate::ysweet::ensure_doc(state, &doc_id).await?;
+                crate::crdt::ensure_doc(state, &doc_id).await?;
                 ydoc::set_text(state, &doc_id, content).await?;
                 applied += 1;
             }
@@ -599,7 +599,7 @@ async fn execute_rollback(
                     }
                 };
                 let doc_id = format!("{vault_id}__{guid}");
-                crate::ysweet::ensure_doc(state, &doc_id).await?;
+                crate::crdt::ensure_doc(state, &doc_id).await?;
                 ydoc::set_structured(state, &doc_id, value).await?;
                 applied += 1;
             }

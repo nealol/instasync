@@ -1,4 +1,15 @@
-use realtime_server::{app, build_state, config::Config, SERVER_NAME};
+use std::future::IntoFuture;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use realtime_server::{
+    app, build_state,
+    config::Config,
+    crdt_storage::{import_ysweet_store, inspect_store},
+    full_backup::{self, InstanceLock},
+    SERVER_NAME,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -8,15 +19,35 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config = Config::from_env();
-    let bind_addr = config.bind_addr.clone();
-
-    if config.ysweet_auth_key.is_empty() {
-        tracing::warn!(
-            "YSWEET_AUTH_KEY is not set — y-sweet authentication will fail. \
-             Set it to the same key passed to `y-sweet serve --auth`."
-        );
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("crdt") => return run_crdt_command(args[1..].to_vec()).await,
+        Some("backup") => return run_backup_command(args[1..].to_vec()).await,
+        Some("compatibility") if args.len() == 1 => {
+            let caps = realtime_server::caps::caps()
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "caps": caps,
+                    "requiredCaps": realtime_server::caps::REQUIRED,
+                }))?
+            );
+            return Ok(());
+        }
+        Some(command) => anyhow::bail!("unknown command {command:?}"),
+        None => {}
     }
+
+    let config = Config::from_env();
+    let _instance_lock = InstanceLock::acquire(&config)?;
+    full_backup::ensure_restore_complete(&config)?;
+    let bind_addr = config.bind_addr.clone();
+    let server_shutdown_timeout_ms = config.server_shutdown_timeout_ms;
+    let server_shutdown_timeout = Duration::from_millis(server_shutdown_timeout_ms);
+
     if config.upload_token == "dev-upload-token-change-me" {
         tracing::warn!(
             "UPLOAD_TOKEN is using the insecure default. \
@@ -25,20 +56,118 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tracing::info!(
-        "{} auth server: oidc_mode={:?}, ysweet={}",
+        "{} server: oidc_mode={:?}, crdt_store={}",
         SERVER_NAME,
         config.oidc_mode,
-        config.ysweet_url
+        config.crdt_store_dir
     );
 
     let state = build_state(config).await?;
+    let jobs = state.jobs.clone();
+    let runtime_health = state.runtime_health.clone();
     let router = app(state);
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!("listening on {bind_addr}");
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let shutdown_started = Arc::new(tokio::sync::Notify::new());
+    let shutdown_observer = shutdown_started.clone();
+    let shutdown = async move {
+        shutdown_signal().await;
+        runtime_health.begin_draining();
+        shutdown_observer.notify_one();
+        tracing::info!("shutdown requested; draining active connections");
+    };
+    let server = axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown)
+        .into_future();
+    tokio::pin!(server);
+    let result = tokio::select! {
+        result = &mut server => result,
+        _ = shutdown_started.notified() => {
+            match tokio::time::timeout(server_shutdown_timeout, &mut server).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_ms = server_shutdown_timeout_ms,
+                        "server drain deadline elapsed; closing remaining connections"
+                    );
+                    Ok(())
+                }
+            }
+        }
+    };
+    jobs.shutdown().await;
+    result?;
+    Ok(())
+}
+
+async fn run_backup_command(args: Vec<String>) -> anyhow::Result<()> {
+    match args.as_slice() {
+        [command, destination] if command == "create" => {
+            let config = Config::from_env();
+            let report = full_backup::create(&config, PathBuf::from(destination).as_path()).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        [command, source] if command == "verify" => {
+            let manifest = full_backup::verify(PathBuf::from(source).as_path()).await?;
+            println!("{}", serde_json::to_string_pretty(&manifest)?);
+        }
+        [command, source, force] if command == "restore" && force == "--force" => {
+            let config = Config::from_env();
+            let report =
+                full_backup::restore(&config, PathBuf::from(source).as_path(), true).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        _ => anyhow::bail!(
+            "usage: realtime-server backup create DESTINATION | verify BACKUP | \
+             restore BACKUP --force"
+        ),
+    }
+    Ok(())
+}
+
+async fn run_crdt_command(args: Vec<String>) -> anyhow::Result<()> {
+    let default_store =
+        || PathBuf::from(std::env::var("CRDT_STORE").unwrap_or_else(|_| "./crdt".to_string()));
+    match args.as_slice() {
+        [command] if command == "inspect" || command == "repair" => {
+            let report = inspect_store(&default_store(), command == "repair").await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if report.corrupt != 0 {
+                anyhow::bail!("{} corrupt document(s) remain", report.corrupt);
+            }
+        }
+        [command, path] if command == "inspect" || command == "repair" => {
+            let report = inspect_store(PathBuf::from(path).as_path(), command == "repair").await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if report.corrupt != 0 {
+                anyhow::bail!("{} corrupt document(s) remain", report.corrupt);
+            }
+        }
+        [command, source] if command == "import-ysweet" => {
+            let report =
+                import_ysweet_store(PathBuf::from(source).as_path(), &default_store()).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if !report.errors.is_empty() {
+                anyhow::bail!("{} document(s) could not be imported", report.errors.len());
+            }
+        }
+        [command, source, destination] if command == "import-ysweet" => {
+            let report = import_ysweet_store(
+                PathBuf::from(source).as_path(),
+                PathBuf::from(destination).as_path(),
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if !report.errors.is_empty() {
+                anyhow::bail!("{} document(s) could not be imported", report.errors.len());
+            }
+        }
+        _ => anyhow::bail!(
+            "usage: realtime-server crdt inspect [STORE] | repair [STORE] | \
+             import-ysweet SOURCE [STORE]"
+        ),
+    }
     Ok(())
 }
 

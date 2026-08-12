@@ -3,6 +3,9 @@ name = "realtime-server"
 version = "0.3.5"
 edition = "2021"
 
+[features]
+fuzzing = []
+
 [dependencies]
 axum = { version = "0.8", features = ["ws", "multipart"] }
 tokio = { version = "1", features = ["full"] }
@@ -13,10 +16,16 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 tower-http = { version = "0.6", features = ["cors"] }
 tokio-util = { version = "0.7", features = ["io"] }
 sha2 = "0.10"
+bincode = "1.3.3"
+yrs-kvstore = "0.3.0"
 sea-orm = { version = "1.1", default-features = false, features = [
     "sqlx-sqlite",
     "runtime-tokio-rustls",
     "macros",
+] }
+sea-orm-migration = { version = "1.1", default-features = false, features = [
+    "sqlx-sqlite",
+    "runtime-tokio-rustls",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,11 +41,13 @@ nanoid = "0.4"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "1"
 anyhow = "1"
+apalis = { version = "=1.0.0-rc.9" }
+apalis-sqlite = { version = "=1.0.0-rc.8" }
+tower = { version = "0.5", features = ["retry"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
-y-sweet-core = "0.9"
-yrs = "0.19"
+yrs = { version = "0.19", features = ["sync"] }
 rmcp = { version = "1.7", features = ["server", "transport-streamable-http-server", "macros"] }
 schemars = "1"
 utoipa = "5"
@@ -44,12 +55,31 @@ utoipa-swagger-ui = { version = "9", features = ["axum"] }
 hmac = "0.12"
 base64 = "0.22"
 regex = "1"
-rusqlite = { version = "0.32", features = ["bundled", "load_extension"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled", "load_extension"] }
+sqlx = { version = "0.8.6", default-features = false, features = [
+    "sqlite",
+    "runtime-tokio-rustls",
+] }
 ssh-key = { version = "0.6.7", features = ["ed25519"] }
+fs2 = "0.4"
 
 [dev-dependencies]
 async-trait = "0.1"
-y-sweet = "0.9.1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-rusqlite = { version = "0.32", features = ["bundled", "load_extension"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled", "load_extension"] }
+proptest = "1"
+
+[[bench]]
+name = "crdt_storage"
+harness = false
+
+[[bench]]
+name = "sync_soak"
+harness = false
+
+[profile.release]
+overflow-checks = true
+
+[profile.bench]
+overflow-checks = true

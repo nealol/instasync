@@ -1,18 +1,19 @@
 import * as Y from "yjs";
 import {
-  YSweetProvider,
-  STATUS_CONNECTED,
-  STATUS_OFFLINE,
-  STATUS_ERROR,
-  EVENT_CONNECTION_STATUS,
-  type YSweetStatus,
-} from "@y-sweet/client";
+  RealtimeProvider,
+  SYNC_EVENT_DOCUMENT_INVALIDATED,
+  SYNC_EVENT_STATUS,
+  SYNC_STATUS_CONNECTED,
+  SYNC_STATUS_OFFLINE,
+  SYNC_STATUS_ERROR,
+  type SyncStatus,
+} from "./sync/RealtimeProvider";
 import { IndexeddbPersistence } from "y-indexeddb";
 import { TFile, TAbstractFile, Notice, Platform, type EventRef } from "obsidian";
 import type RealtimePlugin from "./main";
-import { getClientToken } from "./ysweet";
-import { connectYSweetProvider } from "./ysweetConnect";
-import { muxProviderOptions } from "./sync/wsPolyfill";
+import { getClientToken } from "./sync/clientToken";
+import { createMuxSocket } from "./sync/mux";
+import { epochPersistenceName } from "./documentEpoch";
 import { Document } from "./Document";
 import { CanvasDocument } from "./CanvasDocument";
 import { BaseDocument } from "./BaseDocument";
@@ -21,7 +22,10 @@ import { BinarySync } from "./BinarySync";
 import { ConfigSync } from "./ConfigSync";
 import { enabledConfigCategories } from "./configCategories";
 import { matchesAnyGlob, parseGlobs } from "./glob";
-import { LocalSyncState, type MaterializedKind } from "./localSyncState";
+import { LocalSyncState, shouldFoldOfflineDeletion, type MaterializedKind } from "./localSyncState";
+import { isConflictCopy, preserveTextConflict } from "./conflictRecovery";
+export { isConflictCopy } from "./conflictRecovery";
+import { sha256Text } from "./hash";
 
 type FileKind = "text" | "structured" | "binary" | "ignore";
 type StructuredKind = "canvas" | "base";
@@ -30,6 +34,7 @@ interface QueueItem {
   path: string;
   guid: string;
   kind: QueueKind;
+  reconnect?: boolean;
 }
 interface StructuredMeta {
   guid: string;
@@ -79,16 +84,6 @@ export interface TrashEntry extends TrashEntryValue {
   id: string;
 }
 
-/** Matches the sibling backups written on conflict; these must never sync. */
-const CONFLICT_COPY_RE = / \(conflicted copy .+\)$/;
-
-/** True for files like "Note (conflicted copy Brave Otter 2026-06-02 154233).md". */
-export function isConflictCopy(path: string): boolean {
-  const dot = path.lastIndexOf(".");
-  const base = dot > path.lastIndexOf("/") ? path.slice(0, dot) : path;
-  return CONFLICT_COPY_RE.test(base);
-}
-
 function newGuid(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
     return crypto.randomUUID();
@@ -106,12 +101,12 @@ function newGuid(): string {
  *    file creations/deletions propagate between clients;
  *  - owns a {@link Document} per Markdown file.
  *
- * One vault maps to one y-sweet server (configured by URL + vault id).
+ * One vault maps to one sync server (configured by URL + vault id).
  */
 export class VaultSync {
   private plugin: RealtimePlugin;
   private indexDoc: Y.Doc;
-  private indexProvider: YSweetProvider;
+  private indexProvider: RealtimeProvider;
   private indexPersistence: IndexeddbPersistence;
   /** Shared map of vault-relative path -> document guid. */
   private files: Y.Map<string>;
@@ -129,7 +124,13 @@ export class VaultSync {
   private documents = new Map<string, Document>();
   private structuredDocuments = new Map<string, StructuredDocument>();
   private destroyed = false;
+  /** Mobile-only lifecycle gate: retain CRDT state while releasing network channels. */
+  private mobileSuspended = false;
   private initialSynced = false;
+  private initialSyncRunning = false;
+  private bootstrapPrepared = false;
+  private startupFiles = new Map<string, string>();
+  private startupStructured = new Map<string, StructuredMeta>();
   /** Last time a text document synced (ms epoch); gates background blob uploads. */
   private lastTextActivityAt = 0;
   /** Tracks the live connection so we only notify on a connected→dropped edge. */
@@ -137,19 +138,31 @@ export class VaultSync {
 
   private filesObserver: (event: Y.YMapEvent<string>) => void;
   private structuredObserver: (event: Y.YMapEvent<StructuredMeta>) => void;
-  private statusListener: (status: YSweetStatus) => void;
+  private statusListener: (status: SyncStatus) => void;
   private vaultEvents: EventRef[] = [];
   private docQueue = new Map<string, QueueItem>();
   private activeDocConnections = 0;
+  private docConnectionGeneration = 0;
   private highPriorityDrained = false;
   private backgroundSyncStarted = false;
   private prioritizedPaths = new Set<string>();
   private prioritizedGuids = new Set<string>();
   /** Monotonic per-path version used to abort stale async create/rename work. */
   private pathVersions = new Map<string, number>();
+  private remoteDeleteInFlight = new Set<string>();
+  private remoteDeletePreserved = new Set<string>();
+  private remoteDeletesApplying = new Set<string>();
+  /** Last explicit user/local activity per path; used for mobile LRU eviction. */
+  private mobileLastUsedAt = new Map<string, number>();
+  private mobileTrimTimer: number | null = null;
+  private mobileTrimRunning = false;
+  private mobileCatchUpPending = false;
+  private mobileResumeInProgress = false;
+  private invalidationListener: (documentId: string) => void;
 
   constructor(plugin: RealtimePlugin) {
     this.plugin = plugin;
+    this.mobileSuspended = Platform?.isMobile === true && document.visibilityState === "hidden";
 
     this.indexDoc = new Y.Doc();
     this.files = this.indexDoc.getMap("files");
@@ -161,18 +174,22 @@ export class VaultSync {
     const localScope = `${serverScope}:${vaultId}`;
     this.localSyncState = new LocalSyncState(localScope);
     this.binarySync = new BinarySync(plugin, this, this.indexDoc, this.localSyncState);
+    if (this.mobileSuspended) this.binarySync.setPaused(true);
     this.configSync = new ConfigSync(plugin, this.indexDoc, this.localSyncState);
 
     // Connect only after the persisted index has loaded (see init()), so local
     // offline map changes merge with the server instead of racing it. The index
     // doc keeps the bare vault id; file docs are namespaced as `${vaultId}__${guid}`.
-    this.indexProvider = new YSweetProvider(
-      () => getClientToken(plugin, vaultId),
+    this.indexProvider = new RealtimeProvider(
       vaultId,
       this.indexDoc,
-      { connect: false, showDebuggerLink: false, ...muxProviderOptions() },
+      () => getClientToken(plugin, vaultId),
+      { connect: false, socketFactory: createMuxSocket },
     );
-    this.indexPersistence = new IndexeddbPersistence(`realtime:index:${localScope}`, this.indexDoc);
+    this.indexPersistence = new IndexeddbPersistence(
+      epochPersistenceName(plugin, vaultId, `realtime:index:${localScope}`),
+      this.indexDoc,
+    );
 
     this.filesObserver = this.onFilesChanged.bind(this);
     this.files.observe(this.filesObserver);
@@ -180,21 +197,36 @@ export class VaultSync {
     this.structured.observe(this.structuredObserver);
 
     this.statusListener = (status) => {
-      if (status === STATUS_CONNECTED) {
+      if (this.mobileSuspended) {
+        if (status === SYNC_STATUS_OFFLINE) {
+          this.wasConnected = false;
+          this.plugin.setStatus("offline");
+        }
+        return;
+      }
+      if (status === SYNC_STATUS_CONNECTED) {
         this.wasConnected = true;
         this.plugin.setStatus("connected");
         void this.runInitialSync();
+        if (Platform?.isMobile && this.mobileCatchUpPending && !this.mobileResumeInProgress) {
+          this.mobileCatchUpPending = false;
+          this.queueMobileReconnects();
+        }
       } else if (status === "connecting" || status === "handshaking") {
         this.notifyDisconnected();
         this.plugin.setStatus("connecting");
       } else if (status === "error") {
+        if (Platform?.isMobile && this.initialSynced) this.mobileCatchUpPending = true;
         this.notifyDisconnected();
         this.plugin.setStatus("error");
       } else {
+        if (Platform?.isMobile && this.initialSynced) this.mobileCatchUpPending = true;
         this.notifyDisconnected();
       }
     };
-    this.indexProvider.on(EVENT_CONNECTION_STATUS, this.statusListener);
+    this.indexProvider.on(SYNC_EVENT_STATUS, this.statusListener);
+    this.invalidationListener = (documentId) => this.onDocumentInvalidated(documentId);
+    this.indexProvider.on(SYNC_EVENT_DOCUMENT_INVALIDATED, this.invalidationListener);
 
     this.registerVaultEvents();
     void this.init();
@@ -208,12 +240,30 @@ export class VaultSync {
       console.error("[Realtime] index persistence failed to load", e);
     }
     if (this.destroyed) return;
+    this.migrateLegacyLocalState();
     await this.foldOfflineDeletions();
     if (this.destroyed) return;
+    this.startupFiles = new Map(this.files.entries());
+    this.startupStructured = new Map(
+      [...this.structured.entries()].filter((entry): entry is [string, StructuredMeta] =>
+        isStructuredMeta(entry[1]),
+      ),
+    );
     // Capture the persisted (pre-remote-merge) binary baseline before connecting.
     this.binarySync.seedBaseline();
     this.configSync.seedBaseline();
-    void connectYSweetProvider(this.indexProvider);
+    if (!this.mobileSuspended) void this.indexProvider.connect();
+  }
+
+  private migrateLegacyLocalState(): void {
+    for (const [path, guid] of this.files.entries()) {
+      this.localSyncState.migrateLegacyIdentity(path, "text", guid);
+    }
+    for (const [path, meta] of this.structured.entries()) {
+      if (isStructuredMeta(meta)) {
+        this.localSyncState.migrateLegacyIdentity(path, meta.kind, meta.guid);
+      }
+    }
   }
 
   /**
@@ -223,16 +273,19 @@ export class VaultSync {
   private async foldOfflineDeletions(): Promise<void> {
     this.indexDoc.transact(() => {
       for (const [path, guid] of this.files.entries()) {
-        if (!this.localSyncState.has(path) || this.localFileExists(path)) continue;
+        const state = this.localSyncState.get(path);
+        if (!shouldFoldOfflineDeletion(state, guid, this.localFileExists(path))) {
+          continue;
+        }
         this.recordTrashIn({ path, kind: "text", guid });
         this.files.delete(path);
         this.localSyncState.remove(path);
       }
       for (const [path, meta] of this.structured.entries()) {
+        const state = this.localSyncState.get(path);
         if (
           !isStructuredMeta(meta) ||
-          !this.localSyncState.has(path) ||
-          this.localFileExists(path)
+          !shouldFoldOfflineDeletion(state, meta.guid, this.localFileExists(path))
         ) {
           continue;
         }
@@ -256,27 +309,108 @@ export class VaultSync {
     }
   }
 
-  noteMaterialized(path: string, kind: MaterializedKind): void {
-    this.localSyncState.mark(path, kind);
+  noteMaterialized(path: string, kind: MaterializedKind, identity?: string): void {
+    if (identity) this.localSyncState.commit(path, kind, identity);
+    else this.localSyncState.mark(path, kind);
+  }
+
+  noteContentAcknowledged(
+    path: string,
+    kind: MaterializedKind,
+    identity: string,
+    fingerprint: string,
+    reconciled = false,
+  ): void {
+    this.localSyncState.markSynced(path, kind, identity, fingerprint, reconciled);
   }
 
   /** Nudge the index provider and every document to reconnect if stalled. */
   reconnectAll(): void {
-    if (this.destroyed) return;
+    if (this.destroyed || this.mobileSuspended) return;
     const status = this.indexProvider.status;
-    if (status === STATUS_OFFLINE || status === STATUS_ERROR) {
-      void connectYSweetProvider(this.indexProvider);
+    if (Platform?.isMobile && status !== SYNC_STATUS_CONNECTED) {
+      if (status === SYNC_STATUS_OFFLINE || status === SYNC_STATUS_ERROR) {
+        if (this.initialSynced) this.mobileCatchUpPending = true;
+        void this.indexProvider.connect();
+      }
+      return;
     }
+    if (status === SYNC_STATUS_OFFLINE || status === SYNC_STATUS_ERROR) {
+      void this.indexProvider.connect();
+    }
+    if (Platform?.isMobile) return;
     for (const doc of this.documents.values()) doc.ensureConnected();
     for (const doc of this.structuredDocuments.values()) doc.ensureConnected();
     this.pumpDocQueue();
+  }
+
+  /**
+   * Release mobile network channels while Obsidian is backgrounded. Y.Docs and
+   * IndexedDB persistence stay alive, so local edits remain durable and merge
+   * after the next foreground handshake.
+   */
+  suspendForBackground(): void {
+    if (!Platform?.isMobile || this.destroyed || this.mobileSuspended) return;
+    this.mobileSuspended = true;
+    this.wasConnected = false;
+    this.docConnectionGeneration++;
+    this.activeDocConnections = 0;
+    this.binarySync.setPaused(true);
+    for (const doc of this.documents.values()) doc.disconnect();
+    for (const doc of this.structuredDocuments.values()) doc.disconnect();
+    this.indexProvider.disconnect();
+    this.plugin.setStatus("offline");
+    this.scheduleMobileWorkingSetTrim();
+  }
+
+  /** Resume mobile sync with active/open/recent documents ahead of the backlog. */
+  async resumeFromBackground(): Promise<void> {
+    if (this.destroyed) return;
+    if (!Platform?.isMobile) {
+      this.reconnectAll();
+      return;
+    }
+    this.mobileSuspended = false;
+    const generation = this.docConnectionGeneration;
+    this.mobileResumeInProgress = true;
+    try {
+      if (this.indexProvider.status !== SYNC_STATUS_CONNECTED) {
+        await this.indexProvider.connect();
+      }
+    } finally {
+      this.mobileResumeInProgress = false;
+    }
+    if (
+      this.destroyed ||
+      this.mobileSuspended ||
+      generation !== this.docConnectionGeneration ||
+      this.indexProvider.status !== SYNC_STATUS_CONNECTED
+    ) {
+      return;
+    }
+    this.binarySync.setPaused(false);
+    this.mobileCatchUpPending = false;
+    this.queueMobileReconnects();
   }
 
   prioritizeItem(opts: { path?: string; guid?: string }): void {
     const path = opts.path?.trim() || (opts.guid ? this.pathForGuid(opts.guid) : null);
     if (opts.guid) this.prioritizedGuids.add(opts.guid);
     if (!path) return;
-    this.enqueueKnownPath(path, true);
+    this.markMobileDocumentUsed(path);
+    this.enqueueKnownPath(path, true, Platform?.isMobile === true);
+    this.pumpDocQueue();
+  }
+
+  private onDocumentInvalidated(documentId: string): void {
+    if (!Platform?.isMobile || this.destroyed) return;
+    const prefix = `${this.plugin.settings.activeVaultId}__`;
+    if (!documentId.startsWith(prefix)) return;
+    const guid = documentId.slice(prefix.length);
+    if (!guid) return;
+    const path = this.pathForGuid(guid);
+    if (!path) return;
+    this.enqueueKnownPath(path, true, true);
     this.pumpDocQueue();
   }
 
@@ -414,8 +548,69 @@ export class VaultSync {
   // --- Index synchronisation -------------------------------------------------
 
   private async runInitialSync(): Promise<void> {
-    if (this.initialSynced || this.destroyed) return;
-    this.initialSynced = true;
+    if (this.initialSynced || this.initialSyncRunning || this.destroyed) return;
+    this.initialSyncRunning = true;
+    try {
+      await this.runInitialSyncPass();
+      if (!this.destroyed) {
+        this.initialSynced = true;
+        this.startBackgroundSyncAfterPriorityDrain();
+      }
+    } catch (error) {
+      console.error("[Realtime] vault bootstrap failed; retrying", error);
+      if (!this.destroyed) window.setTimeout(() => void this.runInitialSync(), 2_000);
+    } finally {
+      this.initialSyncRunning = false;
+    }
+  }
+
+  private async runInitialSyncPass(): Promise<void> {
+    const syncFiles = this.plugin.app.vault.getFiles().filter((file) => {
+      const kind = this.classify(file);
+      return kind === "text" || kind === "structured";
+    });
+    for (const file of syncFiles) {
+      const kind = this.classify(file);
+      if (kind === "text" && !this.localSyncState.has(file.path)) {
+        const fingerprint = await sha256Text(await this.plugin.app.vault.read(file));
+        this.localSyncState.beginCandidate(file.path, "text", null, fingerprint);
+      } else if (kind === "structured" && !this.localSyncState.has(file.path)) {
+        const structuredKind = this.structuredKindForExtension(file.extension);
+        if (structuredKind) {
+          const fingerprint = await sha256Text(await this.plugin.app.vault.read(file));
+          this.localSyncState.beginCandidate(file.path, structuredKind, null, fingerprint);
+        }
+      }
+    }
+    this.bootstrapPrepared = true;
+
+    // Index entries present in this device's last durable snapshot but absent
+    // after the remote merge are remote deletions. Resolve them before treating
+    // remaining local files as new candidates.
+    for (const [path, guid] of this.startupFiles) {
+      if (!this.files.has(path)) await this.handleRemoteDelete(path, "text", guid);
+      if (this.destroyed) return;
+    }
+    for (const [path, meta] of this.startupStructured) {
+      if (!this.structured.has(path)) {
+        await this.handleRemoteDelete(path, meta.kind, meta.guid);
+      }
+      if (this.destroyed) return;
+    }
+    for (const file of syncFiles) {
+      const state = this.localSyncState.get(file.path);
+      if (!state || state.candidate || !state.identity) continue;
+      const kind = this.classify(file);
+      if (kind === "text" && !this.files.has(file.path)) {
+        await this.handleRemoteDelete(file.path, "text", state.identity);
+      } else if (kind === "structured" && !this.structured.has(file.path)) {
+        const structuredKind = this.structuredKindForExtension(file.extension);
+        if (structuredKind) {
+          await this.handleRemoteDelete(file.path, structuredKind, state.identity);
+        }
+      }
+      if (this.destroyed) return;
+    }
 
     const priorityPaths = this.startupPriorityPaths();
 
@@ -440,26 +635,28 @@ export class VaultSync {
     }
 
     // Add any local text or structured files that aren't tracked yet.
-    const syncFiles = this.plugin.app.vault.getFiles().filter((file) => {
-      const kind = this.classify(file);
-      return kind === "text" || kind === "structured";
-    });
     for (const file of syncFiles) {
       const path = file.path;
+      if (!this.localFileExists(path)) continue;
       const pathVersion = this.currentPathVersion(path);
       if (isConflictCopy(path)) continue;
       const kind = this.classify(file);
       if (kind === "text") {
-        this.localSyncState.mark(path, "text");
+        if (!this.localSyncState.has(path)) {
+          this.localSyncState.beginCandidate(path, "text", null);
+        }
       } else if (kind === "structured") {
         const structuredKind = this.structuredKindForExtension(file.extension);
-        if (structuredKind) this.localSyncState.mark(path, structuredKind);
+        if (structuredKind && !this.localSyncState.has(path)) {
+          this.localSyncState.beginCandidate(path, structuredKind, null);
+        }
       }
       if (kind === "structured") {
         const structuredKind = this.structuredKindForExtension(file.extension);
         if (!structuredKind) continue;
         if (!this.structured.has(path)) {
-          const guid = newGuid();
+          const guid = this.localSyncState.candidateIdentity(path, structuredKind) ?? newGuid();
+          this.localSyncState.beginCandidate(path, structuredKind, guid);
           const doc = this.ensureStructuredDocument(path, guid, structuredKind, true);
           await doc.whenReady();
           if (this.destroyed) return;
@@ -467,6 +664,7 @@ export class VaultSync {
           this.indexDoc.transact(() => {
             this.structured.set(path, { guid, kind: structuredKind });
           });
+          this.localSyncState.commit(path, structuredKind, guid);
           this.registerFile(path, guid);
         } else {
           const meta = this.structured.get(path);
@@ -477,7 +675,8 @@ export class VaultSync {
         continue;
       }
       if (!this.files.has(path)) {
-        const guid = newGuid();
+        const guid = this.localSyncState.candidateIdentity(path, "text") ?? newGuid();
+        this.localSyncState.beginCandidate(path, "text", guid);
         const doc = this.ensureDocument(path, guid, true);
         await doc.whenReady();
         if (this.destroyed) return;
@@ -485,6 +684,7 @@ export class VaultSync {
         this.indexDoc.transact(() => {
           this.files.set(path, guid);
         });
+        this.localSyncState.commit(path, "text", guid);
         this.registerFile(path, guid);
       } else {
         this.registerFile(path, this.files.get(path)!);
@@ -522,15 +722,163 @@ export class VaultSync {
     const recentPaths = Array.isArray(this.plugin.settings.recentPaths)
       ? this.plugin.settings.recentPaths
       : [];
-    for (const path of recentPaths) paths.add(path);
+    const recentLimit = Platform?.isMobile
+      ? this.plugin.settings.mobileRecentResidentDocs
+      : recentPaths.length;
+    for (const path of recentPaths.slice(0, recentLimit)) paths.add(path);
     return paths;
   }
 
-  private enqueueKnownPath(path: string, front = false): void {
-    const guid = this.files.get(path);
-    if (guid) this.enqueueDoc({ path, guid, kind: "text" }, front);
+  private markMobileDocumentUsed(path: string): void {
+    if (!Platform?.isMobile) return;
+    this.mobileLastUsedAt.set(path, Date.now());
+    this.scheduleMobileWorkingSetTrim(1_000);
+  }
+
+  private scheduleMobileWorkingSetTrim(delayMs = 0): void {
+    if (
+      !Platform?.isMobile ||
+      !this.plugin.auth.supportsCapability("documentInvalidation") ||
+      this.destroyed ||
+      this.mobileTrimTimer !== null
+    ) {
+      return;
+    }
+    this.mobileTrimTimer = window.setTimeout(() => {
+      this.mobileTrimTimer = null;
+      void this.trimMobileWorkingSet();
+    }, delayMs);
+  }
+
+  private async trimMobileWorkingSet(): Promise<void> {
+    if (
+      !Platform?.isMobile ||
+      !this.plugin.auth.supportsCapability("documentInvalidation") ||
+      this.destroyed
+    ) {
+      return;
+    }
+    if (this.mobileTrimRunning) {
+      this.scheduleMobileWorkingSetTrim(1_000);
+      return;
+    }
+    this.mobileTrimRunning = true;
+    let retry = false;
+    try {
+      const retained = this.startupPriorityPaths();
+      const maxResidents = this.plugin.settings.mobileMaxResidentDocs;
+      const entries: Array<[string, Document | StructuredDocument]> = [
+        ...this.documents.entries(),
+        ...this.structuredDocuments.entries(),
+      ];
+      const retainedResidents = entries.reduce(
+        (count, [path]) => count + (retained.has(path) ? 1 : 0),
+        0,
+      );
+      const target = Math.max(maxResidents, retainedResidents);
+      let residentCount = entries.length;
+      const candidates = entries
+        .filter(([path]) => !retained.has(path))
+        .sort(
+          ([left], [right]) =>
+            (this.mobileLastUsedAt.get(left) ?? 0) - (this.mobileLastUsedAt.get(right) ?? 0),
+        );
+
+      for (const [path, doc] of candidates) {
+        if (residentCount <= target) break;
+        if (!this.documentMatchesIndex(path, doc)) continue;
+        if (!(await doc.prepareForHibernation())) {
+          retry = true;
+          continue;
+        }
+        if (
+          this.destroyed ||
+          this.startupPriorityPaths().has(path) ||
+          !this.documentMatchesIndex(path, doc)
+        ) {
+          continue;
+        }
+        if (this.documents.get(path) === doc) this.documents.delete(path);
+        else if (this.structuredDocuments.get(path) === doc) {
+          this.structuredDocuments.delete(path);
+        } else {
+          continue;
+        }
+        doc.destroy();
+        residentCount--;
+      }
+      if (residentCount > target) retry = true;
+    } finally {
+      this.mobileTrimRunning = false;
+    }
+    if (retry) this.scheduleMobileWorkingSetTrim(1_000);
+  }
+
+  private documentMatchesIndex(path: string, doc: Document | StructuredDocument): boolean {
+    if (doc instanceof Document) return this.files.get(path) === doc.guid;
     const meta = this.structured.get(path);
-    if (isStructuredMeta(meta)) this.enqueueDoc({ path, guid: meta.guid, kind: meta.kind }, front);
+    return isStructuredMeta(meta) && meta.guid === doc.guid;
+  }
+
+  private enqueueKnownPath(path: string, front = false, reconnect = false): void {
+    const guid = this.files.get(path);
+    if (guid) {
+      const item = { path, guid, kind: "text" } satisfies QueueItem;
+      if (reconnect) this.enqueueReconnect(item, front);
+      else this.enqueueDoc(item, front);
+    }
+    const meta = this.structured.get(path);
+    if (isStructuredMeta(meta)) {
+      const item = { path, guid: meta.guid, kind: meta.kind } satisfies QueueItem;
+      if (reconnect) this.enqueueReconnect(item, front);
+      else this.enqueueDoc(item, front);
+    }
+  }
+
+  private enqueueReconnect(item: QueueItem, front = false): void {
+    if (this.destroyed) return;
+    const doc =
+      item.kind === "text"
+        ? this.documents.get(item.path)
+        : this.structuredDocuments.get(item.path);
+    if (!doc || doc.guid !== item.guid) {
+      this.enqueueDoc(item, front);
+      return;
+    }
+    if (!doc.isReady()) {
+      if (front) this.prioritizedPaths.add(item.path);
+      this.docQueue.delete(item.path);
+      if (front) this.docQueue = new Map([[item.path, item], ...this.docQueue]);
+      else this.docQueue.set(item.path, item);
+      return;
+    }
+    const status = doc.provider.status;
+    if (status !== SYNC_STATUS_OFFLINE && status !== SYNC_STATUS_ERROR) return;
+
+    const queued = { ...item, reconnect: true };
+    if (front) this.prioritizedPaths.add(item.path);
+    this.docQueue.delete(item.path);
+    if (front) this.docQueue = new Map([[item.path, queued], ...this.docQueue]);
+    else this.docQueue.set(item.path, queued);
+  }
+
+  private queueMobileReconnects(): void {
+    for (const [path, guid] of this.files.entries()) {
+      this.enqueueReconnect({ path, guid, kind: "text" });
+    }
+    for (const [path, meta] of this.structured.entries()) {
+      if (isStructuredMeta(meta)) {
+        this.enqueueReconnect({ path, guid: meta.guid, kind: meta.kind });
+      }
+    }
+
+    // Prepending reverses order, so walk priorities backwards to retain
+    // active → open → recent ordering from startupPriorityPaths().
+    const priorities = [...this.startupPriorityPaths()];
+    for (let i = priorities.length - 1; i >= 0; i--) {
+      this.enqueueKnownPath(priorities[i], true, true);
+    }
+    this.pumpDocQueue();
   }
 
   private enqueueDoc(item: QueueItem, front = false): void {
@@ -554,7 +902,7 @@ export class VaultSync {
   }
 
   private pumpDocQueue(): void {
-    if (this.destroyed) return;
+    if (this.destroyed || this.mobileSuspended) return;
     const concurrency = Platform?.isMobile ? 1 : 2;
     while (this.activeDocConnections < concurrency && this.docQueue.size > 0) {
       const [path, item] = this.docQueue.entries().next().value as [string, QueueItem];
@@ -564,8 +912,14 @@ export class VaultSync {
           ? this.ensureDocument(item.path, item.guid, false, false)
           : this.ensureStructuredDocument(item.path, item.guid, item.kind, false, false);
       this.activeDocConnections++;
+      const generation = this.docConnectionGeneration;
+      const completion =
+        item.reconnect && doc.provider.status !== SYNC_STATUS_CONNECTED
+          ? doc.whenNextServerSync()
+          : doc.whenReady();
       doc.connect();
-      void doc.whenReady().finally(() => {
+      void completion.finally(() => {
+        if (generation !== this.docConnectionGeneration) return;
         this.activeDocConnections = Math.max(0, this.activeDocConnections - 1);
         this.prioritizedPaths.delete(item.path);
         this.prioritizedGuids.delete(item.guid);
@@ -573,6 +927,7 @@ export class VaultSync {
           this.highPriorityDrained = true;
           this.startBackgroundSyncAfterPriorityDrain();
         }
+        this.scheduleMobileWorkingSetTrim();
         this.pumpDocQueue();
       });
     }
@@ -623,11 +978,12 @@ export class VaultSync {
   }
 
   private onFilesChanged(event: Y.YMapEvent<string>): void {
-    if (this.destroyed) return;
+    if (this.destroyed || !this.bootstrapPrepared) return;
     event.changes.keys.forEach((change, path) => {
       if (change.action === "add" || change.action === "update") {
         const guid = this.files.get(path);
         if (guid) {
+          this.remoteDeletePreserved.delete(path);
           this.registerFile(path, guid);
           this.enqueueDoc(
             { path, guid, kind: "text" },
@@ -638,17 +994,22 @@ export class VaultSync {
           this.pumpDocQueue();
         }
       } else if (change.action === "delete") {
-        this.handleRemoteDelete(path);
+        void this.handleRemoteDelete(
+          path,
+          "text",
+          typeof change.oldValue === "string" ? change.oldValue : null,
+        );
       }
     });
   }
 
   private onStructuredChanged(event: Y.YMapEvent<StructuredMeta>): void {
-    if (this.destroyed) return;
+    if (this.destroyed || !this.bootstrapPrepared) return;
     event.changes.keys.forEach((change, path) => {
       if (change.action === "add" || change.action === "update") {
         const meta = this.structured.get(path);
         if (isStructuredMeta(meta)) {
+          this.remoteDeletePreserved.delete(path);
           this.registerFile(path, meta.guid);
           this.enqueueDoc(
             { path, guid: meta.guid, kind: meta.kind },
@@ -659,27 +1020,88 @@ export class VaultSync {
           this.pumpDocQueue();
         }
       } else if (change.action === "delete") {
-        this.handleRemoteDelete(path);
+        const oldMeta = change.oldValue;
+        void this.handleRemoteDelete(
+          path,
+          isStructuredMeta(oldMeta) ? oldMeta.kind : "canvas",
+          isStructuredMeta(oldMeta) ? oldMeta.guid : null,
+        );
       }
     });
   }
 
-  private async handleRemoteDelete(path: string): Promise<void> {
-    if (this.destroyed) return;
-    // A remote delete is authoritative: drop our Document and remove the local
-    // file. We deliberately do not gate on local edits or whether the file is
-    // open — the index is the source of truth, so the delete propagates.
-    this.removeDocument(path);
-    this.removeStructuredDocument(path);
-    const file = this.plugin.app.vault.getAbstractFileByPath(path);
-    if (file instanceof TFile) {
-      try {
-        await this.plugin.app.vault.delete(file);
-      } catch (e) {
-        console.error(`[Realtime] failed to apply remote delete for ${path}`, e);
+  private async handleRemoteDelete(
+    path: string,
+    kind: "text" | StructuredKind,
+    deletedIdentity: string | null,
+  ): Promise<void> {
+    if (this.destroyed || this.remoteDeleteInFlight.has(path)) return;
+    this.remoteDeleteInFlight.add(path);
+    try {
+      const wasReintroduced = () =>
+        kind === "text" ? this.files.has(path) : this.structured.has(path);
+      if (wasReintroduced()) return;
+      const file = this.plugin.app.vault.getAbstractFileByPath(path);
+      if (file instanceof TFile && !this.remoteDeletePreserved.has(path)) {
+        const content = await this.plugin.app.vault.read(file);
+        if (this.destroyed || wasReintroduced()) return;
+        const fingerprint = await sha256Text(content);
+        if (this.destroyed || wasReintroduced()) return;
+        const acknowledged = deletedIdentity
+          ? this.localSyncState.acknowledgedFingerprint(path, deletedIdentity)
+          : null;
+        if (fingerprint !== acknowledged) {
+          const preservedPath = await preserveTextConflict(this.plugin, path, content, "local");
+          if (this.destroyed || wasReintroduced()) return;
+          this.remoteDeletePreserved.add(path);
+          new Notice(
+            `Realtime: "${path}" was deleted remotely; preserved your local version as "${preservedPath}".`,
+          );
+        }
       }
+
+      if (this.destroyed || wasReintroduced()) return;
+      this.removeDocument(path);
+      this.removeStructuredDocument(path);
+      const current = this.plugin.app.vault.getAbstractFileByPath(path);
+      if (current instanceof TFile) {
+        if (this.destroyed || wasReintroduced()) return;
+        this.remoteDeletesApplying.add(path);
+        try {
+          await this.plugin.app.vault.delete(current);
+        } finally {
+          this.remoteDeletesApplying.delete(path);
+        }
+      }
+      if (this.destroyed) return;
+      if (wasReintroduced()) {
+        this.rematerializeReintroducedPath(path);
+        return;
+      }
+      this.localSyncState.remove(path);
+      this.remoteDeletePreserved.delete(path);
+    } catch (e) {
+      console.error(`[Realtime] failed to apply remote delete for ${path}`, e);
+      if (!this.destroyed) {
+        window.setTimeout(() => void this.handleRemoteDelete(path, kind, deletedIdentity), 2_000);
+      }
+    } finally {
+      this.remoteDeleteInFlight.delete(path);
     }
-    this.localSyncState.remove(path);
+  }
+
+  private rematerializeReintroducedPath(path: string): void {
+    const guid = this.files.get(path);
+    if (guid) {
+      this.removeDocument(path);
+      this.enqueueDoc({ path, guid, kind: "text" });
+      return;
+    }
+    const meta = this.structured.get(path);
+    if (!isStructuredMeta(meta)) return;
+    this.removeStructuredDocument(path);
+    const doc = this.ensureStructuredDocument(path, meta.guid, meta.kind, false);
+    void doc.whenReady();
   }
 
   // --- Document registry -----------------------------------------------------
@@ -695,9 +1117,14 @@ export class VaultSync {
     if (existing) this.removeDocument(path);
 
     const serverDocId = `${this.plugin.settings.activeVaultId}__${guid}`;
-    const doc = new Document(this.plugin, path, guid, serverDocId, isCreator, { autoConnect });
+    const doc = new Document(this.plugin, path, guid, serverDocId, isCreator, {
+      autoConnect: autoConnect && !this.mobileSuspended,
+      forceBootstrapConflict:
+        this.localFileExists(path) && this.localSyncState.hasIdentityConflict(path, guid),
+    });
     this.documents.set(path, doc);
     this.plugin.applyAwarenessTo(doc);
+    this.scheduleMobileWorkingSetTrim(1_000);
     return doc;
   }
 
@@ -712,6 +1139,7 @@ export class VaultSync {
       doc.destroy();
       this.documents.delete(path);
     }
+    this.mobileLastUsedAt?.delete(path);
   }
 
   private ensureStructuredDocument(
@@ -728,10 +1156,19 @@ export class VaultSync {
     const serverDocId = `${this.plugin.settings.activeVaultId}__${guid}`;
     const doc =
       kind === "canvas"
-        ? new CanvasDocument(this.plugin, path, guid, serverDocId, isCreator, { autoConnect })
-        : new BaseDocument(this.plugin, path, guid, serverDocId, isCreator, { autoConnect });
+        ? new CanvasDocument(this.plugin, path, guid, serverDocId, isCreator, {
+            autoConnect: autoConnect && !this.mobileSuspended,
+            forceBootstrapConflict:
+              this.localFileExists(path) && this.localSyncState.hasIdentityConflict(path, guid),
+          })
+        : new BaseDocument(this.plugin, path, guid, serverDocId, isCreator, {
+            autoConnect: autoConnect && !this.mobileSuspended,
+            forceBootstrapConflict:
+              this.localFileExists(path) && this.localSyncState.hasIdentityConflict(path, guid),
+          });
     this.structuredDocuments.set(path, doc);
     this.plugin.applyAwarenessTo(doc);
+    this.scheduleMobileWorkingSetTrim(1_000);
     return doc;
   }
 
@@ -741,6 +1178,7 @@ export class VaultSync {
       doc.destroy();
       this.structuredDocuments.delete(path);
     }
+    this.mobileLastUsedAt?.delete(path);
   }
 
   /** Record that a text document just synced (called by {@link Document}). */
@@ -763,12 +1201,13 @@ export class VaultSync {
   }
 
   ensureDocumentForPath(path: string): Document | undefined {
+    this.markMobileDocumentUsed(path);
     const guid = this.files.get(path);
     if (!guid) return this.documents.get(path);
     const doc = this.ensureDocument(path, guid, false, false);
     this.prioritizedPaths.add(path);
     this.prioritizedGuids.add(guid);
-    doc.connect();
+    if (!this.mobileSuspended) doc.connect();
     return doc;
   }
 
@@ -883,11 +1322,31 @@ export class VaultSync {
     const path = file.path;
     const pathVersion = this.bumpPathVersion(path);
     const kind = this.classify(file);
-    if (kind === "text") {
-      this.localSyncState.mark(path, "text");
+    if (kind === "text" && file instanceof TFile) {
+      if (!this.localSyncState.has(path)) {
+        const fingerprint = await sha256Text(await this.plugin.app.vault.read(file));
+        if (
+          this.destroyed ||
+          this.currentPathVersion(path) !== pathVersion ||
+          !this.localFileExists(path)
+        ) {
+          return;
+        }
+        this.localSyncState.beginCandidate(path, "text", null, fingerprint);
+      }
     } else if (kind === "structured" && file instanceof TFile) {
       const structuredKind = this.structuredKindForExtension(file.extension);
-      if (structuredKind) this.localSyncState.mark(path, structuredKind);
+      if (structuredKind && !this.localSyncState.has(path)) {
+        const fingerprint = await sha256Text(await this.plugin.app.vault.read(file));
+        if (
+          this.destroyed ||
+          this.currentPathVersion(path) !== pathVersion ||
+          !this.localFileExists(path)
+        ) {
+          return;
+        }
+        this.localSyncState.beginCandidate(path, structuredKind, null, fingerprint);
+      }
     }
     if (kind === "binary") {
       this.binarySync.onLocalChanged(path);
@@ -903,7 +1362,8 @@ export class VaultSync {
         this.ensureStructuredDocument(path, meta.guid, meta.kind, false);
         return;
       }
-      const guid = newGuid();
+      const guid = this.localSyncState.candidateIdentity(path, structuredKind) ?? newGuid();
+      this.localSyncState.beginCandidate(path, structuredKind, guid);
       const doc = this.ensureStructuredDocument(path, guid, structuredKind, true);
       await doc.whenReady();
       if (this.destroyed) return;
@@ -911,6 +1371,7 @@ export class VaultSync {
       this.indexDoc.transact(() => {
         this.structured.set(path, { guid, kind: structuredKind });
       });
+      this.localSyncState.commit(path, structuredKind, guid);
       this.registerFile(path, guid);
       return;
     }
@@ -921,7 +1382,8 @@ export class VaultSync {
       this.ensureDocument(path, this.files.get(path)!, false);
       return;
     }
-    const guid = newGuid();
+    const guid = this.localSyncState.candidateIdentity(path, "text") ?? newGuid();
+    this.localSyncState.beginCandidate(path, "text", guid);
     const doc = this.ensureDocument(path, guid, true);
     await doc.whenReady();
     if (this.destroyed) return;
@@ -931,12 +1393,14 @@ export class VaultSync {
     this.indexDoc.transact(() => {
       this.files.set(path, guid);
     });
+    this.localSyncState.commit(path, "text", guid);
     this.registerFile(path, guid);
   }
 
   private onLocalDelete(file: TAbstractFile): void {
     if (this.destroyed || !this.initialSynced) return;
     const path = file.path;
+    if (this.remoteDeletesApplying.has(path)) return;
     this.localSyncState.remove(path);
     this.bumpPathVersion(path);
     if (this.documents.has(path) || this.files.has(path)) {
@@ -973,7 +1437,6 @@ export class VaultSync {
   private async handleLocalRename(file: TAbstractFile, oldPath: string): Promise<void> {
     if (this.destroyed || !this.initialSynced || !(file instanceof TFile)) return;
     const newPath = file.path;
-    this.localSyncState.remove(oldPath);
     this.bumpPathVersion(oldPath);
     const newPathVersion = this.bumpPathVersion(newPath);
 
@@ -990,11 +1453,21 @@ export class VaultSync {
     this.removeStructuredDocument(oldPath);
 
     const kind = this.classify(file);
+    const oldLocalState = this.localSyncState.get(oldPath);
     if (kind === "text") {
-      this.localSyncState.mark(newPath, "text");
+      this.localSyncState.move(oldPath, newPath, "text");
     } else if (kind === "structured") {
       const structuredKind = this.structuredKindForExtension(file.extension);
-      if (structuredKind) this.localSyncState.mark(newPath, structuredKind);
+      if (structuredKind) this.localSyncState.move(oldPath, newPath, structuredKind);
+      else this.localSyncState.remove(oldPath);
+    } else if (kind === "binary") {
+      // Keep a binary baseline on the old path until BinarySync publishes the
+      // delete. The new path is an independent first-write candidate.
+      if (oldLocalState?.kind !== "binary") this.localSyncState.remove(oldPath);
+    } else {
+      // A binary renamed out of the sync set still needs its old baseline if
+      // the process stops before BinarySync publishes the delete.
+      if (oldLocalState?.kind !== "binary") this.localSyncState.remove(oldPath);
     }
     if (kind === "text") {
       const finalGuid = guid ?? newGuid();
@@ -1074,13 +1547,33 @@ export class VaultSync {
       return;
     }
     if (kind === "structured") {
-      const doc = this.structuredDocuments.get(file.path);
-      if (doc) void doc.onDiskChanged();
+      this.markMobileDocumentUsed(file.path);
+      const meta = this.structured.get(file.path);
+      const existing = this.structuredDocuments.get(file.path);
+      const doc =
+        existing ??
+        (isStructuredMeta(meta)
+          ? this.ensureStructuredDocument(file.path, meta.guid, meta.kind, false)
+          : undefined);
+      if (doc) {
+        if (existing) {
+          if (!this.mobileSuspended) doc.ensureConnected();
+          void doc.onDiskChanged();
+        }
+      }
       return;
     }
     if (kind !== "text") return;
-    const doc = this.documents.get(file.path);
-    if (doc) void doc.onDiskChanged();
+    this.markMobileDocumentUsed(file.path);
+    const existing = this.documents.get(file.path);
+    const guid = this.files.get(file.path);
+    const doc = existing ?? (guid ? this.ensureDocument(file.path, guid, false) : undefined);
+    if (doc) {
+      if (existing) {
+        if (!this.mobileSuspended) doc.ensureConnected();
+        void doc.onDiskChanged();
+      }
+    }
   }
 
   // --- Trash -----------------------------------------------------------------
@@ -1144,7 +1637,7 @@ export class VaultSync {
 
   /**
    * Restore a trashed file. Re-adds the index entry (content re-materializes
-   * from the retained y-sweet doc / blob) at the original path, or `targetPath`
+   * from the retained CRDT document/blob) at the original path, or `targetPath`
    * when supplied. Throws if the destination is already occupied.
    */
   async restoreTrashEntry(id: string, targetPath?: string): Promise<void> {
@@ -1197,7 +1690,7 @@ export class VaultSync {
   /**
    * Permanently drop a trash entry. For binaries this also reclaims the orphaned
    * blob (skipped server-side if still referenced). Text/structured docs are
-   * orphaned: their y-sweet content lingers but is no longer reachable.
+   * orphaned: their CRDT content lingers but is no longer reachable.
    */
   async permanentlyDeleteTrashEntry(id: string): Promise<void> {
     if (this.destroyed) return;
@@ -1238,7 +1731,12 @@ export class VaultSync {
     this.localSyncState.destroy();
     this.files.unobserve(this.filesObserver);
     this.structured.unobserve(this.structuredObserver);
-    this.indexProvider.off(EVENT_CONNECTION_STATUS, this.statusListener);
+    this.indexProvider.off(SYNC_EVENT_STATUS, this.statusListener);
+    this.indexProvider.off(SYNC_EVENT_DOCUMENT_INVALIDATED, this.invalidationListener);
+    if (this.mobileTrimTimer !== null) {
+      window.clearTimeout(this.mobileTrimTimer);
+      this.mobileTrimTimer = null;
+    }
     for (const doc of this.documents.values()) doc.destroy();
     this.documents.clear();
     for (const doc of this.structuredDocuments.values()) doc.destroy();

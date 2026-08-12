@@ -1,9 +1,15 @@
 # Evaluation: multiplexing sync WebSockets to optimize the client
 
+Status: historical design record. The bounded `/dmux` transport shipped, and
+the server later replaced its y-sweet process with the native Rust CRDT store.
+The plugin later replaced `YSweetProvider` with `src/sync/RealtimeProvider.ts`.
+References to the old provider and proxy below describe the system at the time
+of this evaluation, not the current deployment.
+
 Goal: have the Obsidian client pack vault sync into bounded WebSocket shards instead
 of opening one socket per Yjs document.
 
-## 1. Current architecture (the problem)
+## 1. Architecture at evaluation time
 
 Every collaboratively-synced thing is its own Yjs document, and **each Yjs doc gets
 its own `YSweetProvider`, which opens its own WebSocket** to
@@ -110,6 +116,14 @@ reconnect on demand (the machinery already exists: `ensureConnected`,
 `prioritizeItem`, the doc queue). Doesn't reach "single socket" but cuts steady-state
 socket count dramatically with low risk and little code. Good interim step and a useful
 fallback even after A (also caps upstream fan-out).
+
+Current mobile behavior also bounds the in-memory working set. All channels disconnect
+while Obsidian is hidden; after resume, active/open/recent documents lead a
+single-handshake catch-up queue. Foreground eviction only releases a document after
+server acknowledgement and an IndexedDB flush. The native server sends child-document
+invalidation messages through the vault-index channel, so an evicted file reloads when
+another client edits it. A full pass after reconnect covers invalidations missed while
+offline.
 
 ### Option D — Replace y-sweet with a native multi-doc sync server
 

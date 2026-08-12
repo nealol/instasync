@@ -4,7 +4,7 @@ export async function waitFor(
   opts: { timeout?: number; interval?: number; label?: string } = {},
 ): Promise<void> {
   // Generous default: unit files run in parallel workers, each spawning its
-  // own y-sweet + auth server; sync round-trips can stall well past 10s on a
+  // own native sync/auth server; round-trips can stall well past 10s on a
   // loaded machine (an observed source of spurious document.test.ts failures).
   const timeout = opts.timeout ?? 30_000;
   const interval = opts.interval ?? 25;
@@ -18,7 +18,7 @@ export async function waitFor(
   }
 }
 
-/** A random doc guid so tests don't collide in the shared y-sweet server. */
+/** A random doc guid so tests don't collide in a shared sync server. */
 export function freshGuid(): string {
   return "test-" + Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
 }

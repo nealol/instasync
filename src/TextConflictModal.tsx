@@ -94,7 +94,8 @@ function TextConflictView({
         <h2>Markdown file conflict</h2>
         <p className="setting-item-description">
           "{info.path}" was changed both here and on another device. Pick which version should
-          become the canonical remote version.
+          become canonical. Realtime will preserve the other version as an unsynced conflicted
+          copy beside the file.
         </p>
       </div>
       <div className="realtime-conflict-diff" aria-label="Local and remote diff">

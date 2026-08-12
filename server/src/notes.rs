@@ -6,13 +6,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value};
 
 use crate::audit::{self, AuditEntry};
+use crate::crdt::{ensure_doc, Level};
 use crate::entities::vault_files;
 use crate::error::{AppError, AppResult};
 use crate::routes::{authorize_doc, require_member};
 use crate::session::{now_millis, ApiPrincipal};
 use crate::state::AppState;
 use crate::ydoc;
-use crate::ysweet::{ensure_doc, Level};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -115,7 +115,7 @@ pub(crate) async fn list_notes_inner(
     principal.require_vault(vault_id)?;
     require_member(state, &principal.user.id, vault_id).await?;
 
-    // The y-sweet index doc is the source of truth for which files exist; the
+    // The Yjs index doc is the source of truth for which files exist; the
     // `vault_files` table is a server-side mirror. Reconcile before listing so
     // files deleted on a client (which only removes them from the index doc,
     // never calling the server delete API) don't surface as ghost notes.
@@ -132,7 +132,7 @@ pub(crate) async fn list_notes_inner(
         .collect())
 }
 
-/// Reconcile the `vault_files` registry against the authoritative y-sweet index
+/// Reconcile the `vault_files` registry against the authoritative Yjs index
 /// doc (`files` map of path -> guid), returning the live `(path, guid)` entries.
 ///
 /// Clients propagate deletions/renames only through the index doc's CRDT, so the
@@ -223,7 +223,7 @@ pub(crate) async fn create_note_inner(
     require_member(state, &principal.user.id, vault_id).await?;
     validate_note_path(&body.path)?;
 
-    // The `vault_files` table is a mirror of the authoritative y-sweet index
+    // The `vault_files` table is a mirror of the authoritative Yjs index
     // doc and drifts when clients delete files through the index CRDT without
     // calling the server delete API (the common path — see
     // `reconcile_vault_files`). Reconcile before the existence guard so a
@@ -315,7 +315,7 @@ pub(crate) async fn replace_note_inner(
     let file = require_note_access(state, principal, vault_id, path, true).await?;
     let doc_id = doc_id(vault_id, &file.guid);
     // The before-image is only needed for the cursor audit trail; spare human
-    // callers the extra y-sweet read.
+    // callers the extra document read.
     let before = if audit::is_cursor(principal) {
         let update = ydoc::read_update(state, &doc_id).await?;
         Some(
@@ -502,7 +502,7 @@ pub(crate) async fn delete_note_inner(
     ydoc::index_remove_file(state, vault_id, &file.path).await?;
     if let Err(e) = crate::search::remove_note(state, vault_id, &file.guid).await {
         tracing::warn!("search remove failed for {}: {e}", file.path);
-        state.search.mark_vault_write(state.clone(), vault_id).await;
+        state.search.mark_vault_write(vault_id).await;
     }
     mark_note_write(state, vault_id, principal).await;
     if let Some(before) = before {
@@ -531,7 +531,7 @@ pub(crate) async fn best_effort_index(
 ) {
     if let Err(e) = crate::search::index_note(state, vault_id, guid, path, content).await {
         tracing::warn!("search index failed for {path}: {e}");
-        state.search.mark_vault_write(state.clone(), vault_id).await;
+        state.search.mark_vault_write(vault_id).await;
     }
 }
 

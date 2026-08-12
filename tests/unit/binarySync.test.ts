@@ -1,12 +1,33 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
 import * as Y from "yjs";
-import { YSweetProvider } from "@y-sweet/client";
+import { RealtimeProvider } from "../../src/sync/RealtimeProvider";
 import { BinarySync, type BinaryMeta } from "../../src/BinarySync";
-import { getClientToken } from "../../src/ysweet";
+import { getClientToken } from "../../src/sync/clientToken";
 import { makeFakePlugin } from "../support/fakePlugin";
 import { notices } from "../support/obsidian-mock";
 import { startAuthHarness, type AuthHarness } from "../support/authServer";
-import { waitFor } from "../support/util";
+import { freshGuid, waitFor } from "../support/util";
+import { LocalSyncState } from "../../src/localSyncState";
+import { sha256Hex } from "../../src/hash";
+
+const binaryModal = vi.hoisted(() => ({
+  choice: "local" as "local" | "remote",
+  delayMs: 0,
+  calls: [] as Array<{ path: string; remoteDeleted: boolean }>,
+}));
+
+vi.mock("../../src/BinaryConflictModal", () => ({
+  openBinaryConflictModal: async (
+    _plugin: unknown,
+    info: { path: string; remoteDeleted: boolean },
+  ) => {
+    binaryModal.calls.push(info);
+    if (binaryModal.delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, binaryModal.delayMs));
+    }
+    return binaryModal.choice;
+  },
+}));
 
 let harness: AuthHarness;
 let token: string;
@@ -25,12 +46,15 @@ afterAll(async () => {
 
 afterEach(() => {
   notices.length = 0;
+  binaryModal.choice = "local";
+  binaryModal.delayMs = 0;
+  binaryModal.calls.length = 0;
 });
 
 const bytes = (arr: number[]) => new Uint8Array(arr).buffer;
 const asArray = (buf: ArrayBuffer | undefined) => (buf ? [...new Uint8Array(buf)] : null);
 
-/** A "device": fake vault + an index doc/provider + a BinarySync over it. */
+/** A device: fake vault + an index document/provider + BinarySync. */
 function makeDevice(name: string) {
   const { plugin, vault } = makeFakePlugin(harness.authUrl, {
     sessionToken: token,
@@ -38,11 +62,8 @@ function makeDevice(name: string) {
     clientName: name,
   });
   const indexDoc = new Y.Doc();
-  const provider = new YSweetProvider(
-    () => getClientToken(plugin as any, vaultId) as any,
-    vaultId,
-    indexDoc,
-    { connect: true, showDebuggerLink: false },
+  const provider = new RealtimeProvider(vaultId, indexDoc, () =>
+    getClientToken(plugin as any, vaultId),
   );
   // Record the upload-status transitions the plugin would render.
   const uploadStates: string[] = [];
@@ -63,10 +84,42 @@ function makeDevice(name: string) {
   return { plugin, vault, indexDoc, provider, bs, binaries, uploadStates, vaultSyncStub };
 }
 
-const synced = (p: YSweetProvider) =>
+const synced = (p: RealtimeProvider) =>
   waitFor(() => p.status === "connected", { label: "provider connected" });
 
 describe("BinarySync", () => {
+  it("uses the durable hash baseline when a deleted remote map entry is already absent", async () => {
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const data = bytes([5, 4, 3, 2, 1]);
+    vault.binaries.set("persisted-delete.bin", data);
+    const hash = await sha256Hex(data);
+    const localState = new LocalSyncState(`binary-delete:${freshGuid()}`);
+    await localState.whenSynced;
+    localState.markSynced("persisted-delete.bin", "binary", hash, hash);
+    const indexDoc = new Y.Doc();
+    const bs = new BinarySync(
+      plugin as any,
+      {
+        isTextSyncBusy: () => false,
+        recordTrash: () => {},
+      } as any,
+      indexDoc,
+      localState,
+    );
+    try {
+      bs.seedBaseline();
+      await bs.reconcileAll(["persisted-delete.bin"]);
+      expect(vault.binaries.has("persisted-delete.bin")).toBe(false);
+    } finally {
+      bs.destroy();
+      indexDoc.destroy();
+      localState.destroy();
+    }
+  });
+
   it("uploads a local binary and a peer downloads identical bytes", async () => {
     const A = makeDevice("A");
     const B = makeDevice("B");
@@ -117,6 +170,68 @@ describe("BinarySync", () => {
       A.bs.destroy();
       A.provider.destroy();
       A.indexDoc.destroy();
+    }
+  });
+
+  it("holds queued uploads while mobile sync is paused and resumes them", async () => {
+    const A = makeDevice("mobile-paused");
+    try {
+      await synced(A.provider);
+      A.bs.setPaused(true);
+      A.vault.binaries.set("queued.bin", bytes([8, 6, 7, 5, 3, 0, 9]));
+      A.bs.onLocalChanged("queued.bin");
+
+      await waitFor(() => (A.bs as any).deferredReconciles.has("queued.bin"), {
+        label: "paused binary reconcile deferred",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(A.binaries.has("queued.bin")).toBe(false);
+      expect(A.uploadStates).not.toContain("uploading");
+
+      A.bs.setPaused(false);
+      await waitFor(() => A.binaries.has("queued.bin"), {
+        label: "paused upload resumed",
+      });
+      expect(A.uploadStates.at(-1)).toBe("idle");
+    } finally {
+      A.bs.destroy();
+      A.provider.destroy();
+      A.indexDoc.destroy();
+    }
+  });
+
+  it("preserves startup pull semantics across a mobile pause", async () => {
+    const A = makeDevice("pause-source");
+    const B = makeDevice("pause-target");
+    try {
+      await synced(A.provider);
+      await synced(B.provider);
+      A.vault.binaries.set("startup.bin", bytes([1, 3, 3, 7]));
+      A.bs.seedBaseline();
+      await A.bs.reconcileAll(["startup.bin"]);
+      await waitFor(() => B.binaries.has("startup.bin"), {
+        label: "paused target received binary metadata",
+      });
+
+      B.bs.seedBaseline();
+      B.bs.setPaused(true);
+      await B.bs.reconcileAll([]);
+      expect(B.vault.binaries.has("startup.bin")).toBe(false);
+      expect(B.binaries.has("startup.bin")).toBe(true);
+
+      B.bs.setPaused(false);
+      await waitFor(() => B.vault.binaries.has("startup.bin"), {
+        label: "startup binary pulled after resume",
+      });
+      expect(asArray(B.vault.binaries.get("startup.bin"))).toEqual([1, 3, 3, 7]);
+      expect(B.binaries.has("startup.bin")).toBe(true);
+    } finally {
+      A.bs.destroy();
+      A.provider.destroy();
+      A.indexDoc.destroy();
+      B.bs.destroy();
+      B.provider.destroy();
+      B.indexDoc.destroy();
     }
   });
 
@@ -300,6 +415,7 @@ describe("BinarySync", () => {
   });
 
   it("keeps a peer attachment when remote delete races local edits (conflict)", async () => {
+    binaryModal.delayMs = 1_000;
     const A = makeDevice("A");
     const B = makeDevice("B");
     try {
@@ -358,6 +474,57 @@ describe("BinarySync", () => {
         label: "B has v2",
       });
       expect(asArray(B.vault.binaries.get("photo.jpg"))).toEqual([2, 2, 2, 2]);
+    } finally {
+      A.bs.destroy();
+      A.provider.destroy();
+      A.indexDoc.destroy();
+      B.bs.destroy();
+      B.provider.destroy();
+      B.indexDoc.destroy();
+    }
+  });
+
+  it("re-prompts and preserves the latest remote binary when it changes behind the modal", async () => {
+    const A = makeDevice("A");
+    const B = makeDevice("B");
+    try {
+      await synced(A.provider);
+      await synced(B.provider);
+      B.bs.seedBaseline();
+      await B.bs.reconcileAll([]);
+
+      A.vault.binaries.set("race.bin", bytes([1]));
+      A.bs.seedBaseline();
+      await A.bs.reconcileAll(["race.bin"]);
+      await waitFor(() => asArray(B.vault.binaries.get("race.bin"))?.[0] === 1, {
+        label: "binary conflict baseline downloaded",
+      });
+
+      B.vault.binaries.set("race.bin", bytes([9, 9, 9]));
+      binaryModal.delayMs = 300;
+      A.vault.binaries.set("race.bin", bytes([2, 2]));
+      A.bs.onLocalChanged("race.bin");
+      await waitFor(() => binaryModal.calls.length === 1, {
+        label: "first binary conflict prompt opened",
+      });
+
+      A.vault.binaries.set("race.bin", bytes([3, 3]));
+      A.bs.onLocalChanged("race.bin");
+      await waitFor(() => binaryModal.calls.length === 2, {
+        timeout: 10_000,
+        label: "latest binary conflict prompted again",
+      });
+
+      const localHash = await sha256Hex(bytes([9, 9, 9]));
+      await waitFor(() => B.binaries.get("race.bin")?.hash === localHash, {
+        timeout: 10_000,
+        label: "local binary choice published after revalidation",
+      });
+      const copies = [...B.vault.binaries.keys()].filter((path) =>
+        /\(conflicted copy Remote /.test(path),
+      );
+      expect(copies).toHaveLength(1);
+      expect(asArray(B.vault.binaries.get(copies[0]))).toEqual([3, 3]);
     } finally {
       A.bs.destroy();
       A.provider.destroy();

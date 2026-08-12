@@ -4,7 +4,7 @@
  * Owns the three shared structures inside the per-DB Y.Doc and exposes typed
  * accessors. It does not touch cr-sqlite or the network — the caller injects an
  * already-built {@link PluginDbDocHandle} (a Y.Doc plus, in production, a
- * y-sweet provider + IndexedDB persistence) so the engine is testable with a
+ * Realtime provider + IndexedDB persistence) so the engine is testable with a
  * bare in-memory doc.
  *
  * Doc layout:

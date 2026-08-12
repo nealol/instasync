@@ -1,6 +1,6 @@
-// Tier-2 end-to-end coverage for sub-cap mux sync: real Rust
-// server (with the `/dmux` route) + real y-sweet, driving the actual
-// `MuxWebSocket` polyfill through `YSweetProvider`.
+// Tier-2 end-to-end coverage for sub-cap mux sync: the real Rust
+// server's native CRDT store and `/dmux` route, driving the actual
+// `MuxWebSocket` transport through `RealtimeProvider`.
 //
 // Like the other tier-2 suites this spawns servers and is NOT run in cloud CI
 // (the plugin project is disabled there); run it locally via `bun run test:unit`.
@@ -11,18 +11,22 @@
 //
 // Write attribution through the demux (git/search/plugin-db) is exercised by the
 // wdio Obsidian e2e (it has the git/cr-sqlite infra); the demux reuses the same
-// `is_content_write`/`mark_content_write` tap the `/d` proxy is tested against.
+// content-write attribution path used by direct `/d` connections.
 
 import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
 import * as Y from "yjs";
-import { YSweetProvider } from "@y-sweet/client";
+import { YSweetProvider as LegacyYSweetProvider } from "@y-sweet/client";
+import { RealtimeProvider, type SyncSocket } from "../../src/sync/RealtimeProvider";
 import { makeFakePlugin, type FakePlugin } from "../support/fakePlugin";
 import { Peer } from "../support/peer";
 import { startAuthHarness, type AuthHarness } from "../support/authServer";
 import { waitFor, freshGuid } from "../support/util";
-import { getClientToken, resetTokenRetryStateForTests } from "../../src/ysweet";
-import { muxProviderOptions } from "../../src/sync/wsPolyfill";
-import { resetMuxForTests, setMuxWebSocketCtor } from "../../src/sync/mux";
+import {
+  getClientToken,
+  resetTokenRetryStateForTests,
+  type ClientToken,
+} from "../../src/sync/clientToken";
+import { createMuxSocket, resetMuxForTests, setMuxWebSocketCtor } from "../../src/sync/mux";
 
 let harness: AuthHarness;
 let token: string;
@@ -66,16 +70,16 @@ afterEach(() => {
 function muxProvider(serverDocId: string): {
   doc: Y.Doc;
   text: Y.Text;
-  provider: YSweetProvider;
+  provider: RealtimeProvider;
   destroy: () => void;
 } {
   const doc = new Y.Doc();
   const text = doc.getText("contents");
-  const provider = new YSweetProvider(
-    () => getClientToken(plugin as any, serverDocId) as any,
+  const provider = new RealtimeProvider(
     serverDocId,
     doc,
-    { connect: true, showDebuggerLink: false, ...muxProviderOptions() },
+    () => getClientToken(plugin as any, serverDocId),
+    { socketFactory: createMuxSocket },
   );
   return {
     doc,
@@ -89,6 +93,25 @@ function muxProvider(serverDocId: string): {
 }
 
 const fileDocId = (guid: string) => `${vaultId}__${guid}`;
+
+async function getReadOnlyClientToken(serverDocId: string): Promise<ClientToken> {
+  const response = await fetch(`${harness.authUrl}/api/doc-token`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      vaultId,
+      docId: serverDocId,
+      authorization: "read-only",
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`read-only token request failed: ${response.status}`);
+  }
+  return (await response.json()) as ClientToken;
+}
 
 describe("sub-cap mux sync (tier-2)", () => {
   it("carries multiple docs over one real socket and syncs both directions", async () => {
@@ -171,6 +194,83 @@ describe("sub-cap mux sync (tier-2)", () => {
     } finally {
       a.destroy();
       peer.destroy();
+    }
+  });
+});
+
+describe("native read-only sync (tier-2)", () => {
+  it("completes the real provider handshake and keeps receiving updates", async () => {
+    opened = [];
+    CountingWebSocket.instances = [];
+    const id = fileDocId(freshGuid());
+    const writer = new Peer(plugin, id);
+    await writer.whenSynced();
+    writer.setText("first server value");
+    await writer.whenChangesSynced();
+
+    const doc = new Y.Doc();
+    const text = doc.getText("contents");
+    const provider = new RealtimeProvider(id, doc, () => getReadOnlyClientToken(id), {
+      socketFactory: (url) => new CountingWebSocket(url) as unknown as SyncSocket,
+    });
+    try {
+      await waitFor(
+        () => provider.status === "connected" && text.toString() === "first server value",
+        { label: "read-only provider completed handshake" },
+      );
+
+      // The provider sends SyncStep2 during every handshake. A read-only server
+      // must ignore it rather than close and reconnect the socket.
+      const { promise, resolve } = Promise.withResolvers<void>();
+      window.setTimeout(resolve, 750);
+      await promise;
+      expect(opened).toHaveLength(1);
+
+      writer.setText("second server value");
+      await writer.whenChangesSynced();
+      await waitFor(() => text.toString() === "second server value", {
+        label: "read-only provider received a later update",
+      });
+      expect(provider.status).toBe("connected");
+      expect(opened).toHaveLength(1);
+    } finally {
+      provider.destroy();
+      doc.destroy();
+      writer.destroy();
+    }
+  });
+});
+
+describe("legacy provider compatibility (tier-2)", () => {
+  it("syncs edits both ways with a native provider on the same document", async () => {
+    const id = fileDocId(freshGuid());
+    const native = muxProvider(id);
+    const legacyDoc = new Y.Doc();
+    const legacyText = legacyDoc.getText("contents");
+    const legacy = new LegacyYSweetProvider(
+      () => getClientToken(plugin as any, id) as any,
+      id,
+      legacyDoc,
+      { connect: true, showDebuggerLink: false },
+    );
+    try {
+      await waitFor(() => native.provider.status === "connected" && legacy.status === "connected", {
+        label: "native and legacy providers connected",
+      });
+
+      native.text.insert(0, "native");
+      await waitFor(() => legacyText.toString() === "native", {
+        label: "native edit reached legacy provider",
+      });
+
+      legacyText.insert(legacyText.length, " + legacy");
+      await waitFor(() => native.text.toString() === "native + legacy", {
+        label: "legacy edit reached native provider",
+      });
+    } finally {
+      native.destroy();
+      legacy.destroy();
+      legacyDoc.destroy();
     }
   });
 });

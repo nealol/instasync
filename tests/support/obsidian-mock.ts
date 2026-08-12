@@ -1,5 +1,5 @@
 // Minimal stand-in for the `obsidian` module so that src/Document.ts,
-// src/VaultSync.ts and src/ysweet.ts can be imported and run under Node/vitest.
+// src/VaultSync.ts and src/sync/clientToken.ts can run under Node/vitest.
 // Only the symbols those files actually import are provided.
 
 export class TAbstractFile {
@@ -24,6 +24,11 @@ export class TFile extends TAbstractFile {
 
 /** Placeholder for Obsidian's App; tests pass a fake plugin's `app` in practice. */
 export class App {}
+
+/** Mutable so tests can exercise Obsidian's mobile-only lifecycle paths. */
+export const Platform = {
+  isMobile: false,
+};
 
 /** Minimal Modal stand-in so modules that subclass it can be imported under Node. */
 export class Modal {

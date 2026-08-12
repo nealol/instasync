@@ -8,12 +8,12 @@ use tokio::sync::Mutex;
 use utoipa::ToSchema;
 
 use crate::audit::{self, AuditEntry};
+use crate::crdt::{ensure_doc, Level};
 use crate::error::{AppError, AppResult};
 use crate::routes::{authorize_path, require_member};
 use crate::session::{now_millis, ApiPrincipal};
 use crate::state::AppState;
 use crate::ydoc::{self, StructuredIndexEntry};
-use crate::ysweet::{ensure_doc, Level};
 
 static CANVAS_MUTATION_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
 
@@ -559,7 +559,7 @@ pub(crate) async fn apply_canvas_operations_inner(
     let document_id = doc_id(vault_id, &entry.guid);
     let mutation_lock = canvas_mutation_lock(&document_id).await;
     let _mutation_guard = mutation_lock.lock().await;
-    let current = ydoc::read_update(state, &document_id).await?;
+    let (epoch, current) = ydoc::read_update_for_write(state, &document_id).await?;
     let mut value =
         ydoc::decode_structured(&current).map_err(|error| AppError::Internal(error.to_string()))?;
     let before = value.clone();
@@ -592,7 +592,7 @@ pub(crate) async fn apply_canvas_operations_inner(
 
     let update = ydoc::build_structured_update(&current, &value)?;
     if !update.is_empty() {
-        ydoc::write_update(state, &document_id, update).await?;
+        ydoc::write_update_at_epoch(state, &document_id, epoch, update).await?;
         mark_structured_write(state, vault_id, principal).await;
     }
     if audit::is_cursor(principal) {
@@ -1060,7 +1060,7 @@ pub(crate) async fn write_structured_json(
 ) -> AppResult<StructuredResponse> {
     let entry = require_structured_access(state, principal, vault_id, path, kind, true).await?;
     // The before-image is only needed for the cursor audit trail; spare human
-    // callers the extra y-sweet read.
+    // callers the extra document read.
     let before = if audit::is_cursor(principal) {
         let update = ydoc::read_update(state, &doc_id(vault_id, &entry.guid)).await?;
         Some(ydoc::decode_structured(&update).map_err(|e| AppError::Internal(e.to_string()))?)

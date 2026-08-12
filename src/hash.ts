@@ -14,3 +14,7 @@ export async function sha256Hex(buf: ArrayBuffer): Promise<string> {
   }
   return out;
 }
+
+export function sha256Text(text: string): Promise<string> {
+  return sha256Hex(new TextEncoder().encode(text).buffer);
+}

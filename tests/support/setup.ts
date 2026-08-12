@@ -1,11 +1,11 @@
 // vitest setup (jsdom environment): provide the browser-ish globals that
-// @y-sweet/client and y-indexeddb expect under Node.
+// the native provider, legacy compatibility test, and y-indexeddb expect under Node.
 import "fake-indexeddb/auto";
 import WS from "ws";
 import { beforeEach } from "vitest";
-import { resetTokenRetryStateForTests } from "../../src/ysweet";
+import { resetTokenRetryStateForTests } from "../../src/sync/clientToken";
 
-// The y-sweet token minting in src/ysweet.ts keeps a module-global serial
+// Document-token minting in src/sync/clientToken.ts keeps a module-global serial
 // queue + 30s backoff armed by any failed token request. In tests every
 // Document/Peer in a file shares that module, so a single transient fetch
 // failure (server briefly busy) would stall every later connection for 30s —
@@ -18,7 +18,7 @@ beforeEach(() => {
 // Force the `ws` implementation as the global WebSocket. On Node 22+ a global
 // (undici) WebSocket already exists, but it clashes with jsdom's separate `Event`
 // class ("event argument must be an instance of Event"); `ws` is a clean Node
-// implementation the y-sweet provider drives without that mismatch.
+// implementation both providers drive without that mismatch.
 (globalThis as any).WebSocket = WS as unknown as typeof WebSocket;
 
 // Opt-in sync diagnostics for debugging test failures:

@@ -4,7 +4,7 @@
 //! `/view/{id}` fetches the note snapshot from `GET /api/view/{id}` and then
 //! listens on `GET /api/view/{id}/events` (SSE) for incremental Yjs updates,
 //! which it applies to a local `Y.Doc` and re-renders. Diffs are computed
-//! server-side by polling y-sweet's `as-update` and encoding the state since
+//! server-side by polling the native document snapshot and encoding state since
 //! the previously observed state vector, so clients receive minimal
 //! CRDT-correct updates rather than text diffs.
 
@@ -19,7 +19,6 @@ use base64::Engine;
 use futures_util::stream::Stream;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
-use yrs::updates::decoder::Decode;
 use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
 
 use crate::attachments;
@@ -30,7 +29,7 @@ use crate::session::{now_millis, ApiPrincipal};
 use crate::state::AppState;
 use crate::ydoc;
 
-/// How often an SSE connection polls y-sweet for changes.
+/// How often an SSE connection polls the document store for changes.
 const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 
 #[derive(Serialize)]
@@ -442,7 +441,7 @@ pub async fn view_events(
                 }
             }
 
-            // Transient y-sweet failures just skip a tick.
+            // Transient document read failures just skip a tick.
             let Ok(update) = ydoc::read_update(&p.state, &p.note_doc_id).await else {
                 continue;
             };
@@ -469,7 +468,7 @@ pub async fn view_events(
 /// Decode a full-state v1 update into its state vector.
 fn state_vector_of(update: &[u8]) -> AppResult<StateVector> {
     let doc = Doc::new();
-    let decoded = Update::decode_v1(update)
+    let decoded = crate::safe_yrs::decode_v1::<Update>(update)
         .map_err(|e| AppError::Internal(format!("decode update: {e:?}")))?;
     {
         let mut txn = doc.transact_mut();
@@ -483,7 +482,7 @@ fn state_vector_of(update: &[u8]) -> AppResult<StateVector> {
 /// yet covered by `since`, plus the new full state vector.
 fn delta_since(update: &[u8], since: &StateVector) -> AppResult<(Vec<u8>, StateVector)> {
     let doc = Doc::new();
-    let decoded = Update::decode_v1(update)
+    let decoded = crate::safe_yrs::decode_v1::<Update>(update)
         .map_err(|e| AppError::Internal(format!("decode update: {e:?}")))?;
     {
         let mut txn = doc.transact_mut();
@@ -588,8 +587,8 @@ mod tests {
         let client = Doc::new();
         {
             let mut txn = client.transact_mut();
-            txn.apply_update(Update::decode_v1(&base).unwrap());
-            txn.apply_update(Update::decode_v1(&delta).unwrap());
+            txn.apply_update(crate::safe_yrs::decode_v1::<Update>(&base).unwrap());
+            txn.apply_update(crate::safe_yrs::decode_v1::<Update>(&delta).unwrap());
         }
         let text = client.get_or_insert_text("contents");
         assert_eq!(text.get_string(&client.transact()), "hello world");

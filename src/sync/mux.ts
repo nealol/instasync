@@ -1,23 +1,24 @@
 import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
+import { handleEpochProposal } from "../documentEpoch";
+import type { SyncSocket } from "./RealtimeProvider";
 
 /**
- * Bounded WebSocket multiplexing for y-sweet sync.
+ * Bounded WebSocket multiplexing for Realtime document sync.
  *
- * Each Yjs document normally opens its own `YSweetProvider`, and each provider
- * opens its own WebSocket. With the whole vault synced that is one socket per
+ * Each Yjs document has its own `RealtimeProvider`, which would normally open
+ * its own WebSocket. With the whole vault synced that is one socket per
  * file. This module packs them into bounded real-socket shards per server origin:
  *
- *  - {@link MuxWebSocket} implements just enough of the `WebSocket` surface for
- *    `YSweetProvider` (it is passed via the provider's `WebSocketPolyfill`
- *    option), but instead of opening a socket it registers a *channel* on a
+ *  - {@link MuxWebSocket} implements the provider's small `SyncSocket`
+ *    contract. Instead of opening a socket it registers a *channel* on a
  *    shared {@link MuxConnection}.
  *  - Each {@link MuxConnection} owns one real socket to `wss://{host}/dmux`,
  *    carries at most 512 channels, and routes frames for that shard.
  *
- * The server (`server/src/dmux.rs`) demultiplexes: it dials one upstream
- * y-sweet socket per channel, so the existing y-sweet protocol, auth, and
- * write-attribution are unchanged — only the *client* socket count drops to one.
+ * The server (`server/src/dmux.rs`) demultiplexes each channel into an
+ * in-process native CRDT session while preserving the provider's wire format
+ * and write attribution.
  *
  * Wire frames (binary; ints are lib0 var-uints):
  *   OPEN     = [1][channelId][varString pathAndQuery]   client -> server
@@ -28,10 +29,9 @@ import * as decoding from "lib0/decoding";
  *   PING     = [6][0]                                    client -> server
  *   PONG     = [7][0]                                    server -> client
  *
- * `pathAndQuery` is the per-doc URL the provider would otherwise have connected
- * to (`/d/{docId}/ws/{docId}?token=…`); the server forwards it verbatim to the
- * internal y-sweet, so it keeps minting/validating per-doc tokens exactly as
- * before.
+ * `pathAndQuery` is the per-document URL the provider would otherwise use
+ * (`/d/{docId}/ws/{docId}?token=…`); the server validates the same per-document
+ * token before opening the in-process CRDT connection.
  *
  * PING/PONG are a mux-level heartbeat on the shared socket (channel 0). The
  * provider has its own per-channel heartbeat, but it can only close the
@@ -48,6 +48,8 @@ const FRAME_DATA = 4;
 const FRAME_CLOSE = 5;
 const FRAME_PING = 6;
 const FRAME_PONG = 7;
+const EPOCH_PROPOSAL_MESSAGE = 103;
+const EPOCH_ACK_MESSAGE = 104;
 
 /** Channel id reserved for control frames that are not tied to a channel. */
 const CONTROL_CHANNEL = 0;
@@ -80,6 +82,25 @@ export function encodeOpen(channelId: number, pathAndQuery: string): Uint8Array 
   encoding.writeVarUint(enc, channelId);
   encoding.writeVarString(enc, pathAndQuery);
   return encoding.toUint8Array(enc);
+}
+
+function decodeEpochProposal(payload: Uint8Array): number | null {
+  const decoder = decoding.createDecoder(payload);
+  if (decoding.readVarUint(decoder) !== EPOCH_PROPOSAL_MESSAGE) return null;
+  const body = decoding.readVarUint8Array(decoder);
+  if (decoding.hasContent(decoder)) throw new Error("trailing bytes in document epoch proposal");
+  const parsed = JSON.parse(new TextDecoder().decode(body)) as { epoch?: unknown };
+  if (!Number.isSafeInteger(parsed.epoch) || (parsed.epoch as number) < 0) {
+    throw new Error("invalid document epoch proposal");
+  }
+  return parsed.epoch as number;
+}
+
+function encodeEpochAcknowledgement(epoch: number): Uint8Array {
+  const encoder = encoding.createEncoder();
+  encoding.writeVarUint(encoder, EPOCH_ACK_MESSAGE);
+  encoding.writeVarUint8Array(encoder, new TextEncoder().encode(JSON.stringify({ epoch })));
+  return encoding.toUint8Array(encoder);
 }
 
 export function encodeData(channelId: number, payload: Uint8Array): Uint8Array {
@@ -455,14 +476,14 @@ class MuxConnection {
 }
 
 type WsHandler = ((event: unknown) => void) | null;
+type WsMessageHandler = ((event: { data: unknown }) => void) | null;
 
 /**
- * A virtual WebSocket handed to `YSweetProvider` via its `WebSocketPolyfill`
- * option. It exposes only what the provider touches (`binaryType`, `readyState`,
- * `send`, `close`, the four `on*` handlers, and the static `OPEN`) and routes
- * everything over a shared {@link MuxConnection}.
+ * A virtual socket implementing the small surface used by
+ * {@link RealtimeProvider}: `binaryType`, `readyState`, `send`, `close`, and
+ * the four event handlers. Frames route over a shared {@link MuxConnection}.
  */
-export class MuxWebSocket {
+export class MuxWebSocket implements SyncSocket {
   static readonly CONNECTING = WS_CONNECTING;
   static readonly OPEN = WS_OPEN;
   static readonly CLOSING = WS_CLOSING;
@@ -476,15 +497,18 @@ export class MuxWebSocket {
   binaryType = "arraybuffer";
   readyState: number = WS_CONNECTING;
   onopen: WsHandler = null;
-  onmessage: WsHandler = null;
+  onmessage: WsMessageHandler = null;
   onclose: WsHandler = null;
   onerror: WsHandler = null;
 
   private readonly conn: MuxConnection;
   private readonly channelId: number;
+  private readonly documentId: string;
 
   constructor(url: string) {
     const parsed = new URL(url);
+    const segments = parsed.pathname.split("/");
+    this.documentId = decodeURIComponent(segments[2] ?? "");
     const pathAndQuery = parsed.pathname + parsed.search;
     const muxUrl = `${parsed.protocol}//${parsed.host}/dmux`;
     this.conn = MuxConnection.acquire(muxUrl);
@@ -513,9 +537,19 @@ export class MuxWebSocket {
   }
 
   deliverData(payload: Uint8Array): void {
-    // The provider does `new Uint8Array(event.data)`, so hand it an ArrayBuffer.
-    const ab = payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength);
-    this.onmessage?.({ data: ab });
+    try {
+      const epoch = decodeEpochProposal(payload);
+      if (epoch !== null) {
+        handleEpochProposal(this.documentId, epoch);
+        this.conn.sendData(this.channelId, encodeEpochAcknowledgement(epoch));
+        return;
+      }
+    } catch {
+      this.deliverError();
+      this.close();
+      return;
+    }
+    this.onmessage?.({ data: payload });
   }
 
   deliverError(): void {
@@ -528,4 +562,8 @@ export class MuxWebSocket {
     // The provider ignores the code today, but carry it for parity/diagnostics.
     this.onclose?.({ code, reason: "", wasClean: false });
   }
+}
+
+export function createMuxSocket(url: string): SyncSocket {
+  return new MuxWebSocket(url);
 }

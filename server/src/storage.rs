@@ -6,8 +6,7 @@
 //!    or `configFiles` index maps;
 //!  - **previous** binary attachments — orphaned blobs no longer referenced by
 //!    the live map (older versions and the content behind trashed/deleted files);
-//!  - **plain vault** — the internal y-sweet document store for this vault
-//!    (only when `YSWEET_STORE` is configured and readable).
+//!  - **plain vault** — native persisted CRDT generations for this vault.
 //!
 //! The cleanup endpoint deletes orphaned ("previous") blobs. It deliberately
 //! never touches blobs referenced by the live map, but removing previous
@@ -34,7 +33,7 @@ pub struct StorageUsage {
     pub blobs_previous_bytes: u64,
     pub current_blob_count: u64,
     pub previous_blob_count: u64,
-    /// `None` when the y-sweet store path is not configured / not readable.
+    /// `None` when the native CRDT store cannot be read.
     pub plain_vault_bytes: Option<u64>,
 }
 
@@ -218,44 +217,11 @@ pub async fn delete_blob(
     }
 }
 
-/// Sum the on-disk size of this vault's y-sweet docs, identified by store entries
-/// named `{vault_id}` (the index doc) or `{vault_id}__*` (per-file docs). Returns
-/// `None` if `YSWEET_STORE` is unset or the directory can't be read.
+/// Sum the on-disk size of this vault's native CRDT generations.
 async fn plain_vault_bytes(state: &AppState, vault_id: &str) -> Option<u64> {
-    let store = state.config.ysweet_store_dir.as_ref()?;
-    let mut total = 0u64;
-
-    let mut rd = tokio::fs::read_dir(store).await.ok()?;
-    let prefix = format!("{vault_id}__");
-    while let Ok(Some(entry)) = rd.next_entry().await {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name != vault_id && !name.starts_with(&prefix) {
-            continue;
-        }
-        total += dir_or_file_size(entry.path()).await;
-    }
-
-    Some(total)
-}
-
-/// Total size of a path: the file's length, or the recursive sum of a directory.
-async fn dir_or_file_size(path: PathBuf) -> u64 {
-    let mut total = 0u64;
-    let mut stack = vec![path];
-    while let Some(p) = stack.pop() {
-        let Ok(meta) = tokio::fs::metadata(&p).await else {
-            continue;
-        };
-        if meta.is_file() {
-            total += meta.len();
-        } else if meta.is_dir() {
-            if let Ok(mut rd) = tokio::fs::read_dir(&p).await {
-                while let Ok(Some(entry)) = rd.next_entry().await {
-                    stack.push(entry.path());
-                }
-            }
-        }
-    }
-    total
+    state
+        .documents
+        .document_bytes_for_vault(vault_id)
+        .await
+        .ok()
 }

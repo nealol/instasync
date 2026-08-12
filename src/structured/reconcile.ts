@@ -12,6 +12,11 @@ export interface ReconcileOptions {
   textKeys?: Set<string>;
 }
 
+export interface StructuredMergeResult {
+  value: JsonValue;
+  conflicted: boolean;
+}
+
 /**
  * Apply only the local changes made from `baseline` while retaining unrelated
  * remote changes. Concurrent edits to the same scalar/array prefer local;
@@ -22,12 +27,25 @@ export function mergeStructuredStartup(
   local: JsonValue,
   remote: JsonValue,
 ): JsonValue {
-  if (jsonEqual(local, baseline)) return remote;
-  if (jsonEqual(remote, baseline) || jsonEqual(local, remote)) return local;
-  if (!isRecord(local) || !isRecord(remote)) return local;
+  return mergeStructuredStartupResult(baseline, local, remote).value;
+}
+
+export function mergeStructuredStartupResult(
+  baseline: JsonValue,
+  local: JsonValue,
+  remote: JsonValue,
+): StructuredMergeResult {
+  if (jsonEqual(local, baseline)) return { value: remote, conflicted: false };
+  if (jsonEqual(remote, baseline) || jsonEqual(local, remote)) {
+    return { value: local, conflicted: false };
+  }
+  if (!isRecord(local) || !isRecord(remote)) {
+    return { value: local, conflicted: true };
+  }
 
   const base = isRecord(baseline) ? baseline : {};
   const merged = Object.create(null) as Record<string, JsonValue>;
+  let conflicted = false;
   const keys = new Set([...Object.keys(base), ...Object.keys(local), ...Object.keys(remote)]);
   for (const key of keys) {
     const baseHas = key in base;
@@ -42,23 +60,35 @@ export function mergeStructuredStartup(
       if (!remoteHas) continue;
       // Local deleted the baseline key. Keep a concurrent remote edit, but
       // honor the deletion when remote still equals the baseline.
-      if (!jsonEqual(remote[key], base[key])) merged[key] = remote[key];
+      if (!jsonEqual(remote[key], base[key])) {
+        merged[key] = remote[key];
+        conflicted = true;
+      }
       continue;
     }
     if (!remoteHas) {
-      if (!baseHas || !jsonEqual(local[key], base[key])) merged[key] = local[key];
+      if (!baseHas || !jsonEqual(local[key], base[key])) {
+        merged[key] = local[key];
+        if (baseHas) conflicted = true;
+      }
       continue;
     }
     if (!baseHas) {
-      merged[key] =
-        isRecord(local[key]) && isRecord(remote[key])
-          ? mergeStructuredStartup({}, local[key], remote[key])
-          : local[key];
+      if (isRecord(local[key]) && isRecord(remote[key])) {
+        const child = mergeStructuredStartupResult({}, local[key], remote[key]);
+        merged[key] = child.value;
+        conflicted ||= child.conflicted;
+      } else {
+        merged[key] = local[key];
+        conflicted ||= !jsonEqual(local[key], remote[key]);
+      }
       continue;
     }
-    merged[key] = mergeStructuredStartup(base[key], local[key], remote[key]);
+    const child = mergeStructuredStartupResult(base[key], local[key], remote[key]);
+    merged[key] = child.value;
+    conflicted ||= child.conflicted;
   }
-  return merged;
+  return { value: merged, conflicted };
 }
 
 const DEFAULT_TEXT_KEYS = new Set([

@@ -121,6 +121,9 @@ export interface FakePlugin {
     syncConfigEnabled: boolean;
     configIncludeGlobs: string[];
     diagnosticLogging: boolean;
+    mobileMaxResidentDocs: number;
+    mobileRecentResidentDocs: number;
+    recentPaths: string[];
   };
   auth: AuthClient;
   app: {
@@ -142,7 +145,14 @@ export interface FakePlugin {
 
 export function makeFakePlugin(
   authServerUrl: string,
-  opts: { sessionToken: string; activeVaultId: string; clientName?: string },
+  opts: {
+    sessionToken: string;
+    activeVaultId: string;
+    clientName?: string;
+    recentPaths?: string[];
+    mobileMaxResidentDocs?: number;
+    mobileRecentResidentDocs?: number;
+  },
 ): { plugin: FakePlugin; vault: FakeVault } {
   const vault = new FakeVault();
   const secrets = new Map<string, string>([["realtime-session-token", opts.sessionToken]]);
@@ -169,6 +179,9 @@ export function makeFakePlugin(
       syncConfigEnabled: false,
       configIncludeGlobs: [],
       diagnosticLogging: false,
+      mobileMaxResidentDocs: opts.mobileMaxResidentDocs ?? 16,
+      mobileRecentResidentDocs: opts.mobileRecentResidentDocs ?? 8,
+      recentPaths: opts.recentPaths ?? [],
     },
     // Set just below, once the object exists (AuthClient needs the plugin).
     auth: undefined as unknown as AuthClient,
@@ -193,5 +206,6 @@ export function makeFakePlugin(
     applyDiagnosticLoggingSetting: () => {},
   };
   plugin.auth = new AuthClient(plugin as any);
+  (plugin.auth as any).supportsCapability = (name: string) => name === "documentInvalidation";
   return { plugin, vault };
 }

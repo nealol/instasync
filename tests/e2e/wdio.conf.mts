@@ -6,16 +6,13 @@
 // fully isolated headless Obsidian instances (separate sandboxed vault copies +
 // user-data dirs => isolated IndexedDB), coordinated in one test.
 //
-// We boot a y-sweet server (started with --auth) AND the Realtime auth server
-// (mock OIDC), sharing one key. They are pinned to the plugin's default ports
-// (y-sweet 8080, auth 8081) so a freshly installed plugin reaches them with no
-// URL injection; the spec signs each device in and binds it to a vault.
+// We boot the Realtime server in mock-OIDC mode on the plugin's default port,
+// so a freshly installed plugin reaches it with no URL injection.
 
 import * as path from "path";
 import * as os from "os";
 import * as fs from "fs";
 import { fileURLToPath } from "url";
-import { startYSweetServer, genAuthKey, type YSweetServer } from "../support/ysweetServer.js";
 import { startAuthServer, type AuthServer } from "../support/authServer.js";
 import {
   restoreObsidianProtocolRegistry,
@@ -25,10 +22,8 @@ import {
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "../..");
-const YSWEET_PORT = Number(process.env.YSWEET_PORT ?? 8080);
 const AUTH_PORT = Number(process.env.AUTH_PORT ?? 8081);
 
-let ysweet: YSweetServer | undefined;
 let authServer: AuthServer | undefined;
 let obsidianProtocolSnapshot: ProtocolRegistrySnapshot | undefined;
 let obsidianProtocolRestored = false;
@@ -90,8 +85,7 @@ export const config: WebdriverIO.Config = {
   async onPrepare() {
     obsidianProtocolSnapshot = snapshotObsidianProtocolRegistry();
     process.once("exit", restoreObsidianProtocolOnExit);
-    const authKey = await genAuthKey();
-    const ysweetStoreDir = fs.mkdtempSync(path.join(os.tmpdir(), "realtime-ysweet-store-"));
+    const crdtStoreDir = fs.mkdtempSync(path.join(os.tmpdir(), "realtime-crdt-store-"));
     // Git audit commits go to a temp dir the spec can inspect (plugin-db git
     // dump assertions). The cr-sqlite loadable extension is passed through
     // from the environment when available (enables server replicas + dumps);
@@ -102,15 +96,9 @@ export const config: WebdriverIO.Config = {
       process.env.CRSQLITE_EXT_PATH && fs.existsSync(process.env.CRSQLITE_EXT_PATH)
         ? process.env.CRSQLITE_EXT_PATH
         : undefined;
-    ysweet = await startYSweetServer(YSWEET_PORT, authKey, ysweetStoreDir);
     authServer = await startAuthServer({
       port: AUTH_PORT,
-      ysweetUrl: ysweet.url,
-      // Route the plugin through this server's `/d` + `/dmux` (production
-      // topology); each bounded mux shard dials `{host}/dmux`.
-      ysweetPublicUrl: `http://127.0.0.1:${AUTH_PORT}`,
-      authKey,
-      ysweetStoreDir,
+      crdtStoreDir,
       gitDataDir,
       crsqliteExtPath,
     });
@@ -118,7 +106,6 @@ export const config: WebdriverIO.Config = {
   async onComplete() {
     try {
       await authServer?.stop();
-      await ysweet?.stop();
     } finally {
       restoreObsidianProtocolOnce();
     }

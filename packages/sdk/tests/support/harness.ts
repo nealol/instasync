@@ -1,5 +1,5 @@
 // SDK e2e harness: re-exports the repo's Rust-server-in-mock-mode helpers
-// (temp SQLite DB, mock OIDC, bundled y-sweet) plus a few SDK-test utilities.
+// (temporary SQLite DB, mock OIDC, native CRDT store) plus SDK-test utilities.
 
 import * as net from "node:net";
 

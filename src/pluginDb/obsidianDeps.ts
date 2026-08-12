@@ -1,22 +1,22 @@
 /**
  * Wiring that binds the (Obsidian-agnostic) {@link SyncedPluginDatabase} engine
  * to the live plugin: WASM resolution, snapshot persistence via the vault
- * adapter, the per-DB y-sweet transport, and the server bootstrap/touch calls.
+ * adapter, the per-database sync transport, and the server bootstrap/touch calls.
  */
 
 import * as Y from "yjs";
 import {
-  YSweetProvider,
-  STATUS_CONNECTED,
-  EVENT_CONNECTION_STATUS,
-  EVENT_LOCAL_CHANGES,
-  type YSweetStatus,
-} from "@y-sweet/client";
+  RealtimeProvider,
+  SYNC_EVENT_STATUS,
+  SYNC_EVENT_LOCAL_CHANGES,
+  SYNC_STATUS_CONNECTED,
+  type SyncStatus,
+} from "../sync/RealtimeProvider";
 import { IndexeddbPersistence } from "y-indexeddb";
 import type RealtimePlugin from "../main";
-import { getClientToken } from "../ysweet";
-import { connectYSweetProvider } from "../ysweetConnect";
-import { muxProviderOptions } from "../sync/wsPolyfill";
+import { getClientToken } from "../sync/clientToken";
+import { createMuxSocket } from "../sync/mux";
+import { epochPersistenceName } from "../documentEpoch";
 import { CRSQLITE_WASM_DATA_URL } from "./wasmBinary";
 import type { PluginDbDocHandle } from "./PluginDbSync";
 import type { SyncedPluginDatabaseOptions } from "./SyncedPluginDatabase";
@@ -108,32 +108,34 @@ export function buildEngineDeps(
   };
 }
 
-/** A per-DB y-sweet + IndexedDB transport handle. */
+/** A per-database Realtime + IndexedDB transport handle. */
 function makeDocHandle(plugin: RealtimePlugin, docId: string): PluginDbDocHandle {
   const doc = new Y.Doc();
-  const provider = new YSweetProvider(() => getClientToken(plugin, docId), docId, doc, {
+  const provider = new RealtimeProvider(docId, doc, () => getClientToken(plugin, docId), {
     connect: false,
-    showDebuggerLink: false,
-    ...muxProviderOptions(),
+    socketFactory: createMuxSocket,
   });
   const serverScope = plugin.settings.authServerId || plugin.settings.authServerUrl;
-  const persistence = new IndexeddbPersistence(`realtime:plugindb:${serverScope}:${docId}`, doc);
+  const persistence = new IndexeddbPersistence(
+    epochPersistenceName(plugin, docId, `realtime:plugindb:${serverScope}:${docId}`),
+    doc,
+  );
 
   let connected = false;
   const statusCbs = new Set<(c: boolean) => void>();
-  const statusListener = (status: YSweetStatus) => {
-    const c = status === STATUS_CONNECTED;
+  const statusListener = (status: SyncStatus) => {
+    const c = status === SYNC_STATUS_CONNECTED;
     if (c !== connected) {
       connected = c;
       for (const cb of statusCbs) cb(c);
     }
   };
-  provider.on(EVENT_CONNECTION_STATUS, statusListener);
+  provider.on(SYNC_EVENT_STATUS, statusListener);
 
   const whenSynced = persistence.whenSynced
     .catch(() => {})
     .then(() => {
-      void connectYSweetProvider(provider);
+      void provider.connect();
       return firstSyncedOrTimeout(provider, 3000);
     });
 
@@ -148,24 +150,25 @@ function makeDocHandle(plugin: RealtimePlugin, docId: string): PluginDbDocHandle
     // Wait (bounded) until the provider has no unacknowledged local changes,
     // so a final write right before destroy() — e.g. the delete tombstone —
     // actually reaches the server instead of dying with the WebSocket.
-    whenFlushed: () =>
-      new Promise<void>((resolve) => {
-        if (!provider.hasLocalChanges) return resolve();
-        let done = false;
-        const finish = () => {
-          if (done) return;
-          done = true;
-          provider.off(EVENT_LOCAL_CHANGES, onChange as never);
-          resolve();
-        };
-        const onChange = (has: boolean) => {
-          if (!has) finish();
-        };
-        provider.on(EVENT_LOCAL_CHANGES, onChange as never);
-        setTimeout(finish, 3000);
-      }),
+    whenFlushed: () => {
+      if (!provider.hasLocalChanges) return Promise.resolve();
+      const { promise, resolve } = Promise.withResolvers<void>();
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        provider.off(SYNC_EVENT_LOCAL_CHANGES, onChange);
+        resolve();
+      };
+      const onChange = (has: boolean) => {
+        if (!has) finish();
+      };
+      provider.on(SYNC_EVENT_LOCAL_CHANGES, onChange);
+      window.setTimeout(finish, 3000);
+      return promise;
+    },
     destroy: () => {
-      provider.off(EVENT_CONNECTION_STATUS, statusListener);
+      provider.off(SYNC_EVENT_STATUS, statusListener);
       provider.destroy();
       void persistence.destroy();
       doc.destroy();
@@ -174,19 +177,19 @@ function makeDocHandle(plugin: RealtimePlugin, docId: string): PluginDbDocHandle
 }
 
 /** Resolve on the provider's first server sync, or after `ms` to stay offline-tolerant. */
-function firstSyncedOrTimeout(provider: YSweetProvider, ms: number): Promise<void> {
-  return new Promise<void>((resolve) => {
-    let done = false;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      provider.off("synced", onSynced as never);
-      resolve();
-    };
-    const onSynced = (synced: boolean) => {
-      if (synced) finish();
-    };
-    provider.on("synced", onSynced as never);
-    setTimeout(finish, ms);
-  });
+function firstSyncedOrTimeout(provider: RealtimeProvider, ms: number): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    provider.off("synced", onSynced);
+    resolve();
+  };
+  const onSynced = (synced: boolean) => {
+    if (synced) finish();
+  };
+  provider.on("synced", onSynced);
+  window.setTimeout(finish, ms);
+  return promise;
 }

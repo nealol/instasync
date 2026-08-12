@@ -1,7 +1,12 @@
 import { requestUrl } from "obsidian";
 import type RealtimePlugin from "./main";
-import type { ClientToken } from "./ysweet";
-import { checkServerCaps, CompatibilityError } from "./caps";
+import type { ClientToken } from "./sync/clientToken";
+import {
+  checkServerCaps,
+  CompatibilityError,
+  serverSupportsCapability,
+  type CapName,
+} from "./caps";
 
 /** Identity returned by `GET /api/me`. */
 export interface MeResponse {
@@ -152,7 +157,7 @@ export interface StorageUsage {
   blobsPreviousBytes: number;
   currentBlobCount: number;
   previousBlobCount: number;
-  /** null when the y-sweet store path is not configured / readable server-side. */
+  /** null when the CRDT store is not readable server-side. */
   plainVaultBytes: number | null;
 }
 
@@ -225,6 +230,7 @@ export function validateAvatarUrl(value: string): string | null {
  * endpoints. Uses Obsidian's `requestUrl` so it works around desktop CORS.
  */
 export class AuthClient {
+  private readonly serverCapsByUrl = new Map<string, Record<string, string>>();
   private plugin: RealtimePlugin;
   /** Resolver for an in-flight login call awaiting the deep link / paste code. */
   private pendingLogin: ((token: string) => Promise<MeResponse>) | null = null;
@@ -303,6 +309,11 @@ export class AuthClient {
     return !!this.getToken();
   }
 
+  /** Whether the active server advertises a supported optional capability. */
+  supportsCapability(name: CapName): boolean {
+    return serverSupportsCapability(this.serverCapsByUrl.get(this.baseUrl), name);
+  }
+
   // --- server identity -------------------------------------------------------
 
   /**
@@ -325,9 +336,11 @@ export class AuthClient {
    * `CompatibilityError`); callers tolerate them as today.
    */
   async serverInfoChecked(baseUrl: string): Promise<ServerInfoResponse> {
-    const info = await this.rawServerInfo(baseUrl);
+    const normalizedBaseUrl = normalizeServerUrl(baseUrl);
+    const info = await this.rawServerInfo(normalizedBaseUrl);
     const result = checkServerCaps(info.caps, info.requiredCaps);
     if (result.ok) {
+      this.serverCapsByUrl.set(normalizedBaseUrl, info.caps ?? {});
       this.plugin.lastCompatibilityError = null;
       return info;
     }
@@ -1048,7 +1061,7 @@ export class AuthClient {
     }
   }
 
-  /** Mint a y-sweet client token for a (namespaced) doc id in the active vault. */
+  /** Mint a sync token for a namespaced document in the active vault. */
   docToken(vaultId: string, docId: string, path?: string): Promise<ClientToken> {
     return this.api<ClientToken>("/api/doc-token", {
       method: "POST",

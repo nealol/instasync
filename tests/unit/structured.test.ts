@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import * as Y from "yjs";
-import { mergeStructuredStartup, reconcileInto, toValue } from "../../src/structured/reconcile";
+import {
+  mergeStructuredStartup,
+  mergeStructuredStartupResult,
+  reconcileInto,
+  toValue,
+} from "../../src/structured/reconcile";
 import {
   parseCanvas,
   reconcileCanvas,
@@ -63,6 +68,32 @@ describe("structured reconciler", () => {
         { filters: { status: "closed", owner: "alice" } },
       ),
     ).toEqual({ filters: { status: "closed", owner: "alice" } });
+  });
+
+  it("reports concurrent edits to the same scalar for recovery-copy handling", () => {
+    expect(
+      mergeStructuredStartupResult(
+        { filters: { status: "open" } },
+        { filters: { status: "local" } },
+        { filters: { status: "remote" } },
+      ),
+    ).toEqual({
+      value: { filters: { status: "local" } },
+      conflicted: true,
+    });
+  });
+
+  it("does not report disjoint structured edits as conflicts", () => {
+    expect(
+      mergeStructuredStartupResult(
+        { filters: { status: "open" }, view: "table" },
+        { filters: { status: "local" }, view: "table" },
+        { filters: { status: "open" }, view: "cards" },
+      ),
+    ).toEqual({
+      value: { filters: { status: "local" }, view: "cards" },
+      conflicted: false,
+    });
   });
 });
 

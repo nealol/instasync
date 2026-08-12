@@ -1,12 +1,20 @@
 {
   "name": "realtime",
-  "version": "0.4.3-alpha.6",
-  "description": "Google-docs-like collaborative editing for Obsidian, powered by Yjs and y-sweet.",
-  "main": "main.js",
+  "version": "0.4.3-alpha.7",
   "private": true,
+  "description": "Google-docs-like collaborative editing for Obsidian, powered by Yjs.",
+  "keywords": [
+    "collaboration",
+    "crdt",
+    "obsidian",
+    "yjs"
+  ],
+  "license": "MIT",
+  "author": "",
   "workspaces": [
     "packages/*"
   ],
+  "main": "main.js",
   "scripts": {
     "postinstall": "bun run --filter @realtime-md/plugin-api-types build",
     "dev": "node esbuild.config.mjs watch",
@@ -15,24 +23,37 @@
     "typecheck": "tsc -noEmit",
     "build:web": "bun run --cwd packages/web build",
     "test": "vitest run --project plugin --project sdk-unit",
-    "test:unit": "vitest run --project plugin --project sdk-unit --project cli-unit --project web-unit",
+    "test:unit": "vitest run --project plugin --project sdk-unit --project cli-unit --project web-unit --project compat",
     "test:sdk": "vitest run --project sdk-unit",
     "test:sdk:e2e": "vitest run --project sdk-e2e",
+    "compat:fetch": "bun compat/run.ts",
+    "test:compat": "bun compat/run.ts && vitest run --project compat",
+    "test:compat:released": "bun compat/run.ts --released-server && vitest run --project compat",
     "test:server": "cargo test --manifest-path server/Cargo.toml",
+    "test:fuzz": "cargo test --manifest-path server/Cargo.toml fuzz_",
+    "test:fuzz:smoke": "cd server/fuzz && cargo fuzz run protocol -- -max_total_time=15 -timeout=5 && cargo fuzz run storage -- -max_total_time=15 -timeout=5",
     "test:all": "bun run typecheck && bun run test:unit && bun run test:sdk:e2e && bun run test:server",
     "test:watch": "vitest",
     "pretest:e2e": "bun run build",
     "test:e2e": "wdio run tests/e2e/wdio.conf.mts",
     "release": "node release.mjs"
   },
-  "keywords": [
-    "obsidian",
-    "yjs",
-    "collaboration",
-    "crdt"
-  ],
-  "author": "",
-  "license": "MIT",
+  "dependencies": {
+    "@pierre/diffs": "^1.2.7",
+    "@pierre/trees": "^1.0.0-beta.4",
+    "@realtime-md/plugin-api-types": "workspace:*",
+    "@tanstack/react-virtual": "^3.14.2",
+    "@vlcn.io/crsqlite-wasm": "0.16.0",
+    "diff": "^8.0.3",
+    "lib0": "^0.2.93",
+    "picomatch": "^4.0.3",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "y-indexeddb": "^9.0.12",
+    "y-protocols": "^1.0.6",
+    "yaml": "^2.8.2",
+    "yjs": "^13.6.0"
+  },
   "devDependencies": {
     "@codemirror/state": "^6.6.0",
     "@codemirror/view": "^6.43.0",
@@ -44,6 +65,7 @@
     "@wdio/local-runner": "^9.27.2",
     "@wdio/mocha-framework": "^9.27.2",
     "@wdio/spec-reporter": "^9.27.2",
+    "@y-sweet/client": "^0.9.1",
     "builtin-modules": "3.3.0",
     "esbuild": "^0.27.0",
     "fake-indexeddb": "^6.2.5",
@@ -56,23 +78,6 @@
     "vitest": "^4.1.8",
     "wdio-obsidian-reporter": "^3.0.4",
     "wdio-obsidian-service": "^3.0.4",
-    "ws": "^8.21.0",
-    "y-sweet": "^0.9.1"
-  },
-  "dependencies": {
-    "@pierre/diffs": "^1.2.7",
-    "@pierre/trees": "^1.0.0-beta.4",
-    "@realtime-md/plugin-api-types": "workspace:*",
-    "@tanstack/react-virtual": "^3.14.2",
-    "@vlcn.io/crsqlite-wasm": "0.16.0",
-    "@y-sweet/client": "^0.9.1",
-    "lib0": "^0.2.93",
-    "picomatch": "^4.0.3",
-    "react": "^19.2.7",
-    "react-dom": "^19.2.7",
-    "y-indexeddb": "^9.0.12",
-    "y-protocols": "^1.0.6",
-    "yaml": "^2.8.2",
-    "yjs": "^13.6.0"
+    "ws": "^8.21.0"
   }
 }

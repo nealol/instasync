@@ -32,6 +32,8 @@ const CAPS = {
   oauth: "1",
   pluginDbSync: "crsqlite-1",
   attachmentShim: "https://realtime.md/attachment-shim/v1",
+  documentEpoch: "1",
+  documentInvalidation: "1",
 };
 
 const me = (userId: string) => ({

@@ -6,7 +6,8 @@ import { sha256Hex } from "./hash";
 import { dbg } from "./debug";
 import { ensureParentFolder, getFileByPath, isOpenInWorkspace } from "./vaultHelpers";
 import { openBinaryConflictModal, type ConflictChoice } from "./BinaryConflictModal";
-import type { LocalSyncState } from "./localSyncState";
+import { shouldFoldOfflineDeletion, type LocalSyncState } from "./localSyncState";
+import { preserveBinaryConflict } from "./conflictRecovery";
 
 /**
  * Upload-queue state surfaced to the status bar:
@@ -40,6 +41,8 @@ interface UploadJob {
   size: number;
   attempts: number;
   urgent: boolean;
+  expectedRemoteHash?: string | null;
+  diskVersion: number;
 }
 
 /**
@@ -68,6 +71,8 @@ export class BinarySync {
   /** Serializes reconcile() per path so concurrent triggers can't interleave. */
   private chains = new Map<string, Promise<void>>();
   private pendingReconcile = new Set<string>();
+  private deferredReconciles = new Set<string>();
+  private deferredInitialPulls = new Set<string>();
   /** Remote files whose disk materialization has not succeeded yet. */
   private pendingDownloads = new Set<string>();
   /** Paths we are currently writing to disk, to ignore the resulting vault event. */
@@ -80,6 +85,7 @@ export class BinarySync {
   /** Background upload queue (latest job per path wins). */
   private uploadQueue: UploadJob[] = [];
   private urgentPaths = new Set<string>();
+  private diskVersions = new Map<string, number>();
   private draining = false;
   /** True only while a single blob transfer is actually in flight. */
   private activeUpload = false;
@@ -92,6 +98,7 @@ export class BinarySync {
 
   /** Observer is a no-op until the startup pass runs (see {@link reconcileAll}). */
   private started = false;
+  private paused = false;
   private destroyed = false;
   private observer: (event: Y.YMapEvent<BinaryMeta>) => void;
 
@@ -123,17 +130,36 @@ export class BinarySync {
    */
   seedBaseline(): void {
     for (const [path, meta] of this.binaries.entries()) {
-      if (meta?.hash) this.lastSyncedHash.set(path, meta.hash);
+      if (!meta?.hash) continue;
+      if (!this.localSyncState) {
+        this.lastSyncedHash.set(path, meta.hash);
+        continue;
+      }
+      this.localSyncState.migrateLegacyIdentity(path, "binary", meta.hash);
+      const state = this.localSyncState?.get(path);
+      if (state?.identity === meta.hash && !state.candidate) {
+        this.lastSyncedHash.set(path, meta.hash);
+      }
+    }
+    for (const [path, state] of this.localSyncState?.entries() ?? []) {
+      if (
+        state.kind === "binary" &&
+        !state.candidate &&
+        state.identity &&
+        state.fingerprint === state.identity
+      ) {
+        this.lastSyncedHash.set(path, state.identity);
+      }
     }
     dbg("BinarySync seedBaseline", this.lastSyncedHash.size, "entries");
   }
 
   foldOfflineDeletions(shouldTrack: (path: string) => boolean): void {
     for (const [path, meta] of this.binaries.entries()) {
+      const state = this.localSyncState?.get(path);
       if (
         !shouldTrack(path) ||
-        !this.localSyncState?.has(path) ||
-        getFileByPath(this.plugin.app, path)
+        !shouldFoldOfflineDeletion(state, meta.hash, getFileByPath(this.plugin.app, path) !== null)
       ) {
         continue;
       }
@@ -146,7 +172,7 @@ export class BinarySync {
         });
       }
       this.binaries.delete(path);
-      this.localSyncState.remove(path);
+      this.localSyncState?.remove(path);
     }
   }
 
@@ -218,6 +244,7 @@ export class BinarySync {
   onLocalChanged(path: string): void {
     if (this.ignoredPaths.has(path)) return;
     if (this.writing.has(path)) return;
+    this.bumpDiskVersion(path);
     void this.reconcile(path);
   }
 
@@ -225,12 +252,15 @@ export class BinarySync {
   onLocalDeleted(path: string): void {
     if (this.ignoredPaths.has(path)) return;
     if (this.writing.has(path)) return;
+    this.bumpDiskVersion(path);
     void this.reconcile(path);
   }
 
   /** A local binary file was renamed: treat as a delete of old + change of new. */
   onLocalRenamed(file: TFile, oldPath: string): void {
     if (this.ignoredPaths.has(oldPath) || this.ignoredPaths.has(file.path)) return;
+    this.bumpDiskVersion(oldPath);
+    this.bumpDiskVersion(file.path);
     void this.reconcile(oldPath);
     void this.reconcile(file.path);
   }
@@ -272,18 +302,33 @@ export class BinarySync {
   private async reconcileNow(path: string): Promise<void> {
     if (this.destroyed) return;
     if (this.ignoredPaths.has(path)) return;
+    const initialPull = this.pullingMissingRemote || this.deferredInitialPulls.delete(path);
+    if (this.paused) {
+      this.deferReconcile(path, initialPull);
+      return;
+    }
 
     const localHash = await this.hashDisk(path);
     if (this.destroyed) return;
-    if (localHash) this.localSyncState?.mark(path, "binary");
+    if (this.paused) {
+      this.deferReconcile(path, initialPull);
+      return;
+    }
+    if (localHash && !this.localSyncState?.has(path)) {
+      this.localSyncState?.beginCandidate(path, "binary", localHash, localHash);
+    }
     const remote = this.binaries.get(path);
     const remoteHash = remote?.hash ?? null;
     const base = this.lastSyncedHash.get(path) ?? null;
 
     // Already in agreement (both sides equal, or both absent).
     if (localHash === remoteHash) {
-      if (remoteHash) this.lastSyncedHash.set(path, remoteHash);
-      else this.lastSyncedHash.delete(path);
+      if (remoteHash) {
+        this.lastSyncedHash.set(path, remoteHash);
+        this.localSyncState?.markSynced(path, "binary", remoteHash, remoteHash, true);
+      } else {
+        this.lastSyncedHash.delete(path);
+      }
       this.pendingDownloads.delete(path);
       this.urgentPaths.delete(path);
       return;
@@ -298,7 +343,7 @@ export class BinarySync {
     if (localHash && !remoteHash) {
       if (base === null) {
         // Brand-new local file → publish it.
-        await this.queueLocalUpload(path);
+        await this.queueLocalUpload(path, null, localHash);
       } else if (base === localHash) {
         // Cleanly deleted remotely and we have no unsynced local changes →
         // the remote delete is authoritative, so remove the local copy.
@@ -312,12 +357,12 @@ export class BinarySync {
 
     // Local absent, remote present.
     if (!localHash && remoteHash) {
-      if (base === remoteHash && !this.pullingMissingRemote && !this.pendingDownloads.has(path)) {
+      if (base === remoteHash && !initialPull && !this.pendingDownloads.has(path)) {
         // We deleted it locally → propagate the delete to the index.
         this.publishDelete(path);
       } else {
         // New remote file, or remote moved while we had no local copy → pull.
-        await this.downloadToDisk(path, remoteHash);
+        await this.downloadToDisk(path, remoteHash, localHash);
       }
       return;
     }
@@ -326,10 +371,10 @@ export class BinarySync {
     if (localHash && remoteHash && localHash !== remoteHash) {
       if (base === remoteHash) {
         // Clean local edit: remote hasn't moved since our baseline.
-        await this.queueLocalUpload(path);
+        await this.queueLocalUpload(path, remoteHash, localHash);
       } else if (base === localHash) {
         // Clean remote update: local matches baseline, remote moved.
-        await this.downloadToDisk(path, remoteHash);
+        await this.downloadToDisk(path, remoteHash, localHash);
       } else {
         // Both diverged from the baseline (or no baseline) → conflict.
         await this.resolveConflict(path);
@@ -357,42 +402,66 @@ export class BinarySync {
     return await this.plugin.app.vault.readBinary(file);
   }
 
-  private async downloadToDisk(path: string, hash: string): Promise<void> {
+  private async downloadToDisk(
+    path: string,
+    hash: string,
+    expectedLocalHash?: string | null,
+  ): Promise<boolean> {
+    if (this.paused) {
+      this.deferReconcile(path);
+      return false;
+    }
     this.pendingDownloads.add(path);
     if (isOpenInWorkspace(this.plugin.app, path)) {
       // Don't overwrite a file the user is viewing; retry shortly.
       dbg("binary download deferred (open)", path);
       window.setTimeout(() => void this.reconcile(path), DRAIN_RETRY_MS);
-      return;
+      return false;
     }
     let bytes: ArrayBuffer;
     try {
       bytes = await this.plugin.auth.getBlob(this.vaultId, path, hash);
     } catch (e) {
-      if (this.destroyed) return;
+      if (this.destroyed) return false;
       console.error(`[Realtime] blob download failed for ${path}`, e);
       window.setTimeout(() => void this.reconcile(path), DRAIN_RETRY_MS);
-      return;
+      return false;
     }
-    if (this.destroyed) return;
+    if (this.destroyed) return false;
+    if (this.paused) {
+      this.pendingDownloads.delete(path);
+      this.deferReconcile(path);
+      return false;
+    }
+    const currentLocal = await this.hashDisk(path);
+    if (this.destroyed) return false;
+    if (
+      (this.binaries.get(path)?.hash ?? null) !== hash ||
+      (expectedLocalHash !== undefined && currentLocal !== expectedLocalHash)
+    ) {
+      this.pendingDownloads.delete(path);
+      void this.reconcile(path);
+      return false;
+    }
     if (!(await this.writeDisk(path, bytes))) {
       if (!this.destroyed) window.setTimeout(() => void this.reconcile(path), DRAIN_RETRY_MS);
-      return;
+      return false;
     }
-    if (this.destroyed) return;
+    if (this.destroyed) return false;
     const writtenHash = await this.hashDisk(path);
     if (writtenHash !== hash) {
       if (!this.destroyed) {
         console.error(`[Realtime] binary write verification failed for ${path}`);
         window.setTimeout(() => void this.reconcile(path), DRAIN_RETRY_MS);
       }
-      return;
+      return false;
     }
     this.lastSyncedHash.set(path, hash);
     this.pendingDownloads.delete(path);
-    this.localSyncState?.mark(path, "binary");
+    this.localSyncState?.markSynced(path, "binary", hash, hash, true);
     this.urgentPaths.delete(path);
     dbg("binary downloaded", path, hash, bytes.byteLength);
+    return true;
   }
 
   private async writeDisk(path: string, bytes: ArrayBuffer): Promise<boolean> {
@@ -419,6 +488,10 @@ export class BinarySync {
 
   private async deleteLocal(path: string): Promise<void> {
     if (this.destroyed) return;
+    if (this.paused) {
+      this.deferReconcile(path);
+      return;
+    }
     const file = getFileByPath(this.plugin.app, path);
     if (!file) {
       this.lastSyncedHash.delete(path);
@@ -445,7 +518,7 @@ export class BinarySync {
       this.binaries.set(path, meta);
     });
     this.lastSyncedHash.set(path, meta.hash);
-    this.localSyncState?.mark(path, "binary");
+    this.localSyncState?.markSynced(path, "binary", meta.hash, meta.hash, true);
   }
 
   private publishDelete(path: string): void {
@@ -489,12 +562,22 @@ export class BinarySync {
   // --- upload queue ----------------------------------------------------------
 
   /** Read the current local bytes for `path` and enqueue them for upload. */
-  private async queueLocalUpload(path: string): Promise<void> {
+  private async queueLocalUpload(
+    path: string,
+    expectedRemoteHash?: string | null,
+    expectedLocalHash?: string,
+  ): Promise<boolean> {
+    const diskVersion = this.diskVersions.get(path) ?? 0;
     const bytes = await this.readDisk(path);
-    if (this.destroyed) return;
-    if (!bytes) return;
+    if (this.destroyed || !bytes) return false;
     const hash = await sha256Hex(bytes);
-    if (this.destroyed) return;
+    if (
+      this.destroyed ||
+      (this.diskVersions.get(path) ?? 0) !== diskVersion ||
+      (expectedLocalHash && hash !== expectedLocalHash)
+    ) {
+      return false;
+    }
     this.enqueueUpload({
       path,
       hash,
@@ -502,7 +585,10 @@ export class BinarySync {
       size: bytes.byteLength,
       attempts: 0,
       urgent: this.urgentPaths.has(path),
+      expectedRemoteHash,
+      diskVersion,
     });
+    return true;
   }
 
   private enqueueUpload(job: UploadJob): void {
@@ -527,7 +613,7 @@ export class BinarySync {
   }
 
   private scheduleDrain(delay = 0): void {
-    if (this.drainTimer !== null) return;
+    if (this.paused || this.drainTimer !== null) return;
     this.drainTimer = window.setTimeout(() => {
       this.drainTimer = null;
       void this.drain();
@@ -535,11 +621,11 @@ export class BinarySync {
   }
 
   private async drain(): Promise<void> {
-    if (this.draining || this.destroyed) return;
+    if (this.draining || this.destroyed || this.paused) return;
     this.draining = true;
     this.refreshUploadStatus();
     try {
-      while (this.uploadQueue.length && !this.destroyed) {
+      while (this.uploadQueue.length && !this.destroyed && !this.paused) {
         const job = this.uploadQueue[0];
         // Hold large transfers back while notes are actively syncing — they
         // stay queued and surface as "pending" rather than "uploading".
@@ -580,10 +666,25 @@ export class BinarySync {
       await this.plugin.auth.putBlob(this.vaultId, job.path, job.hash, job.bytes);
     }
     if (this.destroyed) return;
+    if ((this.diskVersions.get(job.path) ?? 0) !== job.diskVersion) {
+      void this.reconcile(job.path);
+      return;
+    }
+    if (
+      job.expectedRemoteHash !== undefined &&
+      (this.binaries.get(job.path)?.hash ?? null) !== job.expectedRemoteHash
+    ) {
+      void this.reconcile(job.path);
+      return;
+    }
     // Publish only now that the bytes are on the server.
     this.publishMeta(job.path, { hash: job.hash, size: job.size });
     this.urgentPaths.delete(job.path);
     dbg("binary uploaded+published", job.path, job.hash, job.size);
+  }
+
+  private bumpDiskVersion(path: string): void {
+    this.diskVersions.set(path, (this.diskVersions.get(path) ?? 0) + 1);
   }
 
   // --- conflicts -------------------------------------------------------------
@@ -594,23 +695,39 @@ export class BinarySync {
    */
   private resolveConflict(path: string): Promise<void> {
     const run = this.conflictChain.then(async () => {
-      if (this.destroyed) return;
-      // Re-check state at prompt time — it may have converged while queued.
-      const nowLocal = await this.hashDisk(path);
-      if (nowLocal === undefined) return;
-      const nowRemote = this.binaries.get(path)?.hash ?? null;
-      if (nowLocal === nowRemote) {
-        if (nowRemote) this.lastSyncedHash.set(path, nowRemote);
-        return;
+      while (!this.destroyed) {
+        if (this.paused) {
+          this.deferReconcile(path);
+          return;
+        }
+        // Re-check state at prompt time — it may have converged while queued.
+        const nowLocal = await this.hashDisk(path);
+        if (nowLocal === undefined) return;
+        if (this.paused) {
+          this.deferReconcile(path);
+          return;
+        }
+        const nowRemote = this.binaries.get(path)?.hash ?? null;
+        if (nowLocal === nowRemote) {
+          if (nowRemote) this.lastSyncedHash.set(path, nowRemote);
+          return;
+        }
+        const choice = await openBinaryConflictModal(this.plugin, {
+          path,
+          remoteDeleted: nowRemote === null,
+        });
+        if (this.destroyed) return;
+        if (this.paused) {
+          this.deferReconcile(path);
+          return;
+        }
+        if (!(await this.conflictStateMatches(path, nowLocal, nowRemote))) continue;
+        if (await this.applyConflictChoice(path, choice, nowLocal, nowRemote)) return;
       }
-      const choice = await openBinaryConflictModal(this.plugin, {
-        path,
-        remoteDeleted: nowRemote === null,
-      });
-      await this.applyConflictChoice(path, choice, nowLocal, nowRemote);
     });
     this.conflictChain = run.catch((e) => {
       console.error(`[Realtime] conflict resolution failed for ${path}`, e);
+      if (!this.destroyed) window.setTimeout(() => void this.reconcile(path), DRAIN_RETRY_MS);
     });
     return this.conflictChain;
   }
@@ -620,27 +737,81 @@ export class BinarySync {
     choice: ConflictChoice,
     localHash: string | null,
     remoteHash: string | null,
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (choice === "local") {
-      if (remoteHash === null && localHash) {
-        // Remote deleted, user keeps local → republish it.
-        await this.queueLocalUpload(path);
-      } else if (localHash) {
-        await this.queueLocalUpload(path);
+      if (remoteHash) {
+        const remoteBytes = await this.plugin.auth.getBlob(this.vaultId, path, remoteHash);
+        if (!(await this.conflictStateMatches(path, localHash, remoteHash))) return false;
+        const preservedPath = await preserveBinaryConflict(
+          this.plugin,
+          path,
+          remoteBytes,
+          "remote",
+        );
+        if (!(await this.conflictStateMatches(path, localHash, remoteHash))) return false;
+        new Notice(`Realtime: preserved the remote copy as "${preservedPath}".`);
+      }
+      if (localHash) {
+        const queued = await this.queueLocalUpload(path, remoteHash, localHash);
+        if (!queued) return false;
       }
       new Notice(`Realtime: kept your local copy of "${path}".`);
+      return true;
     } else {
+      if (localHash) {
+        const localBytes = await this.readDisk(path);
+        if (!localBytes) throw new Error(`Local conflict content disappeared for "${path}".`);
+        if ((await sha256Hex(localBytes)) !== localHash) return false;
+        if (!(await this.conflictStateMatches(path, localHash, remoteHash))) return false;
+        const preservedPath = await preserveBinaryConflict(this.plugin, path, localBytes, "local");
+        if (!(await this.conflictStateMatches(path, localHash, remoteHash))) return false;
+        new Notice(`Realtime: preserved your local copy as "${preservedPath}".`);
+      }
       if (remoteHash === null) {
         // Remote deleted, user keeps remote → delete local.
         await this.deleteLocal(path);
       } else {
-        await this.downloadToDisk(path, remoteHash);
+        if (!(await this.downloadToDisk(path, remoteHash, localHash))) return false;
       }
       new Notice(`Realtime: replaced "${path}" with the remote copy.`);
+      return true;
     }
   }
 
+  private async conflictStateMatches(
+    path: string,
+    localHash: string | null,
+    remoteHash: string | null,
+  ): Promise<boolean> {
+    const currentLocal = await this.hashDisk(path);
+    return (
+      !this.destroyed &&
+      currentLocal !== undefined &&
+      currentLocal === localHash &&
+      (this.binaries.get(path)?.hash ?? null) === remoteHash
+    );
+  }
+
   // --- lifecycle -------------------------------------------------------------
+
+  private deferReconcile(path: string, initialPull = this.pullingMissingRemote): void {
+    this.deferredReconciles.add(path);
+    if (initialPull) this.deferredInitialPulls.add(path);
+  }
+
+  setPaused(paused: boolean): void {
+    if (this.destroyed || this.paused === paused) return;
+    this.paused = paused;
+    if (paused && this.drainTimer !== null) {
+      window.clearTimeout(this.drainTimer);
+      this.drainTimer = null;
+    } else if (!paused) {
+      if (this.uploadQueue.length > 0) this.scheduleDrain();
+      const deferred = [...this.deferredReconciles];
+      this.deferredReconciles.clear();
+      for (const path of deferred) void this.reconcile(path);
+    }
+  }
 
   destroy(): void {
     if (this.destroyed) return;
@@ -653,6 +824,8 @@ export class BinarySync {
     this.uploadQueue = [];
     this.chains.clear();
     this.pendingReconcile.clear();
+    this.deferredReconciles.clear();
+    this.deferredInitialPulls.clear();
     this.pendingDownloads.clear();
     this.urgentPaths.clear();
     this.refreshUploadStatus();

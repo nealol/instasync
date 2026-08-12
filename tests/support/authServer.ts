@@ -1,7 +1,5 @@
-// Spawns the Realtime auth server (Rust) in mock-OIDC mode plus a y-sweet
-// server started with the matching --auth key, for Tier-2 / Tier-3 tests.
-//
-// The Rust binary is built once (cargo build) and then run as a child process.
+// Spawns the Realtime server in mock-OIDC mode for Tier-2 / Tier-3 tests.
+// The Rust binary is built once and then run as a child process.
 
 import { spawn, execFileSync, type ChildProcess } from "child_process";
 import * as http from "http";
@@ -9,7 +7,6 @@ import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 import { fileURLToPath } from "url";
-import { startYSweetServer, genAuthKey, type YSweetServer } from "./ysweetServer.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "../..");
@@ -115,21 +112,16 @@ function buildServerOnce(): void {
 export interface AuthServer {
   url: string;
   stop: () => Promise<void>;
+  /** Abrupt process termination used by durability/chaos tests. */
+  kill: () => Promise<void>;
 }
 
-/** Spawn the auth server against an existing y-sweet, sharing `authKey`. */
 export async function startAuthServer(opts: {
   port?: number;
-  ysweetUrl: string;
-  authKey: string;
-  /**
-   * Public origin baked into minted tokens. Defaults to `ysweetUrl` (clients
-   * talk to y-sweet directly). Set this to the auth server's own URL to route
-   * clients through its `/d` proxy and `/dmux` multiplexer, as in production.
-   */
-  ysweetPublicUrl?: string;
-  /** When provided, sets `YSWEET_STORE` so the server can report y-sweet store usage. */
-  ysweetStoreDir?: string;
+  /** Native CRDT storage directory. Defaults to a fresh temporary directory. */
+  crdtStoreDir?: string;
+  /** SQLite path to reuse across a server restart. */
+  databasePath?: string;
   /** When provided, enables git audit commits into this directory (one repo per vault). */
   gitDataDir?: string;
   /** Git/plugin-db debounce in ms (default 500 in tests for fast assertions). */
@@ -138,13 +130,18 @@ export async function startAuthServer(opts: {
   crsqliteExtPath?: string;
   /** Extra origins allowed as `/auth/login?redirect=` targets (e.g. SDK loopback). */
   allowedLoginRedirects?: string[];
+  /** Focused test-only server configuration overrides. */
+  env?: Record<string, string>;
 }): Promise<AuthServer> {
   buildServerOnce();
 
   const port = opts.port ?? (await freePort());
   const url = `http://127.0.0.1:${port}`;
-  const dbPath = path.join(os.tmpdir(), `realtime-test-${Date.now()}-${port}.db`);
+  const dbPath =
+    opts.databasePath ?? path.join(os.tmpdir(), `realtime-test-${Date.now()}-${port}.db`);
   const blobDir = path.join(os.tmpdir(), `realtime-blobs-${Date.now()}-${port}`);
+  const crdtStoreDir =
+    opts.crdtStoreDir ?? path.join(os.tmpdir(), `realtime-crdt-${Date.now()}-${port}`);
 
   const child: ChildProcess = spawn(serverBinary(), [], {
     stdio: ["ignore", "pipe", "pipe"],
@@ -152,12 +149,9 @@ export async function startAuthServer(opts: {
       ...process.env,
       DATABASE_URL: `sqlite://${dbPath.replace(/\\/g, "/")}?mode=rwc`,
       BLOB_DIR: blobDir,
+      CRDT_STORE: crdtStoreDir,
       BIND_ADDR: `127.0.0.1:${port}`,
       PUBLIC_BASE_URL: url,
-      YSWEET_URL: opts.ysweetUrl,
-      YSWEET_PUBLIC_URL: opts.ysweetPublicUrl ?? opts.ysweetUrl,
-      YSWEET_AUTH_KEY: opts.authKey,
-      ...(opts.ysweetStoreDir ? { YSWEET_STORE: opts.ysweetStoreDir } : {}),
       ...(opts.gitDataDir
         ? {
             GIT_AUDIT_ENABLED: "1",
@@ -171,6 +165,7 @@ export async function startAuthServer(opts: {
       ALLOWED_LOGIN_REDIRECTS: ["http://app", ...(opts.allowedLoginRedirects ?? [])].join(","),
       // The readiness probe waits for the "listening on" info log.
       RUST_LOG: "realtime_server=info,warn",
+      ...opts.env,
     },
   });
 
@@ -203,30 +198,40 @@ export async function startAuthServer(opts: {
     child.on("exit", onExit);
   });
 
-  return {
-    url,
-    stop: () =>
-      new Promise<void>((resolve) => {
-        if (child.exitCode !== null) return resolve();
-        child.once("exit", () => resolve());
-        child.kill("SIGTERM");
-        setTimeout(() => {
+  const terminate = (signal: NodeJS.Signals, timeoutMs: number) =>
+    new Promise<void>((resolve) => {
+      if (child.exitCode !== null) return resolve();
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      child.once("exit", finish);
+      child.kill(signal);
+      setTimeout(() => {
+        if (child.exitCode === null) {
           try {
             child.kill("SIGKILL");
           } catch {
             /* gone */
           }
-          resolve();
-        }, 3000);
-      }),
+        }
+        finish();
+      }, timeoutMs);
+    });
+
+  return {
+    url,
+    stop: () => terminate("SIGTERM", 3000),
+    kill: () => terminate("SIGKILL", 1000),
   };
 }
 
-// ---------- bundled harness (y-sweet + auth server), for Tier-2 ----------
+// ---------- bundled harness, for Tier-2 ----------
 
 export interface AuthHarness {
   authUrl: string;
-  ysweet: YSweetServer;
   stop: () => Promise<void>;
   loginUser: (sub: string) => Promise<string>;
   createVault: (token: string, name: string) => Promise<{ id: string; name: string }>;
@@ -235,33 +240,27 @@ export interface AuthHarness {
 }
 
 export async function startAuthHarness(
-  opts: { allowedLoginRedirects?: string[]; ysweetStorageDir?: string } = {},
+  opts: {
+    allowedLoginRedirects?: string[];
+    crdtStorageDir?: string;
+    env?: Record<string, string>;
+  } = {},
 ): Promise<AuthHarness> {
-  const authKey = await genAuthKey();
-  const ysweet = await startYSweetServer(undefined, authKey, opts.ysweetStorageDir);
-  // Bake the auth server's own URL into tokens so clients connect through its
-  // `/d` proxy and `/dmux` multiplexer — the production topology, and the only
-  // one where the bounded mux shards (`{host}/dmux`) have a route.
   const port = await freePort();
   const authUrl = `http://127.0.0.1:${port}`;
   const server = await startAuthServer({
     port,
-    ysweetUrl: ysweet.url,
-    ysweetPublicUrl: authUrl,
-    authKey,
+    crdtStoreDir: opts.crdtStorageDir,
     allowedLoginRedirects: opts.allowedLoginRedirects,
+    env: opts.env,
   });
 
   return {
     authUrl,
-    ysweet,
     loginUser: (sub) => mockLogin(authUrl, sub),
     createVault: (token, name) => apiCreateVault(authUrl, token, name),
     createInvite: (token, vaultId) => apiCreateInvite(authUrl, token, vaultId),
     redeemInvite: (token, code) => apiRedeemInvite(authUrl, token, code),
-    stop: async () => {
-      await server.stop();
-      await ysweet.stop();
-    },
+    stop: server.stop,
   };
 }

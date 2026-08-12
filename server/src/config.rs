@@ -6,21 +6,30 @@ use crate::{SERVER_BOT_EMAIL, SERVER_NAME};
 #[derive(Clone, Debug)]
 pub struct Config {
     pub database_url: String,
+    /// Master switch for the persistent Apalis workers. Enqueueing remains
+    /// enabled while workers are paused, so no desired work is discarded.
+    pub background_jobs_enabled: bool,
+    pub background_job_concurrency: usize,
+    pub background_job_max_attempts: u32,
+    pub background_job_retry_min_ms: u64,
+    pub background_job_retry_max_ms: u64,
+    pub background_job_shutdown_timeout_ms: u64,
+    /// Maximum time HTTP/WebSocket connections may delay process shutdown.
+    pub server_shutdown_timeout_ms: u64,
     pub bind_addr: String,
     /// Public base URL of *this* server (used to build the OIDC redirect default).
     pub public_base_url: String,
-    /// Internal URL the auth server uses to reach y-sweet.
-    pub ysweet_url: String,
+    /// Filesystem directory for native Yjs document generations.
+    pub crdt_store_dir: String,
+    /// Maximum age of an active CRDT epoch before logical-state replacement.
+    pub crdt_epoch_period_days: u64,
+    /// How long retired CRDT epochs remain available for offline recovery.
+    pub crdt_epoch_recovery_days: u64,
+    pub crdt_epoch_max_updates: u64,
+    pub crdt_epoch_max_state_bytes: u64,
+    pub crdt_epoch_max_delete_set_bytes: u64,
     /// Filesystem directory for the content-addressed binary blob store.
     pub blob_dir: String,
-    /// Filesystem directory of the internal y-sweet document store (`YSWEET_STORE`).
-    /// Optional: used only to measure per-vault "plain vault" storage. When unset
-    /// or inaccessible, that figure is reported as unavailable.
-    pub ysweet_store_dir: Option<String>,
-    /// URL clients should connect to (host rewritten into minted tokens).
-    pub ysweet_public_url: String,
-    /// Shared private key, identical to what `y-sweet serve --auth` is given.
-    pub ysweet_auth_key: String,
     /// "oidc" for a real IdP, "mock" for the in-process test issuer.
     pub oidc_mode: OidcMode,
     pub oidc_issuer: Option<String>,
@@ -86,16 +95,45 @@ impl Config {
         Config {
             database_url: opt("DATABASE_URL")
                 .unwrap_or_else(|| "sqlite://realtime.db?mode=rwc".to_string()),
+            background_jobs_enabled: opt("BACKGROUND_JOBS_ENABLED").as_deref() != Some("0"),
+            background_job_concurrency: opt("BACKGROUND_JOB_CONCURRENCY")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4),
+            background_job_max_attempts: opt("BACKGROUND_JOB_MAX_ATTEMPTS")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(25),
+            background_job_retry_min_ms: opt("BACKGROUND_JOB_RETRY_MIN_MS")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(250),
+            background_job_retry_max_ms: opt("BACKGROUND_JOB_RETRY_MAX_MS")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30_000),
+            background_job_shutdown_timeout_ms: opt("BACKGROUND_JOB_SHUTDOWN_TIMEOUT_MS")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30_000),
+            server_shutdown_timeout_ms: opt("SERVER_SHUTDOWN_TIMEOUT_MS")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30_000),
             bind_addr: opt("BIND_ADDR").unwrap_or_else(|| "127.0.0.1:8081".to_string()),
             public_base_url: opt("PUBLIC_BASE_URL")
                 .unwrap_or_else(|| "http://127.0.0.1:8081".to_string()),
-            ysweet_url: opt("YSWEET_URL").unwrap_or_else(|| "http://127.0.0.1:8080".to_string()),
+            crdt_store_dir: opt("CRDT_STORE").unwrap_or_else(|| "./crdt".to_string()),
+            crdt_epoch_period_days: opt("CRDT_EPOCH_PERIOD_DAYS")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(365),
+            crdt_epoch_recovery_days: opt("CRDT_EPOCH_RECOVERY_DAYS")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30),
+            crdt_epoch_max_updates: opt("CRDT_EPOCH_MAX_UPDATES")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100_000),
+            crdt_epoch_max_state_bytes: opt("CRDT_EPOCH_MAX_STATE_BYTES")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(32 * 1024 * 1024),
+            crdt_epoch_max_delete_set_bytes: opt("CRDT_EPOCH_MAX_DELETE_SET_BYTES")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8 * 1024 * 1024),
             blob_dir: opt("BLOB_DIR").unwrap_or_else(|| "./blobs".to_string()),
-            ysweet_store_dir: opt("YSWEET_STORE"),
-            ysweet_public_url: opt("YSWEET_PUBLIC_URL")
-                .or_else(|| opt("YSWEET_URL"))
-                .unwrap_or_else(|| "http://127.0.0.1:8080".to_string()),
-            ysweet_auth_key: opt("YSWEET_AUTH_KEY").unwrap_or_default(),
             oidc_mode,
             oidc_issuer: opt("OIDC_ISSUER"),
             oidc_client_id: opt("OIDC_CLIENT_ID"),
@@ -180,13 +218,25 @@ impl Config {
     pub(crate) fn test_default() -> Self {
         Config {
             database_url: String::new(),
+            background_jobs_enabled: true,
+            background_job_concurrency: 4,
+            background_job_max_attempts: 25,
+            background_job_retry_min_ms: 250,
+            background_job_retry_max_ms: 30_000,
+            background_job_shutdown_timeout_ms: 30_000,
+            server_shutdown_timeout_ms: 30_000,
             bind_addr: String::new(),
             public_base_url: String::new(),
-            ysweet_url: String::new(),
+            crdt_store_dir: std::env::temp_dir()
+                .join(format!("realtime-crdt-test-{}", uuid::Uuid::new_v4()))
+                .display()
+                .to_string(),
+            crdt_epoch_period_days: 365,
+            crdt_epoch_recovery_days: 30,
+            crdt_epoch_max_updates: 100_000,
+            crdt_epoch_max_state_bytes: 32 * 1024 * 1024,
+            crdt_epoch_max_delete_set_bytes: 8 * 1024 * 1024,
             blob_dir: String::new(),
-            ysweet_store_dir: None,
-            ysweet_public_url: String::new(),
-            ysweet_auth_key: String::new(),
             oidc_mode: OidcMode::Mock,
             oidc_issuer: None,
             oidc_client_id: None,

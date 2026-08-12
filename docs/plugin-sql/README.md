@@ -43,7 +43,7 @@ your plugin
 in-memory cr-sqlite database  ──►  local snapshot (.obsidian/plugins/realtime/plugin-dbs/…)
    │  publishes change batches
    ▼
-per-DB Y.Doc (y-sweet websocket)  ◄──►  other devices / collaborators
+per-DB Y.Doc (native Yjs websocket)  ◄──►  other devices / collaborators
    │
    ▼
 server replica + git dump (.realtime/plugin-dbs/…)  +  bootstrap endpoint

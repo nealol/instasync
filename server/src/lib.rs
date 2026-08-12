@@ -3,22 +3,29 @@ pub mod audit;
 pub mod blobs;
 pub mod caps;
 pub mod config;
+pub mod crdt;
+mod crdt_epoch;
+pub mod crdt_storage;
 pub mod db;
 pub mod dmux;
 pub mod entities;
 pub mod error;
+pub mod full_backup;
 pub mod git;
 pub mod history;
+pub mod jobs;
 pub mod mcp;
+mod migration;
 pub mod notes;
 pub mod oauth;
 pub mod oidc;
 pub mod openapi;
+pub mod operations;
 pub mod permalink;
 pub mod plugindb;
-pub mod proxy;
 pub mod rollback;
 pub mod routes;
+mod safe_yrs;
 pub mod search;
 pub mod session;
 pub mod shares;
@@ -29,7 +36,6 @@ pub mod structured;
 pub mod web;
 pub mod words;
 pub mod ydoc;
-pub mod ysweet;
 
 pub const SERVER_NAME: &str = "Realtime";
 pub const SERVER_SLUG: &str = "realtime";
@@ -48,29 +54,17 @@ use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
-use y_sweet_core::auth::Authenticator;
 
 use crate::config::Config;
+use crate::crdt::DocumentStore;
 use crate::state::AppState;
 
-/// Generate a fresh y-sweet-compatible private key (used by tests and `gen-key`).
-pub fn gen_auth_key() -> String {
-    Authenticator::gen_key()
-        .expect("generate auth key")
-        .private_key()
-}
-
-/// Build the full application state from config, opening the DB and creating the
-/// schema if needed. Shared by the binary and the integration tests.
+/// Build the full application state from config, opening the DB and applying
+/// pending schema migrations. Shared by the binary and integration tests.
 pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
     let db = Database::connect(&config.database_url).await?;
-    db::init_schema(&db).await?;
+    db::migrate_schema(&db).await?;
     let server_id = db::ensure_server_id(&db).await?;
-
-    let authenticator = Arc::new(
-        Authenticator::new(&config.ysweet_auth_key)
-            .map_err(|e| anyhow::anyhow!("invalid YSWEET_AUTH_KEY: {e}"))?,
-    );
 
     let http = reqwest::Client::builder()
         // Following redirects on the token endpoint opens us to SSRF.
@@ -80,35 +74,48 @@ pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
         .build()?;
 
     let config = Arc::new(config);
-    let plugindb = plugindb::PluginDbService::new(
-        config.clone(),
-        http.clone(),
-        db.clone(),
-        authenticator.clone(),
-    );
+    let days_ms = 24 * 60 * 60 * 1_000;
+    let documents = DocumentStore::new_with_policy(
+        &config.crdt_store_dir,
+        crdt_epoch::EpochPolicy {
+            recovery_window_ms: config.crdt_epoch_recovery_days.saturating_mul(days_ms),
+            max_age_ms: config.crdt_epoch_period_days.saturating_mul(days_ms),
+            max_update_count: config.crdt_epoch_max_updates,
+            max_encoded_state_bytes: config.crdt_epoch_max_state_bytes,
+            max_delete_set_bytes: config.crdt_epoch_max_delete_set_bytes,
+        },
+    )
+    .await?;
+    let sync_metrics = documents.sync_metrics();
+    let jobs = jobs::JobQueue::new(&db, &config).await?;
+    let plugindb =
+        plugindb::PluginDbService::new(config.clone(), db.clone(), documents.clone(), jobs.clone());
     let git = git::GitService::new(
         config.clone(),
-        http.clone(),
         db.clone(),
-        authenticator.clone(),
+        documents.clone(),
         plugindb.clone(),
+        jobs.clone(),
     );
-    let search = search::SearchService::new(config.clone());
+    let search = search::SearchService::new(jobs.clone());
 
     let state = AppState {
         db,
         config,
         server_id,
-        authenticator,
+        documents,
+        jobs: jobs.clone(),
         http,
         oidc: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         git,
         plugindb,
         search,
-        principals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        sync_grants: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        sync_metrics,
+        runtime_health: operations::RuntimeHealth::default(),
     };
-    search::spawn_startup_backfill(state.clone());
+    jobs.start(state.clone()).await?;
     audit::spawn_retention_task(state.clone());
     Ok(state)
 }
@@ -134,6 +141,9 @@ pub fn app(state: AppState) -> Router {
     };
 
     Router::new()
+        .route("/health/live", get(operations::live))
+        .route("/health/ready", get(operations::ready))
+        .route("/metrics", get(operations::metrics))
         .merge(SwaggerUi::new("/docs").url("/openapi.json", openapi::ApiDoc::openapi()))
         .merge(mcp::router(state.clone()))
         .route("/auth/login", get(oidc::login))
@@ -254,6 +264,9 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/api/vaults/{id}/storage", get(storage::get_storage))
         .route("/api/vaults/{id}/storage/gc-blobs", post(storage::gc_blobs))
+        .route("/api/vaults/{id}/jobs", get(routes::list_jobs))
+        .route("/api/vaults/{id}/jobs/retry", post(routes::retry_job))
+        .route("/api/vaults/{id}/jobs/cancel", post(routes::cancel_job))
         .route("/api/vaults/{id}/members", get(routes::list_members))
         .route(
             "/api/vaults/{id}/members/{user_id}/promote",
@@ -435,10 +448,15 @@ pub fn app(state: AppState) -> Router {
             "/api/vaults/{id}/plugin-dbs/{plugin}/{name}/execute",
             post(plugindb::routes::execute_plugin_db),
         )
-        // Reverse-proxy the bundled y-sweet so clients need only this server's URL.
-        .route("/d/{*rest}", any(proxy::proxy))
-        // Bounded multiplexing: each client shard fans out to per-doc upstream
-        // y-sweet sockets (see src/sync/mux.ts).
+        // Native Yjs-compatible document transport and document-level HTTP API.
+        .route("/d/{doc_id}/ws/{repeated_id}", get(crdt::websocket))
+        .route("/d/{doc_id}/as-update", get(crdt::get_update))
+        .route(
+            "/d/{doc_id}/update",
+            post(crdt::post_update).layer(DefaultBodyLimit::max(crdt::MAX_UPDATE_BYTES)),
+        )
+        // Bounded multiplexing: each client shard carries many native document
+        // sessions over one WebSocket (see src/sync/mux.ts).
         .route("/dmux", any(dmux::dmux))
         .layer(cors)
         .with_state(state)

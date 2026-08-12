@@ -4,11 +4,13 @@ import type RealtimePlugin from "./main";
 import { SyncedDoc } from "./SyncedDoc";
 import { ensureParentFolder, getFileByPath, isOpenInWorkspace } from "./vaultHelpers";
 import {
-  mergeStructuredStartup,
+  mergeStructuredStartupResult,
   reconcileInto,
   toValue,
   type JsonValue,
 } from "./structured/reconcile";
+import { preserveTextConflict } from "./conflictRecovery";
+import { sha256Text } from "./hash";
 
 export const DISK_ORIGIN = Symbol("realtime-structured-disk");
 
@@ -19,6 +21,8 @@ export abstract class StructuredDocument extends SyncedDoc {
   private writingTextToDisk: string | null = null;
   private writeTimer: number | null = null;
   private startupReconciled = false;
+  private startupReconciling = false;
+  private readonly forceBootstrapConflict: boolean;
   private baselineAtStartup: JsonValue = {};
   private baselineTextAtStartup = "";
   private diskAtStartup: JsonValue | null = null;
@@ -30,9 +34,10 @@ export abstract class StructuredDocument extends SyncedDoc {
     guid: string,
     serverDocId: string,
     isCreator: boolean,
-    opts: { autoConnect?: boolean } = {},
+    opts: { autoConnect?: boolean; forceBootstrapConflict?: boolean } = {},
   ) {
     super(plugin, path, guid, serverDocId, isCreator, opts);
+    this.forceBootstrapConflict = opts.forceBootstrapConflict ?? false;
     this.root = this.ydoc.getMap("root");
     this.rootObserver = (_events, txn) => this.onRootChanged(txn?.origin);
     this.root.observeDeep(this.rootObserver);
@@ -74,21 +79,89 @@ export abstract class StructuredDocument extends SyncedDoc {
   }
 
   protected async finishStartupReconcile(): Promise<void> {
-    if (this.startupReconciled || this.destroyed) return;
-    this.startupReconciled = true;
+    if (this.startupReconciled || this.startupReconciling || this.destroyed) return;
+    this.startupReconciling = true;
+    let completed = false;
     try {
-      if (this.localChangedAtStartup && this.diskAtStartup !== null) {
-        this.applyValue(
-          mergeStructuredStartup(this.baselineAtStartup, this.diskAtStartup, this.value),
-          DISK_ORIGIN,
-        );
+      const remote = this.value;
+      if (
+        this.diskAtStartup !== null &&
+        (this.localChangedAtStartup || this.forceBootstrapConflict)
+      ) {
+        const merge = this.forceBootstrapConflict
+          ? {
+              value: this.diskAtStartup,
+              conflicted: this.serialize(this.diskAtStartup) !== this.serialize(remote),
+            }
+          : mergeStructuredStartupResult(this.baselineAtStartup, this.diskAtStartup, remote);
+        if (merge.conflicted) {
+          const preservedPath = await preserveTextConflict(
+            this.plugin,
+            this.path,
+            this.serialize(remote),
+            "remote",
+          );
+          new Notice(
+            `Realtime: merged "${this.path}" and preserved the conflicting remote version as "${preservedPath}".`,
+          );
+          const latestDisk = await this.readParsedFromDisk();
+          if (this.destroyed) return;
+          if (
+            latestDisk === null ||
+            this.serialize(latestDisk) !== this.serialize(this.diskAtStartup) ||
+            this.serialize(this.value) !== this.serialize(remote)
+          ) {
+            this.diskAtStartup = latestDisk;
+            return;
+          }
+        }
+        if (this.destroyed) return;
+        this.applyValue(merge.value, DISK_ORIGIN);
       }
+      this.startupReconciled = true;
+      this.plugin.vaultSync?.noteMaterialized(
+        this.path,
+        this.path.endsWith(".canvas") ? "canvas" : "base",
+        this.guid,
+      );
       if (!this.suppressedWhileOpen()) await this.writeToDisk(this.serialize(this.value));
+      if (!this.provider.hasLocalChanges) await this.recordAcknowledgedContent(true);
+      completed = true;
     } catch (e) {
       console.error(`[Realtime] structured startup reconcile failed for ${this.path}`, e);
     } finally {
-      this.resolveWhenReady();
+      this.startupReconciling = false;
+      if (completed) {
+        this.resolveWhenReady();
+      } else if (!this.destroyed) {
+        window.setTimeout(() => void this.finishStartupReconcile(), 2_000);
+      }
     }
+  }
+
+  protected async afterChangesSynced(): Promise<void> {
+    if (!this.startupReconciled || this.destroyed) return;
+    await this.recordAcknowledgedContent(true);
+  }
+
+  private async recordAcknowledgedContent(reconciled = false): Promise<void> {
+    const content = this.serialize(this.value);
+    const fingerprint = await sha256Text(content);
+    if (
+      this.destroyed ||
+      this.provider.hasLocalChanges ||
+      this.serialize(this.value) !== content ||
+      !this.startupReconciled
+    ) {
+      return;
+    }
+    this.plugin.vaultSync?.noteContentAcknowledged(
+      this.path,
+      this.path.endsWith(".canvas") ? "canvas" : "base",
+      this.guid,
+      fingerprint,
+      reconciled,
+    );
   }
 
   async onDiskChanged(): Promise<void> {
@@ -108,7 +181,7 @@ export abstract class StructuredDocument extends SyncedDoc {
   }
 
   protected onRootChanged(_origin?: unknown): void {
-    if (this.destroyed) return;
+    if (this.destroyed || !this.startupReconciled) return;
     this.plugin.vaultSync?.noteTextActivity();
     if (this.suppressedWhileOpen()) return;
     this.scheduleWriteToDisk();
@@ -118,7 +191,7 @@ export abstract class StructuredDocument extends SyncedDoc {
     if (this.writeTimer !== null) window.clearTimeout(this.writeTimer);
     this.writeTimer = window.setTimeout(() => {
       this.writeTimer = null;
-      if (this.destroyed || this.suppressedWhileOpen()) return;
+      if (this.destroyed || !this.startupReconciled || this.suppressedWhileOpen()) return;
       void this.writeToDisk(this.serialize(this.value));
     }, 100);
   }
@@ -129,6 +202,10 @@ export abstract class StructuredDocument extends SyncedDoc {
 
   protected isOpen(): boolean {
     return isOpenInWorkspace(this.plugin.app, this.path);
+  }
+
+  protected canHibernateLocally(): boolean {
+    return !this.isOpen() && this.writingTextToDisk === null && this.writeTimer === null;
   }
 
   private async readParsedFromDisk(): Promise<JsonValue | null> {
@@ -150,7 +227,14 @@ export abstract class StructuredDocument extends SyncedDoc {
       const file = this.getFile();
       if (file) {
         if (this.suppressedWhileOpen()) return;
-        if ((await this.plugin.app.vault.read(file)) === text) return;
+        if ((await this.plugin.app.vault.read(file)) === text) {
+          this.plugin.vaultSync?.noteMaterialized(
+            this.path,
+            this.path.endsWith(".canvas") ? "canvas" : "base",
+            this.guid,
+          );
+          return;
+        }
         // Re-check destroyed after the await: a doc replaced mid-write (rename,
         // guid change) must not clobber the file its successor now owns.
         if (this.destroyed || this.suppressedWhileOpen()) return;
@@ -166,6 +250,7 @@ export abstract class StructuredDocument extends SyncedDoc {
       this.plugin.vaultSync?.noteMaterialized(
         this.path,
         this.path.endsWith(".canvas") ? "canvas" : "base",
+        this.guid,
       );
     } catch (e) {
       console.error(`[Realtime] structured writeToDisk failed for ${this.path}`, e);

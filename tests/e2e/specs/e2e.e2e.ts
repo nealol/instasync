@@ -110,8 +110,8 @@ const baseYaml = (name: string) => `views:\n  - type: table\n    name: ${name}\n
 
 // Device A is the wdio session (vault A). Device B is a second, fully isolated
 // Obsidian instance started programmatically (vault B). Both install this plugin;
-// the conf boots y-sweet (--auth) + the auth server (mock OIDC) on the plugin's
-// default ports. Device A signs in and creates a vault from its local files;
+// the config boots the native sync/auth server (mock OIDC) on the plugin's
+// default port. Device A signs in and creates a vault from its local files;
 // device B signs in as a different user, redeems an invite, and adopts it.
 let A: WebdriverIO.Browser;
 let B: WebdriverIO.Browser;
@@ -1370,8 +1370,9 @@ describe("Realtime — two isolated Obsidian devices", function () {
 
   describe("storage API", function () {
     // These are pure Node-side REST calls — no Obsidian instance required.
-    // The harness starts y-sweet with --storage so plainVaultBytes is a real
-    // non-negative number rather than null.
+    // The harness supplies CRDT_STORE, so plainVaultBytes is a real
+    // non-negative number rather than null. The response field keeps its
+    // existing name for API compatibility.
 
     it("returns a valid storage breakdown with the expected shape", async function () {
       const res = await fetch(`${authUrl}/api/vaults/${vaultId}/storage`, {
@@ -1383,7 +1384,7 @@ describe("Realtime — two isolated Obsidian devices", function () {
       expect(typeof body.blobsPreviousBytes).toBe("number");
       expect(typeof body.currentBlobCount).toBe("number");
       expect(typeof body.previousBlobCount).toBe("number");
-      // plainVaultBytes is a number because YSWEET_STORE is wired in the test harness.
+      // plainVaultBytes is a number because CRDT_STORE is wired in the harness.
       expect(typeof body.plainVaultBytes).toBe("number");
       expect((body.plainVaultBytes as number) >= 0).toBe(true);
     });

@@ -1,11 +1,18 @@
 import { describe, it, expect } from "vitest";
-import { checkServerCaps, REQUIRED_CAPS, CompatibilityError } from "../../src/caps";
+import {
+  checkServerCaps,
+  REQUIRED_CAPS,
+  CompatibilityError,
+  serverSupportsCapability,
+} from "../../src/caps";
 
 const OK_CAPS = {
   restApi: REQUIRED_CAPS.restApi[0],
   oauth: REQUIRED_CAPS.oauth[0],
   pluginDbSync: REQUIRED_CAPS.pluginDbSync[0],
   attachmentShim: REQUIRED_CAPS.attachmentShim[0],
+  documentEpoch: REQUIRED_CAPS.documentEpoch[0],
+  documentInvalidation: REQUIRED_CAPS.documentInvalidation[0],
 };
 
 describe("checkServerCaps", () => {
@@ -65,6 +72,34 @@ describe("checkServerCaps", () => {
       expect(r.reason).toBe("server-incompatible");
       expect(r.detail).toContain("restApi");
     }
+  });
+
+  it("accepts an older server without invalidations but does not enable the feature", () => {
+    const { documentInvalidation: _omit, ...olderCaps } = OK_CAPS;
+    void _omit;
+    expect(checkServerCaps(olderCaps)).toEqual({ ok: true });
+    expect(serverSupportsCapability(olderCaps, "documentInvalidation")).toBe(false);
+  });
+
+  it("enables invalidations only for the accepted cap value", () => {
+    expect(serverSupportsCapability(OK_CAPS, "documentInvalidation")).toBe(true);
+    expect(
+      serverSupportsCapability(
+        { ...OK_CAPS, documentInvalidation: "future-incompatible" },
+        "documentInvalidation",
+      ),
+    ).toBe(false);
+  });
+
+  it("rejects a missing optional cap when the server marks it required", () => {
+    const { documentInvalidation: _omit, ...olderCaps } = OK_CAPS;
+    void _omit;
+    const result = checkServerCaps(olderCaps, ["documentInvalidation"]);
+    expect(result).toEqual({
+      ok: false,
+      reason: "server-incompatible",
+      detail: 'server requires unsupported cap "documentInvalidation"',
+    });
   });
 
   it("fails with server-incompatible when a cap value is not accepted", () => {

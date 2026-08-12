@@ -25,7 +25,7 @@ export interface ServerInfoResponse {
   version?: string;
   /** Named capability versions per surface. Optional for old servers. SDK/CLI consumers can self-gate; only the Obsidian plugin enforces caps. */
   caps?: Record<string, string>;
-  /** Cap names the client must understand. Optional; empty in v1. */
+  /** Cap names the client must understand. Optional on older servers. */
   requiredCaps?: string[];
 }
 
@@ -288,7 +288,7 @@ export interface StorageUsage {
   blobsPreviousBytes: number;
   currentBlobCount: number;
   previousBlobCount: number;
-  /** null when the y-sweet store path is not configured / readable server-side. */
+  /** null when the CRDT store is not readable server-side. */
   plainVaultBytes: number | null;
 }
 
@@ -377,12 +377,14 @@ export interface PluginDbStatement {
 
 // ---------- doc tokens ----------
 
-/** y-sweet client token minted by `POST /api/doc-token`. */
+/** Yjs document token minted by `POST /api/doc-token`. */
 export interface DocTokenResponse {
   url?: string;
   baseUrl?: string;
   docId?: string;
   token?: string;
+  /** Logical CRDT epoch. A changed value requires a fresh local Y.Doc. */
+  epoch?: number;
   [key: string]: unknown;
 }
 

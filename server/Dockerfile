@@ -2,9 +2,8 @@
 # Build context is the REPO ROOT (the read-only web viewer SPA lives in
 # packages/web): `docker build -f server/Dockerfile .`
 #
-# The final image bundles a stock y-sweet binary and runs it internally; the auth
-# server reverse-proxies it under /d/*, so only one URL/port needs to be exposed
-# and the Obsidian plugin only ever needs this server's URL.
+# The server owns CRDT storage and synchronization directly, so the image runs
+# one process and exposes one port.
 
 # --- dependency planner (cargo-chef caches the heavy dep build) -------------
 FROM rust:1-bookworm AS chef
@@ -39,26 +38,6 @@ COPY packages/web/package.json packages/web/
 RUN bun install --frozen-lockfile --ignore-scripts
 COPY packages/web/ packages/web/
 RUN bun run --cwd packages/web build
-
-# --- y-sweet binary --------------------------------------------------------
-# Download the prebuilt y-sweet release matching the `y-sweet` npm version used
-# by the plugin/tests (see package.json). Pin via build args.
-FROM debian:bookworm-slim AS ysweet
-ARG YSWEET_VERSION=0.9.1
-ARG TARGETARCH
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/*
-RUN set -eux; \
-    case "${TARGETARCH}" in \
-      amd64) ys_arch=linux-x64 ;; \
-      arm64) ys_arch=linux-arm64 ;; \
-      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac; \
-    url="https://github.com/drifting-in-space/y-sweet/releases/download/v${YSWEET_VERSION}/y-sweet-${ys_arch}.gz"; \
-    curl -fsSL "${url}" | gunzip > /usr/local/bin/y-sweet; \
-    chmod 0755 /usr/local/bin/y-sweet; \
-    /usr/local/bin/y-sweet version
 
 # --- cr-sqlite loadable extension ------------------------------------------
 # Downloads the cr-sqlite loadable extension that backs synced plugin databases
@@ -106,25 +85,23 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/realtime-server /usr/local/bin/realtime-server
-COPY --from=ysweet /usr/local/bin/y-sweet /usr/local/bin/y-sweet
 # Install the cr-sqlite extension if it was fetched (the dir always exists).
 COPY --from=crsqlite /opt/crsqlite/ /usr/local/lib/crsqlite/
 COPY --from=web /app/packages/web/dist /usr/local/share/realtime-web
 COPY server/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
-# Persist the sqlite db and y-sweet store under /data (mount a volume here).
+# Persist the sqlite database and native CRDT snapshots under /data.
 RUN mkdir -p /data
 WORKDIR /data
 VOLUME ["/data"]
 
-# Sensible container defaults; override the rest (YSWEET_AUTH_KEY, OIDC_*) at runtime.
+# Sensible container defaults; override the OIDC settings at runtime.
 # PUBLIC_BASE_URL is baked into minted client tokens, so set it to the URL clients
 # reach this server at (e.g. https://sync.example.com) in production.
 ENV BIND_ADDR=0.0.0.0:8081 \
     PUBLIC_BASE_URL=http://127.0.0.1:8081 \
-    YSWEET_INTERNAL_PORT=8080 \
-    YSWEET_STORE=/data/ysweet \
+    CRDT_STORE=/data/crdt \
     GIT_DATA_DIR=/data/git \
     DATABASE_URL=sqlite:///data/realtime.db?mode=rwc \
     CRSQLITE_EXT_PATH=/usr/local/lib/crsqlite/crsqlite.so \

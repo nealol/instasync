@@ -6,6 +6,9 @@ import { dbg, snip } from "./debug";
 import { ensureParentFolder, getFileByPath, isOpenInEditableMarkdown } from "./vaultHelpers";
 import { openTextConflictModal } from "./TextConflictModal";
 import { SyncedDoc } from "./SyncedDoc";
+import { preserveTextConflict } from "./conflictRecovery";
+import { mergeText } from "./textMerge";
+import { sha256Text } from "./hash";
 
 /**
  * Origin tag used on Yjs transactions that originate from this Document writing
@@ -16,7 +19,7 @@ const DISK_WRITE_RETRY_MS = 2_000;
 
 /**
  * A single collaboratively-edited Markdown file. Owns its own Y.Doc and
- * y-sweet provider, and keeps the shared `contents` Y.Text in sync with the
+ * Realtime provider, and keeps the shared `contents` Y.Text in sync with the
  * file on disk when the file is not actively open in an editor.
  *
  * Offline durability: the Y.Doc is mirrored into IndexedDB via
@@ -43,6 +46,8 @@ export class Document extends SyncedDoc {
   private localChangedAtStartup = false;
   /** Guards the one-time startup merge so reconnects don't re-run it. */
   private startupReconciled = false;
+  private startupReconciling = false;
+  private readonly forceBootstrapConflict: boolean;
   /** Suppress write-through while IndexedDB is replaying the startup baseline. */
   private startupBaselineCaptured = false;
 
@@ -55,9 +60,10 @@ export class Document extends SyncedDoc {
     guid: string,
     serverDocId: string,
     isCreator: boolean,
-    opts: { autoConnect?: boolean } = {},
+    opts: { autoConnect?: boolean; forceBootstrapConflict?: boolean } = {},
   ) {
     super(plugin, path, guid, serverDocId, isCreator, opts);
+    this.forceBootstrapConflict = opts.forceBootstrapConflict ?? false;
     this.ytext = this.ydoc.getText("contents");
 
     // ytext changes (local edits from other peers, or our own editor) flow to
@@ -126,8 +132,9 @@ export class Document extends SyncedDoc {
    *                                     the chosen text as canonical.
    */
   protected async finishStartupReconcile(): Promise<void> {
-    if (this.startupReconciled || this.destroyed) return;
-    this.startupReconciled = true;
+    if (this.startupReconciled || this.startupReconciling || this.destroyed) return;
+    this.startupReconciling = true;
+    let completed = false;
 
     try {
       const remote = this.content;
@@ -141,14 +148,15 @@ export class Document extends SyncedDoc {
       // If their first remote is empty, treat it as unseeded instead of asking
       // the user to resolve a blank-vs-local conflict.
       const isConflict =
-        this.localChangedAtStartup &&
         localDisk !== null &&
-        remoteChanged &&
+        (this.localChangedAtStartup || this.forceBootstrapConflict) &&
         remote !== localDisk &&
+        (remoteChanged || this.forceBootstrapConflict) &&
         !creatorHasLocalAgainstEmptyRemote;
 
       const sameDevicePrefixFastForward =
         isConflict &&
+        !this.forceBootstrapConflict &&
         baseline.length === 0 &&
         localDisk !== null &&
         localDisk.length > remote.length &&
@@ -157,17 +165,14 @@ export class Document extends SyncedDoc {
       if (sameDevicePrefixFastForward) {
         this.applyText(localDisk);
       } else if (isConflict) {
-        const choice = await openTextConflictModal(this.plugin, {
-          path: this.path,
-          localContent: localDisk,
-          remoteContent: remote,
-        });
-        if (this.destroyed) return;
-        if (choice === "local") {
-          this.applyText(localDisk);
-          new Notice(`Realtime: kept your local version of "${this.path}".`);
+        const merge = this.forceBootstrapConflict
+          ? ({ kind: "conflict" } as const)
+          : mergeText(baseline, localDisk, remote);
+        if (merge.kind === "merged") {
+          this.applyText(merge.content);
         } else {
-          new Notice(`Realtime: kept the remote version of "${this.path}".`);
+          await this.resolveStartupConflict(localDisk, remote);
+          if (this.destroyed) return;
         }
       } else if (
         this.localChangedAtStartup &&
@@ -177,16 +182,51 @@ export class Document extends SyncedDoc {
         this.applyText(localDisk);
       }
 
+      this.startupReconciled = true;
+      this.plugin.vaultSync?.noteMaterialized(this.path, "text", this.guid);
+
       // The editor (if open) receives the merged text via the ytext observer;
       // writing through vault.modify would make Obsidian merge an external change.
       if (!this.hasBoundEditor && !this.isOpenInEditableMarkdown()) {
         await this.writeToDisk(this.content);
       }
+      if (!this.provider.hasLocalChanges) await this.recordAcknowledgedContent(true);
+      completed = true;
     } catch (e) {
       console.error(`[Realtime] startup reconcile failed for ${this.path}`, e);
     } finally {
-      this.resolveWhenReady();
+      this.startupReconciling = false;
+      if (completed) {
+        this.resolveWhenReady();
+      } else if (!this.destroyed) {
+        window.setTimeout(() => void this.finishStartupReconcile(), DISK_WRITE_RETRY_MS);
+      }
     }
+  }
+
+  protected async afterChangesSynced(): Promise<void> {
+    if (!this.startupReconciled || this.destroyed) return;
+    await this.recordAcknowledgedContent(true);
+  }
+
+  private async recordAcknowledgedContent(reconciled = false): Promise<void> {
+    const content = this.content;
+    const fingerprint = await sha256Text(content);
+    if (
+      this.destroyed ||
+      this.provider.hasLocalChanges ||
+      this.content !== content ||
+      !this.startupReconciled
+    ) {
+      return;
+    }
+    this.plugin.vaultSync?.noteContentAcknowledged(
+      this.path,
+      "text",
+      this.guid,
+      fingerprint,
+      reconciled,
+    );
   }
 
   private applyText(text: string): void {
@@ -196,9 +236,56 @@ export class Document extends SyncedDoc {
     }, DISK_ORIGIN);
   }
 
+  private async resolveStartupConflict(initialLocal: string, initialRemote: string): Promise<void> {
+    let local = initialLocal;
+    let remote = initialRemote;
+    while (!this.destroyed) {
+      const choice = await openTextConflictModal(this.plugin, {
+        path: this.path,
+        localContent: local,
+        remoteContent: remote,
+      });
+      if (this.destroyed) return;
+
+      const latestLocal = await this.readFromDisk();
+      if (this.destroyed) return;
+      const latestRemote = this.content;
+      if (latestLocal === null) return;
+      if (latestLocal !== local || latestRemote !== remote) {
+        local = latestLocal;
+        remote = latestRemote;
+        continue;
+      }
+
+      const preservedPath = await preserveTextConflict(
+        this.plugin,
+        this.path,
+        choice === "local" ? remote : local,
+        choice === "local" ? "remote" : "local",
+      );
+      if (this.destroyed) return;
+
+      const localAfterCopy = await this.readFromDisk();
+      if (this.destroyed) return;
+      if (localAfterCopy === null) return;
+      if (localAfterCopy !== local || (choice === "local" && this.content !== remote)) {
+        local = localAfterCopy;
+        remote = this.content;
+        continue;
+      }
+
+      if (choice === "local") this.applyText(local);
+      const kept = choice === "local" ? "your local" : "the remote";
+      new Notice(
+        `Realtime: kept ${kept} version of "${this.path}"; preserved the other version as "${preservedPath}".`,
+      );
+      return;
+    }
+  }
+
   private onYTextChanged(): void {
     if (this.destroyed) return;
-    if (!this.startupBaselineCaptured) return;
+    if (!this.startupBaselineCaptured || !this.startupReconciled) return;
     // Note text-sync activity so the binary upload queue can defer large
     // transfers while notes are actively syncing.
     this.plugin.vaultSync?.noteTextActivity();
@@ -221,6 +308,7 @@ export class Document extends SyncedDoc {
       if (
         this.destroyed ||
         !this.startupBaselineCaptured ||
+        !this.startupReconciled ||
         this.hasBoundEditor ||
         this.isOpenInEditableMarkdown()
       )
@@ -272,6 +360,15 @@ export class Document extends SyncedDoc {
     return isOpenInEditableMarkdown(this.plugin.app, this.path);
   }
 
+  protected canHibernateLocally(): boolean {
+    return (
+      !this.hasBoundEditor &&
+      !this.isOpenInEditableMarkdown() &&
+      !this.writingToDisk &&
+      this.writeTimer === null
+    );
+  }
+
   private async readFromDisk(): Promise<string | null> {
     const file = this.getFile();
     if (!file) return null;
@@ -301,7 +398,10 @@ export class Document extends SyncedDoc {
           );
           return;
         }
-        if ((await this.plugin.app.vault.read(file)) === text) return;
+        if ((await this.plugin.app.vault.read(file)) === text) {
+          this.plugin.vaultSync?.noteMaterialized(this.path, "text", this.guid);
+          return;
+        }
         // Re-check destroyed after the await: a doc replaced mid-write (rename,
         // guid change) must not clobber the file its successor now owns.
         if (this.destroyed) return;
@@ -335,7 +435,7 @@ export class Document extends SyncedDoc {
         if (this.destroyed || this.content !== text) return;
         await this.plugin.app.vault.create(path, text);
       }
-      this.plugin.vaultSync?.noteMaterialized(this.path, "text");
+      this.plugin.vaultSync?.noteMaterialized(this.path, "text", this.guid);
     } catch (e) {
       console.error(`[Realtime] writeToDisk failed for ${this.path}`, e);
       if (!this.destroyed) this.scheduleWriteToDisk(DISK_WRITE_RETRY_MS);

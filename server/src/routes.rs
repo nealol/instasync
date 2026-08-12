@@ -9,23 +9,25 @@ use utoipa::ToSchema;
 
 use crate::audit;
 use crate::caps;
+use crate::crdt::{ensure_doc, mint_client_token, Level};
 use crate::entities::{
     git_backups, invites, memberships, permissions, remote_cursor_tokens, remote_cursors, users,
     vault_files, vaults,
 };
 use crate::error::{AppError, AppResult};
+use crate::jobs::JobView;
 use crate::session::{
     bearer_token, hash_token, now_millis, revoke_session, ApiActor, ApiPrincipal, AuthUser,
 };
 use crate::state::{AppState, Principal, PrincipalActor};
 use crate::words::generate_invite_code;
-use crate::ysweet::{ensure_doc, mint_client_token, Level};
 
 const ROLE_ADMIN: &str = "admin";
 const ROLE_MEMBER: &str = "member";
 const INVITE_TTL_MS: i64 = 1000 * 60 * 60 * 24 * 7;
-/// How long a minted connection token stays attributable to its principal.
-const PRINCIPAL_TTL_MS: i64 = 1000 * 60 * 60 * 24;
+/// Opaque sync grants expire after one hour, matching the previous provider
+/// token lifetime. Clients transparently refresh after expiry or server restart.
+const SYNC_GRANT_TTL_MS: i64 = 1000 * 60 * 60;
 
 // ---------- shared response shapes ----------
 
@@ -124,6 +126,76 @@ pub(crate) async fn require_admin(
     Ok(m)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobActionBody {
+    pub intent_key: String,
+}
+
+pub async fn list_jobs(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(vault_id): Path<String>,
+) -> AppResult<Json<Vec<JobView>>> {
+    require_admin(&state, &user.id, &vault_id).await?;
+    let mut jobs = state
+        .jobs
+        .list()
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    jobs.retain(|job| {
+        job.payload.get("vault_id").and_then(Value::as_str) == Some(vault_id.as_str())
+    });
+    Ok(Json(jobs))
+}
+
+pub async fn retry_job(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(vault_id): Path<String>,
+    Json(body): Json<JobActionBody>,
+) -> AppResult<Json<Value>> {
+    require_admin(&state, &user.id, &vault_id).await?;
+    require_job_in_vault(&state, &vault_id, &body.intent_key).await?;
+    state
+        .jobs
+        .retry(&body.intent_key)
+        .await
+        .map_err(|error| AppError::Conflict(error.to_string()))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+pub async fn cancel_job(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(vault_id): Path<String>,
+    Json(body): Json<JobActionBody>,
+) -> AppResult<Json<Value>> {
+    require_admin(&state, &user.id, &vault_id).await?;
+    require_job_in_vault(&state, &vault_id, &body.intent_key).await?;
+    state
+        .jobs
+        .cancel(&body.intent_key)
+        .await
+        .map_err(|error| AppError::Conflict(error.to_string()))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn require_job_in_vault(state: &AppState, vault_id: &str, intent_key: &str) -> AppResult<()> {
+    let jobs = state
+        .jobs
+        .list()
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    jobs.iter()
+        .any(|job| {
+            job.intent_key == intent_key
+                && job.payload.get("vault_id").and_then(Value::as_str) == Some(vault_id)
+        })
+        .then_some(())
+        .ok_or(AppError::NotFound)
+}
+
 // ---------- auth / session ----------
 
 /// Public: advertise this server's stable id so clients can scope cached
@@ -141,8 +213,13 @@ pub async fn server_info(State(state): State<AppState>) -> Json<ServerInfoRespon
         // v1: all four caps are mandatory and known by the v1 client, so none
         // need to be flagged here. Future optional caps can be added to `caps`
         // without listing them here, then moved here once all deployed clients
-        // understand the name.
-        required_caps: Vec::new(),
+        // Epoch replacement requires clients to discard old Yjs struct
+        // history. A client that does not understand this cap cannot write
+        // safely after the server switches epochs.
+        required_caps: caps::REQUIRED
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
     })
 }
 
@@ -330,7 +407,7 @@ pub async fn create_vault(
     // Create the vault's index doc up front. Historically clients created it
     // lazily via /api/doc-token on first connect, which left REST/MCP-only
     // vaults without one — any cursor write touching the index (e.g.
-    // create_note) then failed with a y-sweet auth 404.
+    // create_note) then failed because the index document did not exist.
     ensure_doc(&state, &vault_id).await?;
 
     Ok(Json(VaultResponse {
@@ -1282,6 +1359,9 @@ pub struct DocTokenBody {
     /// Path claimed by a client that is creating a brand-new file document.
     /// Existing registry entries always win over this value.
     pub path: Option<String>,
+    /// Optional client-requested downgrade. A caller can request read-only
+    /// access but can never upgrade the level granted by the path ACL.
+    pub authorization: Option<String>,
 }
 
 pub async fn doc_token(
@@ -1301,7 +1381,7 @@ pub async fn doc_token(
         return Err(AppError::Forbidden);
     }
 
-    let level = authorize_doc_with_claim(
+    let authorized_level = authorize_doc_with_claim(
         &state,
         &user,
         &body.vault_id,
@@ -1309,23 +1389,35 @@ pub async fn doc_token(
         body.path.as_deref(),
     )
     .await?;
+    let level = match body.authorization.as_deref() {
+        None | Some("full") => authorized_level,
+        Some("read-only") => Level::ReadOnly,
+        Some(_) => return Err(AppError::BadRequest("invalid authorization level".into())),
+    };
 
     ensure_doc(&state, &body.doc_id).await?;
     let token = mint_client_token(&state, &body.doc_id, level).await?;
 
-    // Bind this connection token to the principal, so the proxy can attribute
-    // document writes (and thus git audit commits) to an authenticated identity.
+    // Bind this opaque token to exactly one document, authorization level, and
+    // principal before returning it to the client.
     if let Some(conn_token) = token.get("token").and_then(Value::as_str) {
+        let epoch = token
+            .get("epoch")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| AppError::Internal("document token omitted its epoch".into()))?;
         state
-            .record_principal(
+            .record_sync_grant(
                 conn_token.to_string(),
+                body.doc_id.clone(),
+                level,
+                epoch,
                 Principal {
                     user_id: user.id.clone(),
                     display_name: user.display_name.clone(),
                     email: user.email.clone(),
                     git_email: user.git_email.clone(),
                     actor: PrincipalActor::User,
-                    expires_at_ms: now_millis() + PRINCIPAL_TTL_MS,
+                    expires_at_ms: now_millis() + SYNC_GRANT_TTL_MS,
                 },
             )
             .await;

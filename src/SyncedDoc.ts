@@ -1,18 +1,23 @@
 import * as Y from "yjs";
-import { YSweetProvider, STATUS_ERROR, STATUS_OFFLINE } from "@y-sweet/client";
 import type { Awareness } from "y-protocols/awareness";
-import { IndexeddbPersistence } from "y-indexeddb";
+import { IndexeddbPersistence, storeState } from "y-indexeddb";
 import type RealtimePlugin from "./main";
-import { getClientToken } from "./ysweet";
-import { connectYSweetProvider } from "./ysweetConnect";
-import { muxProviderOptions } from "./sync/wsPolyfill";
+import { getClientToken } from "./sync/clientToken";
+import {
+  RealtimeProvider,
+  SYNC_EVENT_LOCAL_CHANGES,
+  SYNC_STATUS_ERROR,
+  SYNC_STATUS_OFFLINE,
+} from "./sync/RealtimeProvider";
+import { createMuxSocket } from "./sync/mux";
+import { epochPersistenceName } from "./documentEpoch";
 
 export abstract class SyncedDoc {
   readonly path: string;
   readonly guid: string;
   readonly serverDocId: string;
   readonly ydoc: Y.Doc;
-  readonly provider: YSweetProvider;
+  readonly provider: RealtimeProvider;
   readonly awareness: Awareness;
   isCreator: boolean;
 
@@ -24,11 +29,13 @@ export abstract class SyncedDoc {
   private resolveReady!: () => void;
   private ready = false;
   private syncedListener: (synced: boolean) => void;
+  private localChangesListener: (hasLocalChanges: boolean) => void;
   private readonly autoConnect: boolean;
   private persistenceReady = false;
   private connectRequested = false;
   /** True once the provider has reported a successful server sync at least once. */
   private syncedOnce = false;
+  private nextServerSyncWaiters = new Set<() => void>();
 
   protected constructor(
     plugin: RealtimePlugin,
@@ -50,22 +57,30 @@ export abstract class SyncedDoc {
       this.resolveReady = resolve;
     });
 
-    this.provider = new YSweetProvider(
-      () => getClientToken(plugin, serverDocId, path),
+    this.provider = new RealtimeProvider(
       serverDocId,
       this.ydoc,
-      { connect: false, showDebuggerLink: false, ...muxProviderOptions() },
+      () => getClientToken(plugin, serverDocId, path),
+      { connect: false, socketFactory: createMuxSocket },
     );
     this.awareness = this.provider.awareness;
-    this.persistence = new IndexeddbPersistence(serverDocId, this.ydoc);
+    this.persistence = new IndexeddbPersistence(
+      epochPersistenceName(plugin, serverDocId, serverDocId),
+      this.ydoc,
+    );
 
     this.syncedListener = (synced) => {
       if (synced) {
         this.syncedOnce = true;
+        this.resolveNextServerSyncWaiters();
         void this.finishStartupReconcile();
       }
     };
     this.provider.on("synced", this.syncedListener);
+    this.localChangesListener = (hasLocalChanges) => {
+      if (!hasLocalChanges && !this.destroyed) void this.afterChangesSynced();
+    };
+    this.provider.on(SYNC_EVENT_LOCAL_CHANGES, this.localChangesListener);
 
     void this.init();
   }
@@ -90,7 +105,7 @@ export abstract class SyncedDoc {
    */
   get isProviderOnline(): boolean {
     const status = this.provider.status;
-    return status !== STATUS_OFFLINE && status !== STATUS_ERROR;
+    return status !== SYNC_STATUS_OFFLINE && status !== SYNC_STATUS_ERROR;
   }
 
   isDestroyed(): boolean {
@@ -106,13 +121,54 @@ export abstract class SyncedDoc {
 
   private connectProvider(): void {
     const status = this.provider.status;
-    if (status === STATUS_OFFLINE || status === STATUS_ERROR) {
-      void connectYSweetProvider(this.provider);
+    if (status === SYNC_STATUS_OFFLINE || status === SYNC_STATUS_ERROR) {
+      void this.provider.connect();
     }
   }
 
   connect(): void {
     this.ensureConnected();
+  }
+
+  disconnect(): void {
+    if (this.destroyed) return;
+    this.provider.disconnect();
+  }
+
+  /**
+   * Flush pending IndexedDB writes before releasing this document's in-memory
+   * state. A document with unacknowledged server changes is never eligible.
+   */
+  async prepareForHibernation(): Promise<boolean> {
+    if (
+      this.destroyed ||
+      !this.ready ||
+      this.provider.hasLocalChanges ||
+      !this.canHibernateLocally()
+    ) {
+      return false;
+    }
+    await storeState(this.persistence, false);
+    return (
+      !this.destroyed && this.ready && !this.provider.hasLocalChanges && this.canHibernateLocally()
+    );
+  }
+
+  protected canHibernateLocally(): boolean {
+    return true;
+  }
+
+  /** Resolve after the next successful server handshake. */
+  whenNextServerSync(): Promise<void> {
+    if (this.destroyed) return Promise.resolve();
+    const { promise, resolve } = Promise.withResolvers<void>();
+    this.nextServerSyncWaiters.add(resolve);
+    return promise;
+  }
+
+  private resolveNextServerSyncWaiters(): void {
+    for (const resolve of this.nextServerSyncWaiters) resolve();
+    this.nextServerSyncWaiters.clear();
   }
 
   protected resolveWhenReady(): void {
@@ -138,6 +194,7 @@ export abstract class SyncedDoc {
 
   protected abstract afterPersistenceSynced(): Promise<void> | void;
   protected abstract finishStartupReconcile(): Promise<void>;
+  protected afterChangesSynced(): Promise<void> | void {}
   protected abstract destroySubclass(): void;
 
   destroy(): void {
@@ -145,9 +202,11 @@ export abstract class SyncedDoc {
     this.destroyed = true;
     this.destroySubclass();
     this.provider.off("synced", this.syncedListener);
+    this.provider.off(SYNC_EVENT_LOCAL_CHANGES, this.localChangesListener);
     this.provider.destroy();
     void this.persistence.destroy();
     this.ydoc.destroy();
+    this.resolveNextServerSyncWaiters();
     this.resolveWhenReady();
   }
 }

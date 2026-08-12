@@ -5,7 +5,7 @@
 //!
 //!  - mirrors that log into an on-disk rusqlite replica (so the server can serve
 //!    bootstraps and produce deterministic git dumps), driven by the same
-//!    debounce pattern as [`crate::git::GitService`];
+//!    persistent job queue used by [`crate::git::GitService`];
 //!  - serves the bootstrap endpoint directly from the Y.Doc batch log, so new
 //!    clients can pull a full changeset even when the loadable extension is
 //!    unavailable;
@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
@@ -28,14 +28,13 @@ use rusqlite::Connection;
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use tokio::sync::Mutex;
-use y_sweet_core::auth::Authenticator;
 use yrs::types::ToJson;
-use yrs::updates::decoder::Decode;
 use yrs::{Any, Array, Doc, Map, ReadTxn, Transact, Update};
 
 use crate::config::Config;
+use crate::crdt::DocumentStore;
 use crate::entities::plugin_db_replicas;
+use crate::jobs::JobQueue;
 use crate::session::now_millis;
 use crate::ydoc::any_to_json;
 
@@ -168,10 +167,12 @@ pub struct ExecuteSqlResult {
     pub db_version: i64,
 }
 
-/// A server-authored batch that committed to the replica but has not yet been
-/// published to the Y.Doc log (see `Inner::pending_publishes`).
+/// A server-authored batch committed atomically with its replica mutation but
+/// not yet acknowledged as published to the Y.Doc log.
 #[derive(Clone, Debug)]
 struct PendingPublish {
+    sequence: i64,
+    batch_id: String,
     rows: Vec<ChangeRow>,
     site_hex: String,
     site_b64: String,
@@ -183,29 +184,15 @@ type Cursor = HashMap<String, i64>;
 
 // ---------- service ----------
 
-struct DbState {
-    dirty: bool,
-    deadline: Instant,
-    running: bool,
-}
-
 struct Inner {
     config: Arc<Config>,
-    http: reqwest::Client,
     db: DatabaseConnection,
-    authenticator: Arc<Authenticator>,
-    dbs: Mutex<HashMap<String, DbState>>,
+    documents: DocumentStore,
+    jobs: JobQueue,
     /// Per-DB async write locks serializing server-authored write sequences
     /// (execute_sql, rollback_to_dump): fetch->refresh->write->publish->cursor.
     /// Replication (`replicate_once`) and read-only queries do NOT take these.
     write_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Server-authored batches that committed to the replica but failed to
-    /// publish to the Y.Doc (doc write error). Keyed like `write_locks`.
-    /// Retried by `flush_pending_publishes` (called from `replicate_once` and
-    /// before the next `execute_sql`/`rollback_to_dump` publish) so clients
-    /// eventually converge. In-memory only: a restart drops the queue, but the
-    /// replica and git dump retain the data.
-    pending_publishes: tokio::sync::Mutex<HashMap<String, Vec<PendingPublish>>>,
     /// One-time probe result: the configured extension actually loads.
     ext_ok: std::sync::OnceLock<bool>,
 }
@@ -216,18 +203,16 @@ pub struct PluginDbService(Arc<Inner>);
 impl PluginDbService {
     pub fn new(
         config: Arc<Config>,
-        http: reqwest::Client,
         db: DatabaseConnection,
-        authenticator: Arc<Authenticator>,
+        documents: DocumentStore,
+        jobs: JobQueue,
     ) -> Self {
         PluginDbService(Arc::new(Inner {
             config,
-            http,
             db,
-            authenticator,
-            dbs: Mutex::new(HashMap::new()),
+            documents,
+            jobs,
             write_locks: tokio::sync::Mutex::new(HashMap::new()),
-            pending_publishes: tokio::sync::Mutex::new(HashMap::new()),
             ext_ok: std::sync::OnceLock::new(),
         }))
     }
@@ -239,7 +224,7 @@ impl PluginDbService {
     /// Whether the cr-sqlite loadable extension is configured *and actually
     /// loads* (probed once, with a clear log line either way, so a wrong-arch
     /// or corrupt binary is obvious at startup instead of failing opaquely
-    /// inside the git debounce).
+    /// inside a background reconciliation).
     fn ext_available(&self) -> bool {
         *self.0.ext_ok.get_or_init(|| {
             let Some(path) = self.0.config.crsqlite_ext_path.as_ref() else {
@@ -296,144 +281,89 @@ impl PluginDbService {
             .clone()
     }
 
-    /// Retry any queued server-authored batches whose Y.Doc publish previously
-    /// failed. MUST be called with the per-DB write lock held. Batches are
-    /// retried in commit order; on the first failure the remainder are
-    /// re-queued and the error is returned (a later replication pass retries).
+    /// Drain the replica-local publication outbox in commit order. MUST be
+    /// called with the per-DB write lock held. A row is deleted only after its
+    /// stable batch id is present in the Y.Doc and the server cursor is stored.
     async fn flush_pending_locked(&self, vault: &str, plugin: &str, name: &str) -> Result<()> {
-        let key = Self::key(vault, plugin, name);
-        let pending = {
-            let mut map = self.0.pending_publishes.lock().await;
-            match map.remove(&key) {
-                Some(p) if !p.is_empty() => p,
-                _ => return Ok(()),
-            }
-        };
-        for (i, p) in pending.iter().enumerate() {
-            if let Err(e) = self
-                .publish_own_batch(
-                    vault,
-                    plugin,
-                    name,
-                    p.rows.clone(),
-                    p.site_hex.clone(),
-                    p.site_b64.clone(),
-                    p.post,
-                )
-                .await
-            {
-                let mut map = self.0.pending_publishes.lock().await;
-                let slot = map.entry(key).or_default();
-                let mut rest: Vec<PendingPublish> = pending[i..].to_vec();
-                rest.append(slot);
-                *slot = rest;
-                return Err(e);
-            }
+        let path = replica_path(&self.0.config, vault, plugin, name);
+        if !path.exists() {
+            return Ok(());
+        }
+        let config = self.0.config.clone();
+        let pending = tokio::task::spawn_blocking(move || load_pending_publishes(&config, &path))
+            .await
+            .context("load pending publishes task panicked")??;
+        for publish in pending {
+            self.publish_pending_locked(vault, plugin, name, &publish)
+                .await?;
         }
         Ok(())
     }
 
-    /// Take the per-DB write lock and flush pending publishes (used by the
-    /// replication debounce, which does not otherwise hold the lock).
+    async fn publish_pending_locked(
+        &self,
+        vault: &str,
+        plugin: &str,
+        name: &str,
+        publish: &PendingPublish,
+    ) -> Result<()> {
+        self.publish_own_batch(vault, plugin, name, publish).await?;
+        let config = self.0.config.clone();
+        let path = replica_path(&config, vault, plugin, name);
+        let sequence = publish.sequence;
+        let batch_id = publish.batch_id.clone();
+        tokio::task::spawn_blocking(move || {
+            delete_pending_publish(&config, &path, sequence, &batch_id)
+        })
+        .await
+        .context("delete pending publish task panicked")??;
+        Ok(())
+    }
+
+    /// Take the per-DB write lock and flush pending publishes (used by
+    /// background replication, which does not otherwise hold the lock).
     async fn flush_pending(&self, vault: &str, plugin: &str, name: &str) -> Result<()> {
-        {
-            let map = self.0.pending_publishes.lock().await;
-            match map.get(&Self::key(vault, plugin, name)) {
-                Some(p) if !p.is_empty() => {}
-                _ => return Ok(()),
-            }
-        }
         let lock = self.write_lock(vault, plugin, name).await;
         let _guard = lock.lock().await;
         self.flush_pending_locked(vault, plugin, name).await
     }
 
-    /// Record that a plugin database changed and (re)arm the replication debounce.
+    /// Persist a plugin-database reconciliation request.
     pub async fn mark_write(&self, vault: &str, plugin: &str, name: &str) {
-        let key = Self::key(vault, plugin, name);
-        let mut dbs = self.0.dbs.lock().await;
-        let entry = dbs.entry(key.clone()).or_insert_with(|| DbState {
-            dirty: false,
-            deadline: Instant::now(),
-            running: false,
-        });
-        entry.dirty = true;
-        entry.deadline = Instant::now() + self.debounce();
-        if !entry.running {
-            entry.running = true;
-            let svc = self.clone();
-            let vault = vault.to_string();
-            let plugin = plugin.to_string();
-            let name = name.to_string();
-            tokio::spawn(async move { svc.run_db(vault, plugin, name).await });
-        }
-    }
-
-    async fn run_db(self, vault: String, plugin: String, name: String) {
-        let key = Self::key(&vault, &plugin, &name);
-        loop {
-            loop {
-                let remaining = {
-                    let dbs = self.0.dbs.lock().await;
-                    match dbs.get(&key) {
-                        Some(s) => s.deadline.checked_duration_since(Instant::now()),
-                        None => return,
-                    }
-                };
-                match remaining {
-                    Some(d) => tokio::time::sleep(d).await,
-                    None => break,
-                }
-            }
-            {
-                let mut dbs = self.0.dbs.lock().await;
-                let Some(s) = dbs.get_mut(&key) else { return };
-                if !s.dirty {
-                    s.running = false;
-                    return;
-                }
-                s.dirty = false;
-            }
-            if let Err(e) = self.replicate_once(&vault, &plugin, &name).await {
-                tracing::warn!("plugin-db replicate {plugin}/{name} (vault {vault}) failed: {e:#}");
-            }
-            {
-                let mut dbs = self.0.dbs.lock().await;
-                let Some(s) = dbs.get_mut(&key) else { return };
-                if !s.dirty {
-                    s.running = false;
-                    return;
-                }
-            }
+        if let Err(error) = self
+            .0
+            .jobs
+            .enqueue_plugin_db(vault, plugin, name, self.debounce())
+            .await
+        {
+            tracing::error!(
+                "queue plugin-db reconciliation {plugin}/{name} (vault {vault}) failed: {error:#}"
+            );
         }
     }
 
     async fn fetch_doc(&self, doc_id: &str) -> Result<DocView> {
-        let update = crate::ydoc::read_update_with(
-            &self.0.config,
-            &self.0.http,
-            &self.0.authenticator,
-            doc_id,
-        )
-        .await
-        .map_err(|e| anyhow!(e.to_string()))?;
+        let update = crate::ydoc::read_update_with(&self.0.documents, doc_id)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))?;
         decode_doc(&update)
     }
 
     /// Apply the doc's batches into the replica, then maybe compact the log.
-    async fn replicate_once(&self, vault: &str, plugin: &str, name: &str) -> Result<()> {
+    pub(crate) async fn replicate_once(&self, vault: &str, plugin: &str, name: &str) -> Result<()> {
         // Retry any server-authored batches whose publish previously failed,
-        // so the doc we replicate from is as complete as we can make it.
-        if let Err(e) = self.flush_pending(vault, plugin, name).await {
-            tracing::warn!(
-                "plugin-db pending publish retry for {plugin}/{name} (vault {vault}) failed: {e:#}"
-            );
-        }
+        // so the doc we replicate from is as complete as we can make it. Keep
+        // the error while applying safe inbound work, then return it so Apalis
+        // retries this reconciliation instead of acknowledging it.
+        let flush_error = self.flush_pending(vault, plugin, name).await.err();
         let view = self.fetch_doc(&Self::doc_id(vault, plugin, name)).await?;
 
         // Soft-deleted databases keep their replica; just stop replicating.
         if view.deleted_at.is_some() {
-            return Ok(());
+            return match flush_error {
+                Some(error) => Err(error.context("flush pending plugin-database publishes")),
+                None => Ok(()),
+            };
         }
 
         if self.ext_available() {
@@ -453,7 +383,30 @@ impl PluginDbService {
             self.store_cursor(vault, plugin, name, &new_cursor).await?;
         }
 
+        if let Some(error) = flush_error {
+            // Do not compact after a failed acknowledgment. The durable
+            // outbox row may refer to a batch that was appended successfully
+            // but not yet deleted; retaining it lets the retry deduplicate by
+            // the stable batch id.
+            return Err(error.context("flush pending plugin-database publishes"));
+        }
         self.maybe_compact(vault, plugin, name, &view).await?;
+        Ok(())
+    }
+
+    /// Bring every live replica in a vault current before Git snapshots its
+    /// SQL dumps. This makes the plugin-database → Git dependency explicit
+    /// instead of relying on two independently scheduled jobs to run in order.
+    pub(crate) async fn reconcile_vault(&self, vault: &str) -> Result<()> {
+        let replicas = plugin_db_replicas::Entity::find()
+            .filter(plugin_db_replicas::Column::VaultId.eq(vault))
+            .filter(plugin_db_replicas::Column::Deleted.eq(false))
+            .all(&self.0.db)
+            .await?;
+        for replica in replicas {
+            self.replicate_once(vault, &replica.plugin_id, &replica.name)
+                .await?;
+        }
         Ok(())
     }
 
@@ -534,12 +487,6 @@ impl PluginDbService {
 
     /// Purge: delete the replica file, mark the DB tombstoned, and trim the Y.Doc.
     pub async fn purge(&self, vault: &str, plugin: &str, name: &str) -> Result<()> {
-        // Drop any queued-but-unpublished server batches; the DB is going away.
-        self.0
-            .pending_publishes
-            .lock()
-            .await
-            .remove(&Self::key(vault, plugin, name));
         // Mark deleted in the server DB so git stops dumping it.
         self.mark_deleted_row(vault, plugin, name).await?;
 
@@ -551,45 +498,16 @@ impl PluginDbService {
 
         // Trim the Y.Doc: clear batches and set the tombstone.
         let doc_id = Self::doc_id(vault, plugin, name);
-        if let Ok(update) = crate::ydoc::read_update_with(
-            &self.0.config,
-            &self.0.http,
-            &self.0.authenticator,
-            &doc_id,
-        )
-        .await
-        {
+        if let Ok((epoch, update)) = self.0.documents.read_update_with_epoch(&doc_id).await {
             if let Ok(trim) = build_purge_update(&update) {
                 if !trim.is_empty() {
-                    let _ = self.write_doc(&doc_id, trim).await;
+                    let _ = self
+                        .0
+                        .documents
+                        .apply_update_at_epoch(&doc_id, epoch, &trim)
+                        .await;
                 }
             }
-        }
-        Ok(())
-    }
-
-    async fn write_doc(&self, doc_id: &str, update: Vec<u8>) -> Result<()> {
-        let _load_guard = crate::ysweet::lock_doc_load(doc_id).await;
-        let (base_url, token) = crate::ysweet::mint_internal_token_with(
-            &self.0.config,
-            &self.0.http,
-            &self.0.authenticator,
-            doc_id,
-            crate::ysweet::Level::Full,
-        )
-        .await
-        .map_err(|e| anyhow!(e.to_string()))?;
-        let url = format!("{}/update", base_url.trim_end_matches('/'));
-        let res = self
-            .0
-            .http
-            .post(&url)
-            .bearer_auth(token)
-            .body(update)
-            .send()
-            .await?;
-        if !res.status().is_success() {
-            return Err(anyhow!("update {doc_id} returned {}", res.status()));
         }
         Ok(())
     }
@@ -658,17 +576,19 @@ impl PluginDbService {
         }
 
         let doc_id = Self::doc_id(vault, plugin, name);
-        let update = crate::ydoc::read_update_with(
-            &self.0.config,
-            &self.0.http,
-            &self.0.authenticator,
-            &doc_id,
-        )
-        .await
-        .map_err(|e| anyhow!(e.to_string()))?;
+        let (epoch, update) = self
+            .0
+            .documents
+            .read_update_with_epoch(&doc_id)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))?;
         if let Ok(trim) = build_compaction_update(&update, drop_count) {
             if !trim.is_empty() {
-                let _ = self.write_doc(&doc_id, trim).await;
+                let _ = self
+                    .0
+                    .documents
+                    .apply_update_at_epoch(&doc_id, epoch, &trim)
+                    .await;
             }
         }
         Ok(())
@@ -821,41 +741,17 @@ impl PluginDbService {
             name.to_string(),
             target_sql.to_string(),
         );
-        let (rows, site_hex, site_b64, post) = tokio::task::spawn_blocking(move || {
+        let publish = tokio::task::spawn_blocking(move || {
             apply_dump_rollback(&config, &vault_s, &plugin_s, &name_s, &sql)
         })
         .await
         .context("rollback task panicked")??;
 
-        if rows.is_empty() {
+        let Some(publish) = publish else {
             return Ok(());
-        }
-
-        if let Err(e) = self
-            .publish_own_batch(
-                vault,
-                plugin,
-                name,
-                rows.clone(),
-                site_hex.clone(),
-                site_b64.clone(),
-                post,
-            )
+        };
+        self.publish_pending_locked(vault, plugin, name, &publish)
             .await
-        {
-            // The replica already holds the rollback; queue the batch so the
-            // replication debounce retries the publish (see execute_sql).
-            let key = Self::key(vault, plugin, name);
-            let mut map = self.0.pending_publishes.lock().await;
-            map.entry(key).or_default().push(PendingPublish {
-                rows,
-                site_hex,
-                site_b64,
-                post,
-            });
-            return Err(e);
-        }
-        Ok(())
     }
     /// Append a server-authored batch (already-computed own-site cr-sqlite
     /// changes) to the database's Y.Doc log and advance the stored server
@@ -869,10 +765,7 @@ impl PluginDbService {
         vault: &str,
         plugin: &str,
         name: &str,
-        rows: Vec<ChangeRow>,
-        site_hex: String,
-        site_b64: String,
-        post: i64,
+        publish: &PendingPublish,
     ) -> Result<()> {
         let doc_id = Self::doc_id(vault, plugin, name);
         let view = self.fetch_doc(&doc_id).await.unwrap_or_default();
@@ -889,34 +782,48 @@ impl PluginDbService {
             .map(|b| b.format.clone())
             .filter(|f| !f.is_empty())
             .unwrap_or_else(|| crate::caps::PLUGIN_DB_SYNC.to_string());
-        let from = rows.iter().map(|r| r.db_version).min().unwrap_or(post) - 1;
+        let from = publish
+            .rows
+            .iter()
+            .map(|row| row.db_version)
+            .min()
+            .unwrap_or(publish.post)
+            - 1;
         let batch = serde_json::json!({
-            "id": uuid::Uuid::new_v4().to_string(),
-            "siteId": site_b64,
+            "id": publish.batch_id,
+            "siteId": publish.site_b64,
             "fromDbVersion": from,
-            "toDbVersion": post,
+            "toDbVersion": publish.post,
             "schemaVersion": schema_version,
-            "changes": serde_json::to_value(&rows)?,
+            "changes": serde_json::to_value(&publish.rows)?,
             "format": format,
         });
-        let current = crate::ydoc::read_update_with(
-            &self.0.config,
-            &self.0.http,
-            &self.0.authenticator,
-            &doc_id,
-        )
-        .await
-        .map_err(|e| anyhow!(e.to_string()))?;
-        let update = build_append_batch_update(&current, &batch)?;
-        if !update.is_empty() {
-            self.write_doc(&doc_id, update).await?;
+        if !view
+            .batches
+            .iter()
+            .any(|batch| batch.id == publish.batch_id)
+        {
+            let (epoch, current) = self
+                .0
+                .documents
+                .read_update_with_epoch(&doc_id)
+                .await
+                .map_err(|e| anyhow!(e.to_string()))?;
+            let update = build_append_batch_update(&current, &batch)?;
+            if !update.is_empty() {
+                self.0
+                    .documents
+                    .apply_update_at_epoch(&doc_id, epoch, &update)
+                    .await
+                    .map_err(|error| anyhow!(error.to_string()))?;
+            }
         }
 
         // Advance the stored server cursor past its own site so replication
         // doesn't re-apply the batch we just produced from the replica.
         let mut cursor = self.load_cursor(vault, plugin, name).await?;
-        let entry = cursor.entry(site_hex).or_insert(0);
-        *entry = (*entry).max(post);
+        let entry = cursor.entry(publish.site_hex.clone()).or_insert(0);
+        *entry = (*entry).max(publish.post);
         self.store_cursor(vault, plugin, name, &cursor).await?;
         Ok(())
     }
@@ -1201,48 +1108,29 @@ impl PluginDbService {
         .await
         .map_err(|e| AppError::Internal(format!("execute task panicked: {e}")))?
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
-        let (rows_affected, rows, site_hex, site_b64, post) = exec_res;
+        let (rows_affected, post, publish) = exec_res;
 
-        if rows.is_empty() {
+        let Some(publish) = publish else {
             // All statements were no-ops (no cr-sqlite change rows). The
             // replica is already current; nothing to publish.
             return std::result::Result::Ok(ExecuteSqlResult {
                 rows_affected,
                 db_version: post,
             });
-        }
+        };
 
         // Publish the batch to the Y.Doc log and advance the server cursor.
-        // The replica commit is durable at this point; a publish failure only
-        // delays client visibility. On failure the batch is queued in
-        // `pending_publishes` and retried by the replication debounce (armed
-        // via `mark_write` by the caller) and by the next server-authored
-        // write — so the call still succeeds, and clients converge once a
-        // retry lands.
+        // The replica mutation and outbox row committed in one transaction.
+        // A publication failure therefore only delays client visibility; the
+        // persistent plugin-DB job drains the same row after a restart.
         if let Err(e) = self
-            .publish_own_batch(
-                vault,
-                plugin,
-                name,
-                rows.clone(),
-                site_hex.clone(),
-                site_b64.clone(),
-                post,
-            )
+            .publish_pending_locked(vault, plugin, name, &publish)
             .await
         {
             tracing::error!(
                 "execute_sql publish failed for {plugin}/{name} (vault {vault}) \
                  after replica commit: {e:#}; queued for retry"
             );
-            let key = Self::key(vault, plugin, name);
-            let mut map = self.0.pending_publishes.lock().await;
-            map.entry(key).or_default().push(PendingPublish {
-                rows,
-                site_hex,
-                site_b64,
-                post,
-            });
         }
         std::result::Result::Ok(ExecuteSqlResult {
             rows_affected,
@@ -1271,7 +1159,8 @@ pub fn parse_doc_id(doc_id: &str) -> Option<(String, String, String)> {
 
 fn doc_from_update(update: &[u8]) -> Result<Doc> {
     let doc = Doc::new();
-    let upd = Update::decode_v1(update).map_err(|e| anyhow!("decode update: {e:?}"))?;
+    let upd = crate::safe_yrs::decode_v1::<Update>(update)
+        .map_err(|e| anyhow!("decode update: {e:?}"))?;
     doc.transact_mut().apply_update(upd);
     Ok(doc)
 }
@@ -1458,6 +1347,7 @@ fn schema_matches(
         let mut stmt = conn.prepare(
             "SELECT sql FROM sqlite_master WHERE type='table' \
              AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'crsql_%' \
+             AND name NOT LIKE 'realtime_internal_%' \
              AND name NOT LIKE '%__crsql_clock' AND name NOT LIKE '%__crsql_pks' \
              ORDER BY name",
         )?;
@@ -1471,16 +1361,132 @@ fn schema_matches(
     Ok(replica_creates == dump_create_statements(dump))
 }
 
-/// Diff the replica's CRR tables against a materialized dump and apply the
-/// difference in one transaction, returning the resulting own-site changes
-/// `(rows, site_hex, site_b64, post_db_version)`.
+fn ensure_publish_outbox(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS realtime_internal_publish_outbox (\
+             sequence INTEGER PRIMARY KEY AUTOINCREMENT,\
+             batch_id TEXT NOT NULL UNIQUE,\
+             rows_json TEXT NOT NULL,\
+             site_hex TEXT NOT NULL,\
+             site_b64 TEXT NOT NULL,\
+             post_db_version INTEGER NOT NULL\
+         )",
+    )?;
+    Ok(())
+}
+
+fn collect_own_changes(conn: &Connection, pre: i64) -> Result<Vec<ChangeRow>> {
+    let mut rows = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq \
+         FROM crsql_changes \
+         WHERE db_version > ?1 AND site_id = crsql_site_id() \
+         ORDER BY db_version, seq",
+    )?;
+    let mapped = stmt.query_map([pre], |row| {
+        let pk: Vec<u8> = row.get(1)?;
+        let val: SqlValue = row.get(3)?;
+        let site: Vec<u8> = row.get(6)?;
+        Ok(ChangeRow {
+            table: row.get(0)?,
+            pk: bytes_to_b64(&pk),
+            cid: row.get(2)?,
+            val: sql_to_json(&val),
+            col_version: row.get(4)?,
+            db_version: row.get(5)?,
+            site_id: bytes_to_b64(&site),
+            cl: row.get(7)?,
+            seq: row.get(8)?,
+        })
+    })?;
+    for row in mapped {
+        rows.push(row?);
+    }
+    Ok(rows)
+}
+
+fn insert_pending_publish(
+    tx: &rusqlite::Transaction<'_>,
+    rows: Vec<ChangeRow>,
+    site_hex: String,
+    site_b64: String,
+    post: i64,
+) -> Result<PendingPublish> {
+    let batch_id = uuid::Uuid::new_v4().to_string();
+    let rows_json = serde_json::to_string(&rows)?;
+    tx.execute(
+        "INSERT INTO realtime_internal_publish_outbox \
+         (batch_id,rows_json,site_hex,site_b64,post_db_version) VALUES (?1,?2,?3,?4,?5)",
+        rusqlite::params![batch_id, rows_json, site_hex, site_b64, post],
+    )?;
+    Ok(PendingPublish {
+        sequence: tx.last_insert_rowid(),
+        batch_id,
+        rows,
+        site_hex,
+        site_b64,
+        post,
+    })
+}
+
+fn load_pending_publishes(config: &Config, path: &Path) -> Result<Vec<PendingPublish>> {
+    let (conn, _is_new) = open_replica(config, path)?;
+    ensure_publish_outbox(&conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT sequence,batch_id,rows_json,site_hex,site_b64,post_db_version \
+         FROM realtime_internal_publish_outbox ORDER BY sequence",
+    )?;
+    let mapped = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
+        ))
+    })?;
+    let mut pending = Vec::new();
+    for row in mapped {
+        let (sequence, batch_id, rows_json, site_hex, site_b64, post) = row?;
+        pending.push(PendingPublish {
+            sequence,
+            batch_id,
+            rows: serde_json::from_str(&rows_json).context("decode replica publish outbox rows")?,
+            site_hex,
+            site_b64,
+            post,
+        });
+    }
+    let _ = conn.query_row("SELECT crsql_finalize()", [], |_| Ok(()));
+    Ok(pending)
+}
+
+fn delete_pending_publish(
+    config: &Config,
+    path: &Path,
+    sequence: i64,
+    batch_id: &str,
+) -> Result<()> {
+    let (conn, _is_new) = open_replica(config, path)?;
+    ensure_publish_outbox(&conn)?;
+    conn.execute(
+        "DELETE FROM realtime_internal_publish_outbox WHERE sequence=?1 AND batch_id=?2",
+        rusqlite::params![sequence, batch_id],
+    )?;
+    let _ = conn.query_row("SELECT crsql_finalize()", [], |_| Ok(()));
+    Ok(())
+}
+
+/// Diff the replica's CRR tables against a materialized dump and atomically
+/// store the resulting publication batch with the mutation.
 fn apply_dump_rollback(
     config: &Config,
     vault: &str,
     plugin: &str,
     name: &str,
     dump: &str,
-) -> Result<(Vec<ChangeRow>, String, String, i64)> {
+) -> Result<Option<PendingPublish>> {
     if !schema_matches(config, vault, plugin, name, dump)? {
         return Err(anyhow!("dump schema differs from the replica"));
     }
@@ -1489,6 +1495,7 @@ fn apply_dump_rollback(
         return Err(anyhow!("no server replica for this database"));
     }
     let (mut conn, _is_new) = open_replica(config, &path)?;
+    ensure_publish_outbox(&conn)?;
 
     // Materialize the dump into a plain temporary database.
     let temp = Connection::open_in_memory()?;
@@ -1504,44 +1511,18 @@ fn apply_dump_rollback(
     for table in &crr {
         diff_apply_table(&tx, &temp, table)?;
     }
+    let post: i64 = tx.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
+    let rows = collect_own_changes(&tx, pre)?;
+    let publish = if rows.is_empty() {
+        None
+    } else {
+        Some(insert_pending_publish(&tx, rows, site_hex, site_b64, post)?)
+    };
     tx.commit()?;
-
-    let post: i64 = conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
-
-    // Collect the changes this rollback produced (our own site, past `pre`).
-    let mut rows = Vec::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq \
-             FROM crsql_changes \
-             WHERE db_version > ?1 AND site_id = crsql_site_id() \
-             ORDER BY db_version, seq",
-        )?;
-        let mapped = stmt.query_map([pre], |row| {
-            let pk: Vec<u8> = row.get(1)?;
-            let val: SqlValue = row.get(3)?;
-            let site: Vec<u8> = row.get(6)?;
-            Ok(ChangeRow {
-                table: row.get(0)?,
-                pk: bytes_to_b64(&pk),
-                cid: row.get(2)?,
-                val: sql_to_json(&val),
-                col_version: row.get(4)?,
-                db_version: row.get(5)?,
-                site_id: bytes_to_b64(&site),
-                cl: row.get(7)?,
-                seq: row.get(8)?,
-            })
-        })?;
-        for r in mapped {
-            rows.push(r?);
-        }
-    }
     let _ = conn.query_row("SELECT crsql_finalize()", [], |_| Ok(()));
-    Ok((rows, site_hex, site_b64, post))
+    Ok(publish)
 }
-/// Execute a batch of write statements against the replica in one transaction,
-/// returning `(rows_affected, own_site_change_rows, site_hex, site_b64, post_db_version)`.
+/// Execute a write batch and atomically persist its publication intent.
 ///
 /// The extension is loaded via `open_replica`. `rusqlite`'s `execute` rejects
 /// statements that return rows (e.g. `INSERT … RETURNING`) and any SQL with
@@ -1554,12 +1535,13 @@ fn execute_against_replica(
     plugin: &str,
     name: &str,
     statements: &[(String, Vec<JsonValue>)],
-) -> Result<(u64, Vec<ChangeRow>, String, String, i64)> {
+) -> Result<(u64, i64, Option<PendingPublish>)> {
     let path = replica_path(config, vault, plugin, name);
     if !path.exists() {
         return Err(anyhow!("no server replica for this database"));
     }
     let (mut conn, _is_new) = open_replica(config, &path)?;
+    ensure_publish_outbox(&conn)?;
     let pre: i64 = conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
     let site_bytes: Vec<u8> = conn.query_row("SELECT crsql_site_id()", [], |row| row.get(0))?;
     let site_hex = bytes_to_hex(&site_bytes);
@@ -1574,41 +1556,16 @@ fn execute_against_replica(
             rows_affected += tx.execute(sql, rusqlite::params_from_iter(param_refs))? as u64;
         }
     }
+    let post: i64 = tx.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
+    let rows = collect_own_changes(&tx, pre)?;
+    let publish = if rows.is_empty() {
+        None
+    } else {
+        Some(insert_pending_publish(&tx, rows, site_hex, site_b64, post)?)
+    };
     tx.commit()?;
-
-    let post: i64 = conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
-
-    // Collect this site's own changes past `pre` (same readback as rollback).
-    let mut rows = Vec::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq \
-             FROM crsql_changes \
-             WHERE db_version > ?1 AND site_id = crsql_site_id() \
-             ORDER BY db_version, seq",
-        )?;
-        let mapped = stmt.query_map([pre], |row| {
-            let pk: Vec<u8> = row.get(1)?;
-            let val: SqlValue = row.get(3)?;
-            let site: Vec<u8> = row.get(6)?;
-            Ok(ChangeRow {
-                table: row.get(0)?,
-                pk: bytes_to_b64(&pk),
-                cid: row.get(2)?,
-                val: sql_to_json(&val),
-                col_version: row.get(4)?,
-                db_version: row.get(5)?,
-                site_id: bytes_to_b64(&site),
-                cl: row.get(7)?,
-                seq: row.get(8)?,
-            })
-        })?;
-        for r in mapped {
-            rows.push(r?);
-        }
-    }
     let _ = conn.query_row("SELECT crsql_finalize()", [], |_| Ok(()));
-    Ok((rows_affected, rows, site_hex, site_b64, post))
+    Ok((rows_affected, post, publish))
 }
 
 /// Table column metadata: `(all_columns, pk_columns)` in declared order.
@@ -2220,6 +2177,7 @@ fn dump_replica(config: &Config, vault: &str, plugin: &str, name: &str) -> Resul
         let mut stmt = conn.prepare(
             "SELECT name, sql FROM sqlite_master WHERE type='table' \
              AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'crsql_%' \
+             AND name NOT LIKE 'realtime_internal_%' \
              AND name NOT LIKE '%__crsql_clock' AND name NOT LIKE '%__crsql_pks' \
              ORDER BY name",
         )?;
@@ -2411,9 +2369,8 @@ fn json_to_sql(v: &JsonValue) -> SqlValue {
 /// (`src/pluginDb/SyncedPluginDatabase.ts`). Token-aware: single-quoted string
 /// literals and comments are ignored (so `WHERE t = 'my_sqlite_note'` is
 /// fine), while bare identifiers and quoted identifiers (`"…"`, `` `…` ``,
-/// `[…]`) starting with `crsql_` or `sqlite_` are rejected — those tables and
-/// functions are owned by the engine or the replication layer, and writes into
-/// them would corrupt sync.
+/// `[…]`) starting with `crsql_`, `sqlite_`, or `realtime_internal_` are
+/// rejected because those names belong to the database engine or server.
 fn lint_sql(sql: &str) -> std::result::Result<(), String> {
     for ident in sql_identifiers(sql) {
         let lower = ident.to_ascii_lowercase();
@@ -2425,6 +2382,11 @@ fn lint_sql(sql: &str) -> std::result::Result<(), String> {
         if lower.starts_with("sqlite_") {
             return Err(format!(
                 "SQL references SQLite internals ({ident}); those are not accessible from here"
+            ));
+        }
+        if lower.starts_with("realtime_internal_") {
+            return Err(format!(
+                "SQL references Realtime internals ({ident}); those are not accessible from here"
             ));
         }
     }
@@ -2546,11 +2508,11 @@ pub mod routes {
     use serde::Deserialize;
     use serde_json::Value;
 
+    use crate::crdt::Level;
     use crate::error::{AppError, AppResult};
     use crate::routes::{authorize_path, require_member};
     use crate::session::{now_millis, ApiPrincipal};
     use crate::state::AppState;
-    use crate::ysweet::Level;
 
     /// `[A-Za-z0-9_-]{1,80}` without `__` — must match the client validation
     /// (`__` is the doc-id separator and would make ids ambiguous to parse).
@@ -2848,10 +2810,10 @@ mod tests {
     }
 
     /// Apply a delta update onto `base` and re-encode the full merged state,
-    /// mirroring how y-sweet merges the server-posted trim into the live doc.
+    /// mirroring how the document store merges a server-authored trim.
     fn apply_delta(base: &[u8], delta: &[u8]) -> Vec<u8> {
         let doc = doc_from_update(base).unwrap();
-        let upd = Update::decode_v1(delta).unwrap();
+        let upd = crate::safe_yrs::decode_v1::<Update>(delta).unwrap();
         doc.transact_mut().apply_update(upd);
         let sv = yrs::StateVector::default();
         let update = doc.transact().encode_state_as_update_v1(&sv);
@@ -2945,6 +2907,430 @@ mod tests {
         assert_eq!(d1, d2, "dump must be byte-identical across runs");
         assert!(d1.contains("-- crr: tasks"));
         assert!(d1.contains("INSERT INTO \"tasks\""));
+        assert!(!d1.contains("realtime_internal_publish_outbox"));
+    }
+
+    #[test]
+    fn replica_write_commits_a_durable_ordered_publish_intent() {
+        let Some(config) = ext_config() else {
+            eprintln!("skipping publish outbox test: CRSQLITE_EXT_PATH not set");
+            return;
+        };
+        let path = replica_path(&config, "v", "p", "n");
+        {
+            let (conn, _new) = open_replica(&config, &path).unwrap();
+            conn.execute_batch("CREATE TABLE tasks (id PRIMARY KEY NOT NULL, title)")
+                .unwrap();
+            conn.execute_batch("SELECT crsql_as_crr('tasks')").unwrap();
+            conn.execute("SELECT crsql_finalize()", []).ok();
+        }
+
+        let (_, _, first) = execute_against_replica(
+            &config,
+            "v",
+            "p",
+            "n",
+            &[(
+                "INSERT INTO tasks (id, title) VALUES (?, ?)".into(),
+                vec![
+                    JsonValue::String("a".into()),
+                    JsonValue::String("one".into()),
+                ],
+            )],
+        )
+        .unwrap();
+        let first = first.unwrap();
+        let (_, _, second) = execute_against_replica(
+            &config,
+            "v",
+            "p",
+            "n",
+            &[(
+                "UPDATE tasks SET title = ? WHERE id = ?".into(),
+                vec![
+                    JsonValue::String("two".into()),
+                    JsonValue::String("a".into()),
+                ],
+            )],
+        )
+        .unwrap();
+        let second = second.unwrap();
+
+        let pending = load_pending_publishes(&config, &path).unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].batch_id, first.batch_id);
+        assert_eq!(pending[1].batch_id, second.batch_id);
+        assert!(pending[0].sequence < pending[1].sequence);
+        assert!(pending[0].post < pending[1].post);
+        execute_against_replica(
+            &config,
+            "v",
+            "p",
+            "n",
+            &[
+                (
+                    "UPDATE tasks SET title = ? WHERE id = ?".into(),
+                    vec![
+                        JsonValue::String("rolled back".into()),
+                        JsonValue::String("a".into()),
+                    ],
+                ),
+                (
+                    "INSERT INTO missing_table (id) VALUES (?)".into(),
+                    vec![JsonValue::String("x".into())],
+                ),
+            ],
+        )
+        .unwrap_err();
+        let (conn, _new) = open_replica(&config, &path).unwrap();
+        let title: String = conn
+            .query_row("SELECT title FROM tasks WHERE id='a'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(title, "two");
+        drop(conn);
+        assert_eq!(load_pending_publishes(&config, &path).unwrap().len(), 2);
+
+        delete_pending_publish(&config, &path, first.sequence, "wrong-batch").unwrap();
+        assert_eq!(load_pending_publishes(&config, &path).unwrap().len(), 2);
+        delete_pending_publish(&config, &path, first.sequence, &first.batch_id).unwrap();
+        let pending = load_pending_publishes(&config, &path).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].batch_id, second.batch_id);
+    }
+
+    #[tokio::test]
+    async fn publish_retry_reuses_batch_id_and_acknowledges_once() {
+        let Some(mut config) = ext_config() else {
+            eprintln!("skipping publish retry test: CRSQLITE_EXT_PATH not set");
+            return;
+        };
+        let root = Path::new(&config.git_data_dir)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        config.database_url = format!(
+            "sqlite://{}?mode=rwc",
+            root.join("realtime.sqlite").display()
+        );
+        config.crdt_store_dir = root.join("crdt").display().to_string();
+        config.git_enabled = false;
+        config.background_jobs_enabled = false;
+        let state = crate::build_state(config.clone()).await.unwrap();
+
+        let path = replica_path(&config, "vault", "plugin", "database");
+        {
+            let (conn, _new) = open_replica(&config, &path).unwrap();
+            conn.execute_batch("CREATE TABLE tasks (id PRIMARY KEY NOT NULL, title)")
+                .unwrap();
+            conn.execute_batch("SELECT crsql_as_crr('tasks')").unwrap();
+            conn.execute("SELECT crsql_finalize()", []).ok();
+        }
+        let (_, _, publish) = execute_against_replica(
+            &config,
+            "vault",
+            "plugin",
+            "database",
+            &[(
+                "INSERT INTO tasks (id, title) VALUES (?, ?)".into(),
+                vec![
+                    JsonValue::String("a".into()),
+                    JsonValue::String("durable".into()),
+                ],
+            )],
+        )
+        .unwrap();
+        let publish = publish.unwrap();
+        state
+            .plugindb
+            .publish_own_batch("vault", "plugin", "database", &publish)
+            .await
+            .unwrap();
+        state
+            .plugindb
+            .publish_own_batch("vault", "plugin", "database", &publish)
+            .await
+            .unwrap();
+
+        let doc_id = PluginDbService::doc_id("vault", "plugin", "database");
+        let update = crate::ydoc::read_update_with(&state.documents, &doc_id)
+            .await
+            .unwrap();
+        let view = decode_doc(&update).unwrap();
+        assert_eq!(
+            view.batches
+                .iter()
+                .filter(|batch| batch.id == publish.batch_id)
+                .count(),
+            1
+        );
+        assert_eq!(load_pending_publishes(&config, &path).unwrap().len(), 1);
+
+        state
+            .plugindb
+            .publish_pending_locked("vault", "plugin", "database", &publish)
+            .await
+            .unwrap();
+        assert!(load_pending_publishes(&config, &path).unwrap().is_empty());
+        state.jobs.shutdown().await;
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn publish_failure_survives_restart_and_is_drained_once() {
+        let Some(mut config) = ext_config() else {
+            eprintln!("skipping publish restart test: CRSQLITE_EXT_PATH not set");
+            return;
+        };
+        let root = Path::new(&config.git_data_dir)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        config.database_url = format!(
+            "sqlite://{}?mode=rwc",
+            root.join("realtime.sqlite").display()
+        );
+        config.crdt_store_dir = root.join("crdt").display().to_string();
+        config.git_enabled = false;
+        config.background_jobs_enabled = false;
+
+        let first_state = crate::build_state(config.clone()).await.unwrap();
+        let doc_id = PluginDbService::doc_id("vault", "plugin", "database");
+        let document_connection = first_state
+            .documents
+            .connect(&doc_id, crate::crdt::Level::ReadOnly, None, None)
+            .await
+            .unwrap();
+        let path = replica_path(&config, "vault", "plugin", "database");
+        {
+            let (conn, _new) = open_replica(&config, &path).unwrap();
+            conn.execute_batch("CREATE TABLE tasks (id PRIMARY KEY NOT NULL, title)")
+                .unwrap();
+            conn.execute_batch("SELECT crsql_as_crr('tasks')").unwrap();
+            conn.execute("SELECT crsql_finalize()", []).ok();
+        }
+        tokio::fs::remove_dir_all(&config.crdt_store_dir)
+            .await
+            .unwrap();
+        tokio::fs::write(&config.crdt_store_dir, b"block CRDT persistence")
+            .await
+            .unwrap();
+        let result = first_state
+            .plugindb
+            .execute_sql(
+                "vault",
+                "plugin",
+                "database",
+                &[ExecuteStatement {
+                    sql: "INSERT INTO tasks (id, title) VALUES (?, ?)".into(),
+                    params: vec![
+                        JsonValue::String("a".into()),
+                        JsonValue::String("durable".into()),
+                    ],
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows_affected, 1);
+        let pending = load_pending_publishes(&config, &path).unwrap();
+        assert_eq!(pending.len(), 1);
+        let publish = &pending[0];
+        let batch_id = publish.batch_id.clone();
+        let site_hex = publish.site_hex.clone();
+        let post = publish.post;
+        let failed_update = crate::ydoc::read_update_with(&first_state.documents, &doc_id)
+            .await
+            .unwrap();
+        assert!(
+            decode_doc(&failed_update).unwrap().batches.is_empty(),
+            "failed durable append must not mutate the live document"
+        );
+        drop(document_connection);
+        first_state.jobs.shutdown().await;
+        drop(first_state);
+
+        tokio::fs::remove_file(&config.crdt_store_dir)
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(&config.crdt_store_dir)
+            .await
+            .unwrap();
+        config.background_jobs_enabled = true;
+        let second_state = crate::build_state(config.clone()).await.unwrap();
+        let mut published = false;
+        for _ in 0..200 {
+            let pending = load_pending_publishes(&config, &path).unwrap();
+            let jobs = second_state.jobs.list().await.unwrap();
+            if pending.is_empty()
+                && jobs.iter().any(|job| {
+                    job.intent_key.contains("plugin-db")
+                        && job.status == "completed"
+                        && job.completed_revision == job.revision
+                })
+            {
+                published = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if !published {
+            let jobs = second_state.jobs.list().await.unwrap();
+            let pending = load_pending_publishes(&config, &path).unwrap();
+            panic!(
+                "startup reconciliation must publish and acknowledge the durable outbox row; \
+                 jobs={jobs:?}, pending={}",
+                pending.len()
+            );
+        }
+        let cursor = second_state
+            .plugindb
+            .load_cursor("vault", "plugin", "database")
+            .await
+            .unwrap();
+        assert_eq!(cursor.get(&site_hex), Some(&post));
+
+        second_state
+            .plugindb
+            .replicate_once("vault", "plugin", "database")
+            .await
+            .unwrap();
+        let update = crate::ydoc::read_update_with(&second_state.documents, &doc_id)
+            .await
+            .unwrap();
+        let view = decode_doc(&update).unwrap();
+        assert!(
+            view.batches
+                .iter()
+                .filter(|batch| batch.id == batch_id)
+                .count()
+                <= 1,
+            "reconciliation retries must not append the same batch twice"
+        );
+        assert!(load_pending_publishes(&config, &path).unwrap().is_empty());
+        second_state.jobs.shutdown().await;
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_retries_a_failed_outbox_flush_without_new_work() {
+        let Some(mut config) = ext_config() else {
+            eprintln!("skipping publish worker retry test: CRSQLITE_EXT_PATH not set");
+            return;
+        };
+        let root = Path::new(&config.git_data_dir)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        config.database_url = format!(
+            "sqlite://{}?mode=rwc",
+            root.join("realtime.sqlite").display()
+        );
+        config.crdt_store_dir = root.join("crdt").display().to_string();
+        config.git_enabled = false;
+        config.git_debounce_ms = 0;
+        config.background_job_concurrency = 1;
+        config.background_job_max_attempts = 3;
+        config.background_job_retry_min_ms = 500;
+        config.background_job_retry_max_ms = 500;
+        let state = crate::build_state(config.clone()).await.unwrap();
+
+        let doc_id = PluginDbService::doc_id("vault", "plugin", "database");
+        let document_connection = state
+            .documents
+            .connect(&doc_id, crate::crdt::Level::ReadOnly, None, None)
+            .await
+            .unwrap();
+        let path = replica_path(&config, "vault", "plugin", "database");
+        {
+            let (conn, _new) = open_replica(&config, &path).unwrap();
+            conn.execute_batch("CREATE TABLE tasks (id PRIMARY KEY NOT NULL, title)")
+                .unwrap();
+            conn.execute_batch("SELECT crsql_as_crr('tasks')").unwrap();
+            conn.execute("SELECT crsql_finalize()", []).ok();
+        }
+        tokio::fs::remove_dir_all(&config.crdt_store_dir)
+            .await
+            .unwrap();
+        tokio::fs::write(&config.crdt_store_dir, b"block CRDT persistence")
+            .await
+            .unwrap();
+        state
+            .plugindb
+            .execute_sql(
+                "vault",
+                "plugin",
+                "database",
+                &[ExecuteStatement {
+                    sql: "INSERT INTO tasks (id, title) VALUES (?, ?)".into(),
+                    params: vec![
+                        JsonValue::String("a".into()),
+                        JsonValue::String("durable".into()),
+                    ],
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(load_pending_publishes(&config, &path).unwrap().len(), 1);
+
+        // Let the failed live document leave the weak cache. The worker's
+        // first attempt must then cold-load against the blocked store and fail.
+        drop(document_connection);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if crate::ydoc::read_update_with(&state.documents, &doc_id)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed document left the live cache");
+
+        state
+            .plugindb
+            .mark_write("vault", "plugin", "database")
+            .await;
+        let failed_once = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(job) = state.jobs.list().await.unwrap().into_iter().next() {
+                    if job.attempts == 1 && job.last_error.is_some() {
+                        break job;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker recorded its first flush failure");
+        assert_ne!(failed_once.status, "completed");
+        assert_eq!(load_pending_publishes(&config, &path).unwrap().len(), 1);
+
+        tokio::fs::remove_file(&config.crdt_store_dir)
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(&config.crdt_store_dir)
+            .await
+            .unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(job) = state.jobs.list().await.unwrap().into_iter().next() {
+                    if job.status == "completed" {
+                        break job;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Apalis retried the failed flush");
+        assert_eq!(completed.attempts, 2);
+        assert_eq!(completed.completed_revision, completed.revision);
+        assert!(load_pending_publishes(&config, &path).unwrap().is_empty());
+
+        state.jobs.shutdown().await;
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
     #[test]
@@ -2977,9 +3363,15 @@ mod tests {
 
         // Roll back: replica must equal the dumped state again, and the
         // produced changes must replay onto a fresh replica to the same state.
-        let (rows, _site_hex, _site_b64, _post) =
-            apply_dump_rollback(&config, "v", "p", "n", &target).unwrap();
+        let publish = apply_dump_rollback(&config, "v", "p", "n", &target)
+            .unwrap()
+            .unwrap();
+        let batch_id = publish.batch_id.clone();
+        let rows = publish.rows;
         assert!(!rows.is_empty());
+        let pending = load_pending_publishes(&config, &path).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].batch_id, batch_id);
         let after = dump_replica(&config, "v", "p", "n").unwrap().unwrap();
         assert_eq!(after, target, "replica must match the dump after rollback");
 
@@ -3225,9 +3617,10 @@ mod tests {
         // Comments are skipped.
         assert!(lint_sql("SELECT 1 -- sqlite_master\n").is_ok());
         assert!(lint_sql("SELECT /* crsql_changes */ 1").is_ok());
-        // Quoted identifiers are identifiers, not strings — still rejected.
+        // Quoted identifiers are identifiers, not strings - still rejected.
         assert!(lint_sql("SELECT * FROM \"sqlite_master\"").is_err());
         assert!(lint_sql("SELECT * FROM `crsql_changes`").is_err());
+        assert!(lint_sql("SELECT * FROM realtime_internal_publish_outbox").is_err());
         assert!(lint_sql("SELECT * FROM [sqlite_master]").is_err());
         // Only identifiers *starting with* the reserved prefixes match.
         assert!(lint_sql("SELECT my_sqlite_col FROM tasks").is_ok());

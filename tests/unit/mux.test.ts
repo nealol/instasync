@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import * as encoding from "lib0/encoding";
+import * as decoding from "lib0/decoding";
 import {
   MuxWebSocket,
   decodeFrame,
@@ -9,6 +10,7 @@ import {
   resetMuxForTests,
   setMuxWebSocketCtor,
 } from "../../src/sync/mux";
+import { setEpochProposalHandler } from "../../src/documentEpoch";
 
 /**
  * A controllable stand-in for the real WebSocket the mux opens to `/dmux`.
@@ -57,11 +59,13 @@ const DOC2_URL = "wss://sync.example.com/d/vault__def/ws/vault__def?token=t-def"
 
 beforeEach(() => {
   resetMuxForTests();
+  setEpochProposalHandler(null);
   FakeServerSocket.instances = [];
   setMuxWebSocketCtor(FakeServerSocket as unknown as { new (url: string): WebSocket });
 });
 
 afterEach(() => {
+  setEpochProposalHandler(null);
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
@@ -198,6 +202,40 @@ describe("MuxWebSocket", () => {
     a.send(new Uint8Array([1, 2, 3]));
     const data = server.frames().find((f) => f?.type === "data");
     expect(data?.type === "data" && Array.from(data.payload)).toEqual([1, 2, 3]);
+  });
+
+  it("persists epoch proposals through the handler before acknowledging them", () => {
+    let persistedEpoch = 0;
+    setEpochProposalHandler((documentId, epoch) => {
+      expect(documentId).toBe("vault__abc");
+      persistedEpoch = epoch;
+    });
+    const socket = new MuxWebSocket(DOC_URL);
+    const onmessage = vi.fn();
+    socket.onmessage = onmessage;
+    const server = FakeServerSocket.instances[0];
+    server.open();
+    const channel = openChannelId(server, "/d/vault__abc/ws/vault__abc?token=t-abc");
+    server.deliver(simpleFrame(2, channel));
+
+    const proposal = encoding.createEncoder();
+    encoding.writeVarUint(proposal, 103);
+    encoding.writeVarUint8Array(proposal, new TextEncoder().encode(JSON.stringify({ epoch: 7 })));
+    server.deliver(encodeData(channel, encoding.toUint8Array(proposal)));
+
+    expect(persistedEpoch).toBe(7);
+    expect(onmessage).not.toHaveBeenCalled();
+    const acknowledgement = server
+      .frames()
+      .filter((frame) => frame?.type === "data")
+      .at(-1);
+    expect(acknowledgement?.type).toBe("data");
+    if (acknowledgement?.type !== "data") throw new Error("missing epoch acknowledgement");
+    const decoder = decoding.createDecoder(acknowledgement.payload);
+    expect(decoding.readVarUint(decoder)).toBe(104);
+    expect(JSON.parse(new TextDecoder().decode(decoding.readVarUint8Array(decoder)))).toEqual({
+      epoch: 7,
+    });
   });
 
   it("fans a real-socket drop out to every channel as error+close", () => {

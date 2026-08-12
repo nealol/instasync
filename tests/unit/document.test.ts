@@ -8,6 +8,7 @@ import { waitFor, freshGuid } from "../support/util";
 
 const modalMock = vi.hoisted(() => ({
   choice: "local" as "local" | "remote",
+  delayMs: 0,
   calls: [] as Array<{ path: string; localContent: string; remoteContent: string }>,
 }));
 
@@ -17,6 +18,9 @@ vi.mock("../../src/TextConflictModal", () => ({
     info: { path: string; localContent: string; remoteContent: string },
   ) => {
     modalMock.calls.push(info);
+    if (modalMock.delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, modalMock.delayMs));
+    }
     return modalMock.choice;
   },
 }));
@@ -44,6 +48,7 @@ afterAll(async () => {
 afterEach(() => {
   notices.length = 0;
   modalMock.choice = "local";
+  modalMock.delayMs = 0;
   modalMock.calls.length = 0;
 });
 
@@ -124,6 +129,7 @@ describe("Document sync", () => {
     const peer = new Peer(memberPlugin, docId(guid));
     await peer.whenSynced();
     peer.setText("authored elsewhere");
+    await peer.whenChangesSynced();
 
     // A starts with no local file at all.
     const { plugin, vault } = makeFakePlugin(harness.authUrl, {
@@ -538,6 +544,7 @@ describe("Document sync", () => {
 
     // Phase 2 — while A is gone, both sides diverge from the baseline.
     peer.setText("base REMOTE side");
+    await peer.whenChangesSynced();
     a1.vault.files.set("note.md", "base LOCAL side"); // external offline edit on A's disk
 
     // Phase 3 — A restarts on the same guid + vault (baseline reloads from IndexedDB).
@@ -547,9 +554,14 @@ describe("Document sync", () => {
       clientName: "Brave Otter",
     });
     (plugin.app.vault as FakeVault).files = a1.vault.files; // same on-disk state
+    modalMock.delayMs = 500;
     const a2 = new Document(plugin as any, "note.md", guid, docId(guid), false);
     try {
-      await a2.whenReady();
+      const ready = a2.whenReady();
+      await waitFor(() => modalMock.calls.length === 1, { label: "conflict prompt opened" });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      expect((plugin.app.vault as FakeVault).files.get("note.md")).toBe("base LOCAL side");
+      await ready;
       await waitFor(() => peer.getText() === a2.content && a2.content.length > 0, {
         timeout: 15_000,
         label: "A2 and B converge",
@@ -566,7 +578,9 @@ describe("Document sync", () => {
           remoteContent: "base REMOTE side",
         },
       ]);
-      expect(conflictFiles(plugin.app.vault as FakeVault)).toHaveLength(0);
+      const conflicts = conflictFiles(plugin.app.vault as FakeVault);
+      expect(conflicts).toHaveLength(1);
+      expect((plugin.app.vault as FakeVault).files.get(conflicts[0])).toBe("base REMOTE side");
       expect(notices.some((n) => /kept your local version/i.test(n))).toBe(true);
 
       // The canonical text was written back to the live file.
@@ -577,7 +591,90 @@ describe("Document sync", () => {
     }
   });
 
-  it("startup conflict: accepts remote as the canonical version without a conflict copy", async () => {
+  it("startup reconciliation auto-merges disjoint local and remote edits", async () => {
+    const guid = freshGuid();
+    const peer = new Peer(memberPlugin, docId(guid));
+    const baseline = "title\nfirst\nsecond\n";
+    const a1 = makeDoc(guid, { file: { path: "note.md", content: baseline } });
+    await a1.doc.whenReady();
+    await peer.whenSynced();
+    await waitFor(() => peer.getText() === baseline, { label: "merge baseline synced" });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    a1.doc.destroy();
+
+    peer.setText("title\nfirst\nremote second\n");
+    await peer.whenChangesSynced();
+    a1.vault.files.set("note.md", "local title\nfirst\nsecond\n");
+
+    const { plugin } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    (plugin.app.vault as FakeVault).files = a1.vault.files;
+    const a2 = new Document(plugin as any, "note.md", guid, docId(guid), false);
+    try {
+      await a2.whenReady();
+      await waitFor(() => peer.getText() === "local title\nfirst\nremote second\n", {
+        timeout: 15_000,
+        label: "three-way merge converged",
+      });
+      expect(a2.content).toBe("local title\nfirst\nremote second\n");
+      expect(modalMock.calls).toHaveLength(0);
+      expect(conflictFiles(plugin.app.vault as FakeVault)).toHaveLength(0);
+    } finally {
+      a2.destroy();
+      peer.destroy();
+    }
+  });
+
+  it("restarts conflict resolution when the remote text changes behind the modal", async () => {
+    const guid = freshGuid();
+    const peer = new Peer(memberPlugin, docId(guid));
+    const a1 = makeDoc(guid, { file: { path: "note.md", content: "base" } });
+    await a1.doc.whenReady();
+    await peer.whenSynced();
+    await waitFor(() => peer.getText() === "base", { label: "live conflict baseline" });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    a1.doc.destroy();
+
+    peer.setText("base REMOTE first");
+    await peer.whenChangesSynced();
+    a1.vault.files.set("note.md", "base LOCAL");
+    const { plugin } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    (plugin.app.vault as FakeVault).files = a1.vault.files;
+    modalMock.delayMs = 300;
+    const restarted = new Document(plugin as any, "note.md", guid, docId(guid), false);
+    try {
+      const ready = restarted.whenReady();
+      await waitFor(() => modalMock.calls.length === 1, {
+        label: "first conflict prompt opened",
+      });
+      peer.setText("base REMOTE latest");
+      await peer.whenChangesSynced();
+
+      await waitFor(() => modalMock.calls.length === 2, {
+        timeout: 10_000,
+        label: "updated remote conflict prompted again",
+      });
+      await ready;
+      await waitFor(() => peer.getText() === "base LOCAL", {
+        label: "local choice applied after remote revalidation",
+      });
+
+      expect(modalMock.calls[1]?.remoteContent).toBe("base REMOTE latest");
+      const copies = conflictFiles(plugin.app.vault as FakeVault);
+      expect(copies).toHaveLength(1);
+      expect((plugin.app.vault as FakeVault).files.get(copies[0])).toBe("base REMOTE latest");
+    } finally {
+      restarted.destroy();
+      peer.destroy();
+    }
+  });
+
+  it("startup conflict: accepts remote and preserves the local version", async () => {
     modalMock.choice = "remote";
     const guid = freshGuid();
     const peer = new Peer(memberPlugin, docId(guid));
@@ -590,6 +687,7 @@ describe("Document sync", () => {
     a1.doc.destroy();
 
     peer.setText("base REMOTE side");
+    await peer.whenChangesSynced();
     a1.vault.files.set("note.md", "base LOCAL side");
 
     const { plugin } = makeFakePlugin(harness.authUrl, {
@@ -608,7 +706,9 @@ describe("Document sync", () => {
 
       expect(a2.content).toBe("base REMOTE side");
       expect(modalMock.calls).toHaveLength(1);
-      expect(conflictFiles(plugin.app.vault as FakeVault)).toHaveLength(0);
+      const conflicts = conflictFiles(plugin.app.vault as FakeVault);
+      expect(conflicts).toHaveLength(1);
+      expect((plugin.app.vault as FakeVault).files.get(conflicts[0])).toBe("base LOCAL side");
       expect((plugin.app.vault as FakeVault).files.get("note.md")).toBe("base REMOTE side");
       expect(notices.some((n) => /kept the remote version/i.test(n))).toBe(true);
     } finally {
@@ -622,6 +722,7 @@ describe("Document sync", () => {
     const peer = new Peer(memberPlugin, docId(guid));
     await peer.whenSynced();
     peer.setText("draft");
+    await peer.whenChangesSynced();
 
     const { plugin, vault } = makeFakePlugin(harness.authUrl, {
       sessionToken: token,
@@ -644,6 +745,54 @@ describe("Document sync", () => {
     }
   });
 
+  it("forces recovery when a durable path identity says the local file is unrelated", async () => {
+    const guid = freshGuid();
+    const peer = new Peer(memberPlugin, docId(guid));
+    await peer.whenSynced();
+    peer.setText("remote identity content");
+    await peer.whenChangesSynced();
+
+    const first = makeDoc(guid);
+    try {
+      await first.doc.whenReady();
+      await waitFor(() => first.vault.files.get("note.md") === "remote identity content", {
+        label: "remote identity materialized",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    } finally {
+      first.doc.destroy();
+    }
+
+    first.vault.files.set("note.md", "unrelated local content");
+    const { plugin } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    (plugin.app.vault as FakeVault).files = first.vault.files;
+    const restarted = new Document(plugin as any, "note.md", guid, docId(guid), false, {
+      forceBootstrapConflict: true,
+    });
+    try {
+      await restarted.whenReady();
+      expect(modalMock.calls).toEqual([
+        {
+          path: "note.md",
+          localContent: "unrelated local content",
+          remoteContent: "remote identity content",
+        },
+      ]);
+      expect(restarted.content).toBe("unrelated local content");
+      const conflicts = conflictFiles(plugin.app.vault as FakeVault);
+      expect(conflicts).toHaveLength(1);
+      expect((plugin.app.vault as FakeVault).files.get(conflicts[0])).toBe(
+        "remote identity content",
+      );
+    } finally {
+      restarted.destroy();
+      peer.destroy();
+    }
+  });
+
   it("creator startup: treats an empty first remote as unseeded, not a conflict", async () => {
     const guid = freshGuid();
     const peer = new Peer(memberPlugin, docId(guid));
@@ -656,6 +805,7 @@ describe("Document sync", () => {
     a1.doc.destroy();
 
     peer.setText("");
+    await peer.whenChangesSynced();
     a1.vault.files.set("note.md", "new local note body");
 
     const { plugin } = makeFakePlugin(harness.authUrl, {
@@ -693,6 +843,7 @@ describe("Document sync", () => {
     a1.doc.destroy();
 
     peer.setText("");
+    await peer.whenChangesSynced();
     a1.vault.files.set("note.md", "base LOCAL side");
 
     const { plugin } = makeFakePlugin(harness.authUrl, {

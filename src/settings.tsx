@@ -95,6 +95,10 @@ export interface RealtimeSettings {
   configSyncCategories: ConfigSyncCategories;
   /** Hidden advanced setting for verbose diagnostic logging. */
   diagnosticLogging: boolean;
+  /** Maximum number of per-file CRDT documents retained in memory on mobile. */
+  mobileMaxResidentDocs: number;
+  /** Most-recently opened documents protected from mobile hibernation. */
+  mobileRecentResidentDocs: number;
   /** Recently opened syncable note/structured paths, newest first. */
   recentPaths: string[];
 }
@@ -125,6 +129,8 @@ export function defaultSettings(): RealtimeSettings {
     syncConfigEnabled: false,
     configSyncCategories: defaultConfigSyncCategories(),
     diagnosticLogging: false,
+    mobileMaxResidentDocs: 16,
+    mobileRecentResidentDocs: 8,
     recentPaths: [],
   };
 }
@@ -2027,6 +2033,7 @@ function AdvancedSettings({
     <details className="realtime-advanced">
       <summary>Advanced settings</summary>
       <ConfigSyncSection plugin={plugin} />
+      <MobileWorkingSetSettings plugin={plugin} />
       <SettingRow
         name="Diagnostic logging"
         desc="Write verbose Realtime diagnostics to the developer console. Keep this off unless troubleshooting."
@@ -2058,6 +2065,80 @@ function AdvancedSettings({
         }
       />
     </details>
+  );
+}
+
+function MobileWorkingSetSettings({ plugin }: { plugin: RealtimePlugin }) {
+  const saveNumber = async (
+    field: "mobileMaxResidentDocs" | "mobileRecentResidentDocs",
+    raw: string,
+    min: number,
+    max: number,
+  ) => {
+    const parsed = Number(raw);
+    const fallback = plugin.settings[field];
+    const value = Number.isFinite(parsed)
+      ? Math.min(max, Math.max(min, Math.round(parsed)))
+      : fallback;
+    const previousMax = plugin.settings.mobileMaxResidentDocs;
+    const previousRecent = plugin.settings.mobileRecentResidentDocs;
+    if (field === "mobileMaxResidentDocs") {
+      plugin.settings.mobileMaxResidentDocs = value;
+      plugin.settings.mobileRecentResidentDocs = Math.min(
+        plugin.settings.mobileRecentResidentDocs,
+        value,
+      );
+    } else {
+      plugin.settings.mobileRecentResidentDocs = Math.min(
+        value,
+        plugin.settings.mobileMaxResidentDocs,
+      );
+    }
+    if (
+      previousMax === plugin.settings.mobileMaxResidentDocs &&
+      previousRecent === plugin.settings.mobileRecentResidentDocs
+    ) {
+      return;
+    }
+    await plugin.saveSettings();
+    await plugin.reloadSync();
+  };
+
+  return (
+    <>
+      <SettingRow
+        name="Mobile resident documents"
+        desc="Maximum per-file CRDT documents kept in memory on mobile. Open documents are never evicted."
+        control={
+          <input
+            className="realtime-modal-input"
+            type="number"
+            min={4}
+            max={64}
+            defaultValue={plugin.settings.mobileMaxResidentDocs}
+            onBlur={(event) =>
+              void saveNumber("mobileMaxResidentDocs", event.currentTarget.value, 4, 64)
+            }
+          />
+        }
+      />
+      <SettingRow
+        name="Mobile recent documents"
+        desc="Recently opened documents protected from hibernation within the resident limit."
+        control={
+          <input
+            className="realtime-modal-input"
+            type="number"
+            min={0}
+            max={32}
+            defaultValue={plugin.settings.mobileRecentResidentDocs}
+            onBlur={(event) =>
+              void saveNumber("mobileRecentResidentDocs", event.currentTarget.value, 0, 32)
+            }
+          />
+        }
+      />
+    </>
   );
 }
 

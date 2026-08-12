@@ -24,7 +24,7 @@ describe("harness smoke", () => {
     await harness?.stop();
   });
 
-  it("two peers sync text through the auth server + y-sweet", async () => {
+  it("two native-provider peers sync text through the Rust server", async () => {
     const docId = `${vaultId}__${freshGuid()}`;
     const a = new Peer(plugin, docId);
     const b = new Peer(plugin, docId);

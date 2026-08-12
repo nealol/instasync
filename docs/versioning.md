@@ -22,9 +22,11 @@ GET /api/server-info
     "restApi": "3",
     "oauth": "1",
     "pluginDbSync": "crsqlite-1",
-    "attachmentShim": "https://realtime.md/attachment-shim/v1"
+    "attachmentShim": "https://realtime.md/attachment-shim/v1",
+    "documentEpoch": "1",
+    "documentInvalidation": "1"
   },
-  "requiredCaps": []            // empty in v1; see "Future optional caps" below
+  "requiredCaps": ["documentEpoch"]
 }
 ```
 
@@ -37,7 +39,7 @@ independent compatibility tags before this system was introduced
 (`SYNC_FORMAT`, `ATTACHMENT_SHIM_VERSION`, per-DB `schemaVersion`); caps
 generalize that pattern.
 
-## The four caps (v1)
+## The six caps
 
 | Cap | Current value | Bumps when |
 |---|---|---|
@@ -45,11 +47,14 @@ generalize that pattern.
 | `oauth` | `"1"` | OAuth 2.1 server metadata or token endpoint shape changes (plugin's own OAuth flow only — see "External MCP clients" below) |
 | `pluginDbSync` | `"crsqlite-1"` | The cr-sqlite `crsql_changes` wire encoding changes |
 | `attachmentShim` | `"https://realtime.md/attachment-shim/v1"` | The text shim format committed into git backups for oversized blobs changes |
+| `documentEpoch` | `"1"` | The proposal/acknowledgement protocol, token epoch semantics, or logical replacement rules change |
+| `documentInvalidation` | `"1"` | The advisory child-document invalidation message or its delivery semantics change |
 
 ### Where the constants live
 
 - **Server**: `server/src/caps.rs` — `REST_API`, `OAUTH`, `PLUGIN_DB_SYNC`,
-  `ATTACHMENT_SHIM`, plus `caps()` returning all four in stable order.
+  `ATTACHMENT_SHIM`, `DOCUMENT_EPOCH`, `DOCUMENT_INVALIDATION`, plus `caps()`
+  returning all six in stable order.
   `ATTACHMENT_SHIM` is the single source of truth, re-exported by
   `git::ATTACHMENT_SHIM_VERSION`.
 - **Client (plugin)**: `src/caps.ts` — `REQUIRED_CAPS` maps each cap name to
@@ -83,8 +88,9 @@ implementing these rules:
 | Server response | Result |
 |---|---|
 | `caps` is `null` / `undefined` / not an object | **block** — `"server-incompatible"` |
-| `caps` is an object but missing a mandatory cap (`restApi`, `oauth`, `pluginDbSync`, `attachmentShim`) | **block** — `"server-incompatible"` |
-| cap value not in `REQUIRED_CAPS[name]` | **block** — `"server-incompatible"` |
+| `caps` is an object but missing a mandatory cap (`restApi`, `oauth`, `pluginDbSync`, `attachmentShim`, `documentEpoch`) | **block** — `"server-incompatible"` |
+| mandatory cap value not in `REQUIRED_CAPS[name]` | **block** — `"server-incompatible"` |
+| `documentInvalidation` missing or unsupported | **allow sync**, but disable mobile document eviction |
 | cap name in server's `requiredCaps` but unknown to client | **block** — `"client-too-old"` |
 | unknown cap name NOT in `requiredCaps` | **ignored** (forward-compatible additive surfaces) |
 
@@ -147,8 +153,8 @@ document as a follow-up.
 ## Testing
 
 - **Server**: `server/tests/integration.rs` —
-  `server_info_returns_stable_id_without_auth` asserts `version`, all four
-  `caps` values, and empty `requiredCaps`.
+  `server_info_returns_stable_id_without_auth` asserts `version`, all six
+  `caps` values, and the required `documentEpoch` cap.
 - **Client**: `tests/unit/caps.test.ts` — unit tests covering every
   branch of `checkServerCaps` (undefined/null/non-object/array caps, exact
   match, missing mandatory cap, unsupported value, non-string value, unknown
@@ -156,3 +162,9 @@ document as a follow-up.
   and `CompatibilityError` shape).
 - **Full local validation**: `bun run test:all` runs typecheck, all unit
   suites, SDK e2e, and Rust server tests.
+- **Released-version lab**: `bun run test:compat` downloads SHA-256-pinned
+  release assets into `.compat-cache`, executes the released client cap checker,
+  executes both released and current server cap declarations, runs the rollout
+  matrix, and replays the checked-in Yjs v1 and y-sweet 0.9.1 corpora.
+  `bun run test:compat:released` also starts the pinned released server image
+  and compares its live `/api/server-info` response with its tagged source.

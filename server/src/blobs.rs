@@ -1,11 +1,11 @@
 //! Content-addressed binary blob store.
 //!
-//! Markdown files sync through y-sweet, but binary attachments (images, PDFs, …)
+//! Markdown files sync through Yjs, but binary attachments (images, PDFs, …)
 //! would bloat the text CRDT. Instead the plugin syncs only a `path -> sha256`
 //! mapping through the index doc and stores the bytes here, keyed by their hash.
 //!
 //! Blobs live on the filesystem under `{blob_dir}/{vault_id}/{hash}`, alongside
-//! the y-sweet data. Access is authorized against the attachment/config path
+//! the CRDT snapshots. Access is authorized against the attachment/config path
 //! supplied by the client. Legacy unscoped requests are accepted only when the
 //! principal has one uniform permission level across the entire vault.
 //! Uploads are content-verified — the streamed bytes must hash to the claimed
@@ -22,11 +22,11 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
+use crate::crdt::Level;
 use crate::error::{AppError, AppResult};
 use crate::routes::{authorize_path, authorize_uniform_vault, require_member};
 use crate::session::{now_millis, AuthUser};
 use crate::state::{AppState, Principal, PrincipalActor};
-use crate::ysweet::Level;
 
 pub const MAX_BLOB_BYTES: u64 = 100 * 1024 * 1024;
 

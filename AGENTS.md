@@ -45,7 +45,8 @@ Prefer targeted test commands while iterating, then run the broadest relevant su
 
 ## Operational Notes
 
-- The plugin expects one public auth/sync URL; the server reverse-proxies y-sweet under `/d/*`.
+- The plugin expects one public auth/sync URL; the server owns the native Yjs
+  document lifecycle and multiplexes document channels under `/dmux`.
 - Public REST/OAuth/API behavior is documented through the server OpenAPI setup and README files. Keep docs in sync when changing user-facing routes, configuration, SDK APIs, or plugin setup.
 - Workspace packages are linked with Bun workspaces. Keep version and package boundary changes deliberate.
 
@@ -53,9 +54,19 @@ Prefer targeted test commands while iterating, then run the broadest relevant su
 
 The server and client release on independent cadences; a single server serves many client versions and a single client talks to many server versions. Compatibility is gated by **named capability versions** ("caps"), not by either side's semver.
 
-- `GET /api/server-info` returns `serverId`, `version` (server release semver, operator-facing only — **not** used for gating), `caps` (map of surface name → opaque string version), and `requiredCaps` (cap names the client must understand; empty in v1).
+- `GET /api/server-info` returns `serverId`, `version` (server release semver, operator-facing only — **not** used for gating), `caps` (map of surface name → opaque string version), and `requiredCaps` (cap names the client must understand; currently `documentEpoch`).
 - Cap constants live in `server/src/caps.rs` (server) and `src/caps.ts` (`REQUIRED_CAPS`, client). The cr-sqlite sync format constant is shared: `caps::PLUGIN_DB_SYNC` on the server, `SYNC_FORMAT` in `src/pluginDb/types.ts` on the client — they must stay in lockstep.
-- Current caps: `restApi="1"`, `oauth="1"`, `pluginDbSync="crsqlite-1"`, `attachmentShim="https://realtime.md/attachment-shim/v1"`.
+- Current caps: `restApi="3"`, `oauth="1"`,
+  `pluginDbSync="crsqlite-1"`,
+  `attachmentShim="https://realtime.md/attachment-shim/v1"`,
+  `documentEpoch="1"`, `documentInvalidation="1"`.
+- `documentEpoch` is required. It gates the proposal/acknowledgement rollover
+  protocol and the `epoch` field on document tokens; clients must create a
+  fresh local Y.Doc and persistence namespace when it changes.
+- `documentInvalidation` is optional. It gates advisory child-document
+  invalidation messages. Mobile document eviction must remain disabled when
+  the cap is absent or unsupported; do not add it to server `requiredCaps`
+  because older non-evicting clients remain safe.
 
 ### Bump rules
 
@@ -68,7 +79,11 @@ The server and client release on independent cadences; a single server serves ma
 `checkServerCaps(caps, requiredCaps)` enforces:
 - `caps` is `null`/`undefined`/not an object → block `"server-incompatible"` (this plugin requires caps to prove `/dmux` support).
 - `caps` is an object but lacks a mandatory cap → block `"server-incompatible"`.
-- cap value not in `REQUIRED_CAPS[name]` → block `"server-incompatible"` (direction cannot be inferred from opaque strings; never reported as "too old/new").
+- mandatory or server-required cap value not in `REQUIRED_CAPS[name]` → block
+  `"server-incompatible"` (direction cannot be inferred from opaque strings;
+  never reported as "too old/new").
+- optional `documentInvalidation` missing or unsupported → allow sync but
+  disable mobile document eviction.
 - cap name in server's `requiredCaps` but unknown to client → block `"client-too-old"`.
 - unknown cap name NOT in `requiredCaps` → ignored (forward-compatible additive surfaces).
 

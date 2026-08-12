@@ -1,115 +1,16 @@
-//! Integration tests over the axum app with the mock OIDC issuer, a temp sqlite
-//! db, and a hermetic fake y-sweet (so the doc-token relay path is exercised
-//! without the real binary).
+//! Integration tests over the axum app with the mock OIDC issuer, temp SQLite
+//! databases, and isolated native CRDT stores.
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
 use http_body_util::BodyExt;
 use realtime_server::config::{Config, OidcMode};
-use realtime_server::{app, build_state, gen_auth_key};
+use realtime_server::{app, build_state};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tower::ServiceExt;
-
-// ---------- fake y-sweet ----------
-
-async fn fake_ysweet() -> String {
-    use axum::extract::Path;
-    use axum::http::HeaderMap;
-    use axum::routing::post;
-    use axum::Json;
-
-    async fn new_doc(Json(body): Json<Value>) -> Json<Value> {
-        Json(json!({ "docId": body.get("docId").cloned().unwrap_or(Value::Null) }))
-    }
-    async fn auth_doc(headers: HeaderMap, Path(doc_id): Path<String>) -> Json<Value> {
-        let host = headers
-            .get(header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("127.0.0.1")
-            .to_string();
-        Json(json!({
-            "url": format!("ws://{host}/d/{doc_id}/ws"),
-            "baseUrl": format!("http://{host}/d/{doc_id}"),
-            "docId": doc_id,
-            "token": "fake-token",
-            "authorization": "full",
-        }))
-    }
-
-    let router = Router::new()
-        .route("/doc/new", post(new_doc))
-        .route("/doc/{doc_id}/auth", post(auth_doc));
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    format!("http://{addr}")
-}
-
-/// Minimal y-sweet fake whose token advertises a different public origin.
-/// The bundled production process does this through `--url-prefix`.
-async fn fake_ysweet_advertising(
-    advertised_origin: String,
-) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-    use axum::extract::{Path, State};
-    use axum::routing::{get, post};
-    use axum::Json;
-
-    #[derive(Clone)]
-    struct AdvertisedState {
-        origin: String,
-        writes: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    async fn auth_doc(
-        State(state): State<AdvertisedState>,
-        Path(doc_id): Path<String>,
-    ) -> Json<Value> {
-        Json(json!({
-            "url": format!("{}/d/{doc_id}/ws", state.origin),
-            "baseUrl": format!("{}/d/{doc_id}", state.origin),
-            "docId": doc_id,
-            "token": "fake-token",
-            "authorization": "read-only",
-        }))
-    }
-
-    async fn as_update() -> Vec<u8> {
-        text_update("contents", "internal route reached")
-    }
-
-    async fn update(State(state): State<AdvertisedState>) -> Json<Value> {
-        state
-            .writes
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Json(json!({ "ok": true }))
-    }
-
-    let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let router = Router::new()
-        .route("/doc/{doc_id}/auth", post(auth_doc))
-        .route("/d/{doc_id}/as-update", get(as_update))
-        .route("/d/{doc_id}/update", post(update))
-        .with_state(AdvertisedState {
-            origin: advertised_origin,
-            writes: writes.clone(),
-        });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    (format!("http://{addr}"), writes)
-}
-
-// ---------- fake y-sweet that also serves /as-update (for the git audit test) ----------
 
 fn text_update(name: &str, value: &str) -> Vec<u8> {
     use yrs::{Text, Transact};
@@ -143,432 +44,6 @@ fn files_update(entries: &[(&str, &str)]) -> Vec<u8> {
     u
 }
 
-/// A fake y-sweet whose `/doc/{id}/as-update` returns deterministic state: the
-/// index doc (id without `__`) yields a one-entry `files` map, and each file doc
-/// (`{vault}__{guid}`) yields `contents` text derived from its guid.
-async fn fake_ysweet_as_update() -> String {
-    use axum::extract::Path;
-    use axum::http::HeaderMap;
-    use axum::routing::{get, post};
-    use axum::Json;
-
-    async fn auth_doc(headers: HeaderMap, Path(doc_id): Path<String>) -> Json<Value> {
-        let host = headers
-            .get(header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("127.0.0.1")
-            .to_string();
-        Json(json!({
-            "url": format!("ws://{host}/d/{doc_id}/ws"),
-            "baseUrl": format!("http://{host}/d/{doc_id}"),
-            "docId": doc_id,
-            "token": "fake-token",
-            "authorization": "read-only",
-        }))
-    }
-
-    async fn as_update(Path(doc_id): Path<String>) -> Vec<u8> {
-        match doc_id.split_once("__") {
-            Some((_, guid)) => text_update("contents", &format!("# Note {guid}\n")),
-            None => files_update(&[("note.md", "g1")]),
-        }
-    }
-
-    let router = Router::new()
-        .route("/doc/{doc_id}/auth", post(auth_doc))
-        .route("/d/{doc_id}/as-update", get(as_update));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    format!("http://{addr}")
-}
-
-/// Like [`fake_ysweet_as_update`], but the index doc also carries a `binaries`
-/// map with the given attachment entries (path, sha256 hex, size).
-async fn fake_ysweet_with_binaries(binaries: Vec<(String, String, i64)>) -> String {
-    use axum::extract::{Path, State};
-    use axum::http::HeaderMap;
-    use axum::routing::{get, post};
-    use axum::Json;
-    use yrs::{Any, Map, ReadTxn, Transact};
-
-    async fn auth_doc(headers: HeaderMap, Path(doc_id): Path<String>) -> Json<Value> {
-        let host = headers
-            .get(header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("127.0.0.1")
-            .to_string();
-        Json(json!({
-            "url": format!("ws://{host}/d/{doc_id}/ws"),
-            "baseUrl": format!("http://{host}/d/{doc_id}"),
-            "docId": doc_id,
-            "token": "fake-token",
-            "authorization": "read-only",
-        }))
-    }
-
-    async fn as_update(
-        State(binaries): State<Arc<Vec<(String, String, i64)>>>,
-        Path(doc_id): Path<String>,
-    ) -> Vec<u8> {
-        if let Some((_, guid)) = doc_id.split_once("__") {
-            return text_update("contents", &format!("# Note {guid}\n"));
-        }
-        let doc = yrs::Doc::new();
-        let files_map = doc.get_or_insert_map("files");
-        let bin_map = doc.get_or_insert_map("binaries");
-        {
-            let mut txn = doc.transact_mut();
-            files_map.insert(&mut txn, "note.md".to_string(), "g1".to_string());
-            for (path, hash, size) in binaries.iter() {
-                let meta = HashMap::from([
-                    ("hash".to_string(), Any::String(hash.as_str().into())),
-                    ("size".to_string(), Any::BigInt(*size)),
-                ]);
-                bin_map.insert(&mut txn, path.to_string(), Any::from(meta));
-            }
-        }
-        let update = doc
-            .transact()
-            .encode_state_as_update_v1(&yrs::StateVector::default());
-        update
-    }
-
-    let router = Router::new()
-        .route("/doc/{doc_id}/auth", post(auth_doc))
-        .route("/d/{doc_id}/as-update", get(as_update))
-        .with_state(Arc::new(binaries));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    format!("http://{addr}")
-}
-
-/// Shared doc store for [`fake_ysweet_store_with_docs`].
-type FakeDocs = Arc<Mutex<HashMap<String, Vec<u8>>>>;
-
-async fn fake_ysweet_store() -> String {
-    fake_ysweet_store_with_docs().await.0
-}
-
-/// Like [`fake_ysweet_store`] but also returns the backing doc map so tests can
-/// seed and inspect raw doc state directly (used by the plugin-db tests).
-async fn fake_ysweet_store_with_docs() -> (String, FakeDocs) {
-    use axum::body::Bytes;
-    use axum::extract::{Path, State};
-    use axum::http::HeaderMap;
-    use axum::routing::{get, post};
-    use axum::Json;
-    use yrs::updates::decoder::Decode;
-    use yrs::{ReadTxn, Transact};
-
-    type Docs = FakeDocs;
-
-    fn empty_update() -> Vec<u8> {
-        let doc = yrs::Doc::new();
-        let update = doc
-            .transact()
-            .encode_state_as_update_v1(&yrs::StateVector::default());
-        update
-    }
-
-    async fn new_doc(State(docs): State<Docs>, Json(body): Json<Value>) -> Json<Value> {
-        let doc_id = body
-            .get("docId")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        docs.lock()
-            .await
-            .entry(doc_id.clone())
-            .or_insert_with(empty_update);
-        Json(json!({ "docId": doc_id }))
-    }
-
-    async fn auth_doc(headers: HeaderMap, Path(doc_id): Path<String>) -> Json<Value> {
-        let host = headers
-            .get(header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("127.0.0.1")
-            .to_string();
-        Json(json!({
-            "url": format!("ws://{host}/d/{doc_id}/ws"),
-            "baseUrl": format!("http://{host}/d/{doc_id}"),
-            "docId": doc_id,
-            "token": "fake-token",
-            "authorization": "full",
-        }))
-    }
-
-    async fn as_update(State(docs): State<Docs>, Path(doc_id): Path<String>) -> Vec<u8> {
-        docs.lock()
-            .await
-            .get(&doc_id)
-            .cloned()
-            .unwrap_or_else(empty_update)
-    }
-
-    async fn update(
-        State(docs): State<Docs>,
-        Path(doc_id): Path<String>,
-        body: Bytes,
-    ) -> Json<Value> {
-        let base = docs
-            .lock()
-            .await
-            .get(&doc_id)
-            .cloned()
-            .unwrap_or_else(empty_update);
-        let doc = yrs::Doc::new();
-        {
-            let mut txn = doc.transact_mut();
-            txn.apply_update(yrs::Update::decode_v1(&base).unwrap());
-            txn.apply_update(yrs::Update::decode_v1(&body).unwrap());
-        }
-        let merged = doc
-            .transact()
-            .encode_state_as_update_v1(&yrs::StateVector::default());
-        docs.lock().await.insert(doc_id, merged);
-        Json(json!({ "ok": true }))
-    }
-
-    let docs: Docs = Arc::new(Mutex::new(HashMap::new()));
-    let router = Router::new()
-        .route("/doc/new", post(new_doc))
-        .route("/doc/{doc_id}/auth", post(auth_doc))
-        .route("/d/{doc_id}/as-update", get(as_update))
-        .route("/d/{doc_id}/update", post(update))
-        .with_state(docs.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    (format!("http://{addr}"), docs)
-}
-
-/// Awareness states observed by the live fake y-sweet: `(clock, state_json)`
-/// per entry, in arrival order. The streaming caret test asserts on these.
-type AwarenessLog = Arc<Mutex<Vec<(u32, String)>>>;
-
-/// Like [`fake_ysweet_store_with_docs`], but additionally serves the y-sweet
-/// doc *WebSocket* (`/d/{docId}/ws/{docId}?token=…`, the same path the real
-/// client and `stream.rs` use), speaking enough of the y-protocols handshake
-/// to act as the document peer: it greets with SyncStep1, answers SyncStep1
-/// with SyncStep2, applies incoming updates into the shared doc store, and
-/// records every awareness state it receives.
-async fn fake_ysweet_live() -> (String, FakeDocs, AwarenessLog) {
-    use axum::body::Bytes;
-    use axum::extract::ws::{Message as FakeWsMsg, WebSocket, WebSocketUpgrade};
-    use axum::extract::{Path, State};
-    use axum::http::HeaderMap;
-    use axum::response::Response;
-    use axum::routing::{any, get, post};
-    use axum::Json;
-    use y_sweet_core::sync::{Message as YMsg, SyncMessage};
-    use yrs::updates::decoder::Decode;
-    use yrs::updates::encoder::Encode;
-    use yrs::{ReadTxn, Transact};
-
-    #[derive(Clone)]
-    struct LiveState {
-        docs: FakeDocs,
-        awareness: AwarenessLog,
-    }
-
-    fn empty_update() -> Vec<u8> {
-        let doc = yrs::Doc::new();
-        let update = doc
-            .transact()
-            .encode_state_as_update_v1(&yrs::StateVector::default());
-        update
-    }
-
-    async fn new_doc(State(st): State<LiveState>, Json(body): Json<Value>) -> Json<Value> {
-        let doc_id = body
-            .get("docId")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        st.docs
-            .lock()
-            .await
-            .entry(doc_id.clone())
-            .or_insert_with(empty_update);
-        Json(json!({ "docId": doc_id }))
-    }
-
-    async fn auth_doc(headers: HeaderMap, Path(doc_id): Path<String>) -> Json<Value> {
-        let host = headers
-            .get(header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("127.0.0.1")
-            .to_string();
-        Json(json!({
-            "url": format!("ws://{host}/d/{doc_id}/ws"),
-            "baseUrl": format!("http://{host}/d/{doc_id}"),
-            "docId": doc_id,
-            "token": "fake-token",
-            "authorization": "full",
-        }))
-    }
-
-    async fn as_update(State(st): State<LiveState>, Path(doc_id): Path<String>) -> Vec<u8> {
-        st.docs
-            .lock()
-            .await
-            .get(&doc_id)
-            .cloned()
-            .unwrap_or_else(empty_update)
-    }
-
-    async fn update(
-        State(st): State<LiveState>,
-        Path(doc_id): Path<String>,
-        body: Bytes,
-    ) -> Json<Value> {
-        let base = st
-            .docs
-            .lock()
-            .await
-            .get(&doc_id)
-            .cloned()
-            .unwrap_or_else(empty_update);
-        let doc = yrs::Doc::new();
-        {
-            let mut txn = doc.transact_mut();
-            txn.apply_update(yrs::Update::decode_v1(&base).unwrap());
-            txn.apply_update(yrs::Update::decode_v1(&body).unwrap());
-        }
-        let merged = doc
-            .transact()
-            .encode_state_as_update_v1(&yrs::StateVector::default());
-        st.docs.lock().await.insert(doc_id, merged);
-        Json(json!({ "ok": true }))
-    }
-
-    /// Decode the awareness entries `(client, clock, json)` out of a raw
-    /// y-protocols awareness frame (`varint 1, buf[varint count, (client,
-    /// clock, string)…]`).
-    fn decode_awareness_entries(frame: &[u8]) -> Option<Vec<(u32, String)>> {
-        use yrs::encoding::read::Read;
-        use yrs::updates::decoder::DecoderV1;
-        let mut dec = DecoderV1::from(frame);
-        let msg_type: u8 = dec.read_var().ok()?;
-        if msg_type != 1 {
-            return None;
-        }
-        let payload = dec.read_buf().ok()?.to_vec();
-        let mut dec = DecoderV1::from(payload.as_slice());
-        let count: u32 = dec.read_var().ok()?;
-        let mut out = Vec::new();
-        for _ in 0..count {
-            let _client: u64 = dec.read_var().ok()?;
-            let clock: u32 = dec.read_var().ok()?;
-            let json = dec.read_string().ok()?.to_string();
-            out.push((clock, json));
-        }
-        Some(out)
-    }
-
-    async fn ws_doc(
-        State(st): State<LiveState>,
-        Path((doc_id, _doc_id2)): Path<(String, String)>,
-        ws: WebSocketUpgrade,
-    ) -> Response {
-        ws.on_upgrade(move |socket| handle_doc_ws(st, doc_id, socket))
-    }
-
-    async fn handle_doc_ws(st: LiveState, doc_id: String, mut socket: WebSocket) {
-        // Materialize the stored doc for this connection.
-        let doc = yrs::Doc::new();
-        if let Some(base) = st.docs.lock().await.get(&doc_id) {
-            let mut txn = doc.transact_mut();
-            txn.apply_update(yrs::Update::decode_v1(base).unwrap());
-        }
-
-        // Like the real y-sweet: greet with our state vector.
-        let sv = doc.transact().state_vector();
-        let greeting = YMsg::Sync(SyncMessage::SyncStep1(sv)).encode_v1();
-        if socket
-            .send(FakeWsMsg::Binary(greeting.into()))
-            .await
-            .is_err()
-        {
-            return;
-        }
-
-        while let Some(Ok(msg)) = socket.recv().await {
-            let FakeWsMsg::Binary(data) = msg else {
-                continue;
-            };
-            match YMsg::decode_v1(&data) {
-                Ok(YMsg::Sync(SyncMessage::SyncStep1(sv))) => {
-                    let diff = doc.transact().encode_state_as_update_v1(&sv);
-                    let reply = YMsg::Sync(SyncMessage::SyncStep2(diff)).encode_v1();
-                    if socket.send(FakeWsMsg::Binary(reply.into())).await.is_err() {
-                        return;
-                    }
-                }
-                Ok(YMsg::Sync(SyncMessage::SyncStep2(update)))
-                | Ok(YMsg::Sync(SyncMessage::Update(update))) => {
-                    if let Ok(decoded) = yrs::Update::decode_v1(&update) {
-                        let mut txn = doc.transact_mut();
-                        txn.apply_update(decoded);
-                    }
-                    // Merge the *incremental* update into the shared store
-                    // rather than overwriting it with this connection's full
-                    // state: the real y-sweet has one authoritative doc, and
-                    // merging keeps edits from concurrent writers (HTTP
-                    // /update, direct store edits) alive.
-                    let mut docs = st.docs.lock().await;
-                    let base = docs.get(&doc_id).cloned().unwrap_or_else(empty_update);
-                    let merged_doc = yrs::Doc::new();
-                    {
-                        let mut txn = merged_doc.transact_mut();
-                        txn.apply_update(yrs::Update::decode_v1(&base).unwrap());
-                        if let Ok(decoded) = yrs::Update::decode_v1(&update) {
-                            txn.apply_update(decoded);
-                        }
-                    }
-                    let merged = merged_doc
-                        .transact()
-                        .encode_state_as_update_v1(&yrs::StateVector::default());
-                    docs.insert(doc_id.clone(), merged);
-                }
-                Ok(YMsg::Awareness(_)) => {
-                    if let Some(entries) = decode_awareness_entries(&data) {
-                        st.awareness.lock().await.extend(entries);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let state = LiveState {
-        docs: Arc::new(Mutex::new(HashMap::new())),
-        awareness: Arc::new(Mutex::new(Vec::new())),
-    };
-    let router = Router::new()
-        .route("/doc/new", post(new_doc))
-        .route("/doc/{doc_id}/auth", post(auth_doc))
-        .route("/d/{doc_id}/as-update", get(as_update))
-        .route("/d/{doc_id}/update", post(update))
-        .route("/d/{doc_id}/ws/{doc_id2}", any(ws_doc))
-        .with_state(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    (format!("http://{addr}"), state.docs, state.awareness)
-}
-
 async fn fake_attachment_source() -> String {
     use axum::routing::get;
 
@@ -586,22 +61,18 @@ async fn fake_attachment_source() -> String {
 }
 
 /// Build a git-enabled `AppState` plus its repo dir and a synthetic vault id.
-async fn git_state(
-    ysweet_url: &str,
-) -> (realtime_server::state::AppState, std::path::PathBuf, String) {
-    git_state_ext(ysweet_url, None).await
+async fn git_state() -> (realtime_server::state::AppState, std::path::PathBuf, String) {
+    git_state_ext(None).await
 }
 
 /// Like [`git_state`], optionally wiring the cr-sqlite loadable extension.
 async fn git_state_ext(
-    ysweet_url: &str,
     crsqlite_ext_path: Option<String>,
 ) -> (realtime_server::state::AppState, std::path::PathBuf, String) {
-    git_state_ext_with_debounce(ysweet_url, crsqlite_ext_path, 50).await
+    git_state_ext_with_debounce(crsqlite_ext_path, 50).await
 }
 
 async fn git_state_ext_with_debounce(
-    ysweet_url: &str,
     crsqlite_ext_path: Option<String>,
     git_debounce_ms: u64,
 ) -> (realtime_server::state::AppState, std::path::PathBuf, String) {
@@ -612,13 +83,25 @@ async fn git_state_ext_with_debounce(
 
     let config = Config {
         database_url: format!("sqlite://{}?mode=rwc", db_path.display()),
+        background_jobs_enabled: true,
+        background_job_concurrency: 4,
+        background_job_max_attempts: 25,
+        background_job_retry_min_ms: 250,
+        background_job_retry_max_ms: 30_000,
+        background_job_shutdown_timeout_ms: 30_000,
+        server_shutdown_timeout_ms: 30_000,
         bind_addr: "127.0.0.1:0".into(),
         public_base_url: "http://auth.test".into(),
+        crdt_store_dir: std::env::temp_dir()
+            .join(format!("realtime-crdt-{}", uuid::Uuid::new_v4()))
+            .display()
+            .to_string(),
+        crdt_epoch_period_days: 365,
+        crdt_epoch_recovery_days: 30,
+        crdt_epoch_max_updates: 100_000,
+        crdt_epoch_max_state_bytes: 32 * 1024 * 1024,
+        crdt_epoch_max_delete_set_bytes: 8 * 1024 * 1024,
         blob_dir: std::env::temp_dir().display().to_string(),
-        ysweet_store_dir: None,
-        ysweet_url: ysweet_url.to_string(),
-        ysweet_public_url: ysweet_url.to_string(),
-        ysweet_auth_key: gen_auth_key(),
         oidc_mode: OidcMode::Mock,
         oidc_issuer: None,
         oidc_client_id: None,
@@ -661,6 +144,44 @@ async fn git_state_ext_with_debounce(
     (state, git_dir, vault_id)
 }
 
+async fn seed_git_note(state: &realtime_server::state::AppState, vault_id: &str) {
+    state
+        .documents
+        .apply_update(vault_id, &files_update(&[("note.md", "g1")]))
+        .await
+        .unwrap();
+    state
+        .documents
+        .apply_update(
+            &format!("{vault_id}__g1"),
+            &text_update("contents", "# Note g1\n"),
+        )
+        .await
+        .unwrap();
+}
+
+fn files_and_binaries_update(binaries: &[(String, String, i64)]) -> Vec<u8> {
+    use yrs::{Any, Map, ReadTxn, Transact};
+    let doc = yrs::Doc::new();
+    let files = doc.get_or_insert_map("files");
+    let binary_map = doc.get_or_insert_map("binaries");
+    {
+        let mut txn = doc.transact_mut();
+        files.insert(&mut txn, "note.md", "g1");
+        for (path, hash, size) in binaries {
+            let metadata = HashMap::from([
+                ("hash".to_string(), Any::String(hash.as_str().into())),
+                ("size".to_string(), Any::BigInt(*size)),
+            ]);
+            binary_map.insert(&mut txn, path.clone(), Any::from(metadata));
+        }
+    }
+    let update = doc
+        .transact()
+        .encode_state_as_update_v1(&yrs::StateVector::default());
+    update
+}
+
 fn git_out(repo: &std::path::Path, args: &[&str]) -> (bool, String) {
     let out = std::process::Command::new("git")
         .arg("-C")
@@ -699,42 +220,27 @@ fn principal(id: &str, name: &str, email: &str) -> realtime_server::state::Princ
 
 // ---------- harness ----------
 
-async fn test_app(ysweet_url: &str, ysweet_public_url: &str) -> Router {
-    test_app_with_attachment_max(
-        ysweet_url,
-        ysweet_public_url,
-        realtime_server::blobs::MAX_BLOB_BYTES,
-    )
-    .await
+async fn test_app() -> Router {
+    test_app_with_attachment_max(realtime_server::blobs::MAX_BLOB_BYTES).await
 }
 
-async fn test_app_with_state(
-    ysweet_url: &str,
-    ysweet_public_url: &str,
+async fn test_app_with_state() -> (Router, realtime_server::state::AppState) {
+    test_app_with_public_url("http://auth.test").await
+}
+
+async fn test_app_with_public_url(
+    public_base_url: &str,
 ) -> (Router, realtime_server::state::AppState) {
-    let config = test_config(
-        ysweet_url,
-        ysweet_public_url,
-        realtime_server::blobs::MAX_BLOB_BYTES,
-    );
+    let config = test_config(public_base_url, realtime_server::blobs::MAX_BLOB_BYTES);
     let state = build_state(config).await.unwrap();
     (app(state.clone()), state)
 }
 
-async fn test_app_with_attachment_max(
-    ysweet_url: &str,
-    ysweet_public_url: &str,
-    attachment_max_bytes: u64,
-) -> Router {
-    app_from_config(&test_config(
-        ysweet_url,
-        ysweet_public_url,
-        attachment_max_bytes,
-    ))
-    .await
+async fn test_app_with_attachment_max(attachment_max_bytes: u64) -> Router {
+    app_from_config(&test_config("http://auth.test", attachment_max_bytes)).await
 }
 
-fn test_config(ysweet_url: &str, ysweet_public_url: &str, attachment_max_bytes: u64) -> Config {
+fn test_config(public_base_url: &str, attachment_max_bytes: u64) -> Config {
     let mut path = std::env::temp_dir();
     path.push(format!("realtime-test-{}.db", uuid::Uuid::new_v4()));
     let database_url = format!("sqlite://{}?mode=rwc", path.display());
@@ -747,13 +253,25 @@ fn test_config(ysweet_url: &str, ysweet_public_url: &str, attachment_max_bytes: 
 
     Config {
         database_url,
+        background_jobs_enabled: true,
+        background_job_concurrency: 4,
+        background_job_max_attempts: 25,
+        background_job_retry_min_ms: 250,
+        background_job_retry_max_ms: 30_000,
+        background_job_shutdown_timeout_ms: 30_000,
+        server_shutdown_timeout_ms: 30_000,
         bind_addr: "127.0.0.1:0".into(),
-        public_base_url: "http://auth.test".into(),
+        public_base_url: public_base_url.to_string(),
+        crdt_store_dir: std::env::temp_dir()
+            .join(format!("realtime-crdt-{}", uuid::Uuid::new_v4()))
+            .display()
+            .to_string(),
+        crdt_epoch_period_days: 365,
+        crdt_epoch_recovery_days: 30,
+        crdt_epoch_max_updates: 100_000,
+        crdt_epoch_max_state_bytes: 32 * 1024 * 1024,
+        crdt_epoch_max_delete_set_bytes: 8 * 1024 * 1024,
         blob_dir: blob_dir.display().to_string(),
-        ysweet_store_dir: None,
-        ysweet_url: ysweet_url.to_string(),
-        ysweet_public_url: ysweet_public_url.to_string(),
-        ysweet_auth_key: gen_auth_key(),
         oidc_mode: OidcMode::Mock,
         oidc_issuer: None,
         oidc_client_id: None,
@@ -796,6 +314,70 @@ fn test_config(ysweet_url: &str, ysweet_public_url: &str, attachment_max_bytes: 
 
 async fn app_from_config(config: &Config) -> Router {
     app(build_state(config.clone()).await.unwrap())
+}
+
+#[tokio::test]
+async fn operational_health_and_metrics_track_readiness_and_crdt_writes() {
+    let config = test_config("http://auth.test", realtime_server::blobs::MAX_BLOB_BYTES);
+    let state = build_state(config).await.unwrap();
+    state
+        .documents
+        .apply_update("health__document", &text_update("contents", "observed"))
+        .await
+        .unwrap();
+    let router = app(state.clone());
+
+    let (live_status, live) = send(&router, "GET", "/health/live", None, None).await;
+    assert_eq!(live_status, StatusCode::OK);
+    assert_eq!(live["status"], "up");
+
+    let (ready_status, ready) = send(&router, "GET", "/health/ready", None, None).await;
+    assert_eq!(ready_status, StatusCode::OK);
+    assert_eq!(ready["status"], "ready");
+    assert_eq!(ready["checks"]["database"], true);
+    assert_eq!(ready["checks"]["crdtStore"], true);
+    assert_eq!(ready["checks"]["blobStore"], true);
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/openmetrics-text; version=1.0.0; charset=utf-8"
+    );
+    let body = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("realtime_crdt_updates_total 1\n"));
+    assert!(body.contains("realtime_crdt_update_bytes_total "));
+    assert!(body.ends_with("# EOF\n"));
+
+    state.runtime_health.begin_draining();
+    let (draining_status, draining) = send(&router, "GET", "/health/ready", None, None).await;
+    assert_eq!(draining_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(draining["status"], "not_ready");
+    assert_eq!(draining["checks"]["draining"], true);
+    state.jobs.shutdown().await;
 }
 
 async fn send(
@@ -1063,32 +645,12 @@ async fn oauth_token(app: &Router, owner_sub: &str, verifier: &str) -> (String, 
 // ---------- tests ----------
 
 #[tokio::test]
-async fn internal_ydoc_reads_and_writes_ignore_public_token_origin() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let public_origin = format!("http://{}", listener.local_addr().unwrap());
-    let (ys, writes) = fake_ysweet_advertising(public_origin).await;
-
-    // Mirrors the bundled container: YSWEET_URL is internal,
-    // YSWEET_PUBLIC_URL is unset and therefore defaults to that same internal
-    // URL, while y-sweet advertises PUBLIC_BASE_URL through --url-prefix.
-    let config = test_config(&ys, &ys, realtime_server::blobs::MAX_BLOB_BYTES);
-    let state = build_state(config).await.unwrap();
-    let router = app(state.clone());
-    let server = tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-
-    let update = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        realtime_server::ydoc::read_update(&state, "vault__note"),
-    )
-    .await
-    .expect("internal read must not loop through /d and deadlock")
-    .unwrap();
-    assert_eq!(
-        realtime_server::ydoc::decode_text(&update, "contents").unwrap(),
-        "internal route reached"
+async fn internal_ydoc_reads_and_writes_do_not_use_the_public_origin() {
+    let config = test_config(
+        "http://unused-public-origin.invalid",
+        realtime_server::blobs::MAX_BLOB_BYTES,
     );
+    let state = build_state(config).await.unwrap();
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
         realtime_server::ydoc::write_update(
@@ -1098,17 +660,24 @@ async fn internal_ydoc_reads_and_writes_ignore_public_token_origin() {
         ),
     )
     .await
-    .expect("internal write must not loop through /d and deadlock")
+    .expect("native internal write must not use the public origin")
     .unwrap();
-    assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 1);
-
-    server.abort();
+    let update = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        realtime_server::ydoc::read_update(&state, "vault__note"),
+    )
+    .await
+    .expect("native internal read must not use the public origin")
+    .unwrap();
+    assert_eq!(
+        realtime_server::ydoc::decode_text(&update, "contents").unwrap(),
+        "MCP create body"
+    );
 }
 
 #[tokio::test]
 async fn login_creates_session_and_me_works() {
-    let ys = fake_ysweet().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
 
     let token = login_with_picture(&app, "alice", Some("https://example.com/alice.png")).await;
     let (status, me) = send(&app, "GET", "/api/me", Some(&token), None).await;
@@ -1283,8 +852,7 @@ async fn login_creates_session_and_me_works() {
 
 #[tokio::test]
 async fn server_info_returns_stable_id_without_auth() {
-    let ys = fake_ysweet().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
 
     // Public: no bearer required.
     let (status, info) = send(&app, "GET", "/api/server-info", None, None).await;
@@ -1309,22 +877,20 @@ async fn server_info_returns_stable_id_without_auth() {
         caps["attachmentShim"].as_str(),
         Some("https://realtime.md/attachment-shim/v1")
     );
+    assert_eq!(caps["documentEpoch"].as_str(), Some("1"));
+    assert_eq!(caps["documentInvalidation"].as_str(), Some("1"));
 
-    // v1 advertises no required caps (all four are mandatory and known by the
-    // v1 client; the field exists for future optional caps).
-    assert!(
-        info["requiredCaps"]
-            .as_array()
-            .map(|a| a.is_empty())
-            .unwrap_or(false),
-        "requiredCaps should be an empty array in v1"
+    // Epoch-aware clients are required before the server can safely retire a
+    // physical Yjs history.
+    assert_eq!(
+        info["requiredCaps"].as_array(),
+        Some(&vec![serde_json::json!("documentEpoch")])
     );
 }
 
 #[tokio::test]
 async fn server_info_and_session_survive_restart() {
-    let ys = fake_ysweet().await;
-    let config = test_config(&ys, &ys, realtime_server::blobs::MAX_BLOB_BYTES);
+    let config = test_config("http://auth.test", realtime_server::blobs::MAX_BLOB_BYTES);
 
     let first = app_from_config(&config).await;
     let token = login(&first, "alice").await;
@@ -1348,8 +914,7 @@ async fn server_info_and_session_survive_restart() {
 
 #[tokio::test]
 async fn logout_revokes_session() {
-    let ys = fake_ysweet().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
 
     let token = login(&app, "alice").await;
     let (status, _) = send(&app, "POST", "/api/logout", Some(&token), Some(json!({}))).await;
@@ -1361,8 +926,7 @@ async fn logout_revokes_session() {
 
 #[tokio::test]
 async fn login_rejects_unallowed_redirect() {
-    let ys = fake_ysweet().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
 
     let res = app
         .clone()
@@ -1380,8 +944,7 @@ async fn login_rejects_unallowed_redirect() {
 
 #[tokio::test]
 async fn openapi_json_and_swagger_docs_are_served() {
-    let ys = fake_ysweet().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
 
     let (status, spec) = send(&app, "GET", "/openapi.json", None, None).await;
     assert_eq!(status, StatusCode::OK);
@@ -1424,8 +987,7 @@ async fn openapi_json_and_swagger_docs_are_served() {
 
 #[tokio::test]
 async fn oauth_authorize_token_refresh_and_rest_access() {
-    let ys = fake_ysweet_store().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let verifier = "correct-horse-battery-staple";
     let (access, refresh, vault_id) = oauth_token(&app, "alice", verifier).await;
 
@@ -1458,8 +1020,7 @@ async fn oauth_authorize_token_refresh_and_rest_access() {
 
 #[tokio::test]
 async fn oauth_rejects_bad_pkce_and_is_single_use() {
-    let ys = fake_ysweet_store().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let session = login(&app, "alice").await;
     let (status, vault) = send(
         &app,
@@ -1572,8 +1133,7 @@ async fn oauth_rejects_bad_pkce_and_is_single_use() {
 
 #[tokio::test]
 async fn oauth_wrong_owner_authorize_forbidden() {
-    let ys = fake_ysweet_store().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let session = login(&app, "alice").await;
     let (status, vault) = send(
         &app,
@@ -1646,8 +1206,7 @@ async fn oauth_wrong_owner_authorize_forbidden() {
 
 #[tokio::test]
 async fn mcp_unauthenticated_returns_resource_metadata_challenge() {
-    let ys = fake_ysweet_store().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let session = login(&app, "alice").await;
     let (status, vault) = send(
         &app,
@@ -1736,8 +1295,7 @@ async fn mcp_call(
 
 #[tokio::test]
 async fn mcp_lists_tools_and_round_trips_note_edits() {
-    let ys = fake_ysweet_store().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let session = login(&app, "alice").await;
     let (status, vault) = send(
         &app,
@@ -1890,8 +1448,7 @@ async fn mcp_lists_tools_and_round_trips_note_edits() {
 
 #[tokio::test]
 async fn create_list_vault() {
-    let ys = fake_ysweet().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let token = login(&app, "alice").await;
 
     let (status, vault) = send(
@@ -1913,9 +1470,73 @@ async fn create_list_vault() {
 }
 
 #[tokio::test]
+async fn vault_admin_can_inspect_and_cancel_persistent_jobs() {
+    let mut config = test_config("http://auth.test", realtime_server::blobs::MAX_BLOB_BYTES);
+    config.background_jobs_enabled = false;
+    let state = build_state(config).await.unwrap();
+    let app = app(state.clone());
+    let admin = login(&app, "jobs-admin").await;
+    let outsider = login(&app, "jobs-outsider").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&admin),
+        Some(json!({"name": "Jobs"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap();
+    state.jobs.enqueue_search_vault(vault_id).await.unwrap();
+    let jobs_url = format!("/api/vaults/{vault_id}/jobs");
+
+    let (status, _) = send(&app, "GET", &jobs_url, Some(&outsider), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, jobs) = send(&app, "GET", &jobs_url, Some(&admin), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let queued = jobs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|job| job["payload"]["kind"] == "search_vault")
+        .unwrap();
+    assert_eq!(queued["status"], "pending");
+    let intent_key = queued["intentKey"].as_str().unwrap();
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/jobs/cancel"),
+        Some(&admin),
+        Some(json!({"intentKey": intent_key})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+
+    let (_, jobs) = send(&app, "GET", &jobs_url, Some(&admin), None).await;
+    let canceled = jobs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|job| job["intentKey"] == intent_key)
+        .unwrap();
+    assert_eq!(canceled["status"], "completed");
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/jobs/retry"),
+        Some(&admin),
+        Some(json!({"intentKey": intent_key})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
 async fn note_crud_rest_roundtrip() {
-    let ys = fake_ysweet_store().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let token = login(&app, "alice").await;
     let (_, vault) = send(
         &app,
@@ -2081,8 +1702,7 @@ async fn note_crud_rest_roundtrip() {
 
 #[tokio::test]
 async fn periodic_daily_note_get_create_and_append() {
-    let ys = fake_ysweet_store().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let token = login(&app, "alice").await;
     let (_, vault) = send(
         &app,
@@ -2134,8 +1754,7 @@ async fn periodic_daily_note_get_create_and_append() {
 
 #[tokio::test]
 async fn attachment_upload_list_read_delete_roundtrip() {
-    let ys = fake_ysweet_store().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let token = login(&app, "alice").await;
     let (_, vault) = send(
         &app,
@@ -2227,8 +1846,7 @@ async fn attachment_upload_list_read_delete_roundtrip() {
 
 #[tokio::test]
 async fn authenticated_attachment_upload_accepts_arbitrary_vault_files() {
-    let ys = fake_ysweet_store().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let token = login(&app, "alice").await;
     let (_, vault) = send(
         &app,
@@ -2258,8 +1876,7 @@ async fn authenticated_attachment_upload_accepts_arbitrary_vault_files() {
 
 #[tokio::test]
 async fn signed_upload_link_uploads_once_and_rejects_bad_inputs() {
-    let ys = fake_ysweet_store().await;
-    let app = test_app_with_attachment_max(&ys, &ys, 16).await;
+    let app = test_app_with_attachment_max(16).await;
     let token = login(&app, "alice").await;
     let (_, vault) = send(
         &app,
@@ -2363,9 +1980,8 @@ async fn signed_upload_link_uploads_once_and_rejects_bad_inputs() {
 
 #[tokio::test]
 async fn attachment_upload_from_url_roundtrip() {
-    let ys = fake_ysweet_store().await;
     let source = fake_attachment_source().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let token = login(&app, "alice").await;
     let (_, vault) = send(
         &app,
@@ -2410,8 +2026,7 @@ async fn attachment_upload_from_url_roundtrip() {
 
 #[tokio::test]
 async fn invite_is_single_use_and_grants_membership() {
-    let ys = fake_ysweet().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let admin = login(&app, "alice").await;
     let bob = login(&app, "bob").await;
     let carol = login(&app, "carol").await;
@@ -2475,8 +2090,7 @@ async fn invite_is_single_use_and_grants_membership() {
 
 #[tokio::test]
 async fn promote_member_to_admin() {
-    let ys = fake_ysweet().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let admin = login(&app, "alice").await;
     let bob = login(&app, "bob").await;
     let bob_id = send(&app, "GET", "/api/me", Some(&bob), None).await.1["userId"]
@@ -2545,8 +2159,7 @@ async fn promote_member_to_admin() {
 
 #[tokio::test]
 async fn remove_member_permissions() {
-    let ys = fake_ysweet().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let owner = login(&app, "owner").await;
     let admin = login(&app, "admin").await;
     let member = login(&app, "member").await;
@@ -2698,8 +2311,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[tokio::test]
 async fn blob_put_head_get_roundtrip() {
-    let ys = fake_ysweet().await;
-    let (app, state) = test_app_with_state(&ys, &ys).await;
+    let (app, state) = test_app_with_state().await;
     let alice = login(&app, "alice").await;
     let bob = login(&app, "bob").await;
     let carol = login(&app, "carol").await;
@@ -2783,8 +2395,7 @@ async fn blob_put_head_get_roundtrip() {
 
 #[tokio::test]
 async fn blob_rejects_bad_hash_and_mismatch() {
-    let ys = fake_ysweet().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let alice = login(&app, "alice").await;
     let (_, vault) = send(
         &app,
@@ -2809,8 +2420,7 @@ async fn blob_rejects_bad_hash_and_mismatch() {
 
 #[tokio::test]
 async fn blob_requires_auth() {
-    let ys = fake_ysweet().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let alice = login(&app, "alice").await;
     let (_, vault) = send(
         &app,
@@ -2831,8 +2441,8 @@ async fn blob_requires_auth() {
 
 #[tokio::test]
 async fn git_audit_commits_attributed_to_principal() {
-    let ys = fake_ysweet_as_update().await;
-    let (state, git_dir, vault_id) = git_state(&ys).await;
+    let (state, git_dir, vault_id) = git_state().await;
+    seed_git_note(&state, &vault_id).await;
     let repo = git_dir.join(&vault_id);
 
     // A write by Alice triggers a debounced commit materializing the vault tree.
@@ -2855,7 +2465,7 @@ async fn git_audit_commits_attributed_to_principal() {
         "committer identity"
     );
 
-    // The note's content was reconstructed from y-sweet, at its real vault path.
+    // The note's content was reconstructed from the native store at its vault path.
     let content = std::fs::read_to_string(repo.join("note.md")).unwrap();
     assert!(content.contains("# Note g1"), "got {content:?}");
 
@@ -2887,16 +2497,30 @@ async fn git_audit_commits_attachments_inline_or_as_shim() {
     let large_hash = "c".repeat(64);
     let large_size: i64 = 50 * 1024 * 1024; // over the 5 MB inline threshold
 
-    let ys = fake_ysweet_with_binaries(vec![
-        (
-            "img/small.png".to_string(),
-            small_hash.clone(),
-            small_bytes.len() as i64,
-        ),
-        ("img/large.pdf".to_string(), large_hash.clone(), large_size),
-    ])
-    .await;
-    let (state, git_dir, vault_id) = git_state(&ys).await;
+    let (state, git_dir, vault_id) = git_state().await;
+    state
+        .documents
+        .apply_update(
+            &vault_id,
+            &files_and_binaries_update(&[
+                (
+                    "img/small.png".to_string(),
+                    small_hash.clone(),
+                    small_bytes.len() as i64,
+                ),
+                ("img/large.pdf".to_string(), large_hash.clone(), large_size),
+            ]),
+        )
+        .await
+        .unwrap();
+    state
+        .documents
+        .apply_update(
+            &format!("{vault_id}__g1"),
+            &text_update("contents", "# Note g1\n"),
+        )
+        .await
+        .unwrap();
     let repo = git_dir.join(&vault_id);
 
     // Seed the small attachment's bytes in the blob store; the large one's
@@ -2983,8 +2607,8 @@ async fn backup_row(
 
 #[tokio::test]
 async fn git_backup_pushes_to_remote_after_commit() {
-    let ys = fake_ysweet_as_update().await;
-    let (state, git_dir, vault_id) = git_state(&ys).await;
+    let (state, git_dir, vault_id) = git_state().await;
+    seed_git_note(&state, &vault_id).await;
 
     // A bare repo standing in for the remote.
     let bare = git_dir.join("remote.git");
@@ -3027,8 +2651,8 @@ async fn git_backup_pushes_to_remote_after_commit() {
 
 #[tokio::test]
 async fn git_backup_push_failure_recorded_without_breaking_commits() {
-    let ys = fake_ysweet_as_update().await;
-    let (state, git_dir, vault_id) = git_state(&ys).await;
+    let (state, git_dir, vault_id) = git_state().await;
+    seed_git_note(&state, &vault_id).await;
     insert_backup_row(
         &state.db,
         &vault_id,
@@ -3057,8 +2681,7 @@ async fn git_backup_push_failure_recorded_without_breaking_commits() {
 
 #[tokio::test]
 async fn git_backup_routes_admin_only_and_secrets_never_leak() {
-    let ys = fake_ysweet().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let alice = login(&app, "alice").await;
     let bob = login(&app, "bob").await;
 
@@ -3181,9 +2804,8 @@ async fn git_backup_routes_admin_only_and_secrets_never_leak() {
 
 #[tokio::test]
 async fn doc_token_scopes_and_mints() {
-    let ys = fake_ysweet().await;
     let public = "http://public.example:9999";
-    let (app, state) = test_app_with_state(&ys, public).await;
+    let (app, state) = test_app_with_public_url(public).await;
     let alice = login(&app, "alice").await;
     let bob = login(&app, "bob").await;
 
@@ -3219,13 +2841,14 @@ async fn doc_token_scopes_and_mints() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    // Member gets a token (default allow-all), with the host rewritten to public.
+    // Member gets a document-scoped token for the configured public URL.
+    let document_id = format!("{vault_id}__deadbeef");
     let (status, token) = send(
         &app,
         "POST",
         "/api/doc-token",
         Some(&alice),
-        Some(json!({"vaultId": vault_id, "docId": format!("{vault_id}__deadbeef")})),
+        Some(json!({"vaultId": vault_id, "docId": document_id})),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -3237,6 +2860,119 @@ async fn doc_token_scopes_and_mints() {
         "host should be rewritten to public url, got {}",
         token["url"]
     );
+    assert_eq!(token["epoch"].as_u64(), Some(0));
+    let opaque = token["token"].as_str().unwrap();
+    assert_eq!(
+        state
+            .sync_grant(opaque, &document_id)
+            .await
+            .map(|grant| grant.level),
+        Some(realtime_server::crdt::Level::Full)
+    );
+    assert!(
+        state
+            .sync_grant(opaque, &format!("{vault_id}__other"))
+            .await
+            .is_none(),
+        "a token must not authorize another document"
+    );
+    assert!(
+        state
+            .sync_grant(&format!("{opaque}x"), &document_id)
+            .await
+            .is_none(),
+        "a modified opaque token must be rejected"
+    );
+
+    let update = text_update("contents", "native route");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/d/{document_id}/update"))
+                .header(header::AUTHORIZATION, format!("Bearer {opaque}"))
+                .body(Body::from(update))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let persisted = state.documents.read_update(&document_id).await.unwrap();
+    assert_eq!(
+        realtime_server::ydoc::decode_text(&persisted, "contents").unwrap(),
+        "native route"
+    );
+
+    // Activating a replacement preserves logical content but invalidates every
+    // token bound to the retired physical epoch.
+    assert_eq!(
+        state
+            .documents
+            .begin_epoch_transition(&document_id)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        realtime_server::ydoc::decode_text(
+            &state.documents.read_update(&document_id).await.unwrap(),
+            "contents"
+        )
+        .unwrap(),
+        "native route"
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/d/{document_id}/update"))
+                .header(header::AUTHORIZATION, format!("Bearer {opaque}"))
+                .body(Body::from(text_update("contents", "stale")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/d/{document_id}/as-update"))
+                .header(header::AUTHORIZATION, format!("Bearer {opaque}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let (status, replacement_token) = send(
+        &app,
+        "POST",
+        "/api/doc-token",
+        Some(&alice),
+        Some(json!({"vaultId": vault_id, "docId": document_id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replacement_token["epoch"].as_u64(), Some(1));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/d/{vault_id}__other/update"))
+                .header(header::AUTHORIZATION, format!("Bearer {opaque}"))
+                .body(Body::from(text_update("contents", "forbidden")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
     // Once a member has path ACLs, both token minting and registry rewrites
     // must authorize the registered/requested paths rather than falling back
@@ -3317,8 +3053,7 @@ async fn doc_token_scopes_and_mints() {
 
 #[tokio::test]
 async fn search_tags_backlinks_reindex_and_rename_rewrite() {
-    let ys = fake_ysweet_store().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let token = login(&app, "alice").await;
     let (_, vault) = send(
         &app,
@@ -3464,20 +3199,31 @@ async fn search_tags_backlinks_reindex_and_rename_rewrite() {
 async fn search_refreshes_one_modified_note_without_waiting_for_git_debounce() {
     use sea_orm::{ConnectionTrait, Statement};
 
-    let (ys, docs) = fake_ysweet_store_with_docs().await;
-    let (state, _git_dir, vault_id) = git_state_ext_with_debounce(&ys, None, 5_000).await;
-    docs.lock().await.insert(
-        vault_id.clone(),
-        files_update(&[("one.md", "g1"), ("two.md", "g2")]),
-    );
-    docs.lock().await.insert(
-        format!("{vault_id}__g1"),
-        text_update("contents", "old search content"),
-    );
-    docs.lock().await.insert(
-        format!("{vault_id}__g2"),
-        text_update("contents", "unchanged content"),
-    );
+    let (state, _git_dir, vault_id) = git_state_ext_with_debounce(None, 5_000).await;
+    state
+        .documents
+        .apply_update(
+            &vault_id,
+            &files_update(&[("one.md", "g1"), ("two.md", "g2")]),
+        )
+        .await
+        .unwrap();
+    state
+        .documents
+        .apply_update(
+            &format!("{vault_id}__g1"),
+            &text_update("contents", "old search content"),
+        )
+        .await
+        .unwrap();
+    state
+        .documents
+        .apply_update(
+            &format!("{vault_id}__g2"),
+            &text_update("contents", "unchanged content"),
+        )
+        .await
+        .unwrap();
     realtime_server::search::reindex_vault(&state, &vault_id)
         .await
         .unwrap();
@@ -3499,15 +3245,11 @@ async fn search_refreshes_one_modified_note_without_waiting_for_git_debounce() {
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
-    docs.lock().await.insert(
-        format!("{vault_id}__g1"),
-        text_update("contents", "new searchable content"),
-    );
+    realtime_server::ydoc::set_text(&state, &format!("{vault_id}__g1"), "new searchable content")
+        .await
+        .unwrap();
     let started = std::time::Instant::now();
-    state
-        .search
-        .mark_note_write(state.clone(), &vault_id, "g1")
-        .await;
+    state.search.mark_note_write(&vault_id, "g1").await;
 
     let mut updated = false;
     for _ in 0..40 {
@@ -3522,11 +3264,12 @@ async fn search_refreshes_one_modified_note_without_waiting_for_git_debounce() {
                 ],
             ))
             .await
-            .unwrap()
             .unwrap();
-        if row.try_get::<String>("", "body").unwrap() == "new searchable content" {
-            updated = true;
-            break;
+        if let Some(row) = row {
+            if row.try_get::<String>("", "body").unwrap() == "new searchable content" {
+                updated = true;
+                break;
+            }
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -3555,8 +3298,7 @@ async fn search_refreshes_one_modified_note_without_waiting_for_git_debounce() {
 
 #[tokio::test]
 async fn note_move_rewrites_pathed_links_preserving_paths() {
-    let ys = fake_ysweet_store().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let token = login(&app, "alice").await;
     let (_, vault) = send(
         &app,
@@ -3620,8 +3362,7 @@ async fn create_note_after_client_side_delete_succeeds() {
     use yrs::updates::decoder::Decode;
     use yrs::{Map, ReadTxn, Transact};
 
-    let (ys, docs) = fake_ysweet_store_with_docs().await;
-    let app = test_app(&ys, &ys).await;
+    let (app, state) = test_app_with_state().await;
     let token = login(&app, "alice").await;
     let (_, vault) = send(
         &app,
@@ -3648,7 +3389,7 @@ async fn create_note_after_client_side_delete_succeeds() {
     let first_guid = created["guid"].as_str().unwrap().to_string();
 
     {
-        let raw = docs.lock().await.get(&vault_id).cloned().unwrap();
+        let raw = state.documents.read_update(&vault_id).await.unwrap();
         let doc = yrs::Doc::new();
         let files = doc.get_or_insert_map("files");
         let mut txn = doc.transact_mut();
@@ -3658,9 +3399,11 @@ async fn create_note_after_client_side_delete_succeeds() {
         let new_update = doc
             .transact()
             .encode_state_as_update_v1(&yrs::StateVector::default());
-        docs.lock()
+        state
+            .documents
+            .apply_update(&vault_id, &new_update)
             .await
-            .insert(vault_id.clone(), new_update.to_vec());
+            .unwrap();
     }
 
     // create_note must agree with list_notes and accept the freed path. Test it
@@ -3700,8 +3443,7 @@ async fn create_note_after_client_side_delete_succeeds() {
 
 #[tokio::test]
 async fn attachment_move_update_embeds_rewrites_opt_in_only() {
-    let ys = fake_ysweet_store().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let token = login(&app, "alice").await;
     let (_, vault) = send(
         &app,
@@ -3792,8 +3534,7 @@ async fn attachment_move_update_embeds_rewrites_opt_in_only() {
 
 #[tokio::test]
 async fn canvas_move_update_embeds_rewrites_note_references() {
-    let ys = fake_ysweet_store().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let token = login(&app, "alice").await;
     let (_, vault) = send(
         &app,
@@ -3847,8 +3588,7 @@ async fn canvas_move_update_embeds_rewrites_note_references() {
 
 #[tokio::test]
 async fn canvas_operation_batches_are_atomic_authorized_and_idempotent() {
-    let ys = fake_ysweet_store().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let token = login(&app, "alice").await;
     let (_, vault) = send(
         &app,
@@ -3944,8 +3684,7 @@ async fn canvas_operation_batches_are_atomic_authorized_and_idempotent() {
 
 #[tokio::test]
 async fn note_move_rewrites_canvas_file_refs_and_undo_restores_them() {
-    let ys = fake_ysweet_store().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let session = login(&app, "alice").await;
     let (_, vault) = send(
         &app,
@@ -4261,27 +4000,39 @@ fn plugin_db_doc_update(schema: &[String], batches: &Value, deleted_at: Option<i
 }
 
 /// Merge `meta.deletedAt` into an existing raw doc state.
-async fn set_doc_deleted_at(docs: &FakeDocs, doc_id: &str, ms: i64) {
+async fn set_doc_deleted_at(state: &realtime_server::state::AppState, doc_id: &str, ms: i64) {
     use yrs::updates::decoder::Decode;
     use yrs::{Map, ReadTxn, Transact};
-    let mut guard = docs.lock().await;
-    let base = guard.get(doc_id).cloned().unwrap_or_default();
+    let base = state.documents.read_update(doc_id).await.unwrap();
     let doc = yrs::Doc::new();
     {
         let mut txn = doc.transact_mut();
-        if !base.is_empty() {
-            txn.apply_update(yrs::Update::decode_v1(&base).unwrap());
-        }
+        txn.apply_update(yrs::Update::decode_v1(&base).unwrap());
     }
+    let state_vector = doc.transact().state_vector();
     let meta = doc.get_or_insert_map("meta");
     {
         let mut txn = doc.transact_mut();
         meta.insert(&mut txn, "deletedAt", yrs::Any::BigInt(ms));
     }
-    let merged = doc
-        .transact()
-        .encode_state_as_update_v1(&yrs::StateVector::default());
-    guard.insert(doc_id.to_string(), merged);
+    let delta = doc.transact().encode_state_as_update_v1(&state_vector);
+    state.documents.apply_update(doc_id, &delta).await.unwrap();
+}
+
+async fn clear_doc_deleted_at(state: &realtime_server::state::AppState, doc_id: &str) {
+    use yrs::updates::decoder::Decode;
+    use yrs::{Map, ReadTxn, Transact};
+    let base = state.documents.read_update(doc_id).await.unwrap();
+    let doc = yrs::Doc::new();
+    {
+        let mut txn = doc.transact_mut();
+        txn.apply_update(yrs::Update::decode_v1(&base).unwrap());
+    }
+    let state_vector = doc.transact().state_vector();
+    doc.get_or_insert_map("meta")
+        .remove(&mut doc.transact_mut(), "deletedAt");
+    let delta = doc.transact().encode_state_as_update_v1(&state_vector);
+    state.documents.apply_update(doc_id, &delta).await.unwrap();
 }
 
 /// Scratch source DB with a CRR `tasks` table and two rows; returns the wire
@@ -4350,17 +4101,18 @@ async fn plugin_db_replication_dump_compaction_and_bootstrap() {
         eprintln!("skipping plugin_db_replication test: CRSQLITE_EXT_PATH not set");
         return;
     };
-    let (ys, docs) = fake_ysweet_store_with_docs().await;
-    let (state, git_dir, vault_id) = git_state_ext(&ys, Some(ext.clone())).await;
+
+    let (state, git_dir, vault_id) = git_state_ext(Some(ext.clone())).await;
     let repo = git_dir.join(&vault_id);
 
     // Seed the per-DB doc with one published batch (two task rows).
     let (schema, batches, site_hex, max_v) = make_source_batch(&ext);
     let doc_id = format!("{vault_id}__plugindb__my-plugin__tasks");
-    docs.lock().await.insert(
-        doc_id.clone(),
-        plugin_db_doc_update(&schema, &batches, None),
-    );
+    state
+        .documents
+        .apply_update(&doc_id, &plugin_db_doc_update(&schema, &batches, None))
+        .await
+        .unwrap();
 
     // Replay batches -> replica matches the source.
     state
@@ -4381,7 +4133,7 @@ async fn plugin_db_replication_dump_compaction_and_bootstrap() {
     // cursors hold it back, so the doc log gets trimmed.
     let mut compacted = false;
     for _ in 0..100 {
-        let raw = docs.lock().await.get(&doc_id).cloned().unwrap();
+        let raw = state.documents.read_update(&doc_id).await.unwrap();
         let view = realtime_server::plugindb::decode_doc(&raw).unwrap();
         if view.batches.is_empty() {
             assert_eq!(
@@ -4470,16 +4222,17 @@ async fn plugin_db_soft_delete_keeps_replica_and_purge_removes_everything() {
         eprintln!("skipping plugin_db_purge test: CRSQLITE_EXT_PATH not set");
         return;
     };
-    let (ys, docs) = fake_ysweet_store_with_docs().await;
-    let (state, git_dir, vault_id) = git_state_ext(&ys, Some(ext.clone())).await;
+
+    let (state, git_dir, vault_id) = git_state_ext(Some(ext.clone())).await;
     let repo = git_dir.join(&vault_id);
 
     let (schema, batches, _site_hex, _max_v) = make_source_batch(&ext);
     let doc_id = format!("{vault_id}__plugindb__my-plugin__tasks");
-    docs.lock().await.insert(
-        doc_id.clone(),
-        plugin_db_doc_update(&schema, &batches, None),
-    );
+    state
+        .documents
+        .apply_update(&doc_id, &plugin_db_doc_update(&schema, &batches, None))
+        .await
+        .unwrap();
 
     // Replicate, then commit the dump.
     state
@@ -4506,7 +4259,7 @@ async fn plugin_db_soft_delete_keeps_replica_and_purge_removes_everything() {
     assert!(committed_dump.exists());
 
     // Soft delete: tombstone the doc. Replication stops but the replica stays.
-    set_doc_deleted_at(&docs, &doc_id, 12345).await;
+    set_doc_deleted_at(&state, &doc_id, 12345).await;
     state
         .plugindb
         .mark_write(&vault_id, "my-plugin", "tasks")
@@ -4524,7 +4277,7 @@ async fn plugin_db_soft_delete_keeps_replica_and_purge_removes_everything() {
         .await
         .unwrap();
     assert!(!replica.exists(), "purge must delete the replica file");
-    let raw = docs.lock().await.get(&doc_id).cloned().unwrap();
+    let raw = state.documents.read_update(&doc_id).await.unwrap();
     let view = realtime_server::plugindb::decode_doc(&raw).unwrap();
     assert!(view.batches.is_empty(), "purge must trim the batch log");
     assert!(view.deleted_at.is_some(), "purge must set the tombstone");
@@ -4558,8 +4311,8 @@ async fn plugin_db_soft_delete_keeps_replica_and_purge_removes_everything() {
 #[tokio::test]
 async fn plugin_db_routes_validate_ids_and_membership() {
     // The store-backed fake serves /as-update, which the bootstrap route reads.
-    let ys = fake_ysweet_store().await;
-    let app = test_app(&ys, &ys).await;
+
+    let app = test_app().await;
     let alice = login(&app, "alice").await;
 
     let (status, vault) = send(
@@ -4666,10 +4419,10 @@ async fn plugin_db_decodes_and_replicates_a_real_client_published_doc() {
         eprintln!("skipping replica half: CRSQLITE_EXT_PATH not set");
         return;
     };
-    let (ys, docs) = fake_ysweet_store_with_docs().await;
-    let (state, git_dir, vault_id) = git_state_ext(&ys, Some(ext.clone())).await;
+
+    let (state, git_dir, vault_id) = git_state_ext(Some(ext.clone())).await;
     let doc_id = format!("{vault_id}__plugindb__client-plugin__tasks");
-    docs.lock().await.insert(doc_id.clone(), raw.to_vec());
+    state.documents.apply_update(&doc_id, raw).await.unwrap();
 
     state
         .plugindb
@@ -4705,16 +4458,17 @@ async fn plugin_db_sql_endpoints() {
         eprintln!("skipping plugin_db_sql_endpoints test: CRSQLITE_EXT_PATH not set");
         return;
     };
-    let (ys, docs) = fake_ysweet_store_with_docs().await;
-    let (state, _git_dir, vault_id) = git_state_ext(&ys, Some(ext.clone())).await;
+
+    let (state, _git_dir, vault_id) = git_state_ext(Some(ext.clone())).await;
 
     // Seed the per-DB doc with one published batch (two task rows).
     let (schema, batches, site_hex, max_v) = make_source_batch(&ext);
     let doc_id = format!("{vault_id}__plugindb__my-plugin__tasks");
-    docs.lock().await.insert(
-        doc_id.clone(),
-        plugin_db_doc_update(&schema, &batches, None),
-    );
+    state
+        .documents
+        .apply_update(&doc_id, &plugin_db_doc_update(&schema, &batches, None))
+        .await
+        .unwrap();
 
     // list_dbs before any replication -> empty (rows appear once the server
     // has replicated at least once, which a query triggers via its refresh).
@@ -4772,7 +4526,7 @@ async fn plugin_db_sql_endpoints() {
     assert_eq!(exec.rows_affected, 2, "both statements mutated rows");
 
     // Decode the doc: a new server-authored batch was appended.
-    let raw = docs.lock().await.get(&doc_id).cloned().unwrap();
+    let raw = state.documents.read_update(&doc_id).await.unwrap();
     let view = realtime_server::plugindb::decode_doc(&raw).unwrap();
     // The new batch is the last one; its site_id differs from the client's
     // and its changes are non-empty.
@@ -4837,7 +4591,7 @@ async fn plugin_db_sql_endpoints() {
     assert!(unknown.is_err(), "unknown name -> NotFound");
 
     // Tombstone the doc; query must reject.
-    set_doc_deleted_at(&docs, &doc_id, 12345).await;
+    set_doc_deleted_at(&state, &doc_id, 12345).await;
     let tomb = state
         .plugindb
         .query_sql(&vault_id, "my-plugin", "tasks", "SELECT 1", &[], None)
@@ -4845,14 +4599,10 @@ async fn plugin_db_sql_endpoints() {
     assert!(tomb.is_err(), "deleted database rejects queries");
 
     // Server-cursor advance: after execute, bootstrap_changes with an empty
-    // cursor includes the server-authored rows (clients can bootstrap them),
+    // server-authored rows (clients can bootstrap them),
     // and a cursor caught up to the server's own site excludes them.
     // Clear the tombstone so bootstrap proceeds.
-    docs.lock().await.remove(&doc_id);
-    docs.lock().await.insert(
-        doc_id.clone(),
-        plugin_db_doc_update(&schema, &batches, None),
-    );
+    clear_doc_deleted_at(&state, &doc_id).await;
     // Re-run execute to re-publish (the doc was reset above).
     let stmts = vec![realtime_server::plugindb::ExecuteStatement {
         sql: "INSERT INTO tasks (id, title) VALUES (?1, ?2)".into(),
@@ -4882,9 +4632,8 @@ async fn plugin_db_sql_endpoints() {
     //
     // The service-method checks above do not exercise Axum routing, the
     // ApiPrincipal extractor, JSON (de)serialization, or the lib.rs wiring.
-    // Build a git+ext-enabled app over the *same* fake y-sweet doc store (so
-    // doc seeding still works), then drive the new routes through HTTP.
-    let (app, http_state, _git_dir2) = git_ext_app(&ys, Some(ext.clone())).await;
+    // Build a git+ext-enabled app and drive the new routes through HTTP.
+    let (app, http_state, _git_dir2) = git_ext_app(Some(ext.clone())).await;
     let alice = login(&app, "alice").await;
     let (status, vault) = send(
         &app,
@@ -4901,10 +4650,14 @@ async fn plugin_db_sql_endpoints() {
     // the replica on the way so the rows are visible over HTTP.
     let (schema2, batches2, _site2, _max2) = make_source_batch(&ext);
     let http_doc_id = format!("{http_vault_id}__plugindb__my-plugin__tasks");
-    docs.lock().await.insert(
-        http_doc_id.clone(),
-        plugin_db_doc_update(&schema2, &batches2, None),
-    );
+    http_state
+        .documents
+        .apply_update(
+            &http_doc_id,
+            &plugin_db_doc_update(&schema2, &batches2, None),
+        )
+        .await
+        .unwrap();
 
     let (status, body) = send(
         &app,
@@ -5156,8 +4909,7 @@ async fn plugin_db_sql_endpoints() {
 /// The handler now does an atomic upsert, so every concurrent request succeeds.
 #[tokio::test]
 async fn concurrent_file_registry_upserts_for_same_guid_do_not_collide() {
-    let ys = fake_ysweet().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let token = login(&app, "alice").await;
 
     let (status, vault) = send(
@@ -5240,13 +4992,31 @@ async fn send_stream_frame(ws: &mut WsClient, frame: Value) {
     ws.send(TtMsg::Text(frame.to_string())).await.unwrap();
 }
 
+async fn next_awareness_entry(
+    connection: &mut realtime_server::crdt::CrdtConnection,
+) -> (u32, String) {
+    use yrs::updates::decoder::Decode;
+    loop {
+        let bytes = tokio::time::timeout(tokio::time::Duration::from_secs(10), connection.recv())
+            .await
+            .expect("timed out waiting for awareness")
+            .expect("observer document connection closed");
+        let Ok(yrs::sync::Message::Awareness(update)) = yrs::sync::Message::decode_v1(&bytes)
+        else {
+            continue;
+        };
+        if let Some(entry) = update.clients.into_values().next() {
+            return (entry.clock, entry.json);
+        }
+    }
+}
+
 /// End-to-end streaming session over real sockets: REST setup → WebSocket
-/// token streaming into a live (fake) y-sweet doc → caret awareness published
+/// token streaming into a native CRDT doc → caret awareness published
 /// and cleared → Git/audit attribution → audit-log undo via REST.
 #[tokio::test]
 async fn stream_ws_e2e_tokens_caret_audit_and_undo() {
-    let (ysweet, _docs, awareness) = fake_ysweet_live().await;
-    let app = test_app(&ysweet, &ysweet).await;
+    let (app, state) = test_app_with_state().await;
 
     // WebSocket upgrades need a real connection, not `oneshot`.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5269,7 +5039,7 @@ async fn stream_ws_e2e_tokens_caret_audit_and_undo() {
     assert_eq!(status, StatusCode::OK);
     let vault_id = vault["id"].as_str().unwrap().to_string();
 
-    let (status, _) = send(
+    let (status, note_created) = send(
         &app,
         "POST",
         &format!("/api/vaults/{vault_id}/notes"),
@@ -5278,6 +5048,12 @@ async fn stream_ws_e2e_tokens_caret_audit_and_undo() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    let note_doc_id = format!("{vault_id}__{}", note_created["guid"].as_str().unwrap());
+    let mut awareness_observer = state
+        .documents
+        .connect_internal(&note_doc_id, realtime_server::crdt::Level::ReadOnly)
+        .await
+        .unwrap();
 
     let (status, cursor) = send(
         &app,
@@ -5312,6 +5088,7 @@ async fn stream_ws_e2e_tokens_caret_audit_and_undo() {
     let started = next_stream_frame(&mut ws).await;
     assert_eq!(started["type"], "started", "got: {started}");
     assert!(started["guid"].is_string());
+    let mut caret_entry = next_awareness_entry(&mut awareness_observer).await;
 
     send_stream_frame(&mut ws, json!({ "type": "text", "text": "Hello " })).await;
     send_stream_frame(&mut ws, json!({ "type": "text", "text": "world" })).await;
@@ -5345,30 +5122,16 @@ async fn stream_ws_e2e_tokens_caret_audit_and_undo() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(note["content"], "# Title\nHello world");
 
-    // The caret was published as Yjs awareness in the RemoteSelections shape,
-    // and cleared (state "null") when the session ended. The clear races our
-    // `done` frame, so poll briefly.
-    let log = {
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        loop {
-            let log = awareness.lock().await.clone();
-            if log.last().is_some_and(|(_, json)| json == "null") {
-                break log;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "awareness was never cleared; log: {log:?}"
-            );
-            tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+    // The caret was published over the native transport in the
+    // RemoteSelections shape and then cleared with a higher awareness clock.
+    let cleared_entry = loop {
+        let entry = next_awareness_entry(&mut awareness_observer).await;
+        if entry.1 == "null" {
+            break entry;
         }
+        caret_entry = entry;
     };
-    let caret: Value = serde_json::from_str(
-        &log.iter()
-            .find(|(_, json)| json != "null")
-            .expect("a caret state must be published during the stream")
-            .1,
-    )
-    .unwrap();
+    let caret: Value = serde_json::from_str(&caret_entry.1).unwrap();
     assert_eq!(caret["user"]["name"], "Streamy");
     assert!(caret["user"]["color"].as_str().unwrap().starts_with('#'));
     assert_eq!(caret["cursor"]["anchor"], caret["cursor"]["head"]);
@@ -5377,10 +5140,10 @@ async fn stream_ws_e2e_tokens_caret_audit_and_undo() {
         anchor["item"]["client"].is_u64() || anchor["tname"].is_string(),
         "anchor must be a yjs-style relative position: {anchor}"
     );
-    let clocks: Vec<u32> = log.iter().map(|(clock, _)| *clock).collect();
     assert!(
-        clocks.windows(2).all(|w| w[0] < w[1]),
-        "awareness clocks must increase: {clocks:?}"
+        caret_entry.0 < cleared_entry.0,
+        "awareness clocks must increase: {:?}",
+        [caret_entry.0, cleared_entry.0]
     );
 
     // The session shows up in the cursor's audit log with the full diff…
@@ -5437,15 +5200,14 @@ async fn stream_ws_e2e_tokens_caret_audit_and_undo() {
 }
 
 /// Streaming into a note after an anchor while a "human" concurrently edits
-/// the same doc through y-sweet: the stream position must shift with the
+/// the same native doc: the stream position must shift with the
 /// concurrent edit instead of splitting or clobbering it.
 #[tokio::test]
 async fn stream_ws_e2e_anchor_survives_concurrent_edit() {
     use yrs::updates::decoder::Decode;
     use yrs::{GetString, ReadTxn, Text, Transact};
 
-    let (ysweet, docs, _awareness) = fake_ysweet_live().await;
-    let app = test_app(&ysweet, &ysweet).await;
+    let (app, state) = test_app_with_state().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     {
@@ -5499,26 +5261,21 @@ async fn stream_ws_e2e_anchor_survives_concurrent_edit() {
     // Wait for the first batch to be applied before editing concurrently.
     assert_eq!(next_stream_frame(&mut ws).await["type"], "ack");
 
-    // A "human" prepends text directly via the doc store (as a y-sweet client
-    // edit would): everything after this lands while the stream is mid-flight.
+    // A "human" prepends text directly via the native store: everything after
+    // this lands while the stream is mid-flight.
     {
         let doc_id = format!("{vault_id}__{guid}");
-        let mut docs = docs.lock().await;
-        let base = docs.get(&doc_id).cloned().unwrap();
+        let base = state.documents.read_update(&doc_id).await.unwrap();
         let doc = yrs::Doc::new();
         let text = doc.get_or_insert_text("contents");
         let mut txn = doc.transact_mut();
         txn.apply_update(yrs::Update::decode_v1(&base).unwrap());
+        let state_vector = txn.state_vector();
         text.insert(&mut txn, 0, "PREFIX ");
         drop(txn);
-        let merged = doc
-            .transact()
-            .encode_state_as_update_v1(&yrs::StateVector::default());
-        docs.insert(doc_id, merged);
+        let delta = doc.transact().encode_state_as_update_v1(&state_vector);
+        state.documents.apply_update(&doc_id, &delta).await.unwrap();
     }
-    // NOTE: the store edit above isn't pushed over the session's WebSocket
-    // (the fake doesn't broadcast), but CRDT merge order makes the end state
-    // identical; the sticky position keeps the stream chained either way.
 
     send_stream_frame(&mut ws, json!({ "type": "text", "text": "-b" })).await;
     send_stream_frame(&mut ws, json!({ "type": "end" })).await;
@@ -5534,7 +5291,7 @@ async fn stream_ws_e2e_anchor_survives_concurrent_edit() {
 
     // Merge result: prefix kept, streamed text contiguous after the anchor.
     let doc_id = format!("{vault_id}__{guid}");
-    let merged = docs.lock().await.get(&doc_id).cloned().unwrap();
+    let merged = state.documents.read_update(&doc_id).await.unwrap();
     let doc = yrs::Doc::new();
     {
         let mut txn = doc.transact_mut();
@@ -5547,9 +5304,9 @@ async fn stream_ws_e2e_anchor_survives_concurrent_edit() {
 
 // ---------- git history + rollback e2e ----------
 
-/// Git-enabled app over the stateful fake y-sweet, returning the dirs the
-/// history tests need to inspect (per-vault repo, blob store).
-async fn history_test_app(ysweet_url: &str) -> (Router, std::path::PathBuf, std::path::PathBuf) {
+/// Git-enabled app returning the dirs the history tests need to inspect
+/// (per-vault repo, blob store).
+async fn history_test_app() -> (Router, std::path::PathBuf, std::path::PathBuf) {
     let mut db_path = std::env::temp_dir();
     db_path.push(format!("realtime-test-{}.db", uuid::Uuid::new_v4()));
     let mut blob_dir = std::env::temp_dir();
@@ -5559,13 +5316,25 @@ async fn history_test_app(ysweet_url: &str) -> (Router, std::path::PathBuf, std:
 
     let config = Config {
         database_url: format!("sqlite://{}?mode=rwc", db_path.display()),
+        background_jobs_enabled: true,
+        background_job_concurrency: 4,
+        background_job_max_attempts: 25,
+        background_job_retry_min_ms: 250,
+        background_job_retry_max_ms: 30_000,
+        background_job_shutdown_timeout_ms: 30_000,
+        server_shutdown_timeout_ms: 30_000,
         bind_addr: "127.0.0.1:0".into(),
         public_base_url: "http://auth.test".into(),
+        crdt_store_dir: std::env::temp_dir()
+            .join(format!("realtime-crdt-{}", uuid::Uuid::new_v4()))
+            .display()
+            .to_string(),
+        crdt_epoch_period_days: 365,
+        crdt_epoch_recovery_days: 30,
+        crdt_epoch_max_updates: 100_000,
+        crdt_epoch_max_state_bytes: 32 * 1024 * 1024,
+        crdt_epoch_max_delete_set_bytes: 8 * 1024 * 1024,
         blob_dir: blob_dir.display().to_string(),
-        ysweet_store_dir: None,
-        ysweet_url: ysweet_url.to_string(),
-        ysweet_public_url: ysweet_url.to_string(),
-        ysweet_auth_key: gen_auth_key(),
         oidc_mode: OidcMode::Mock,
         oidc_issuer: None,
         oidc_client_id: None,
@@ -5601,7 +5370,6 @@ async fn history_test_app(ysweet_url: &str) -> (Router, std::path::PathBuf, std:
 /// server-side SQL endpoints) and returns the git dir. Used by the plugin-db
 /// SQL integration test to exercise the new REST routes through Axum.
 async fn git_ext_app(
-    ysweet_url: &str,
     crsqlite_ext_path: Option<String>,
 ) -> (Router, realtime_server::state::AppState, std::path::PathBuf) {
     let mut db_path = std::env::temp_dir();
@@ -5610,13 +5378,25 @@ async fn git_ext_app(
     git_dir.push(format!("realtime-git-{}", uuid::Uuid::new_v4()));
     let config = Config {
         database_url: format!("sqlite://{}?mode=rwc", db_path.display()),
+        background_jobs_enabled: true,
+        background_job_concurrency: 4,
+        background_job_max_attempts: 25,
+        background_job_retry_min_ms: 250,
+        background_job_retry_max_ms: 30_000,
+        background_job_shutdown_timeout_ms: 30_000,
+        server_shutdown_timeout_ms: 30_000,
         bind_addr: "127.0.0.1:0".into(),
         public_base_url: "http://auth.test".into(),
+        crdt_store_dir: std::env::temp_dir()
+            .join(format!("realtime-crdt-{}", uuid::Uuid::new_v4()))
+            .display()
+            .to_string(),
+        crdt_epoch_period_days: 365,
+        crdt_epoch_recovery_days: 30,
+        crdt_epoch_max_updates: 100_000,
+        crdt_epoch_max_state_bytes: 32 * 1024 * 1024,
+        crdt_epoch_max_delete_set_bytes: 8 * 1024 * 1024,
         blob_dir: std::env::temp_dir().display().to_string(),
-        ysweet_store_dir: None,
-        ysweet_url: ysweet_url.to_string(),
-        ysweet_public_url: ysweet_url.to_string(),
-        ysweet_auth_key: gen_auth_key(),
         oidc_mode: OidcMode::Mock,
         oidc_issuer: None,
         oidc_client_id: None,
@@ -5667,8 +5447,7 @@ async fn wait_for_commit_count(repo: &std::path::Path, n: u64) -> String {
 
 #[tokio::test]
 async fn history_endpoints_browse_commits_changes_trees_and_files() {
-    let ys = fake_ysweet_store().await;
-    let (app, git_dir, _blobs) = history_test_app(&ys).await;
+    let (app, git_dir, _blobs) = history_test_app().await;
     let alice = login(&app, "alice").await;
     let (_, vault) = send(
         &app,
@@ -5858,8 +5637,7 @@ async fn history_endpoints_browse_commits_changes_trees_and_files() {
 
 #[tokio::test]
 async fn rollback_restores_notes_requires_admin_and_stamps_trailer() {
-    let ys = fake_ysweet_store().await;
-    let (app, git_dir, _blobs) = history_test_app(&ys).await;
+    let (app, git_dir, _blobs) = history_test_app().await;
     let alice = login(&app, "alice").await;
     let (_, vault) = send(
         &app,
@@ -6045,8 +5823,7 @@ async fn rollback_restores_notes_requires_admin_and_stamps_trailer() {
 
 #[tokio::test]
 async fn rollback_restores_attachment_blob_from_git_after_gc() {
-    let ys = fake_ysweet_store().await;
-    let (app, git_dir, blob_dir) = history_test_app(&ys).await;
+    let (app, git_dir, blob_dir) = history_test_app().await;
     let alice = login(&app, "alice").await;
     let (_, vault) = send(
         &app,
@@ -6141,8 +5918,7 @@ async fn rollback_restores_attachment_blob_from_git_after_gc() {
 /// vault_id, alice, bob, base_url).
 async fn single_file_rollback_setup() -> (Router, std::path::PathBuf, String, String, String, String)
 {
-    let ys = fake_ysweet_store().await;
-    let (app, git_dir, _blobs) = history_test_app(&ys).await;
+    let (app, git_dir, _blobs) = history_test_app().await;
     let alice = login(&app, "alice").await;
     let (_, vault) = send(
         &app,
@@ -6700,8 +6476,7 @@ async fn list_commits_path_returns_path_at_commit() {
 
 #[tokio::test]
 async fn public_share_lifecycle_create_view_and_revoke() {
-    let ys = fake_ysweet_store().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let alice = login(&app, "alice").await;
     let (status, vault) = send(
         &app,
@@ -6839,8 +6614,7 @@ async fn public_share_lifecycle_create_view_and_revoke() {
 
 #[tokio::test]
 async fn public_attachment_share_is_scoped_to_the_shared_version_and_revocable() {
-    let ys = fake_ysweet_store().await;
-    let app = test_app(&ys, &ys).await;
+    let app = test_app().await;
     let alice = login(&app, "alice").await;
     let (_, vault) = send(
         &app,

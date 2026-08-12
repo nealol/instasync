@@ -2,7 +2,7 @@
 //!
 //! `GET /api/vaults/{vault_id}/stream` upgrades to a WebSocket on which an
 //! external app (holding a remote cursor bearer token) streams LLM tokens into
-//! a note. The server joins the note's y-sweet document as a peer: it applies
+//! a note. The server joins the note's native CRDT document as a peer: it applies
 //! token batches as incremental Yjs updates and publishes a Yjs awareness state
 //! for the cursor, so connected editors render the streamed text *and* a named
 //! caret in realtime (see `src/editor/RemoteSelections.ts` — no client changes
@@ -31,29 +31,23 @@ use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
-use tokio::net::TcpStream;
 use tokio::time::{interval, timeout, Duration, Instant};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::Message as WsMsg;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use url::Url;
-use y_sweet_core::sync::{Message as YMsg, SyncMessage, MSG_AWARENESS};
 use yrs::encoding::write::Write;
-use yrs::updates::decoder::Decode;
+use yrs::sync::protocol::MSG_AWARENESS;
+use yrs::sync::{Message as YMsg, SyncMessage};
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
 use yrs::{
     Assoc, Doc, GetString, IndexScope, IndexedSequence, ReadTxn, StickyIndex, Text, Transact,
-    Update,
 };
 
 use crate::audit::{self, AuditEntry};
+use crate::crdt::{CrdtConnection, Level};
 use crate::error::AppError;
 use crate::notes;
 use crate::session::{
     bearer_token, cursor_by_token_hash, cursor_principal, hash_token, ApiActor, ApiPrincipal,
 };
 use crate::state::AppState;
-use crate::ysweet::{self, Level};
 
 /// Batch pending tokens and flush on this cadence (or on `FLUSH_BYTES`).
 const FLUSH_INTERVAL: Duration = Duration::from_millis(150);
@@ -64,7 +58,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_SESSION: Duration = Duration::from_secs(15 * 60);
 /// Hard cap on text inserted per session.
 const MAX_INSERTED_BYTES: usize = 2 * 1024 * 1024;
-/// How long we wait for the `start` frame / the initial y-sweet sync.
+/// How long we wait for the `start` frame and initial Yjs sync.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
@@ -134,8 +128,6 @@ pub async fn stream_ws(
     })
 }
 
-type Upstream = WebSocketStream<MaybeTlsStream<TcpStream>>;
-
 async fn run_session(
     state: AppState,
     vault_id: String,
@@ -159,16 +151,20 @@ async fn run_session(
     };
     let doc_id = format!("{vault_id}__{}", file.guid);
 
-    // 3. Join the note's y-sweet doc as a peer and sync the current state.
-    let mut upstream = match connect_ysweet(&state, &doc_id).await {
-        Ok(upstream) => upstream,
+    // 3. Join the native document as a peer and sync the current state.
+    let mut document = match state
+        .documents
+        .connect(&doc_id, Level::Full, None, None)
+        .await
+    {
+        Ok(connection) => connection,
         Err(e) => {
-            tracing::warn!("stream: y-sweet connect failed: {e}");
+            tracing::warn!("stream: document connect failed: {e}");
             return fail(&mut client, "sync_failed", "could not join document").await;
         }
     };
     let mut session = DocSession::new(&principal);
-    if let Err(e) = timeout(SETUP_TIMEOUT, initial_sync(&mut session, &mut upstream))
+    if let Err(e) = timeout(SETUP_TIMEOUT, initial_sync(&mut session, &mut document))
         .await
         .map_err(|_| anyhow::anyhow!("initial sync timed out"))
         .and_then(|r| r)
@@ -183,9 +179,8 @@ async fn run_session(
         Ok(position) => position,
         Err(code) => return fail(&mut client, code, "could not resolve anchor").await,
     };
-    let (mut up_tx, mut up_rx) = upstream.split();
     if let Some(msg) = session.awareness_message() {
-        up_tx.send(WsMsg::Binary(msg)).await?;
+        document.send(msg).await?;
     }
     send_json(
         &mut client,
@@ -213,7 +208,7 @@ async fn run_session(
                             }
                             session.pending.push_str(&text);
                             if session.pending.len() >= FLUSH_BYTES {
-                                flush(&mut session, &mut up_tx, &mut cl_tx).await?;
+                                flush(&mut session, &document, &mut cl_tx).await?;
                             }
                         }
                         Ok(ClientFrame::End) => break 'main,
@@ -231,20 +226,19 @@ async fn run_session(
                 Some(Ok(_)) => {}
                 Some(Err(_)) => break 'main,
             },
-            msg = up_rx.next() => match msg {
-                Some(Ok(WsMsg::Binary(data))) => {
+            msg = document.recv() => match msg {
+                Some(data) => {
                     if let Some(reply) = session.handle_upstream(&data) {
-                        up_tx.send(WsMsg::Binary(reply)).await?;
+                        document.send(reply).await?;
                     }
                 }
-                Some(Ok(_)) => {}
-                Some(Err(_)) | None => {
+                None => {
                     error = Some(("sync_lost", "document connection closed".into()));
                     break 'main;
                 }
             },
             _ = flush_tick.tick() => {
-                flush(&mut session, &mut up_tx, &mut cl_tx).await?;
+                flush(&mut session, &document, &mut cl_tx).await?;
                 if last_activity.elapsed() > IDLE_TIMEOUT {
                     error = Some(("idle_timeout", "no frames received; committing".into()));
                     break 'main;
@@ -258,11 +252,10 @@ async fn run_session(
     }
 
     // 6. Commit: flush the tail, drop the caret, attribute + audit the write.
-    flush(&mut session, &mut up_tx, &mut cl_tx).await.ok();
+    flush(&mut session, &document, &mut cl_tx).await.ok();
     if let Some(msg) = session.clear_awareness_message() {
-        up_tx.send(WsMsg::Binary(msg)).await.ok();
+        document.send(msg).await.ok();
     }
-    up_tx.close().await.ok();
 
     let after_content = session.content();
     let mut audit_id = None;
@@ -342,15 +335,15 @@ fn error_code(e: &AppError) -> &'static str {
 
 async fn flush(
     session: &mut DocSession,
-    up_tx: &mut SplitSink<Upstream, WsMsg>,
+    document: &CrdtConnection,
     cl_tx: &mut SplitSink<WebSocket, AxumMsg>,
 ) -> anyhow::Result<()> {
     let Some(out) = session.flush() else {
         return Ok(());
     };
-    up_tx.send(WsMsg::Binary(out.update_message)).await?;
+    document.send(out.update_message).await?;
     if let Some(awareness) = out.awareness_message {
-        up_tx.send(WsMsg::Binary(awareness)).await?;
+        document.send(awareness).await?;
     }
     cl_tx
         .send(AxumMsg::Text(
@@ -362,57 +355,19 @@ async fn flush(
     Ok(())
 }
 
-/// Open a WebSocket to the internal y-sweet for `doc_id`, the same way
-/// @y-sweet/client's `generateUrl` does: the minted token's `baseUrl` is
-/// doc-scoped (`{ysweet}/d/{docId}`) and the WS route hangs off its `/ws`
-/// child with the doc id repeated (`{ysweet}/d/{docId}/ws/{docId}?token=…`).
-async fn connect_ysweet(state: &AppState, doc_id: &str) -> anyhow::Result<Upstream> {
-    let _load_guard = ysweet::lock_doc_load(doc_id).await;
-    let (base_url, token) = ysweet::mint_internal_token(state, doc_id, Level::Full)
-        .await
-        .map_err(|e| anyhow::anyhow!("mint token: {e}"))?;
-    let ws_base = if let Some(rest) = base_url.strip_prefix("http") {
-        format!("ws{rest}")
-    } else {
-        base_url
-    };
-    let mut url = Url::parse(&ws_base)?;
-    url.path_segments_mut()
-        .map_err(|_| anyhow::anyhow!("invalid y-sweet url"))?
-        .pop_if_empty()
-        .push("ws")
-        .push(doc_id);
-    url.query_pairs_mut().append_pair("token", &token);
-
-    let request = url.as_str().into_client_request()?;
-    let host = request
-        .uri()
-        .authority()
-        .map(|a| a.as_str().to_string())
-        .ok_or_else(|| anyhow::anyhow!("missing authority"))?;
-    let tcp = timeout(Duration::from_secs(10), TcpStream::connect(&host)).await??;
-    let (upstream, _resp) = timeout(
-        Duration::from_secs(10),
-        tokio_tungstenite::client_async(request, MaybeTlsStream::Plain(tcp)),
-    )
-    .await??;
-    Ok(upstream)
-}
-
 /// Drive the y-protocols handshake until we hold the doc's full state: send our
 /// SyncStep1, answer the server's, and apply its SyncStep2.
-async fn initial_sync(session: &mut DocSession, upstream: &mut Upstream) -> anyhow::Result<()> {
-    upstream
-        .send(WsMsg::Binary(session.sync_step1_message()))
-        .await?;
+async fn initial_sync(
+    session: &mut DocSession,
+    document: &mut CrdtConnection,
+) -> anyhow::Result<()> {
+    document.send(session.sync_step1_message()).await?;
     while !session.synced {
-        let Some(msg) = upstream.next().await else {
-            anyhow::bail!("y-sweet closed during initial sync");
+        let Some(data) = document.recv().await else {
+            anyhow::bail!("document connection closed during initial sync");
         };
-        if let WsMsg::Binary(data) = msg? {
-            if let Some(reply) = session.handle_upstream(&data) {
-                upstream.send(WsMsg::Binary(reply)).await?;
-            }
+        if let Some(reply) = session.handle_upstream(&data) {
+            document.send(reply).await?;
         }
     }
     Ok(())
@@ -474,12 +429,12 @@ impl DocSession {
         YMsg::Sync(SyncMessage::SyncStep1(sv)).encode_v1()
     }
 
-    /// Handle one binary y-protocols frame from y-sweet; returns an optional reply.
+    /// Handle one binary y-protocols frame from the document peer.
     fn handle_upstream(&mut self, data: &[u8]) -> Option<Vec<u8>> {
-        let msg = match YMsg::decode_v1(data) {
+        let msg = match crate::safe_yrs::decode_message(data) {
             Ok(msg) => msg,
             Err(e) => {
-                tracing::debug!("stream: undecodable y-sweet frame: {e}");
+                tracing::debug!("stream: undecodable Yjs frame: {e}");
                 return None;
             }
         };
@@ -503,7 +458,7 @@ impl DocSession {
     }
 
     fn apply_update(&mut self, update: &[u8]) {
-        let Ok(update) = Update::decode_v1(update) else {
+        let Ok(update) = crate::safe_yrs::validate_update(update) else {
             tracing::debug!("stream: undecodable doc update");
             return;
         };
@@ -688,7 +643,7 @@ mod tests {
         }
     }
 
-    /// Simulate the y-sweet side: a doc that applies our updates and can hand
+    /// Simulate the remote document peer: apply updates and hand
     /// us its state as a SyncStep2.
     fn seeded_remote(content: &str) -> (Doc, Vec<u8>) {
         let doc = Doc::new();
@@ -711,12 +666,12 @@ mod tests {
     }
 
     fn apply_flush(remote: &Doc, out: &FlushOut) {
-        let msg = YMsg::decode_v1(&out.update_message).unwrap();
+        let msg = crate::safe_yrs::decode_v1::<YMsg>(&out.update_message).unwrap();
         let YMsg::Sync(SyncMessage::Update(update)) = msg else {
             panic!("expected sync update message");
         };
         let mut txn = remote.transact_mut();
-        txn.apply_update(Update::decode_v1(&update).unwrap());
+        txn.apply_update(crate::safe_yrs::decode_v1::<yrs::Update>(&update).unwrap());
     }
 
     fn synced_session(content: &str) -> (DocSession, Doc) {
@@ -734,7 +689,7 @@ mod tests {
         let step1 = YMsg::Sync(SyncMessage::SyncStep1(yrs::StateVector::default())).encode_v1();
         let reply = session.handle_upstream(&step1).expect("reply");
         assert!(matches!(
-            YMsg::decode_v1(&reply).unwrap(),
+            crate::safe_yrs::decode_v1::<YMsg>(&reply).unwrap(),
             YMsg::Sync(SyncMessage::SyncStep2(_))
         ));
     }
@@ -819,7 +774,7 @@ mod tests {
         let msg = session.awareness_message().expect("awareness");
 
         // The frame must round-trip through the y-protocols decoder…
-        let decoded = YMsg::decode_v1(&msg).unwrap();
+        let decoded = crate::safe_yrs::decode_v1::<YMsg>(&msg).unwrap();
         let YMsg::Awareness(_) = decoded else {
             panic!("expected awareness message");
         };
@@ -831,7 +786,7 @@ mod tests {
         // Clearing publishes the protocol's "null" state.
         let cleared = session.clear_awareness_message().unwrap();
         assert!(matches!(
-            YMsg::decode_v1(&cleared).unwrap(),
+            crate::safe_yrs::decode_v1::<YMsg>(&cleared).unwrap(),
             YMsg::Awareness(_)
         ));
     }

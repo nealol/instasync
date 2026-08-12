@@ -4,7 +4,7 @@ import { makeFakePlugin } from "../support/fakePlugin";
 
 /**
  * The `plugindb` trash flow operates entirely on the local index doc, so it can
- * be exercised without a live y-sweet connection: we construct a VaultSync,
+ * be exercised without a live sync connection: we construct a VaultSync,
  * inject a fake `sqlApi`, and drive the trash methods directly.
  */
 function makeSync() {

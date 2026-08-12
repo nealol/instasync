@@ -18,7 +18,14 @@
 import { SYNC_FORMAT } from "./pluginDb/types";
 
 /** Names of every compatibility surface the plugin understands. */
-export const CAP_NAMES = ["restApi", "oauth", "pluginDbSync", "attachmentShim"] as const;
+export const CAP_NAMES = [
+  "restApi",
+  "oauth",
+  "pluginDbSync",
+  "attachmentShim",
+  "documentEpoch",
+  "documentInvalidation",
+] as const;
 export type CapName = (typeof CAP_NAMES)[number];
 
 /**
@@ -34,10 +41,31 @@ export const REQUIRED_CAPS: Record<CapName, string[]> = {
   oauth: ["1"],
   pluginDbSync: [SYNC_FORMAT],
   attachmentShim: ["https://realtime.md/attachment-shim/v1"],
+  documentEpoch: ["1"],
+  documentInvalidation: ["1"],
 };
 
-/** Mandatory caps the client always requires (vs. future optional caps). */
-const MANDATORY_CAPS: readonly CapName[] = CAP_NAMES;
+/**
+ * Caps required for every connection. `documentInvalidation` is intentionally
+ * optional: clients can still sync with an older server, but must retain every
+ * mobile document in memory because that server cannot wake an evicted child.
+ */
+const MANDATORY_CAPS: readonly CapName[] = [
+  "restApi",
+  "oauth",
+  "pluginDbSync",
+  "attachmentShim",
+  "documentEpoch",
+];
+
+/** Whether a server advertises an accepted version of a known capability. */
+export function serverSupportsCapability(caps: unknown, name: CapName): boolean {
+  if (caps === null || caps === undefined || typeof caps !== "object" || Array.isArray(caps)) {
+    return false;
+  }
+  const advertised = (caps as Record<string, unknown>)[name];
+  return typeof advertised === "string" && REQUIRED_CAPS[name].includes(advertised);
+}
 
 export type CompatibilityResult =
   | { ok: true }
@@ -53,7 +81,8 @@ export type CompatibilityResult =
  *    servers that do not advertise caps.
  *  - `caps` is an object but lacks a mandatory cap → block
  *    `"server-incompatible"`.
- *  - cap value not in `REQUIRED_CAPS[name]` → block `"server-incompatible"`.
+ *  - mandatory or server-required cap value not in `REQUIRED_CAPS[name]` →
+ *    block `"server-incompatible"`.
  *  - cap name listed in the server's `requiredCaps` but unknown to this client
  *    → block `"client-too-old"`.
  *  - unknown cap name NOT in `requiredCaps` → ignored (forward-compatible
@@ -107,6 +136,14 @@ export function checkServerCaps(caps: unknown, requiredCaps?: unknown): Compatib
           ok: false,
           reason: "client-too-old",
           detail: `server requires cap "${name}" which this client does not know`,
+        };
+      }
+      const capName = name as CapName;
+      if (!serverSupportsCapability(capsMap, capName)) {
+        return {
+          ok: false,
+          reason: "server-incompatible",
+          detail: `server requires unsupported cap "${name}"`,
         };
       }
     }

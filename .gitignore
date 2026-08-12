@@ -1,5 +1,6 @@
 # Project exclude paths
 /references
+/.compat-cache/
 /.idea
 /main.js
 /crsqlite.wasm
@@ -172,3 +173,5 @@
 /packages/cli/node_modules/
 /packages/web/node_modules/
 /packages/web/dist/
+.cyboflow/worktrees/
+worktrees/

@@ -1,5 +1,5 @@
 // E2e tests for the plugin-facing remote cursor API (src/cursors/api.ts)
-// against the real Rust auth server + y-sweet: plugins make local calls (no
+// against the real Rust auth and sync server: plugins make local calls (no
 // WebSocket or token plumbing) and get the same audit log + robot Git
 // attribution as MCP/streaming edits.
 

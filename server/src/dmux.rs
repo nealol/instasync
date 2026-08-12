@@ -1,17 +1,13 @@
-//! Bounded multiplexing endpoint for y-sweet sync.
+//! Bounded multiplexing endpoint for native CRDT sync.
 //!
-//! `/d/*` opens one upstream y-sweet socket per *client* socket, so a client
-//! syncing a whole vault opens one socket per document. `/dmux` lets a client
-//! carry a bounded shard of documents over one socket: the client tags each
-//! frame with a channel id, and this handler demultiplexes — dialing one
-//! upstream y-sweet socket per channel and pumping frames between them. Clients
-//! open additional `/dmux` sockets before reaching this handler's hard limit.
+//! Each virtual channel is an in-process document session. Clients can therefore
+//! sync a bounded shard of documents over one physical WebSocket without any
+//! server-side socket fan-out.
 //!
-//! Auth/attribution are unchanged from [`crate::proxy`]: each `OPEN` frame
+//! Each `OPEN` frame
 //! carries the per-doc path+query (`/d/{docId}/ws/{docId}?token=…`) the client
-//! would otherwise have connected to, and we forward it verbatim to the internal
-//! y-sweet (which still validates the doc token) and attribute writes via
-//! [`crate::proxy::resolve_attribution`].
+//! would otherwise have connected to. The native engine validates the opaque,
+//! document-scoped token before opening the channel.
 //!
 //! Wire frames mirror `src/sync/mux.ts` (ints are lib0 var-uints):
 //!   OPEN     = [1][channel][varString pathAndQuery]   client -> server
@@ -21,7 +17,6 @@
 //!   CLOSE    = [5][channel]                            both directions
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::{
@@ -29,19 +24,15 @@ use axum::{
         ws::{Message as AxumMsg, WebSocket, WebSocketUpgrade},
         State,
     },
-    http::Uri,
     response::Response,
 };
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::time::{interval, timeout, Duration, Instant, MissedTickBehavior};
-use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as WsMsg};
+use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
+use url::Url;
 
-use crate::proxy::{
-    is_content_write, read_varint, resolve_attribution, upstream_authority, Attribution,
-};
+use crate::crdt::{read_varint, Attribution, CrdtConnection};
 use crate::state::AppState;
 
 const FRAME_OPEN: u64 = 1;
@@ -61,33 +52,16 @@ const CHANNEL_CAPACITY: usize = 256;
 const MAX_CHANNELS: usize = 1_024;
 /// Bound OPEN parsing/allocation and the request forwarded to tungstenite.
 const MAX_OPEN_PATH_BYTES: usize = 4_096;
+/// Bound DATA frame payloads before they are cloned into a per-channel queue.
+/// A Yjs sync update larger than this is rejected at the frame layer; the
+/// document session also enforces `MAX_UPDATE_BYTES`, but this cap prevents
+/// `to_vec()` + 256-deep queue amplification across 1,024 channels.
+const MAX_DATA_FRAME_BYTES: usize = 1024 * 1024;
 /// Bound dial-task creation even when a client immediately closes each channel.
 const MAX_OPENS_PER_WINDOW: usize = 128;
 const OPEN_RATE_WINDOW: Duration = Duration::from_secs(10);
 /// The browser client sends mux PING frames every five seconds.
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Process-wide count of live upstream y-sweet sockets across every `/dmux`
-/// connection — the fan-out metric the eval called for. Logged on each change.
-static UPSTREAM_SOCKETS: AtomicU64 = AtomicU64::new(0);
-
-/// RAII gauge: one live upstream y-sweet socket for as long as it is held.
-struct UpstreamGuard;
-
-impl UpstreamGuard {
-    fn new() -> Self {
-        let n = UPSTREAM_SOCKETS.fetch_add(1, Ordering::Relaxed) + 1;
-        tracing::debug!(upstream_sockets = n, "dmux: upstream socket opened");
-        Self
-    }
-}
-
-impl Drop for UpstreamGuard {
-    fn drop(&mut self) {
-        let n = UPSTREAM_SOCKETS.fetch_sub(1, Ordering::Relaxed) - 1;
-        tracing::debug!(upstream_sockets = n, "dmux: upstream socket closed");
-    }
-}
 
 struct OpenLimiter {
     seen_channels: HashSet<u64>,
@@ -128,10 +102,11 @@ pub async fn dmux(State(state): State<AppState>, ws: WebSocketUpgrade) -> Respon
 }
 
 async fn handle(client: WebSocket, state: AppState) {
+    state.sync_metrics.physical_connection_opened();
     let (mut cl_sink, mut cl_stream) = client.split();
 
     // All writes to the single client socket are serialized through this queue,
-    // since every upstream pump (one per channel) plus control replies share it.
+    // since every document session plus control replies share it.
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
     let writer = tokio::spawn(async move {
         while let Some(buf) = out_rx.recv().await {
@@ -141,14 +116,14 @@ async fn handle(client: WebSocket, state: AppState) {
         }
     });
 
-    // channel id -> sender into that channel's upstream pump.
+    // channel id -> sender into that channel's native document session.
     let mut channels: HashMap<u64, mpsc::Sender<Vec<u8>>> = HashMap::new();
     let mut open_limiter = OpenLimiter::new(Instant::now());
     let mut last_client_activity = Instant::now();
     let mut idle_tick = interval(Duration::from_secs(5));
     idle_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    // Upstream tasks notify this loop when their channel has ended, so terminal
-    // paths such as OPEN_ERR or upstream close do not leave stale senders behind.
+    // Session tasks notify this loop when their channel has ended, so terminal
+    // paths do not leave stale senders behind.
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<u64>();
 
     loop {
@@ -167,6 +142,7 @@ async fn handle(client: WebSocket, state: AppState) {
                         path_and_query,
                     }) => {
                         if !open_limiter.admit(channel, channels.len(), Instant::now()) {
+                            state.sync_metrics.document_channel_rejected();
                             let _ = out_tx.try_send(encode_simple(FRAME_OPEN_ERR, channel));
                             tracing::warn!(
                                 channel,
@@ -175,12 +151,11 @@ async fn handle(client: WebSocket, state: AppState) {
                             );
                             continue;
                         }
-                        // Register the channel synchronously, then dial upstream in a
-                        // spawned task. Dialing here would block the whole multiplexed
-                        // socket (head-of-line) — a slow/hung upstream would freeze every
-                        // other channel — so the read loop must never await the dial.
+                        // Register synchronously, then load/connect the document in a
+                        // task. Cold storage I/O must not block unrelated channels.
                         let (up_tx, up_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
                         channels.insert(channel, up_tx);
+                        state.sync_metrics.document_channel_opened();
                         let state = state.clone();
                         let out = out_tx.clone();
                         let done = done_tx.clone();
@@ -193,24 +168,25 @@ async fn handle(client: WebSocket, state: AppState) {
                         if let Some(up_tx) = channels.get(&channel) {
                             match up_tx.try_send(payload.to_vec()) {
                                 Ok(()) => {}
-                                // Upstream is backed up. Silently dropping a Yjs update
+                                // The document session is backed up. Silently dropping a Yjs update
                                 // would diverge the doc (the provider thinks it sent it
                                 // and won't resend until reconnect), so instead reset the
                                 // channel: the provider reconnects and does a full resync.
                                 Err(TrySendError::Full(_)) => {
-                                    channels.remove(&channel);
+                                    remove_channel(&mut channels, channel, &state);
+                                    state.sync_metrics.document_channel_backpressure_reset();
                                     let _ = out_tx.try_send(encode_simple(FRAME_CLOSE, channel));
-                                    tracing::warn!(channel, "dmux: upstream backpressure; reset channel");
+                                    tracing::warn!(channel, "dmux: document backpressure; reset channel");
                                 }
                                 Err(TrySendError::Closed(_)) => {
-                                    channels.remove(&channel);
+                                    remove_channel(&mut channels, channel, &state);
                                 }
                             }
                         }
                     }
                     Some(Frame::Close { channel }) => {
                         // Dropping the sender ends that channel's upstream pump.
-                        channels.remove(&channel);
+                        remove_channel(&mut channels, channel, &state);
                     }
                     Some(Frame::Ping) => {
                         let _ = out_tx.try_send(encode_simple(FRAME_PONG, CONTROL_CHANNEL));
@@ -220,7 +196,7 @@ async fn handle(client: WebSocket, state: AppState) {
             }
             done = done_rx.recv() => {
                 if let Some(channel) = done {
-                    channels.remove(&channel);
+                    remove_channel(&mut channels, channel, &state);
                 }
             }
             _ = idle_tick.tick() => {
@@ -232,15 +208,28 @@ async fn handle(client: WebSocket, state: AppState) {
         }
     }
 
-    // Client gone: drop every channel (ends each upstream pump) and the writer.
+    // Client gone: drop every channel and the writer.
+    state.sync_metrics.document_channels_closed(channels.len());
     channels.clear();
     drop(out_tx);
     writer.abort();
     let _ = writer.await;
+    state.sync_metrics.physical_connection_closed();
 }
 
-/// Resolve attribution, dial the upstream y-sweet, then pump frames for one
-/// channel. Runs in its own task so the client read loop never blocks on a dial.
+fn remove_channel(
+    channels: &mut HashMap<u64, mpsc::Sender<Vec<u8>>>,
+    channel: u64,
+    state: &AppState,
+) {
+    if channels.remove(&channel).is_some() {
+        state.sync_metrics.document_channels_closed(1);
+    }
+}
+
+/// Validate a document-scoped token, open a native session, then pump one
+/// virtual channel. Runs in its own task so cold document I/O never blocks the
+/// multiplexed client read loop.
 async fn open_and_pump(
     state: AppState,
     channel: u64,
@@ -248,40 +237,36 @@ async fn open_and_pump(
     up_rx: mpsc::Receiver<Vec<u8>>,
     out_tx: mpsc::Sender<Vec<u8>>,
 ) {
-    let authority = match upstream_authority(&state) {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::warn!("dmux: invalid y-sweet upstream: {e}");
+    let Some((document_id, token)) = parse_sync_target(&path_and_query) else {
+        let _ = out_tx.send(encode_simple(FRAME_OPEN_ERR, channel)).await;
+        return;
+    };
+    let Some(grant) = state.sync_grant(&token, &document_id).await else {
+        let _ = out_tx.send(encode_simple(FRAME_OPEN_ERR, channel)).await;
+        return;
+    };
+    let attribution = Arc::new(Attribution::new(
+        state.clone(),
+        &document_id,
+        grant.principal,
+    ));
+    let connection = match state
+        .documents
+        .connect(
+            &document_id,
+            grant.level,
+            Some(attribution),
+            Some(grant.epoch),
+        )
+        .await
+    {
+        Ok(connection) => connection,
+        Err(error) => {
+            tracing::debug!("dmux: native document open failed: {error}");
             let _ = out_tx.send(encode_simple(FRAME_OPEN_ERR, channel)).await;
             return;
         }
     };
-
-    // Attribute writes exactly as the /d proxy does, from the path+query token.
-    let attribution = match path_and_query.parse::<Uri>() {
-        Ok(uri) => resolve_attribution(&state, &uri).await.map(Arc::new),
-        Err(_) => None,
-    };
-
-    let target = format!("ws://{authority}{path_and_query}");
-    let doc_id = path_and_query
-        .split('?')
-        .next()
-        .and_then(crate::ysweet::doc_id_from_path);
-    let load_guard = match doc_id {
-        Some(doc_id) => Some(crate::ysweet::lock_doc_load(doc_id).await),
-        None => None,
-    };
-    let upstream = match dial_upstream(&target).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            tracing::debug!("dmux: upstream dial failed: {e}");
-            let _ = out_tx.send(encode_simple(FRAME_OPEN_ERR, channel)).await;
-            return;
-        }
-    };
-    drop(load_guard);
-    let _guard = UpstreamGuard::new();
 
     if out_tx
         .send(encode_simple(FRAME_OPEN_OK, channel))
@@ -291,72 +276,53 @@ async fn open_and_pump(
         return;
     }
 
-    pump_channel(channel, upstream, up_rx, out_tx, attribution).await;
+    pump_channel(channel, connection, up_rx, out_tx).await;
 }
 
-type Upstream = tokio_tungstenite::WebSocketStream<TcpStream>;
-
-/// Open a plain-TCP WebSocket to the internal y-sweet (no TLS; it is internal).
-async fn dial_upstream(target: &str) -> anyhow::Result<Upstream> {
-    let request = target.into_client_request()?;
-    let host = request
-        .uri()
-        .authority()
-        .map(|a| a.as_str().to_string())
-        .ok_or_else(|| anyhow::anyhow!("missing authority in {target}"))?;
-    let tcp = timeout(Duration::from_secs(10), TcpStream::connect(&host)).await??;
-    let (upstream, _resp) = timeout(
-        Duration::from_secs(10),
-        tokio_tungstenite::client_async(request, tcp),
-    )
-    .await??;
-    Ok(upstream)
+fn parse_sync_target(path_and_query: &str) -> Option<(String, String)> {
+    let url = Url::parse(&format!("http://localhost{path_and_query}")).ok()?;
+    let segments = url.path_segments()?.collect::<Vec<_>>();
+    let ["d", document_id, "ws", repeated_id] = segments.as_slice() else {
+        return None;
+    };
+    if document_id.is_empty() || document_id != repeated_id {
+        return None;
+    }
+    let token = url
+        .query_pairs()
+        .find(|(key, _)| key == "token")
+        .map(|(_, value)| value.into_owned())?;
+    Some(((*document_id).to_string(), token))
 }
 
 /// Pump one channel's frames in both directions until either side closes.
-/// Ends when `up_rx` is dropped (the channel was closed / client left) or the
-/// upstream socket closes (then a CLOSE frame is sent to the client).
+/// Ends when `up_rx` is dropped or the native session closes.
 async fn pump_channel(
     channel: u64,
-    upstream: Upstream,
+    mut connection: CrdtConnection,
     mut up_rx: mpsc::Receiver<Vec<u8>>,
     out_tx: mpsc::Sender<Vec<u8>>,
-    attribution: Option<Arc<Attribution>>,
 ) {
-    let (mut up_sink, mut up_stream) = upstream.split();
     loop {
         tokio::select! {
             from_client = up_rx.recv() => {
                 match from_client {
                     Some(bytes) => {
-                        // Tap content writes for git/search/plugin-db, exactly as
-                        // the /d proxy does — here rather than in the read loop so
-                        // attribution never blocks other channels.
-                        if let Some(attr) = &attribution {
-                            if is_content_write(&bytes) {
-                                attr.mark_content_write().await;
-                            }
-                        }
-                        if up_sink.send(WsMsg::Binary(bytes)).await.is_err() {
+                        if connection.send(bytes).await.is_err() {
                             break;
                         }
                     }
                     None => break, // channel closed or client gone
                 }
             }
-            from_upstream = up_stream.next() => {
-                match from_upstream {
-                    Some(Ok(WsMsg::Binary(bytes))) => {
+            from_document = connection.recv() => {
+                match from_document {
+                    Some(bytes) => {
                         if out_tx.send(encode_data(channel, &bytes)).await.is_err() {
                             break;
                         }
                     }
-                    Some(Ok(WsMsg::Ping(payload))) => {
-                        let _ = up_sink.send(WsMsg::Pong(payload)).await;
-                    }
-                    Some(Ok(WsMsg::Close(_))) | None => break,
-                    Some(Ok(_)) => {}
-                    Some(Err(_)) => break,
+                    None => break,
                 }
             }
         }
@@ -387,23 +353,50 @@ fn parse_frame(buf: &[u8]) -> Option<Frame<'_>> {
     match frame_type {
         t if t == FRAME_OPEN => {
             let (len, rest) = read_varint(rest)?;
-            let len = len as usize;
-            if len > MAX_OPEN_PATH_BYTES || rest.len() < len {
+            let len = usize::try_from(len).ok()?;
+            if len > MAX_OPEN_PATH_BYTES || rest.len() != len {
                 return None;
             }
-            let path_and_query = String::from_utf8(rest[..len].to_vec()).ok()?;
+            let path_and_query = String::from_utf8(rest.to_vec()).ok()?;
             Some(Frame::Open {
                 channel,
                 path_and_query,
             })
         }
-        t if t == FRAME_DATA => Some(Frame::Data {
-            channel,
-            payload: rest,
-        }),
-        t if t == FRAME_CLOSE => Some(Frame::Close { channel }),
-        t if t == FRAME_PING && channel == CONTROL_CHANNEL => Some(Frame::Ping),
+        t if t == FRAME_DATA => {
+            if rest.len() > MAX_DATA_FRAME_BYTES {
+                return None;
+            }
+            Some(Frame::Data {
+                channel,
+                payload: rest,
+            })
+        }
+        t if t == FRAME_CLOSE && rest.is_empty() => Some(Frame::Close { channel }),
+        t if t == FRAME_PING && channel == CONTROL_CHANNEL && rest.is_empty() => Some(Frame::Ping),
         _ => None,
+    }
+}
+
+/// Parser entry point used by the out-of-process fuzz target.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_parse_frame(bytes: &[u8]) {
+    if let Some(frame) = parse_frame(bytes) {
+        match frame {
+            Frame::Open {
+                channel,
+                path_and_query,
+            } => {
+                std::hint::black_box((channel, path_and_query));
+            }
+            Frame::Data { channel, payload } => {
+                std::hint::black_box((channel, payload));
+            }
+            Frame::Close { channel } => {
+                std::hint::black_box(channel);
+            }
+            Frame::Ping => {}
+        }
     }
 }
 
@@ -441,10 +434,11 @@ fn encode_data(channel: u64, payload: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn varint_roundtrips() {
-        for n in [0u64, 1, 127, 128, 300, 16384, u32::MAX as u64] {
+        for n in [0u64, 1, 127, 128, 300, 16384, u32::MAX as u64, u64::MAX] {
             let mut buf = Vec::new();
             write_varint(&mut buf, n);
             let (got, rest) = read_varint(&buf).unwrap();
@@ -508,6 +502,24 @@ mod tests {
     }
 
     #[test]
+    fn rejects_overflowing_varints_and_trailing_control_bytes() {
+        assert!(
+            read_varint(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02]).is_none()
+        );
+
+        let mut open = Vec::new();
+        write_varint(&mut open, FRAME_OPEN);
+        write_varint(&mut open, 1);
+        write_varint(&mut open, 1);
+        open.extend_from_slice(b"xy");
+        assert!(parse_frame(&open).is_none());
+
+        let mut close = encode_simple(FRAME_CLOSE, 1);
+        close.push(0);
+        assert!(parse_frame(&close).is_none());
+    }
+
+    #[test]
     fn rejects_oversized_open_path() {
         let mut buf = Vec::new();
         write_varint(&mut buf, FRAME_OPEN);
@@ -515,6 +527,26 @@ mod tests {
         write_varint(&mut buf, (MAX_OPEN_PATH_BYTES + 1) as u64);
         buf.resize(buf.len() + MAX_OPEN_PATH_BYTES + 1, b'x');
         assert!(parse_frame(&buf).is_none());
+    }
+
+    #[test]
+    #[test]
+    fn rejects_oversized_data_payload() {
+        let payload = vec![0u8; MAX_DATA_FRAME_BYTES + 1];
+        let data = encode_data(1, &payload);
+        assert!(parse_frame(&data).is_none());
+    }
+
+    #[test]
+    fn sync_target_requires_matching_document_ids_and_token() {
+        assert_eq!(
+            parse_sync_target("/d/vault__doc/ws/vault__doc?token=secret"),
+            Some(("vault__doc".to_string(), "secret".to_string()))
+        );
+        assert!(parse_sync_target("/d/a/ws/b?token=secret").is_none());
+        assert!(parse_sync_target("/d/a/ws/a").is_none());
+        assert!(parse_sync_target("/other/a/ws/a?token=secret").is_none());
+        assert!(parse_sync_target("//attacker.example/d/a/ws/a?token=secret").is_none());
     }
 
     #[test]
@@ -553,5 +585,36 @@ mod tests {
         }
         now += OPEN_RATE_WINDOW;
         assert!(!fanout_limiter.admit((MAX_CHANNELS + 1) as u64, MAX_CHANNELS, now));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1_024))]
+
+        #[test]
+        fn fuzz_every_u64_has_one_bounded_varint_roundtrip(value in any::<u64>()) {
+            let mut encoded = Vec::new();
+            write_varint(&mut encoded, value);
+            prop_assert!(encoded.len() <= 10);
+            let (decoded, rest) = read_varint(&encoded).expect("writer output must decode");
+            prop_assert_eq!(decoded, value);
+            prop_assert!(rest.is_empty());
+        }
+
+        #[test]
+        fn fuzz_arbitrary_mux_frames_never_escape_parser_bounds(
+            bytes in prop::collection::vec(any::<u8>(), 0..8_192),
+        ) {
+            if let Some(frame) = parse_frame(&bytes) {
+                match frame {
+                    Frame::Open { path_and_query, .. } => {
+                        prop_assert!(path_and_query.len() <= MAX_OPEN_PATH_BYTES);
+                    }
+                    Frame::Data { payload, .. } => {
+                        prop_assert!(payload.len() <= bytes.len().min(MAX_DATA_FRAME_BYTES));
+                    }
+                    Frame::Close { .. } | Frame::Ping => {}
+                }
+            }
+        }
     }
 }
