@@ -51,6 +51,9 @@ export function restoreObsidianProtocolRegistry(snapshot: ProtocolRegistrySnapsh
   }
 
   if (snapshot.existed) {
-    throwIfFailed(runReg(["import", snapshot.backupPath]), "Restoring Obsidian protocol registry key");
+    throwIfFailed(
+      runReg(["import", snapshot.backupPath]),
+      "Restoring Obsidian protocol registry key",
+    );
   }
 }

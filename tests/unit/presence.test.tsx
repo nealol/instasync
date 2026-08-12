@@ -203,8 +203,7 @@ describe("Canvas collaboration awareness", () => {
       clientLeft: { value: 0 },
       clientTop: { value: 0 },
     });
-    wrapper.getBoundingClientRect = () =>
-      ({ left: 0, top: 0, width: 800, height: 600 } as DOMRect);
+    wrapper.getBoundingClientRect = () => ({ left: 0, top: 0, width: 800, height: 600 }) as DOMRect;
     const canvas = {
       x: 0,
       y: 0,
@@ -225,9 +224,7 @@ describe("Canvas collaboration awareness", () => {
     expect(host.querySelector(".realtime-canvas-presence-box.is-drag")).not.toBeNull();
     expect(host.textContent).toContain("Remote");
     expect(host.querySelector(".realtime-canvas-cursor")).not.toBeNull();
-    const followButton = host.querySelector<HTMLButtonElement>(
-      ".realtime-canvas-cursor-label",
-    )!;
+    const followButton = host.querySelector<HTMLButtonElement>(".realtime-canvas-cursor-label")!;
     expect(followButton.getAttribute("aria-label")).toContain("Follow Remote");
     followButton.click();
     expect(canvas.setViewport).toHaveBeenCalledWith({ x: 5, y: 6, scale: 2 });
@@ -238,10 +235,7 @@ describe("Canvas collaboration awareness", () => {
       sequence: 3,
       viewport: { x: 50, y: 60, scale: 1 },
     };
-    (aw as any).emit("change", [
-      { added: [], updated: [remoteId], removed: [] },
-      "remote",
-    ]);
+    (aw as any).emit("change", [{ added: [], updated: [remoteId], removed: [] }, "remote"]);
     expect(canvas.setViewport).not.toHaveBeenCalled();
     cleanup();
     expect(aw.getLocalState()?.canvasPresence ?? null).toBeNull();
@@ -327,12 +321,9 @@ describe("Canvas viewport follow adapter", () => {
   it("applies viewport through a feature-detected setter", () => {
     const requestFrame = vi.fn();
     const setViewport = vi.fn();
-    expect(
-      writeCanvasViewport(
-        { setViewport, requestFrame },
-        { x: 10, y: 20, scale: 1.5 },
-      ),
-    ).toBe(true);
+    expect(writeCanvasViewport({ setViewport, requestFrame }, { x: 10, y: 20, scale: 1.5 })).toBe(
+      true,
+    );
     expect(setViewport).toHaveBeenCalledWith({ x: 10, y: 20, scale: 1.5 });
     expect(requestFrame).toHaveBeenCalledOnce();
   });

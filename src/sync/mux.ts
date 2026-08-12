@@ -389,11 +389,7 @@ class MuxConnection {
   }
 
   private teardownIfIdle(): void {
-    if (
-      this.channels.size === 0 &&
-      this.pendingOpens.size === 0 &&
-      this.openBlockedUntil === 0
-    ) {
+    if (this.channels.size === 0 && this.pendingOpens.size === 0 && this.openBlockedUntil === 0) {
       this.teardown();
     }
   }

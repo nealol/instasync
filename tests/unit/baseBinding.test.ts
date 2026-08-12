@@ -37,10 +37,7 @@ describe("BaseBinding reused view (file switch)", () => {
   it("does not capture the other file's YAML after the view switches files", () => {
     const view = makeView("A.base", () => "views:\n  - type: table\n    name: B\n");
     const doc = makeDoc("A.base");
-    const binding = new BaseBinding(
-      { app: { workspace: makeWorkspace(view) } } as any,
-      doc as any,
-    );
+    const binding = new BaseBinding({ app: { workspace: makeWorkspace(view) } } as any, doc as any);
     binding.tryBind();
     doc.reconcileFromBaseText.mockClear();
 
@@ -57,10 +54,7 @@ describe("BaseBinding reused view (file switch)", () => {
   it("does not push its CRDT into a view that now shows another file", () => {
     const view = makeView("A.base", () => "");
     const doc = makeDoc("A.base");
-    const binding = new BaseBinding(
-      { app: { workspace: makeWorkspace(view) } } as any,
-      doc as any,
-    );
+    const binding = new BaseBinding({ app: { workspace: makeWorkspace(view) } } as any, doc as any);
     binding.tryBind();
     view.setViewData.mockClear();
 

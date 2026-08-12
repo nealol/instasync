@@ -50,6 +50,10 @@ export abstract class StructuredDocument extends SyncedDoc {
   protected abstract parse(text: string): JsonValue;
   protected abstract serialize(value: JsonValue): string;
 
+  protected serializeRecoveryContent(): string {
+    return this.serialize(this.value);
+  }
+
   /**
    * When the file is open in the workspace, should we defer to a live editor
    * binding instead of writing through to disk? Canvas overrides this to `true`

@@ -216,6 +216,7 @@ export abstract class SyncedDoc {
   protected abstract afterPersistenceSynced(): Promise<void> | void;
   protected abstract finishStartupReconcile(): Promise<void>;
   protected afterChangesSynced(): Promise<void> | void {}
+  protected abstract serializeRecoveryContent(): string;
   protected abstract destroySubclass(): void;
 
   private async preserveReadOnlyRecovery(): Promise<void> {
@@ -226,7 +227,7 @@ export abstract class SyncedDoc {
     try {
       while (this.readOnlyRecoveryRequested && !this.destroyed) {
         this.readOnlyRecoveryRequested = false;
-        const value = this.ydoc.getText("contents").toString();
+        const value = this.serializeRecoveryContent();
         if (value === this.readOnlyRecoveryBaseline) continue;
         await preserveTextConflict(this.plugin, this.path, value, "local");
         if (!this.destroyed) {

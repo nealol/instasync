@@ -157,20 +157,12 @@ export class ConfigSync {
       }
       this.localSyncState.migrateLegacyIdentity(path, "config", meta.hash);
       const state = this.localSyncState.get(path);
-      if (
-        state?.kind === "config" &&
-        !state.candidate &&
-        state.identity === meta.hash
-      ) {
+      if (state?.kind === "config" && !state.candidate && state.identity === meta.hash) {
         this.lastSyncedHash.set(path, meta.hash);
       }
     }
     for (const [path, state] of this.localSyncState?.entries() ?? []) {
-      if (
-        state.kind === "config" &&
-        !state.candidate &&
-        state.identity
-      ) {
+      if (state.kind === "config" && !state.candidate && state.identity) {
         this.lastSyncedHash.set(path, state.identity);
       }
     }

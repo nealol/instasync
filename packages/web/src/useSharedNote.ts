@@ -81,7 +81,11 @@ export function useSharedNote(shareId: string): SharedNoteState {
             epoch: number;
             update: string;
           };
-          if (data.epoch <= epoch) return;
+          if (data.epoch < epoch) return;
+          if (data.epoch === epoch) {
+            Y.applyUpdate(doc, b64ToBytes(data.update));
+            return;
+          }
           const previous = doc;
           doc = new Y.Doc();
           epoch = data.epoch;

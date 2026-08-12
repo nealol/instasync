@@ -129,9 +129,7 @@ describe("ConfigSync reconcile decisions", () => {
     const indexDoc = new Y.Doc();
     const sync = new ConfigSync(plugin as any, indexDoc);
     let release!: (exists: boolean) => void;
-    plugin.auth.blobExists = vi.fn(
-      () => new Promise<boolean>((resolve) => (release = resolve)),
-    );
+    plugin.auth.blobExists = vi.fn(() => new Promise<boolean>((resolve) => (release = resolve)));
     const upload = (sync as any).uploadBytes(
       ".obsidian/appearance.json",
       new Uint8Array([1]).buffer,
@@ -155,9 +153,7 @@ describe("ConfigSync reconcile decisions", () => {
     const indexDoc = new Y.Doc();
     const sync = new ConfigSync(plugin as any, indexDoc);
     let release!: (bytes: ArrayBuffer) => void;
-    plugin.auth.getBlob = vi.fn(
-      () => new Promise<ArrayBuffer>((resolve) => (release = resolve)),
-    );
+    plugin.auth.getBlob = vi.fn(() => new Promise<ArrayBuffer>((resolve) => (release = resolve)));
     const writeBinary = vi.fn(async () => undefined);
     (plugin.app.vault as any).adapter = {
       exists: vi.fn(async () => false),
@@ -215,9 +211,7 @@ describe("ConfigSync reconcile decisions", () => {
     const sync = new ConfigSync(plugin as any, indexDoc, localState);
     try {
       sync.seedBaseline();
-      expect((sync as any).lastSyncedHash.get(".obsidian/appearance.json")).toBe(
-        "remote-hash",
-      );
+      expect((sync as any).lastSyncedHash.get(".obsidian/appearance.json")).toBe("remote-hash");
     } finally {
       sync.destroy();
       indexDoc.destroy();

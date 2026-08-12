@@ -77,6 +77,10 @@ export class Document extends SyncedDoc {
     return this.ytext.toString();
   }
 
+  protected serializeRecoveryContent(): string {
+    return this.content;
+  }
+
   bindEditor(): void {
     this.boundEditors++;
     dbg("bindEditor", this.path, "count", this.boundEditors);

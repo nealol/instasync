@@ -104,10 +104,7 @@ export async function getClientToken(
     }
     return token;
   } catch (e) {
-    if (
-      !(e instanceof DocumentEpochChangedError) &&
-      !(e instanceof DocumentEpochPendingError)
-    ) {
+    if (!(e instanceof DocumentEpochChangedError) && !(e instanceof DocumentEpochPendingError)) {
       nextTokenAttemptAt = Date.now() + tokenRetryDelayMs;
     }
     throw e;

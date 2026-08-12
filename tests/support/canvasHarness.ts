@@ -1,6 +1,11 @@
 import { vi } from "vitest";
 import * as Y from "yjs";
-import { parseCanvas, reconcileCanvas, serializeCanvas, type StructuredCanvas } from "../../src/structured/canvas";
+import {
+  parseCanvas,
+  reconcileCanvas,
+  serializeCanvas,
+  type StructuredCanvas,
+} from "../../src/structured/canvas";
 import { toValue, type JsonValue } from "../../src/structured/reconcile";
 
 export interface CanvasSnapshotOptions {
@@ -10,12 +15,46 @@ export interface CanvasSnapshotOptions {
 
 export function canvasSnapshot(options: CanvasSnapshotOptions = {}) {
   const nodes: Array<Record<string, JsonValue>> = [
-    { id: "text", type: "text", text: "Hello", x: 0, y: 0, width: 240, height: 120, custom: { future: true } },
-    { id: "file", type: "file", file: "assets/image.png", x: 300, y: 0, width: 320, height: 200, unknownNodeField: "preserved" },
-    { id: "group", type: "group", label: "Group", x: -40, y: -40, width: 720, height: 320, color: "3" },
+    {
+      id: "text",
+      type: "text",
+      text: "Hello",
+      x: 0,
+      y: 0,
+      width: 240,
+      height: 120,
+      custom: { future: true },
+    },
+    {
+      id: "file",
+      type: "file",
+      file: "assets/image.png",
+      x: 300,
+      y: 0,
+      width: 320,
+      height: 200,
+      unknownNodeField: "preserved",
+    },
+    {
+      id: "group",
+      type: "group",
+      label: "Group",
+      x: -40,
+      y: -40,
+      width: 720,
+      height: 320,
+      color: "3",
+    },
   ];
   const edges: Array<Record<string, JsonValue>> = [
-    { id: "edge", fromNode: "text", toNode: "file", fromSide: "right", toSide: "left", unknownEdgeField: { value: 1 } },
+    {
+      id: "edge",
+      fromNode: "text",
+      toNode: "file",
+      fromSide: "right",
+      toSide: "left",
+      unknownEdgeField: { value: 1 },
+    },
   ];
   for (const override of options.nodeOverrides ?? []) {
     const index = nodes.findIndex((node) => node.id === override.id);
@@ -83,7 +122,10 @@ function applySnapshot(doc: Y.Doc, data: unknown) {
   doc.transact(() => reconcileCanvas(doc.getMap("root"), normalizedCanvas(data), doc.clientID));
 }
 
-export function makeLiveCanvasFixture(path = "Board.canvas", initialData: unknown = canvasSnapshot()) {
+export function makeLiveCanvasFixture(
+  path = "Board.canvas",
+  initialData: unknown = canvasSnapshot(),
+) {
   let data = structuredClone(initialData);
   let mounted = true;
   const host = document.createElement("div");

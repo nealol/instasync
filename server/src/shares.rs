@@ -68,20 +68,16 @@ pub struct ViewEventsQuery {
     pub epoch: Option<u64>,
 }
 
-fn snapshot_event_if_epoch_changed(
-    client_epoch: Option<u64>,
+fn initial_snapshot_event(
+    _client_epoch: Option<u64>,
     stream_epoch: u64,
     update: &[u8],
-) -> Option<Result<Event, Infallible>> {
-    client_epoch
-        .filter(|epoch| *epoch != stream_epoch)
-        .map(|_| {
-            let payload = serde_json::json!({
-                "epoch": stream_epoch,
-                "update": base64::engine::general_purpose::STANDARD.encode(update),
-            });
-            Ok(Event::default().event("snapshot").data(payload.to_string()))
-        })
+) -> Result<Event, Infallible> {
+    let payload = serde_json::json!({
+        "epoch": stream_epoch,
+        "update": base64::engine::general_purpose::STANDARD.encode(update),
+    });
+    Ok(Event::default().event("snapshot").data(payload.to_string()))
 }
 
 #[derive(Serialize)]
@@ -424,10 +420,10 @@ pub async fn view_events(
     let (share, _) = resolve_share(&state, &share_id).await?;
     let note_doc_id = doc_id(&share.vault_id, &share.guid);
 
-    // Establish the baseline so the stream only carries changes made after the
-    // client's snapshot fetch. A change between the snapshot and this read is
-    // folded into the baseline; the client tolerates that because Yjs updates
-    // are idempotent and the next poll re-delivers anything newer.
+    // Establish a stream baseline, then emit that full state as the first SSE
+    // event. This closes the GET-to-EventSource race: edits made after the GET
+    // but before this read are included here, and replaying the GET state is
+    // harmless because Yjs full updates are idempotent.
     let (initial_epoch, initial) = state.documents.read_update_with_epoch(&note_doc_id).await?;
     let last_sv = state_vector_of(&initial)?;
 
@@ -510,8 +506,8 @@ pub async fn view_events(
         }
     });
 
-    let initial_snapshot = snapshot_event_if_epoch_changed(query.epoch, initial_epoch, &initial);
-    let stream = futures_util::stream::iter(initial_snapshot).chain(stream);
+    let initial_snapshot = initial_snapshot_event(query.epoch, initial_epoch, &initial);
+    let stream = futures_util::stream::once(async move { initial_snapshot }).chain(stream);
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(25))))
 }
@@ -655,11 +651,11 @@ mod tests {
     }
 
     #[test]
-    fn stale_client_epoch_gets_immediate_snapshot_for_stream_baseline() {
+    fn stream_always_starts_with_snapshot_to_cover_get_eventsource_race() {
         let update = full_update(&text_doc("replacement"));
-        assert!(snapshot_event_if_epoch_changed(Some(7), 8, &update).is_some());
-        assert!(snapshot_event_if_epoch_changed(Some(8), 8, &update).is_none());
-        assert!(snapshot_event_if_epoch_changed(None, 8, &update).is_none());
+        assert!(initial_snapshot_event(Some(7), 8, &update).is_ok());
+        assert!(initial_snapshot_event(Some(8), 8, &update).is_ok());
+        assert!(initial_snapshot_event(None, 8, &update).is_ok());
     }
 
     #[test]

@@ -151,9 +151,7 @@ function makeDocHandle(plugin: RealtimePlugin, docId: string): PluginDbDocHandle
     }
   };
 
-  const whenSynced = persistence.whenSynced
-    .catch(() => {})
-    .then(connectAfterCapabilityCheck);
+  const whenSynced = persistence.whenSynced.catch(() => {}).then(connectAfterCapabilityCheck);
 
   return {
     doc,

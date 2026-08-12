@@ -247,7 +247,7 @@ impl DocumentStore {
         let write_gate = self.write_gate(document_id).await?;
         let _write_guard = write_gate.lock().await;
         let (epoch, document) = self.get_or_load(document_id).await?;
-        Ok((epoch, document.read_update().await?))
+        document.read_update().await.map(|update| (epoch, update))
     }
 
     async fn read_update_for_epoch(
@@ -407,9 +407,19 @@ impl DocumentStore {
 
     pub async fn document_exists(&self, document_id: &str) -> Result<bool, CrdtError> {
         validate_document_id(document_id)?;
-        Ok(crdt_epoch::manifest_exists(&self.0.directory, document_id)
+        if crdt_epoch::manifest_exists(&self.0.directory, document_id)
             .await
-            .map_err(epoch_error)?)
+            .map_err(epoch_error)?
+        {
+            return Ok(true);
+        }
+        let physical_manifest = self
+            .0
+            .directory
+            .join(format!("{document_id}.crdt/manifest.json"));
+        let legacy_snapshot = self.0.directory.join(format!("{document_id}.yjs"));
+        Ok(tokio::fs::try_exists(physical_manifest).await?
+            || tokio::fs::try_exists(legacy_snapshot).await?)
     }
 
     pub(crate) async fn connect(
@@ -2020,6 +2030,25 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(directory).await;
     }
 
+    #[tokio::test]
+    async fn document_exists_recognizes_legacy_snapshot_before_migration() {
+        let directory = temp_store();
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let document_id = "vault__legacy-guid";
+        tokio::fs::write(
+            directory.join(format!("{document_id}.yjs")),
+            map_update("legacy", "present"),
+        )
+        .await
+        .unwrap();
+        let store = DocumentStore::new(&directory).await.unwrap();
+
+        assert!(store.document_exists(document_id).await.unwrap());
+        assert!(directory.join(format!("{document_id}.yjs")).exists());
+        assert!(!directory.join(format!("{document_id}.crdt")).exists());
+        let _ = tokio::fs::remove_dir_all(directory).await;
+    }
+
     fn map_update(key: &str, value: &str) -> Vec<u8> {
         let doc = Doc::new();
         let map = doc.get_or_insert_map("values");
@@ -2386,9 +2415,7 @@ mod tests {
         .await
         .unwrap();
         let (_, document) = store.get_or_load("vault__document").await.unwrap();
-        let awareness = document.awareness.read().unwrap();
-        assert!(awareness.clients().is_empty());
-        drop(awareness);
+        assert!(document.awareness.read().unwrap().clients().is_empty());
         let _ = tokio::fs::remove_dir_all(directory).await;
     }
 
@@ -2430,9 +2457,7 @@ mod tests {
         .await
         .unwrap();
         let (_, document) = store.get_or_load("vault__document").await.unwrap();
-        let awareness = document.awareness.read().unwrap();
-        assert!(awareness.clients().is_empty());
-        drop(awareness);
+        assert!(document.awareness.read().unwrap().clients().is_empty());
         let _ = tokio::fs::remove_dir_all(directory).await;
     }
 

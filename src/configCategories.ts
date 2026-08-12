@@ -186,10 +186,7 @@ export function categoryForConfigPath(relPath: string): ConfigCategoryId | null 
  * category, or `null` when the path is outside this device's config folder
  * (e.g. another profile's folder) or is a file config sync never touches.
  */
-export function categoryForVaultPath(
-  path: string,
-  configDir: string,
-): ConfigCategoryId | null {
+export function categoryForVaultPath(path: string, configDir: string): ConfigCategoryId | null {
   const prefix = `${configDir}/`;
   if (!path.startsWith(prefix)) return null;
   return categoryForConfigPath(path.slice(prefix.length));

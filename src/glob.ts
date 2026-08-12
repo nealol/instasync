@@ -19,4 +19,3 @@ export function matchesAnyGlob(path: string, globs: string[]): boolean {
   }
   return matched;
 }
-

@@ -58,9 +58,7 @@ function databaseKey(database: Pick<DebugDatabase, "pluginId" | "name">): string
 
 export function SqlQueryPanel({ plugin }: { plugin: RealtimePlugin }) {
   const [query, setQuery] = useState(DEFAULT_QUERY);
-  const [databases, setDatabases] = useState<DebugDatabase[]>(() =>
-    plugin.sqlApi.debugDatabases(),
-  );
+  const [databases, setDatabases] = useState<DebugDatabase[]>(() => plugin.sqlApi.debugDatabases());
   const [selected, setSelected] = useState("");
   const [rows, setRows] = useState<Record<string, SqlValue>[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -89,11 +87,7 @@ export function SqlQueryPanel({ plugin }: { plugin: RealtimePlugin }) {
     setError(null);
     try {
       setRows(
-        await plugin.sqlApi.debugExecute(
-          selectedDatabase.pluginId,
-          selectedDatabase.name,
-          query,
-        ),
+        await plugin.sqlApi.debugExecute(selectedDatabase.pluginId, selectedDatabase.name, query),
       );
       refreshDatabases();
     } catch (cause) {

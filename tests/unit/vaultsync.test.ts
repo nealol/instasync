@@ -873,6 +873,25 @@ describe("VaultSync index", () => {
     }
   });
 
+  it("does not create unowned startup priority state when an editor activates a document", () => {
+    const sync = Object.create(VaultSync.prototype) as any;
+    const doc = { connect: vi.fn() };
+    Object.assign(sync, {
+      files: new Map([["active.md", "active-guid"]]),
+      documents: new Map(),
+      prioritizedPaths: new Set(),
+      prioritizedGuids: new Set(),
+      mobileSuspended: false,
+      markMobileDocumentUsed: vi.fn(),
+      ensureDocument: vi.fn(() => doc),
+    });
+
+    expect(sync.ensureDocumentForPath("active.md")).toBe(doc);
+    expect(doc.connect).toHaveBeenCalledOnce();
+    expect(sync.prioritizedPaths).toEqual(new Set());
+    expect(sync.prioritizedGuids).toEqual(new Set());
+  });
+
   it("releases mobile channels in the background and catches up after resume", async () => {
     (Platform as any).isMobile = true;
     const vault = await harness.createVault(aliceToken, "mobile-lifecycle");
@@ -1192,30 +1211,29 @@ describe("VaultSync index", () => {
     files.set("b.md", "b");
     files.set("active.md", "active");
     const connected: string[] = [];
-    const completions = new Map<
-      string,
-      { promise: Promise<void>; resolve: () => void }
-    >();
+    const completions = new Map<string, { promise: Promise<void>; resolve: () => void }>();
     const documents = new Map(
-      [...files.entries()].filter(([path]) => path !== "b.md").map(([path, guid]) => {
-        let resolve!: () => void;
-        const promise = new Promise<void>((done) => {
-          resolve = done;
-        });
-        const completion = { promise, resolve };
-        completions.set(path, completion);
-        return [
-          path,
-          {
-            guid,
-            provider: { status: "offline" },
-            isReady: () => true,
-            whenNextServerSync: () => completion.promise,
-            whenReady: () => Promise.resolve(),
-            connect: () => connected.push(path),
-          },
-        ];
-      }),
+      [...files.entries()]
+        .filter(([path]) => path !== "b.md")
+        .map(([path, guid]) => {
+          let resolve!: () => void;
+          const promise = new Promise<void>((done) => {
+            resolve = done;
+          });
+          const completion = { promise, resolve };
+          completions.set(path, completion);
+          return [
+            path,
+            {
+              guid,
+              provider: { status: "offline" },
+              isReady: () => true,
+              whenNextServerSync: () => completion.promise,
+              whenReady: () => Promise.resolve(),
+              connect: () => connected.push(path),
+            },
+          ];
+        }),
     );
 
     Object.assign(sync, {
@@ -1517,9 +1535,7 @@ describe("VaultSync index", () => {
     Object.assign(sync, {
       destroyed: false,
       initialSynced: false,
-      bootstrapVaultEvents: [
-        { type: "delete", file: renamed, version: 1 },
-      ],
+      bootstrapVaultEvents: [{ type: "delete", file: renamed, version: 1 }],
       pathVersions: new Map([
         ["created.md", 1],
         ["renamed.md", 1],

@@ -27,7 +27,6 @@ import { isConflictCopy, preserveTextConflict } from "./conflictRecovery";
 export { isConflictCopy } from "./conflictRecovery";
 import { sha256Text } from "./hash";
 
-
 type FileKind = "text" | "structured" | "binary" | "ignore";
 type StructuredKind = "canvas" | "base";
 type QueueKind = "text" | StructuredKind;
@@ -223,34 +222,34 @@ export class VaultSync {
   }
 
   private handleIndexStatus(status: SyncStatus): void {
-      if (this.mobileSuspended) {
-        if (status === SYNC_STATUS_OFFLINE) {
-          this.wasConnected = false;
-          this.plugin.setStatus("offline");
-        }
-        return;
+    if (this.mobileSuspended) {
+      if (status === SYNC_STATUS_OFFLINE) {
+        this.wasConnected = false;
+        this.plugin.setStatus("offline");
       }
-      if (status === SYNC_STATUS_CONNECTED) {
-        this.wasConnected = true;
-        this.plugin.setStatus("connected");
-        void this.runInitialSync();
-        if (Platform?.isMobile && this.mobileCatchUpPending && !this.mobileResumeInProgress) {
-          this.mobileCatchUpPending = false;
-          this.binarySync.setPaused(false);
-          this.configSync.setPaused(false);
-          this.queueMobileReconnects();
-        }
-      } else if (status === "connecting" || status === "handshaking") {
-        this.notifyDisconnected();
-        this.plugin.setStatus("connecting");
-      } else if (status === "error") {
-        if (Platform?.isMobile && this.initialSynced) this.mobileCatchUpPending = true;
-        this.notifyDisconnected();
-        this.plugin.setStatus("error");
-      } else {
-        if (Platform?.isMobile && this.initialSynced) this.mobileCatchUpPending = true;
-        this.notifyDisconnected();
+      return;
+    }
+    if (status === SYNC_STATUS_CONNECTED) {
+      this.wasConnected = true;
+      this.plugin.setStatus("connected");
+      void this.runInitialSync();
+      if (Platform?.isMobile && this.mobileCatchUpPending && !this.mobileResumeInProgress) {
+        this.mobileCatchUpPending = false;
+        this.binarySync.setPaused(false);
+        this.configSync.setPaused(false);
+        this.queueMobileReconnects();
       }
+    } else if (status === "connecting" || status === "handshaking") {
+      this.notifyDisconnected();
+      this.plugin.setStatus("connecting");
+    } else if (status === "error") {
+      if (Platform?.isMobile && this.initialSynced) this.mobileCatchUpPending = true;
+      this.notifyDisconnected();
+      this.plugin.setStatus("error");
+    } else {
+      if (Platform?.isMobile && this.initialSynced) this.mobileCatchUpPending = true;
+      this.notifyDisconnected();
+    }
   }
 
   /** Load the persisted index, then connect so local offline changes sync. */
@@ -312,11 +311,7 @@ export class VaultSync {
         const category = path.startsWith(prefix)
           ? categoryForConfigPath(path.slice(prefix.length))
           : null;
-        if (
-          meta?.hash &&
-          category !== null &&
-          categories.has(category)
-        ) {
+        if (meta?.hash && category !== null && categories.has(category)) {
           this.localSyncState.migrateLegacyIdentity(path, "config", meta.hash);
         }
       }
@@ -1314,8 +1309,6 @@ export class VaultSync {
     const guid = this.files.get(path);
     if (!guid) return this.documents.get(path);
     const doc = this.ensureDocument(path, guid, false, false);
-    this.prioritizedPaths.add(path);
-    this.prioritizedGuids.add(guid);
     if (!this.mobileSuspended) doc.connect();
     return doc;
   }
