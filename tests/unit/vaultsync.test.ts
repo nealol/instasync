@@ -7,11 +7,12 @@ import { Platform } from "obsidian";
 import { RealtimeProvider } from "../../src/sync/RealtimeProvider";
 import { VaultSync, shouldSyncCanvasBinaryPath } from "../../src/VaultSync";
 import { getClientToken } from "../../src/sync/clientToken";
-import { sha256Hex } from "../../src/hash";
+import { sha256Hex, sha256Text } from "../../src/hash";
 import { startAuthHarness, type AuthHarness } from "../support/authServer";
 import { makeFakePlugin, type FakePlugin } from "../support/fakePlugin";
 import { waitFor } from "../support/util";
 import { CompatibilityError } from "../../src/caps";
+import { CanvasDocument } from "../../src/CanvasDocument";
 
 const bootstrapModal = vi.hoisted(() => ({
   choice: "local" as "local" | "remote",
@@ -1562,6 +1563,77 @@ describe("VaultSync index", () => {
       ["same.md", "text", "old"],
       ["same.md", "text", "final"],
     ]);
+  });
+
+  it("preserves resident text instead of stale disk content on remote delete", async () => {
+    const local = makeFakePlugin("http://unused.invalid", {});
+    const path = "resident.md";
+    local.vault.files.set(path, "acknowledged disk");
+    const index = new Y.Doc();
+    const sync = Object.create(VaultSync.prototype) as any;
+    const acknowledged = await sha256Text("acknowledged disk");
+    Object.assign(sync, {
+      destroyed: false,
+      plugin: local.plugin,
+      files: index.getMap("files"),
+      structured: index.getMap("structured"),
+      documents: new Map([[path, { content: "unsaved resident edit" }]]),
+      structuredDocuments: new Map(),
+      remoteDeletePreserved: new Set(),
+      remoteDeletesApplying: new Set(),
+      localSyncState: {
+        acknowledgedFingerprint: vi.fn(() => acknowledged),
+        remove: vi.fn(),
+      },
+      removeDocument: vi.fn(),
+      removeStructuredDocument: vi.fn(),
+    });
+
+    await sync.reconcileRemoteDelete(path, "text", "guid");
+
+    expect([...local.vault.files.values()]).toContain("unsaved resident edit");
+    expect(local.vault.files.has(path)).toBe(false);
+    index.destroy();
+  });
+
+  it("preserves non-empty resident canvas content on remote delete", async () => {
+    const local = makeFakePlugin("http://unused.invalid", {});
+    const path = "resident.canvas";
+    const acknowledgedDisk = '{\n  "nodes": [],\n  "edges": []\n}\n';
+    const residentCanvas =
+      '{\n  "nodes": [\n    {\n      "id": "node-1",\n      "type": "text",\n      "text": "unsaved"\n    }\n  ],\n  "edges": [\n    {\n      "id": "edge-1",\n      "fromNode": "node-1",\n      "toNode": "node-1"\n    }\n  ]\n}\n';
+    local.vault.files.set(path, acknowledgedDisk);
+    const index = new Y.Doc();
+    const sync = Object.create(VaultSync.prototype) as any;
+    const acknowledged = await sha256Text(acknowledgedDisk);
+    Object.assign(sync, {
+      destroyed: false,
+      plugin: local.plugin,
+      files: index.getMap("files"),
+      structured: index.getMap("structured"),
+      documents: new Map(),
+      structuredDocuments: new Map([[path, { canvasText: () => residentCanvas }]]),
+      remoteDeletePreserved: new Set(),
+      remoteDeletesApplying: new Set(),
+      localSyncState: {
+        acknowledgedFingerprint: vi.fn(() => acknowledged),
+        remove: vi.fn(),
+      },
+      removeDocument: vi.fn(),
+      removeStructuredDocument: vi.fn(),
+    });
+    Object.setPrototypeOf(sync.structuredDocuments.get(path), CanvasDocument.prototype);
+
+    await sync.reconcileRemoteDelete(path, "canvas", "guid");
+
+    const preserved = [...local.vault.files.values()].find((content) => content === residentCanvas);
+    expect(preserved).toBe(residentCanvas);
+    expect(JSON.parse(preserved!)).toMatchObject({
+      nodes: [{ id: "node-1", text: "unsaved" }],
+      edges: [{ id: "edge-1", fromNode: "node-1", toNode: "node-1" }],
+    });
+    expect(local.vault.files.has(path)).toBe(false);
+    index.destroy();
   });
 
   it("ignores malformed structured index entries when resolving paths", () => {

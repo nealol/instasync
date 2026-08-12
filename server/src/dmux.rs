@@ -640,11 +640,7 @@ mod tests {
         }
         now += OPEN_RATE_WINDOW;
         assert!(lifetime_limiter.exhausted());
-        assert!(!lifetime_limiter.admit(
-            MAX_OPENS_PER_CONNECTION as u64 + 1,
-            0,
-            now
-        ));
+        assert!(!lifetime_limiter.admit(MAX_OPENS_PER_CONNECTION as u64 + 1, 0, now));
     }
 
     proptest! {

@@ -1145,7 +1145,16 @@ export class VaultSync {
       if (wasReintroduced()) return;
       const file = this.plugin.app.vault.getAbstractFileByPath(path);
       if (file instanceof TFile && !this.remoteDeletePreserved.has(path)) {
-        const content = await this.plugin.app.vault.read(file);
+        const textDocument = this.documents.get(path);
+        const structuredDocument = this.structuredDocuments.get(path);
+        const content =
+          kind === "text" && textDocument
+            ? textDocument.content
+            : kind === "canvas" && structuredDocument instanceof CanvasDocument
+              ? structuredDocument.canvasText()
+              : kind === "base" && structuredDocument instanceof BaseDocument
+                ? structuredDocument.baseData()
+                : await this.plugin.app.vault.read(file);
         if (this.destroyed || wasReintroduced()) return;
         const fingerprint = await sha256Text(content);
         if (this.destroyed || wasReintroduced()) return;

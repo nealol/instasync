@@ -39,7 +39,10 @@ impl MigrationTrait for Migration {
                                 Alias::new("background_job_contributors_v2"),
                                 Alias::new("intent_key"),
                             )
-                            .to(Alias::new("background_job_intents"), Alias::new("intent_key"))
+                            .to(
+                                Alias::new("background_job_intents"),
+                                Alias::new("intent_key"),
+                            )
                             .on_delete(ForeignKeyAction::Cascade),
                     )
                     .to_owned(),
@@ -55,11 +58,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
         manager
-            .drop_table(
-                Table::drop()
-                    .table(Alias::new(JOB_CONTRIBUTORS))
-                    .to_owned(),
-            )
+            .drop_table(Table::drop().table(Alias::new(JOB_CONTRIBUTORS)).to_owned())
             .await?;
         manager
             .rename_table(

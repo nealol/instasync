@@ -241,9 +241,10 @@ async function releasedClientChecker(
   let extracted = bundle.slice(dependencyStart, statement.end);
   const syncReference = /pluginDbSync:\[([$A-Z_a-z][$\w]*)\]/.exec(extracted)?.[1];
   invariant(syncReference, `${baseline.id}: released plugin DB cap is missing`);
-  const syncDefinition = new RegExp(`(?:var|let|const)\\s+${syncReference}=(["'][^"']+["'])`).exec(
-    bundle.slice(0, dependencyStart),
-  );
+  const escapedSyncReference = syncReference.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const syncDefinition = new RegExp(
+    `(?:\\b(?:const|let|var)\\s+${escapedSyncReference}\\s*=|\\b${escapedSyncReference}\\s*=)\\s*(["'][^"']+["'])`,
+  ).exec(bundle.slice(0, dependencyStart));
   invariant(syncDefinition, `${baseline.id}: released plugin DB cap value is missing`);
   extracted = `var ${syncReference}=${syncDefinition[1]};${extracted}`;
   const functionMatch = /function\s+([$A-Z_a-z][$\w]*)\s*\([^)]*\)\s*\{/.exec(extracted);

@@ -77,12 +77,15 @@ export abstract class SyncedDoc {
       this.ydoc,
     );
     const storeUpdate = this.persistence._storeUpdate;
-    this.persistence._storeUpdate = (update, origin) => {
+    this.ydoc.off("update", storeUpdate);
+    const filteredStoreUpdate = (update: Uint8Array, origin: unknown) => {
       if (this.provider.clientToken?.authorization === "read-only" && origin !== this.provider) {
         return;
       }
       storeUpdate(update, origin);
     };
+    this.persistence._storeUpdate = filteredStoreUpdate;
+    this.ydoc.on("update", filteredStoreUpdate);
 
     this.syncedListener = (synced) => {
       if (synced) {

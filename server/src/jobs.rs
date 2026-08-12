@@ -699,11 +699,20 @@ impl JobQueue {
     ) -> Result<(i64, Vec<Principal>)> {
         let mut transaction = self.0.pool.begin().await?;
         let rows = sqlx::query(
-            "SELECT principal_json FROM background_job_contributors \
-             WHERE intent_key=? AND revision<=? \
-             GROUP BY actor_key ORDER BY actor_key",
+            "SELECT contributor.principal_json \
+             FROM background_job_contributors contributor \
+             WHERE contributor.intent_key=? AND contributor.revision<=? \
+               AND contributor.revision=(\
+                 SELECT MAX(latest.revision) \
+                 FROM background_job_contributors latest \
+                 WHERE latest.intent_key=contributor.intent_key \
+                   AND latest.actor_key=contributor.actor_key \
+                   AND latest.revision<=?\
+             ) \
+             ORDER BY contributor.actor_key",
         )
         .bind(intent_key)
+        .bind(revision)
         .bind(revision)
         .fetch_all(&mut *transaction)
         .await?;
@@ -907,8 +916,25 @@ mod tests {
             .enqueue_git("vault", &principal, Duration::ZERO)
             .await
             .unwrap();
+        let updated = Principal {
+            display_name: "Updated User".into(),
+            email: "updated@example.com".into(),
+            ..principal.clone()
+        };
         queue
-            .enqueue_git("vault", &principal, Duration::ZERO)
+            .enqueue_git("vault", &updated, Duration::ZERO)
+            .await
+            .unwrap();
+        let other = Principal {
+            user_id: "other".into(),
+            display_name: "Other".into(),
+            email: "other@example.com".into(),
+            git_email: None,
+            actor: crate::state::PrincipalActor::User,
+            expires_at_ms: i64::MAX,
+        };
+        queue
+            .enqueue_git("vault", &other, Duration::ZERO)
             .await
             .unwrap();
         let key = JobPayload::GitReconcile {
@@ -916,8 +942,8 @@ mod tests {
         }
         .intent_key();
         assert_eq!(
-            queue.load_contributors(&key, 2).await.unwrap().1,
-            vec![principal]
+            queue.load_contributors(&key, 3).await.unwrap().1,
+            vec![other, updated]
         );
     }
 

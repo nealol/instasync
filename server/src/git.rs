@@ -354,9 +354,7 @@ impl GitService {
         } else {
             (None, contributors)
         };
-        let committed = self
-            .commit(&repo, vault_id, contributors, ov)
-            .await?;
+        let committed = self.commit(&repo, vault_id, contributors, ov).await?;
         if let (Some((intent_key, _)), Some(revision)) = (intent, claim_revision) {
             self.0.jobs.clear_contributors(intent_key, revision).await?;
         }

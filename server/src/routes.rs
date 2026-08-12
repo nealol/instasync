@@ -2,8 +2,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1360,9 +1359,7 @@ pub async fn upsert_file(
             .count(&state.db)
             .await?;
         if registered >= state.config.crdt_max_documents_per_vault {
-            return Err(AppError::BadRequest(
-                "vault document limit reached".into(),
-            ));
+            return Err(AppError::BadRequest("vault document limit reached".into()));
         }
     }
 
@@ -1447,12 +1444,8 @@ pub async fn doc_token(
             .documents
             .document_count_for_vault(&body.vault_id)
             .await?;
-        if needs_physical_creation
-            && document_count >= state.config.crdt_max_documents_per_vault
-        {
-            return Err(AppError::BadRequest(
-                "vault document limit reached".into(),
-            ));
+        if needs_physical_creation && document_count >= state.config.crdt_max_documents_per_vault {
+            return Err(AppError::BadRequest("vault document limit reached".into()));
         }
         ensure_doc(&state, &body.doc_id).await?;
     } else {
@@ -1512,9 +1505,11 @@ pub(crate) async fn authorize_doc(
     vault_id: &str,
     doc_id: &str,
 ) -> AppResult<Level> {
-    Ok(authorize_doc_with_claim(state, user, vault_id, doc_id, None)
-        .await?
-        .level)
+    Ok(
+        authorize_doc_with_claim(state, user, vault_id, doc_id, None)
+            .await?
+            .level,
+    )
 }
 
 struct DocumentAuthorization {
@@ -1586,13 +1581,7 @@ async fn authorize_doc_with_claim(
                 };
                 if reservation.user_id == user.id && claimed_path_matches {
                     return Ok(DocumentAuthorization {
-                        level: authorize_path(
-                            state,
-                            user,
-                            vault_id,
-                            &reservation.path,
-                        )
-                        .await?,
+                        level: authorize_path(state, user, vault_id, &reservation.path).await?,
                         path: reservation.path,
                         requires_creation_reservation: true,
                     });
@@ -1610,9 +1599,7 @@ async fn authorize_doc_with_claim(
             .count(&state.db)
             .await?;
         if registered_count >= state.config.crdt_max_documents_per_vault {
-            return Err(AppError::BadRequest(
-                "vault document limit reached".into(),
-            ));
+            return Err(AppError::BadRequest("vault document limit reached".into()));
         }
     }
     let (path, requires_creation_reservation) = match registered {

@@ -177,23 +177,31 @@ describe("BinarySync", () => {
     const A = makeDevice("mobile-paused");
     try {
       await synced(A.provider);
+      A.provider.disconnect();
+      vi.useFakeTimers();
       A.bs.setPaused(true);
+      const blobExists = vi.spyOn(A.plugin.auth, "blobExists");
       A.vault.binaries.set("queued.bin", bytes([8, 6, 7, 5, 3, 0, 9]));
       A.bs.onLocalChanged("queued.bin");
 
-      await waitFor(() => (A.bs as any).deferredReconciles.has("queued.bin"), {
-        label: "paused binary reconcile deferred",
-      });
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      const reconcile = (A.bs as any).chains.get("queued.bin");
+      expect(reconcile).toBeDefined();
+      await reconcile;
+      expect((A.bs as any).deferredReconciles.has("queued.bin")).toBe(true);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect((A.bs as any).deferredReconciles.has("queued.bin")).toBe(true);
+      expect(blobExists).not.toHaveBeenCalled();
       expect(A.binaries.has("queued.bin")).toBe(false);
       expect(A.uploadStates).not.toContain("uploading");
 
+      vi.useRealTimers();
       A.bs.setPaused(false);
       await waitFor(() => A.binaries.has("queued.bin"), {
         label: "paused upload resumed",
       });
       expect(A.uploadStates.at(-1)).toBe("idle");
     } finally {
+      vi.useRealTimers();
       A.bs.destroy();
       A.provider.destroy();
       A.indexDoc.destroy();

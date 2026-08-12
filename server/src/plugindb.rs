@@ -179,8 +179,7 @@ struct PendingPublish {
     post: i64,
 }
 
-const PUBLISH_OUTBOX_SCHEMA: &str =
-    "CREATE TABLE IF NOT EXISTS realtime_server.publish_outbox (\
+const PUBLISH_OUTBOX_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS realtime_server.publish_outbox (\
          sequence INTEGER PRIMARY KEY AUTOINCREMENT,\
          batch_id TEXT NOT NULL UNIQUE,\
          rows_json TEXT NOT NULL,\
@@ -2931,9 +2930,7 @@ mod tests {
             conn.execute("SELECT crsql_finalize()", []).ok();
         }
 
-        let target = dump_replica(&config, "vcompat", "p", "n")
-            .unwrap()
-            .unwrap();
+        let target = dump_replica(&config, "vcompat", "p", "n").unwrap().unwrap();
         assert!(target.contains("CREATE TABLE realtime_internal_notes"));
         assert!(target.contains("CREATE TABLE realtime_internal_publish_outbox"));
         assert!(target.contains("'user data'"));
@@ -2965,9 +2962,7 @@ mod tests {
         apply_dump_rollback(&config, "vcompat", "p", "n", &target)
             .unwrap()
             .unwrap();
-        let after = dump_replica(&config, "vcompat", "p", "n")
-            .unwrap()
-            .unwrap();
+        let after = dump_replica(&config, "vcompat", "p", "n").unwrap().unwrap();
         assert_eq!(after, target);
 
         let (conn, _new) = open_replica(&config, &path).unwrap();

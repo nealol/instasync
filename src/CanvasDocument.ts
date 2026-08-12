@@ -50,6 +50,10 @@ export class CanvasDocument extends StructuredDocument {
     return JSON.parse(serializeCanvas(this.value));
   }
 
+  canvasText(): string {
+    return serializeCanvas(this.value);
+  }
+
   canvasNodeText(nodeId: string): Y.Text | null {
     const nodes = this.root.get("nodes");
     if (!(nodes instanceof Y.Map)) return null;

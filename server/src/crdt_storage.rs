@@ -323,8 +323,7 @@ async fn create_document(
 ) -> Result<LoadedDocument, StorageError> {
     let directory = document_directory(root, document_id);
     tokio::fs::create_dir_all(root).await?;
-    let temporary =
-        root.join(format!(".{document_id}.crdt.tmp-{}", nanoid::nanoid!(12)));
+    let temporary = root.join(format!(".{document_id}.crdt.tmp-{}", nanoid::nanoid!(12)));
     tokio::fs::create_dir(&temporary).await?;
     sync_directory(root).await?;
     let result = async {
@@ -1202,7 +1201,9 @@ mod tests {
         let error = crate::crdt_epoch::validate_store_manifests(&root)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("missing current physical document"));
+        assert!(error
+            .to_string()
+            .contains("missing current physical document"));
         assert!(!root.join("doc.crdt").exists());
         let _ = tokio::fs::remove_dir_all(root).await;
     }

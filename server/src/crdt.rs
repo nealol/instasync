@@ -2564,9 +2564,7 @@ mod tests {
             .pause_next_connection_write_after_check("vault__document")
             .await;
         writer
-            .send(
-                Message::Sync(SyncMessage::Update(map_update("raced", "preserved"))).encode_v1(),
-            )
+            .send(Message::Sync(SyncMessage::Update(map_update("raced", "preserved"))).encode_v1())
             .await
             .unwrap();
         write_checked.await.unwrap();

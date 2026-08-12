@@ -258,9 +258,7 @@ async fn run_session(
     // are guaranteed to observe every queued stream update.
     let flush_barrier = uuid::Uuid::new_v4().as_bytes().to_vec();
     document
-        .send(
-            YMsg::Custom(crate::crdt::SYNC_STATUS_MESSAGE, flush_barrier.clone()).encode_v1(),
-        )
+        .send(YMsg::Custom(crate::crdt::SYNC_STATUS_MESSAGE, flush_barrier.clone()).encode_v1())
         .await?;
     loop {
         let Some(message) = document.recv().await else {

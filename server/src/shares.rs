@@ -29,7 +29,6 @@ use crate::routes::require_member;
 use crate::session::{now_millis, ApiPrincipal};
 use crate::state::AppState;
 
-
 /// How often an SSE connection polls the document store for changes.
 const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 
@@ -429,10 +428,7 @@ pub async fn view_events(
     // client's snapshot fetch. A change between the snapshot and this read is
     // folded into the baseline; the client tolerates that because Yjs updates
     // are idempotent and the next poll re-delivers anything newer.
-    let (initial_epoch, initial) = state
-        .documents
-        .read_update_with_epoch(&note_doc_id)
-        .await?;
+    let (initial_epoch, initial) = state.documents.read_update_with_epoch(&note_doc_id).await?;
     let last_sv = state_vector_of(&initial)?;
 
     struct Poller {

@@ -3055,10 +3055,7 @@ async fn doc_token_scopes_and_mints() {
 
 #[tokio::test]
 async fn doc_token_bounds_unregistered_document_reservations() {
-    let mut config = test_config(
-        "http://auth.test",
-        realtime_server::blobs::MAX_BLOB_BYTES,
-    );
+    let mut config = test_config("http://auth.test", realtime_server::blobs::MAX_BLOB_BYTES);
     config.crdt_max_documents_per_vault = 2;
     let app = app_from_config(&config).await;
     let alice = login(&app, "alice").await;
@@ -3241,7 +3238,11 @@ async fn doc_token_reconnect_honors_only_matching_live_creation_reservation() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     let legacy_document_id = format!("{vault_id}__legacy");
-    state.documents.ensure_document(&legacy_document_id).await.unwrap();
+    state
+        .documents
+        .ensure_document(&legacy_document_id)
+        .await
+        .unwrap();
     let (status, _) = send(
         &app,
         "POST",
@@ -3259,10 +3260,7 @@ async fn doc_token_reconnect_honors_only_matching_live_creation_reservation() {
 
 #[tokio::test]
 async fn preregistered_guid_cannot_bypass_physical_document_quota() {
-    let mut config = test_config(
-        "http://auth.test",
-        realtime_server::blobs::MAX_BLOB_BYTES,
-    );
+    let mut config = test_config("http://auth.test", realtime_server::blobs::MAX_BLOB_BYTES);
     config.crdt_max_documents_per_vault = 1;
     let app = app_from_config(&config).await;
     let alice = login(&app, "alice").await;
@@ -5241,10 +5239,7 @@ async fn concurrent_file_registry_upserts_for_same_guid_do_not_collide() {
 
 #[tokio::test]
 async fn concurrent_new_file_registry_upserts_respect_vault_quota() {
-    let mut config = test_config(
-        "http://auth.test",
-        realtime_server::blobs::MAX_BLOB_BYTES,
-    );
+    let mut config = test_config("http://auth.test", realtime_server::blobs::MAX_BLOB_BYTES);
     config.crdt_max_documents_per_vault = 1;
     let app = app_from_config(&config).await;
     let token = login(&app, "alice").await;
