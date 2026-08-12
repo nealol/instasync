@@ -496,13 +496,31 @@ impl PluginDbService {
 
     /// Purge: delete the replica file, mark the DB tombstoned, and trim the Y.Doc.
     pub async fn purge(&self, vault: &str, plugin: &str, name: &str) -> Result<()> {
+        let write_lock = self.write_lock(vault, plugin, name).await;
+        let _guard = write_lock.lock().await;
+
         // Mark deleted in the server DB so git stops dumping it.
         self.mark_deleted_row(vault, plugin, name).await?;
 
-        // Remove the replica file.
+        // Remove the replica and every SQLite sidecar. In particular, deleting
+        // the outbox-containing WAL prevents a later reopen from resurrecting
+        // unpublished batches after the main file has been purged.
         let path = replica_path(&self.0.config, vault, plugin, name);
-        if path.exists() {
-            let _ = std::fs::remove_file(&path);
+        for candidate in [
+            path.clone(),
+            PathBuf::from(format!("{}-wal", path.display())),
+            PathBuf::from(format!("{}-shm", path.display())),
+            PathBuf::from(format!("{}-journal", path.display())),
+        ] {
+            match std::fs::remove_file(&candidate) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("remove plugin database file {}", candidate.display())
+                    });
+                }
+            }
         }
 
         // Trim the Y.Doc: clear batches and set the tombstone.

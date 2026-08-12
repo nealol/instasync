@@ -1062,10 +1062,20 @@ export class AuthClient {
   }
 
   /** Mint a sync token for a namespaced document in the active vault. */
-  docToken(vaultId: string, docId: string, path?: string): Promise<ClientToken> {
+  docToken(
+    vaultId: string,
+    docId: string,
+    path?: string,
+    authorization?: "full" | "read-only",
+  ): Promise<ClientToken> {
     return this.api<ClientToken>("/api/doc-token", {
       method: "POST",
-      body: { vaultId, docId, ...(path ? { path } : {}) },
+      body: {
+        vaultId,
+        docId,
+        ...(path ? { path } : {}),
+        ...(authorization ? { authorization } : {}),
+      },
     });
   }
 

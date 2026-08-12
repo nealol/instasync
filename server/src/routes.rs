@@ -11,7 +11,7 @@ use utoipa::ToSchema;
 
 use crate::audit;
 use crate::caps;
-use crate::crdt::{ensure_doc, mint_client_token, Level};
+use crate::crdt::{mint_client_token, Level};
 use crate::entities::{
     git_backups, invites, memberships, permissions, remote_cursor_tokens, remote_cursors, users,
     vault_files, vaults,
@@ -410,7 +410,7 @@ pub async fn create_vault(
     // lazily via /api/doc-token on first connect, which left REST/MCP-only
     // vaults without one — any cursor write touching the index (e.g.
     // create_note) then failed because the index document did not exist.
-    ensure_doc(&state, &vault_id).await?;
+    state.ensure_vault_document(&vault_id, &vault_id).await?;
 
     Ok(Json(VaultResponse {
         id: vault_id,
@@ -1436,21 +1436,9 @@ pub async fn doc_token(
         Some(_) => return Err(AppError::BadRequest("invalid authorization level".into())),
     };
 
-    let needs_physical_creation = !state.documents.document_exists(&body.doc_id).await?;
-    if needs_physical_creation {
-        let _creation_guard = state.document_creation_lock.lock().await;
-        let needs_physical_creation = !state.documents.document_exists(&body.doc_id).await?;
-        let document_count = state
-            .documents
-            .document_count_for_vault(&body.vault_id)
-            .await?;
-        if needs_physical_creation && document_count >= state.config.crdt_max_documents_per_vault {
-            return Err(AppError::BadRequest("vault document limit reached".into()));
-        }
-        ensure_doc(&state, &body.doc_id).await?;
-    } else {
-        ensure_doc(&state, &body.doc_id).await?;
-    }
+    state
+        .ensure_vault_document(&body.vault_id, &body.doc_id)
+        .await?;
     let token = mint_client_token(&state, &body.doc_id, level).await?;
 
     // Bind this opaque token to exactly one document, authorization level, and
@@ -1566,41 +1554,37 @@ async fn authorize_doc_with_claim(
         .filter(vault_files::Column::Guid.eq(suffix))
         .one(&state.db)
         .await?;
-    if registered.is_none() {
-        if state.documents.document_exists(doc_id).await? {
-            let now = now_millis();
-            let reservation = {
-                let mut reservations = state.pending_document_creations.lock().await;
-                reservations.retain(|_, reservation| reservation.expires_at_ms > now);
-                reservations.get(doc_id).cloned()
+    if registered.is_none() && state.documents.document_exists(doc_id).await? {
+        let now = now_millis();
+        let reservation = {
+            let mut reservations = state.pending_document_creations.lock().await;
+            reservations.retain(|_, reservation| reservation.expires_at_ms > now);
+            reservations.get(doc_id).cloned()
+        };
+        if let Some(reservation) = reservation {
+            let claimed_path_matches = match claimed_path {
+                Some(path) if reservation.path.is_empty() => !path.is_empty(),
+                Some(path) => !path.is_empty() && path == reservation.path,
+                None => true,
             };
-            if let Some(reservation) = reservation {
-                let claimed_path_matches = match claimed_path {
-                    Some(path) => !path.is_empty() && path == reservation.path,
-                    None => true,
-                };
-                if reservation.user_id == user.id && claimed_path_matches {
-                    return Ok(DocumentAuthorization {
-                        level: authorize_path(state, user, vault_id, &reservation.path).await?,
-                        path: reservation.path,
-                        requires_creation_reservation: true,
-                    });
-                }
-                return Err(AppError::Forbidden);
+            if reservation.user_id == user.id && claimed_path_matches {
+                let path = claimed_path
+                    .filter(|_| reservation.path.is_empty())
+                    .unwrap_or(&reservation.path)
+                    .to_string();
+                return Ok(DocumentAuthorization {
+                    level: authorize_path(state, user, vault_id, &path).await?,
+                    path,
+                    requires_creation_reservation: true,
+                });
             }
-            return Ok(DocumentAuthorization {
-                level: authorize_uniform_vault(state, user, vault_id).await?,
-                path: String::new(),
-                requires_creation_reservation: false,
-            });
+            return Err(AppError::Forbidden);
         }
-        let registered_count = vault_files::Entity::find()
-            .filter(vault_files::Column::VaultId.eq(vault_id))
-            .count(&state.db)
-            .await?;
-        if registered_count >= state.config.crdt_max_documents_per_vault {
-            return Err(AppError::BadRequest("vault document limit reached".into()));
-        }
+        return Ok(DocumentAuthorization {
+            level: authorize_uniform_vault(state, user, vault_id).await?,
+            path: String::new(),
+            requires_creation_reservation: false,
+        });
     }
     let (path, requires_creation_reservation) = match registered {
         Some(file) => (file.path, false),

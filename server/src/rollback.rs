@@ -576,7 +576,7 @@ async fn execute_rollback(
                     }
                 };
                 let doc_id = format!("{vault_id}__{guid}");
-                crate::crdt::ensure_doc(state, &doc_id).await?;
+                state.ensure_vault_document(vault_id, &doc_id).await?;
                 ydoc::set_text(state, &doc_id, content).await?;
                 applied += 1;
             }
@@ -599,7 +599,7 @@ async fn execute_rollback(
                     }
                 };
                 let doc_id = format!("{vault_id}__{guid}");
-                crate::crdt::ensure_doc(state, &doc_id).await?;
+                state.ensure_vault_document(vault_id, &doc_id).await?;
                 ydoc::set_structured(state, &doc_id, value).await?;
                 applied += 1;
             }

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value};
 
 use crate::audit::{self, AuditEntry};
-use crate::crdt::{ensure_doc, Level};
+use crate::crdt::Level;
 use crate::entities::vault_files;
 use crate::error::{AppError, AppResult};
 use crate::routes::{authorize_doc, require_member};
@@ -237,7 +237,7 @@ pub(crate) async fn create_note_inner(
 
     let guid = uuid::Uuid::new_v4().to_string();
     let doc_id = doc_id(vault_id, &guid);
-    ensure_doc(state, &doc_id).await?;
+    state.ensure_vault_document(vault_id, &doc_id).await?;
     ydoc::set_text(state, &doc_id, &body.content).await?;
     ydoc::index_set_file(state, vault_id, &body.path, &guid).await?;
     best_effort_index(state, vault_id, &guid, &body.path, &body.content).await;
@@ -825,7 +825,7 @@ pub(crate) async fn periodic_note_get_or_create_inner(
     validate_note_path(&note_path)?;
     let guid = uuid::Uuid::new_v4().to_string();
     let doc_id = doc_id(vault_id, &guid);
-    ensure_doc(state, &doc_id).await?;
+    state.ensure_vault_document(vault_id, &doc_id).await?;
     ydoc::set_text(state, &doc_id, &body.content).await?;
     ydoc::index_set_file(state, vault_id, &note_path, &guid).await?;
     best_effort_index(state, vault_id, &guid, &note_path, &body.content).await;

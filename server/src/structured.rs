@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 use utoipa::ToSchema;
 
 use crate::audit::{self, AuditEntry};
-use crate::crdt::{ensure_doc, Level};
+use crate::crdt::Level;
 use crate::error::{AppError, AppResult};
 use crate::routes::{authorize_path, require_member};
 use crate::session::{now_millis, ApiPrincipal};
@@ -1112,7 +1112,9 @@ pub(crate) async fn create_structured(
         return Err(AppError::Forbidden);
     }
     let guid = uuid::Uuid::new_v4().to_string();
-    ensure_doc(state, &doc_id(vault_id, &guid)).await?;
+    state
+        .ensure_vault_document(vault_id, &doc_id(vault_id, &guid))
+        .await?;
     ydoc::set_structured(state, &doc_id(vault_id, &guid), &value).await?;
     ydoc::index_set_structured(state, vault_id, path, &guid, kind).await?;
     mark_structured_write(state, vault_id, principal).await;

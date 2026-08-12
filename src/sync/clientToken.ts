@@ -100,7 +100,20 @@ export async function getClientToken(
       throw new DocumentEpochChangedError(docId, serverEpoch);
     }
     if (serverEpoch < localEpoch) {
-      throw new DocumentEpochPendingError(docId, localEpoch, serverEpoch);
+      // The client may have persisted an epoch proposal immediately before it
+      // crashed or was restarted, leaving the server waiting for its
+      // acknowledgement. It must reconnect to the retiring epoch to receive
+      // the proposal again, but must not publish fresh-epoch state into that
+      // retiring document. Use a read-only grant for that recovery handshake.
+      const recoveryToken = await plugin.auth.docToken(vaultId, docId, path, "read-only");
+      if (
+        !recoveryToken?.url ||
+        recoveryToken.authorization !== "read-only" ||
+        (recoveryToken.epoch ?? 0) !== serverEpoch
+      ) {
+        throw new DocumentEpochPendingError(docId, localEpoch, serverEpoch);
+      }
+      return recoveryToken;
     }
     return token;
   } catch (e) {

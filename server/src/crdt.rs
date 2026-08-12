@@ -1835,7 +1835,6 @@ pub async fn mint_client_token(
     level: Level,
 ) -> AppResult<Value> {
     validate_document_id(document_id)?;
-    state.documents.ensure_document(document_id).await?;
     let epoch = state.documents.current_epoch(document_id).await?;
     let (url, base_url) = client_urls(&state.config.public_base_url, document_id)
         .map_err(|error| AppError::Internal(error.to_string()))?;

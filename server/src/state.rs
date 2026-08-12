@@ -139,6 +139,33 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Ensure a logical document exists while atomically admitting new content
+    /// documents against the per-vault quota. Vault roots and plugin databases
+    /// are intentionally outside the content-document quota.
+    pub async fn ensure_vault_document(
+        &self,
+        vault_id: &str,
+        document_id: &str,
+    ) -> crate::error::AppResult<()> {
+        let _guard = self.document_creation_lock.lock().await;
+        if self.documents.document_exists(document_id).await? {
+            self.documents.ensure_document(document_id).await?;
+            return Ok(());
+        }
+        let is_root = document_id == vault_id;
+        let is_plugin_db = crate::plugindb::parse_doc_id(document_id).is_some();
+        if !is_root && !is_plugin_db {
+            let count = self.documents.document_count_for_vault(vault_id).await?;
+            if count >= self.config.crdt_max_documents_per_vault {
+                return Err(crate::error::AppError::BadRequest(
+                    "vault document limit reached".into(),
+                ));
+            }
+        }
+        self.documents.ensure_document(document_id).await?;
+        Ok(())
+    }
+
     /// Remember the document, access level, and principal for a freshly minted
     /// connection token. Lazily evicts expired entries.
     pub async fn record_sync_grant(
@@ -194,6 +221,7 @@ impl AppState {
             }
             if existing.path.is_empty() && !path.is_empty() {
                 existing.path = path;
+                existing.expires_at_ms = now + CREATION_TTL_MS;
                 return true;
             }
             return path.is_empty() || existing.path == path;

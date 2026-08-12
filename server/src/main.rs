@@ -77,20 +77,24 @@ async fn main() -> anyhow::Result<()> {
         shutdown_observer.notify_one();
         tracing::info!("shutdown requested; draining active connections");
     };
-    let server = axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
-        .into_future();
+    let server = tokio::spawn(
+        axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown)
+            .into_future(),
+    );
     tokio::pin!(server);
     let result = tokio::select! {
-        result = &mut server => result,
+        result = &mut server => result?,
         _ = shutdown_started.notified() => {
             match tokio::time::timeout(server_shutdown_timeout, &mut server).await {
-                Ok(result) => result,
+                Ok(result) => result?,
                 Err(_) => {
                     tracing::warn!(
                         timeout_ms = server_shutdown_timeout_ms,
                         "server drain deadline elapsed; closing remaining connections"
                     );
+                    server.abort();
+                    let _ = server.await;
                     Ok(())
                 }
             }
@@ -175,17 +179,26 @@ async fn run_crdt_command(args: Vec<String>) -> anyhow::Result<()> {
                 kill(pid, Signal::SIGTERM).map_err(|error| {
                     anyhow::anyhow!("failed to signal y-sweet process {pid}: {error}")
                 })?;
-                while match kill(pid, None) {
-                    Ok(()) | Err(Errno::EPERM) => true,
-                    Err(Errno::ESRCH) => false,
-                    Err(error) => {
-                        return Err(anyhow::anyhow!(
-                            "failed to check y-sweet process {pid}: {error}"
-                        ));
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while match kill(pid, None) {
+                        Ok(()) | Err(Errno::EPERM) => true,
+                        Err(Errno::ESRCH) => false,
+                        Err(error) => {
+                            return Err(anyhow::anyhow!(
+                                "failed to check y-sweet process {pid}: {error}"
+                            ));
+                        }
+                    } {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
-                } {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
+                    Ok(())
+                })
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "y-sweet process {pid} did not exit within 30 seconds; refusing to import"
+                    )
+                })??;
             }
             #[cfg(not(unix))]
             anyhow::bail!("live y-sweet migration requires Unix process signaling");

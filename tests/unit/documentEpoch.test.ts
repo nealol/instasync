@@ -90,16 +90,63 @@ describe("document epochs", () => {
     expect(instance.acceptDocumentEpoch).not.toHaveBeenCalled();
   });
 
-  it("retries without downgrading while another client delays epoch activation", async () => {
+  it("uses a read-only retiring-epoch token to finish an interrupted acknowledgement", async () => {
     const instance = plugin();
     setDocumentEpoch(instance, "vault__note", 3);
-    instance.auth.docToken.mockResolvedValue({
-      url: "wss://sync.example.com/d/vault__note/ws",
-      baseUrl: "https://sync.example.com/d/vault__note",
-      docId: "vault__note",
-      token: "old-epoch-token",
-      epoch: 2,
-    });
+    instance.auth.docToken
+      .mockResolvedValueOnce({
+        url: "wss://sync.example.com/d/vault__note/ws",
+        baseUrl: "https://sync.example.com/d/vault__note",
+        docId: "vault__note",
+        token: "old-epoch-token",
+        epoch: 2,
+      })
+      .mockResolvedValueOnce({
+        url: "wss://sync.example.com/d/vault__note/ws",
+        baseUrl: "https://sync.example.com/d/vault__note",
+        docId: "vault__note",
+        token: "read-only-old-epoch-token",
+        authorization: "read-only",
+        epoch: 2,
+      });
+
+    await expect(getClientToken(instance, "vault__note")).resolves.toEqual(
+      expect.objectContaining({
+        token: "read-only-old-epoch-token",
+        authorization: "read-only",
+        epoch: 2,
+      }),
+    );
+    expect(instance.auth.docToken).toHaveBeenNthCalledWith(
+      2,
+      "vault",
+      "vault__note",
+      undefined,
+      "read-only",
+    );
+    expect(getDocumentEpoch(instance, "vault__note")).toBe(3);
+    expect(instance.acceptDocumentEpoch).not.toHaveBeenCalled();
+  });
+
+  it("rejects a recovery token unless the server confirms read-only authorization", async () => {
+    const instance = plugin();
+    setDocumentEpoch(instance, "vault__note", 3);
+    instance.auth.docToken
+      .mockResolvedValueOnce({
+        url: "wss://sync.example.com/d/vault__note/ws",
+        baseUrl: "https://sync.example.com/d/vault__note",
+        docId: "vault__note",
+        token: "old-epoch-token",
+        epoch: 2,
+      })
+      .mockResolvedValueOnce({
+        url: "wss://sync.example.com/d/vault__note/ws",
+        baseUrl: "https://sync.example.com/d/vault__note",
+        docId: "vault__note",
+        token: "unsafe-full-old-epoch-token",
+        authorization: "full",
+        epoch: 2,
+      });
 
     await expect(getClientToken(instance, "vault__note")).rejects.toEqual(
       expect.objectContaining<DocumentEpochPendingError>({
@@ -109,24 +156,30 @@ describe("document epochs", () => {
         serverEpoch: 2,
       }),
     );
-    expect(getDocumentEpoch(instance, "vault__note")).toBe(3);
-    expect(instance.acceptDocumentEpoch).not.toHaveBeenCalled();
   });
 
   it("does not globally back off unrelated documents while an epoch is pending", async () => {
     resetTokenRetryStateForTests(30_000);
     const instance = plugin();
     setDocumentEpoch(instance, "vault__pending", 3);
-    instance.auth.docToken.mockImplementation(async (_vault: string, docId: string) => ({
-      url: `wss://sync.example.com/d/${docId}/ws`,
-      baseUrl: `https://sync.example.com/d/${docId}`,
-      docId,
-      token: "token",
-      epoch: docId === "vault__pending" ? 2 : 0,
-    }));
+    instance.auth.docToken.mockImplementation(
+      async (
+        _vault: string,
+        docId: string,
+        _path?: string,
+        authorization?: "full" | "read-only",
+      ) => ({
+        url: `wss://sync.example.com/d/${docId}/ws`,
+        baseUrl: `https://sync.example.com/d/${docId}`,
+        docId,
+        token: "token",
+        authorization,
+        epoch: docId === "vault__pending" ? 2 : 0,
+      }),
+    );
 
-    await expect(getClientToken(instance, "vault__pending")).rejects.toBeInstanceOf(
-      DocumentEpochPendingError,
+    await expect(getClientToken(instance, "vault__pending")).resolves.toEqual(
+      expect.objectContaining({ docId: "vault__pending", authorization: "read-only" }),
     );
     await expect(getClientToken(instance, "vault__other")).resolves.toEqual(
       expect.objectContaining({ docId: "vault__other" }),
