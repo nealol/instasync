@@ -800,6 +800,53 @@ describe("VaultSync index", () => {
     expect(localVault.handlerCount("modify")).toBe(0);
   });
 
+  it("rescans files created while the initial sync pass is running", async () => {
+    const vault = await harness.createVault(aliceToken, "initial-event-race");
+    const { plugin, vault: localVault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    localVault.files.set("slow.md", "slow");
+    const sync = new VaultSync(plugin as any);
+    (plugin as any).vaultSync = sync;
+    try {
+      await waitFor(() => (sync as any).initialSyncRunning, { label: "initial sync running" });
+      await localVault.create("during-bootstrap.md", "created during bootstrap");
+      await waitFor(() => (sync as any).files.has("during-bootstrap.md"), {
+        timeout: 20_000,
+        label: "bootstrap race file indexed",
+      });
+    } finally {
+      sync.destroy();
+    }
+  });
+
+  it("retries when the final bootstrap rescan fails", async () => {
+    const vault = await harness.createVault(aliceToken, "initial-rescan-retry");
+    const { plugin } = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    const sync = new VaultSync(plugin as any);
+    (plugin as any).vaultSync = sync;
+    const original = (sync as any).runInitialSyncPass.bind(sync);
+    let calls = 0;
+    (sync as any).runInitialSyncPass = vi.fn(async () => {
+      calls += 1;
+      if (calls === 2) throw new Error("final rescan failed");
+      return original();
+    });
+    try {
+      await waitFor(() => calls >= 3 && (sync as any).initialSynced, {
+        timeout: 20_000,
+        label: "bootstrap retried after final rescan failure",
+      });
+      expect((sync as any).backgroundSyncStarted).toBe(true);
+    } finally {
+      sync.destroy();
+    }
+  });
+
   it("releases mobile channels in the background and catches up after resume", async () => {
     (Platform as any).isMobile = true;
     const vault = await harness.createVault(aliceToken, "mobile-lifecycle");
@@ -1119,10 +1166,17 @@ describe("VaultSync index", () => {
     files.set("b.md", "b");
     files.set("active.md", "active");
     const connected: string[] = [];
-    const completions = new Map<string, ReturnType<typeof Promise.withResolvers<void>>>();
+    const completions = new Map<
+      string,
+      { promise: Promise<void>; resolve: () => void }
+    >();
     const documents = new Map(
       [...files.entries()].map(([path, guid]) => {
-        const completion = Promise.withResolvers<void>();
+        let resolve!: () => void;
+        const promise = new Promise<void>((done) => {
+          resolve = done;
+        });
+        const completion = { promise, resolve };
         completions.set(path, completion);
         return [
           path,

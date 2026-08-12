@@ -46,6 +46,7 @@
         "wdio-obsidian-reporter": "^3.0.4",
         "wdio-obsidian-service": "^3.0.4",
         "ws": "^8.21.0",
+        "y-sweet": "0.9.1",
       },
     },
     "packages/cli": {
@@ -1880,6 +1881,8 @@
     "y-indexeddb": ["y-indexeddb@9.0.12", "", { "dependencies": { "lib0": "^0.2.74" }, "peerDependencies": { "yjs": "^13.0.0" } }, "sha512-9oCFRSPPzBK7/w5vOkJBaVCQZKHXB/v6SIT+WYhnJxlEC61juqG0hBrAf+y3gmSMLFLwICNH9nQ53uscuse6Hg=="],
 
     "y-protocols": ["y-protocols@1.0.7", "", { "dependencies": { "lib0": "^0.2.85" }, "peerDependencies": { "yjs": "^13.0.0" } }, "sha512-YSVsLoXxO67J6eE/nV4AtFtT3QEotZf5sK5BHxFBXso7VDUT3Tx07IfA6hsu5Q5OmBdMkQVmFZ9QOA7fikWvnw=="],
+
+    "y-sweet": ["y-sweet@0.9.1", "", { "bin": { "y-sweet": "src/run.js" } }, "sha512-RJv3YCfMKgJDi1YqH1LNq1ugu6FkqJBiqpB2OUfJmt2jlD3IPfgtjgcfqDrhu/KI21IxShbtF65qzWxciwt0rQ=="],
 
     "y18n": ["y18n@5.0.8", "", {}, "sha512-0pfFzegeDWJHJIAmTLRP2DwHjdF5s7jo9tuztdQxAhINCdvS+3nGINqPd00AphqJR/0LhANUS6/+7SCb98YOfA=="],
 

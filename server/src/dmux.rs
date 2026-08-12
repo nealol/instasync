@@ -47,18 +47,20 @@ const FRAME_PONG: u64 = 7;
 const CONTROL_CHANNEL: u64 = 0;
 
 /// Outbound queue depth per direction; bounds memory if one side stalls.
-const CHANNEL_CAPACITY: usize = 256;
+const CHANNEL_CAPACITY: usize = 16;
 /// Hard fan-out bound for one client connection.
-const MAX_CHANNELS: usize = 1_024;
+const MAX_CHANNELS: usize = 512;
 /// Bound OPEN parsing/allocation and the request forwarded to tungstenite.
 const MAX_OPEN_PATH_BYTES: usize = 4_096;
-/// Bound DATA frame payloads before they are cloned into a per-channel queue.
-/// A Yjs sync update larger than this is rejected at the frame layer; the
-/// document session also enforces `MAX_UPDATE_BYTES`, but this cap prevents
-/// `to_vec()` + 256-deep queue amplification across 1,024 channels.
-const MAX_DATA_FRAME_BYTES: usize = 1024 * 1024;
+/// Match the native CRDT protocol limit. Queue depth and channel fan-out are
+/// deliberately small enough that backpressure resets happen before large
+/// frames can accumulate across the physical connection.
+const MAX_DATA_FRAME_BYTES: usize = crate::crdt::MAX_UPDATE_BYTES;
 /// Bound dial-task creation even when a client immediately closes each channel.
 const MAX_OPENS_PER_WINDOW: usize = 128;
+/// A physical connection is cheap to replace. Cap its lifetime channel churn
+/// so rejected/short-lived OPEN attempts cannot retain unbounded history.
+const MAX_OPENS_PER_CONNECTION: usize = 4_096;
 const OPEN_RATE_WINDOW: Duration = Duration::from_secs(10);
 /// The browser client sends mux PING frames every five seconds.
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -67,6 +69,7 @@ struct OpenLimiter {
     seen_channels: HashSet<u64>,
     window_started: Instant,
     opens_in_window: usize,
+    opens_total: usize,
 }
 
 impl OpenLimiter {
@@ -75,7 +78,12 @@ impl OpenLimiter {
             seen_channels: HashSet::new(),
             window_started: now,
             opens_in_window: 0,
+            opens_total: 0,
         }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.opens_total >= MAX_OPENS_PER_CONNECTION
     }
 
     fn admit(&mut self, channel: u64, active_channels: usize, now: Instant) -> bool {
@@ -87,10 +95,12 @@ impl OpenLimiter {
             || self.seen_channels.contains(&channel)
             || active_channels >= MAX_CHANNELS
             || self.opens_in_window >= MAX_OPENS_PER_WINDOW
+            || self.opens_total >= MAX_OPENS_PER_CONNECTION
         {
             return false;
         }
         self.opens_in_window += 1;
+        self.opens_total += 1;
         self.seen_channels.insert(channel);
         true
     }
@@ -149,6 +159,9 @@ async fn handle(client: WebSocket, state: AppState) {
                                 active_channels = channels.len(),
                                 "dmux: rejected channel open"
                             );
+                            if open_limiter.exhausted() {
+                                break;
+                            }
                             continue;
                         }
                         // Register synchronously, then load/connect the document in a
@@ -183,6 +196,16 @@ async fn handle(client: WebSocket, state: AppState) {
                                 }
                             }
                         }
+                    }
+                    Some(Frame::OversizedData { channel }) => {
+                        remove_channel(&mut channels, channel, &state);
+                        state.sync_metrics.document_channel_backpressure_reset();
+                        let _ = out_tx.try_send(encode_simple(FRAME_CLOSE, channel));
+                        tracing::warn!(
+                            channel,
+                            payload_limit = MAX_DATA_FRAME_BYTES,
+                            "dmux: oversized document frame; reset channel"
+                        );
                     }
                     Some(Frame::Close { channel }) => {
                         // Dropping the sender ends that channel's upstream pump.
@@ -341,6 +364,9 @@ enum Frame<'a> {
         channel: u64,
         payload: &'a [u8],
     },
+    OversizedData {
+        channel: u64,
+    },
     Close {
         channel: u64,
     },
@@ -365,7 +391,7 @@ fn parse_frame(buf: &[u8]) -> Option<Frame<'_>> {
         }
         t if t == FRAME_DATA => {
             if rest.len() > MAX_DATA_FRAME_BYTES {
-                return None;
+                return Some(Frame::OversizedData { channel });
             }
             Some(Frame::Data {
                 channel,
@@ -391,6 +417,9 @@ pub fn fuzz_parse_frame(bytes: &[u8]) {
             }
             Frame::Data { channel, payload } => {
                 std::hint::black_box((channel, payload));
+            }
+            Frame::OversizedData { channel } => {
+                std::hint::black_box(channel);
             }
             Frame::Close { channel } => {
                 std::hint::black_box(channel);
@@ -530,11 +559,26 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn rejects_oversized_data_payload() {
         let payload = vec![0u8; MAX_DATA_FRAME_BYTES + 1];
         let data = encode_data(1, &payload);
-        assert!(parse_frame(&data).is_none());
+        assert!(matches!(
+            parse_frame(&data),
+            Some(Frame::OversizedData { channel: 1 })
+        ));
+    }
+
+    #[test]
+    fn accepts_large_native_protocol_frames_without_forcing_reconnect() {
+        let payload = vec![7u8; 2 * 1024 * 1024];
+        let data = encode_data(9, &payload);
+        match parse_frame(&data) {
+            Some(Frame::Data {
+                channel: 9,
+                payload: decoded,
+            }) => assert_eq!(decoded, payload),
+            _ => panic!("expected a complete large DATA frame"),
+        }
     }
 
     #[test]
@@ -585,6 +629,22 @@ mod tests {
         }
         now += OPEN_RATE_WINDOW;
         assert!(!fanout_limiter.admit((MAX_CHANNELS + 1) as u64, MAX_CHANNELS, now));
+
+        let mut lifetime_limiter = OpenLimiter::new(start);
+        let mut now = start;
+        for channel in 1..=MAX_OPENS_PER_CONNECTION as u64 {
+            if channel > 1 && (channel - 1) % MAX_OPENS_PER_WINDOW as u64 == 0 {
+                now += OPEN_RATE_WINDOW;
+            }
+            assert!(lifetime_limiter.admit(channel, 0, now));
+        }
+        now += OPEN_RATE_WINDOW;
+        assert!(lifetime_limiter.exhausted());
+        assert!(!lifetime_limiter.admit(
+            MAX_OPENS_PER_CONNECTION as u64 + 1,
+            0,
+            now
+        ));
     }
 
     proptest! {
@@ -612,7 +672,7 @@ mod tests {
                     Frame::Data { payload, .. } => {
                         prop_assert!(payload.len() <= bytes.len().min(MAX_DATA_FRAME_BYTES));
                     }
-                    Frame::Close { .. } | Frame::Ping => {}
+                    Frame::OversizedData { .. } | Frame::Close { .. } | Frame::Ping => {}
                 }
             }
         }

@@ -113,6 +113,10 @@ pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
         plugindb,
         search,
         sync_grants: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        pending_document_creations: Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        document_creation_lock: Arc::new(tokio::sync::Mutex::new(())),
         sync_metrics,
         runtime_health: operations::RuntimeHealth::default(),
     };
@@ -144,7 +148,6 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health/live", get(operations::live))
         .route("/health/ready", get(operations::ready))
-
         .route("/metrics", get(operations::metrics))
         .merge(SwaggerUi::new("/docs").url("/openapi.json", openapi::ApiDoc::openapi()))
         .merge(mcp::router(state.clone()))

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import fc from "fast-check";
 import * as Y from "yjs";
+import * as decoding from "lib0/decoding";
 import * as encoding from "lib0/encoding";
 import * as syncProtocol from "y-protocols/sync";
 import {
@@ -72,15 +73,20 @@ function syncStep2(): Uint8Array {
 function epochProposal(epoch: number): Uint8Array {
   const encoder = encoding.createEncoder();
   encoding.writeVarUint(encoder, MESSAGE_EPOCH_PROPOSAL);
-  encoding.writeVarUint8Array(
-    encoder,
-    new TextEncoder().encode(JSON.stringify({ epoch })),
-  );
+  encoding.writeVarUint8Array(encoder, new TextEncoder().encode(JSON.stringify({ epoch })));
   return encoding.toUint8Array(encoder);
 }
 
 function messageKind(message: Uint8Array): number {
   return message[0] ?? -1;
+}
+
+function acknowledgedEpoch(message: Uint8Array): number | null {
+  const decoder = decoding.createDecoder(message);
+  if (decoding.readVarUint(decoder) !== MESSAGE_EPOCH_ACKNOWLEDGEMENT) return null;
+  const payload = decoding.readVarUint8Array(decoder);
+  const parsed = JSON.parse(new TextDecoder().decode(payload)) as { epoch?: unknown };
+  return typeof parsed.epoch === "number" ? parsed.epoch : null;
 }
 
 async function flush(): Promise<void> {
@@ -105,96 +111,101 @@ describe("stateful sync boundary properties", () => {
   it("models epoch acknowledgement and reconnect-after-token-expiry", async () => {
     vi.useFakeTimers();
     await fc.assert(
-      fc.asyncProperty(fc.array(providerCommand, { minLength: 1, maxLength: 40 }), async (commands) => {
-        resetDocumentEpochStateForTests();
-        const { plugin } = makeFakePlugin("https://sync.example.com", {
-          sessionToken: "session",
-          activeVaultId: "vault",
-        });
-        let tokenGeneration = 0;
-        let tokenCalls = 0;
-        let connected = true;
-        const sockets: ModelSocket[] = [];
-        const socketFactory: SyncSocketFactory = () => {
-          const socket = new ModelSocket(tokenGeneration);
-          sockets.push(socket);
-          return socket;
-        };
-        const tokenSource = async (): Promise<ClientToken> => {
-          tokenCalls += 1;
-          return {
-            docId: "vault__doc",
-            url: "ws://sync.test/dmux",
-            token: `token-${tokenGeneration}`,
-            epoch: getDocumentEpoch(plugin as unknown as RealtimePlugin, "vault__doc"),
+      fc.asyncProperty(
+        fc.array(providerCommand, { minLength: 1, maxLength: 40 }),
+        async (commands) => {
+          resetDocumentEpochStateForTests();
+          const { plugin } = makeFakePlugin("https://sync.example.com", {
+            sessionToken: "session",
+            activeVaultId: "vault",
+          });
+          let tokenGeneration = 0;
+          let tokenCalls = 0;
+          let connected = true;
+          const sockets: ModelSocket[] = [];
+          const socketFactory: SyncSocketFactory = () => {
+            const socket = new ModelSocket(tokenGeneration);
+            sockets.push(socket);
+            return socket;
           };
-        };
-        setEpochProposalHandler((documentId, epoch) => {
-          setDocumentEpoch(plugin as unknown as RealtimePlugin, documentId, epoch);
-        });
-        const doc = new Y.Doc();
-        const provider = new RealtimeProvider("vault__doc", doc, tokenSource, {
-          connect: false,
-          socketFactory,
-        });
+          const tokenSource = async (): Promise<ClientToken> => {
+            tokenCalls += 1;
+            return {
+              docId: "vault__doc",
+              url: "ws://sync.test/dmux",
+              token: `token-${tokenGeneration}`,
+              epoch: getDocumentEpoch(plugin as unknown as RealtimePlugin, "vault__doc"),
+            };
+          };
+          setEpochProposalHandler((documentId, epoch) => {
+            setDocumentEpoch(plugin as unknown as RealtimePlugin, documentId, epoch);
+          });
+          const doc = new Y.Doc();
+          const provider = new RealtimeProvider("vault__doc", doc, tokenSource, {
+            connect: false,
+            socketFactory,
+          });
 
-        try {
-          for (const command of commands) {
-            if (command.type === "connect") {
-              connected = true;
-              void provider.connect();
-              await flush();
-              sockets.at(-1)?.receive(syncStep2());
-              await flush();
-            } else if (command.type === "disconnect") {
-              connected = false;
-              provider.disconnect();
-            } else if (command.type === "expireToken") {
-              tokenGeneration += 1;
-              const before = tokenCalls;
-              const activeSocket = sockets.at(-1);
-              activeSocket?.fail();
-              for (let attempt = 0; attempt < 3; attempt += 1) {
-                await vi.advanceTimersByTimeAsync(20_000);
+          try {
+            for (const command of commands) {
+              if (command.type === "connect") {
+                connected = true;
+                void provider.connect();
                 await flush();
-                const retrySocket = sockets.at(-1);
-                if (retrySocket && retrySocket !== activeSocket) retrySocket.fail();
-              }
-              await vi.advanceTimersByTimeAsync(20_000);
-              await flush();
-              if (connected && activeSocket) expect(tokenCalls).toBeGreaterThan(before);
-            } else {
-              const previous = getDocumentEpoch(
-                plugin as unknown as RealtimePlugin,
-                "vault__doc",
-              );
-              const proposed = Math.max(previous, command.epoch);
-              const socket = sockets.at(-1);
-              if (socket?.readyState === SOCKET_OPEN) {
-                socket.receive(epochProposal(proposed));
+                sockets.at(-1)?.receive(syncStep2());
                 await flush();
-                expect(
-                  getDocumentEpoch(plugin as unknown as RealtimePlugin, "vault__doc"),
-                ).toBe(proposed);
-                expect(socket.sent.some((message) => messageKind(message) === MESSAGE_EPOCH_ACKNOWLEDGEMENT)).toBe(true);
+              } else if (command.type === "disconnect") {
+                connected = false;
+                provider.disconnect();
+              } else if (command.type === "expireToken") {
+                tokenGeneration += 1;
+                const before = tokenCalls;
+                const activeSocket = sockets.at(-1);
+                if (connected && activeSocket?.readyState === SOCKET_OPEN) {
+                  activeSocket.fail();
+                  await vi.advanceTimersByTimeAsync(20_000);
+                  await flush();
+                  const retrySocket = sockets.at(-1);
+                  if (retrySocket && retrySocket !== activeSocket) {
+                    retrySocket.receive(syncStep2());
+                    await flush();
+                  }
+                  if (tokenCalls > before) expect(retrySocket).not.toBe(activeSocket);
+                }
               } else {
-                handleEpochProposal("vault__doc", proposed);
-                expect(
-                  getDocumentEpoch(plugin as unknown as RealtimePlugin, "vault__doc"),
-                ).toBe(proposed);
+                const previous = getDocumentEpoch(
+                  plugin as unknown as RealtimePlugin,
+                  "vault__doc",
+                );
+                const proposed = Math.max(previous, command.epoch);
+                const socket = sockets.at(-1);
+                if (socket?.readyState === SOCKET_OPEN) {
+                  const sentBefore = socket.sent.length;
+                  socket.receive(epochProposal(proposed));
+                  await flush();
+                  expect(getDocumentEpoch(plugin as unknown as RealtimePlugin, "vault__doc")).toBe(
+                    proposed,
+                  );
+                  expect(socket.sent.slice(sentBefore).map(acknowledgedEpoch)).toContain(proposed);
+                } else {
+                  handleEpochProposal("vault__doc", proposed);
+                  expect(getDocumentEpoch(plugin as unknown as RealtimePlugin, "vault__doc")).toBe(
+                    proposed,
+                  );
+                }
               }
             }
+            expect(
+              getDocumentEpoch(plugin as unknown as RealtimePlugin, "vault__doc"),
+            ).toBeGreaterThanOrEqual(0);
+          } finally {
+            provider.destroy();
+            doc.destroy();
+            setEpochProposalHandler(null);
+            resetDocumentEpochStateForTests();
           }
-          expect(
-            getDocumentEpoch(plugin as unknown as RealtimePlugin, "vault__doc"),
-          ).toBeGreaterThanOrEqual(0);
-        } finally {
-          provider.destroy();
-          doc.destroy();
-          setEpochProposalHandler(null);
-          resetDocumentEpochStateForTests();
-        }
-      }),
+        },
+      ),
       { numRuns: 35 },
     );
     vi.useRealTimers();

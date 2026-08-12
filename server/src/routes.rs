@@ -1,7 +1,10 @@
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set,
+    TransactionTrait,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -1340,11 +1343,36 @@ pub async fn upsert_file(
     if authorize_path(&state, &user, &vault_id, &body.path).await? != Level::Full {
         return Err(AppError::Forbidden);
     }
+    if body.guid.is_empty() || body.guid.contains("__") || !safe_doc_id(&body.guid) {
+        return Err(AppError::BadRequest("invalid file guid".into()));
+    }
+    let existing = vault_files::Entity::find()
+        .filter(vault_files::Column::VaultId.eq(&vault_id))
+        .filter(vault_files::Column::Guid.eq(&body.guid))
+        .one(&state.db)
+        .await?;
+    if existing.is_none() {
+        let registered = vault_files::Entity::find()
+            .filter(vault_files::Column::VaultId.eq(&vault_id))
+            .count(&state.db)
+            .await?;
+        if registered >= state.config.crdt_max_documents_per_vault {
+            return Err(AppError::BadRequest(
+                "vault document limit reached".into(),
+            ));
+        }
+    }
 
     // Atomic upsert: the client fires registry updates fire-and-forget on every
     // file event, so the same guid can arrive concurrently (delete/restore/move)
     // and a find-then-insert would collide on the unique (vault_id, guid) index.
     crate::ydoc::upsert_vault_file(&state, &vault_id, &body.path, &body.guid).await?;
+    let document_id = format!("{vault_id}__{}", body.guid);
+    state
+        .pending_document_creations
+        .lock()
+        .await
+        .remove(&document_id);
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -1381,7 +1409,7 @@ pub async fn doc_token(
         return Err(AppError::Forbidden);
     }
 
-    let authorized_level = authorize_doc_with_claim(
+    let authorization = authorize_doc_with_claim(
         &state,
         &user,
         &body.vault_id,
@@ -1389,13 +1417,40 @@ pub async fn doc_token(
         body.path.as_deref(),
     )
     .await?;
+    if authorization.requires_creation_reservation
+        && !state
+            .reserve_document_creation(
+                body.doc_id.clone(),
+                user.id.clone(),
+                authorization.path.clone(),
+            )
+            .await
+    {
+        return Err(AppError::BadRequest(
+            "too many pending document creations".into(),
+        ));
+    }
     let level = match body.authorization.as_deref() {
-        None | Some("full") => authorized_level,
+        None | Some("full") => authorization.level,
         Some("read-only") => Level::ReadOnly,
         Some(_) => return Err(AppError::BadRequest("invalid authorization level".into())),
     };
 
-    ensure_doc(&state, &body.doc_id).await?;
+    if authorization.requires_creation_reservation {
+        let _creation_guard = state.document_creation_lock.lock().await;
+        let document_count = state
+            .documents
+            .document_count_for_vault(&body.vault_id)
+            .await?;
+        if document_count >= state.config.crdt_max_documents_per_vault {
+            return Err(AppError::BadRequest(
+                "vault document limit reached".into(),
+            ));
+        }
+        ensure_doc(&state, &body.doc_id).await?;
+    } else {
+        ensure_doc(&state, &body.doc_id).await?;
+    }
     let token = mint_client_token(&state, &body.doc_id, level).await?;
 
     // Bind this opaque token to exactly one document, authorization level, and
@@ -1450,7 +1505,15 @@ pub(crate) async fn authorize_doc(
     vault_id: &str,
     doc_id: &str,
 ) -> AppResult<Level> {
-    authorize_doc_with_claim(state, user, vault_id, doc_id, None).await
+    Ok(authorize_doc_with_claim(state, user, vault_id, doc_id, None)
+        .await?
+        .level)
+}
+
+struct DocumentAuthorization {
+    level: Level,
+    path: String,
+    requires_creation_reservation: bool,
 }
 
 async fn authorize_doc_with_claim(
@@ -1459,11 +1522,15 @@ async fn authorize_doc_with_claim(
     vault_id: &str,
     doc_id: &str,
     claimed_path: Option<&str>,
-) -> AppResult<Level> {
+) -> AppResult<DocumentAuthorization> {
     if doc_id == vault_id {
         // A Y.Map cannot hide individual entries. Only uniformly-authorized
         // principals may receive the shared index document.
-        return authorize_uniform_vault(state, user, vault_id).await;
+        return Ok(DocumentAuthorization {
+            level: authorize_uniform_vault(state, user, vault_id).await?,
+            path: String::new(),
+            requires_creation_reservation: false,
+        });
     }
 
     let prefix = format!("{vault_id}__");
@@ -1480,7 +1547,11 @@ async fn authorize_doc_with_claim(
             plugin.expect("checked above"),
             name.expect("checked above"),
         );
-        return authorize_path(state, user, vault_id, &path).await;
+        return Ok(DocumentAuthorization {
+            level: authorize_path(state, user, vault_id, &path).await?,
+            path,
+            requires_creation_reservation: false,
+        });
     }
 
     // Normal file guids never contain the plugin-db separator.
@@ -1493,19 +1564,40 @@ async fn authorize_doc_with_claim(
         .filter(vault_files::Column::Guid.eq(suffix))
         .one(&state.db)
         .await?;
-    let path = match registered {
-        Some(file) => file.path,
+    if registered.is_none() {
+        let registered_count = vault_files::Entity::find()
+            .filter(vault_files::Column::VaultId.eq(vault_id))
+            .count(&state.db)
+            .await?;
+        if registered_count >= state.config.crdt_max_documents_per_vault {
+            return Err(AppError::BadRequest(
+                "vault document limit reached".into(),
+            ));
+        }
+    }
+    let (path, requires_creation_reservation) = match registered {
+        Some(file) => (file.path, false),
         // Creator documents connect before their index entry is published.
         // The claimed path permits that one empty-document bootstrap without
         // turning every unknown guid into vault-level access.
         None => match claimed_path.filter(|path| !path.is_empty()) {
-            Some(path) => path.to_string(),
+            Some(path) => (path.to_string(), true),
             // Preserve direct document creation for principals whose policy is
             // uniform across the vault. Partial ACLs must provide a path.
-            None => return authorize_uniform_vault(state, user, vault_id).await,
+            None => {
+                return Ok(DocumentAuthorization {
+                    level: authorize_uniform_vault(state, user, vault_id).await?,
+                    path: String::new(),
+                    requires_creation_reservation: true,
+                });
+            }
         },
     };
-    authorize_path(state, user, vault_id, &path).await
+    Ok(DocumentAuthorization {
+        level: authorize_path(state, user, vault_id, &path).await?,
+        path,
+        requires_creation_reservation,
+    })
 }
 
 pub(crate) async fn authorize_path(

@@ -327,7 +327,9 @@ describe("Document sync", () => {
       peer.setText("base + remote");
       await writePromise;
 
-      await new Promise((r) => setTimeout(r, 50));
+      await waitFor(() => doc.content === "base + remote", {
+        label: "newer remote update applied",
+      });
       expect(doc.content).toBe("base + remote");
       expect(peer.getText()).toBe("base + remote");
     } finally {
@@ -929,7 +931,9 @@ describe("Document sync", () => {
     const peer = new Peer(memberPlugin, docId(guid));
     try {
       await doc.whenReady();
+      await peer.whenSynced();
       await waitFor(() => doc.provider.status === "connected");
+      await waitFor(() => peer.getText() === "hi", { label: "peer received initial text" });
 
       doc.provider.disconnect();
       await waitFor(() => doc.provider.status === "offline", { label: "went offline" });

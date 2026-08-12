@@ -728,7 +728,7 @@ mod tests {
         let t = parse_trailers(body);
         assert_eq!(t.get("Principal-Id").unwrap(), "u1");
         assert_eq!(t.get("Rollback-Of").unwrap(), "abc123");
-        assert!(t.get("Missing").is_none());
+        assert!(!t.contains_key("Missing"));
     }
 
     #[test]
@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn parses_ls_tree_z() {
-        let out = b"100644 blob 1111111111111111111111111111111111111111      12\ta.md\0100644 blob 2222222222222222222222222222222222222222    3456\timg/sp ace.png\0";
+        let out = b"100644 blob 1111111111111111111111111111111111111111      12\ta.md\x00100644 blob 2222222222222222222222222222222222222222    3456\timg/sp ace.png\0";
         let entries = parse_ls_tree_z(out);
         assert_eq!(
             entries,

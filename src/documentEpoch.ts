@@ -44,7 +44,8 @@ export function epochPersistenceName(
   documentId: string,
   baseName: string,
 ): string {
-  return `${baseName}:epoch:${getDocumentEpoch(plugin, documentId)}`;
+  const epoch = getDocumentEpoch(plugin, documentId);
+  return epoch === 0 ? baseName : `${baseName}:epoch:${epoch}`;
 }
 
 export function setEpochProposalHandler(handler: EpochProposalHandler | null): void {

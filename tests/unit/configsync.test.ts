@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import {
   ConfigSync,
@@ -9,11 +9,95 @@ import {
 import { LocalSyncState } from "../../src/localSyncState";
 import { makeFakePlugin } from "../support/fakePlugin";
 import { freshGuid } from "../support/util";
+import { waitFor } from "../support/util";
 
 const local: ConfigMeta = { hash: "local", size: 1, mtime: 200 };
 const remote: ConfigMeta = { hash: "remote", size: 1, mtime: 100 };
 
 describe("ConfigSync reconcile decisions", () => {
+  it("defers config reconciliation while paused and scans on resume", async () => {
+    const { plugin } = makeFakePlugin("https://sync.example.com", {
+      sessionToken: "token",
+      activeVaultId: "vault",
+    });
+    const indexDoc = new Y.Doc();
+    (plugin.app.vault as any).adapter = {
+      readBinary: vi.fn(async () => new Uint8Array([1]).buffer),
+      exists: vi.fn(async () => true),
+      stat: vi.fn(async () => ({ mtime: 1, ctime: 1, size: 1, type: "file" })),
+    };
+    const sync = new ConfigSync(plugin as any, indexDoc);
+    const reconcile = vi.spyOn(sync, "reconcileAll").mockResolvedValue();
+    sync.setPaused(true);
+    sync.start(new Set(["appearance"] as any));
+    await Promise.resolve();
+    expect(reconcile).not.toHaveBeenCalled();
+    sync.setPaused(false);
+    await Promise.resolve();
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    sync.destroy();
+    indexDoc.destroy();
+  });
+
+  it("does not publish an upload that was paused in flight", async () => {
+    const { plugin } = makeFakePlugin("https://sync.example.com", {
+      sessionToken: "token",
+      activeVaultId: "vault",
+    });
+    const indexDoc = new Y.Doc();
+    const sync = new ConfigSync(plugin as any, indexDoc);
+    let release!: (exists: boolean) => void;
+    plugin.auth.blobExists = vi.fn(
+      () => new Promise<boolean>((resolve) => (release = resolve)),
+    );
+    const upload = (sync as any).uploadBytes(
+      ".obsidian/appearance.json",
+      new Uint8Array([1]).buffer,
+      null,
+      null,
+    );
+    await waitFor(() => typeof release === "function", { label: "blob check started" });
+    sync.setPaused(true);
+    release(true);
+    await upload;
+    expect(indexDoc.getMap("configFiles").has(".obsidian/appearance.json")).toBe(false);
+    sync.destroy();
+    indexDoc.destroy();
+  });
+
+  it("does not apply a download that was paused in flight", async () => {
+    const { plugin } = makeFakePlugin("https://sync.example.com", {
+      sessionToken: "token",
+      activeVaultId: "vault",
+    });
+    const indexDoc = new Y.Doc();
+    const sync = new ConfigSync(plugin as any, indexDoc);
+    let release!: (bytes: ArrayBuffer) => void;
+    plugin.auth.getBlob = vi.fn(
+      () => new Promise<ArrayBuffer>((resolve) => (release = resolve)),
+    );
+    const writeBinary = vi.fn(async () => undefined);
+    (plugin.app.vault as any).adapter = {
+      exists: vi.fn(async () => false),
+      stat: vi.fn(async () => null),
+      readBinary: vi.fn(),
+      writeBinary,
+      mkdir: vi.fn(async () => undefined),
+    };
+    const download = (sync as any).download(
+      ".obsidian/appearance.json",
+      { hash: "remote", size: 1, mtime: 1 },
+      null,
+    );
+    await waitFor(() => typeof release === "function", { label: "config download started" });
+    sync.setPaused(true);
+    release(new Uint8Array([1]).buffer);
+    await download;
+    expect(writeBinary).not.toHaveBeenCalled();
+    sync.destroy();
+    indexDoc.destroy();
+  });
+
   it("retains a durable config baseline after the remote map deletion has persisted", async () => {
     const { plugin } = makeFakePlugin("https://sync.example.com", {
       sessionToken: "token",
@@ -27,6 +111,31 @@ describe("ConfigSync reconcile decisions", () => {
     try {
       sync.seedBaseline();
       expect((sync as any).lastSyncedHash.get(".obsidian/appearance.json")).toBe("old-hash");
+    } finally {
+      sync.destroy();
+      indexDoc.destroy();
+      localState.destroy();
+    }
+  });
+
+  it("migrates a legacy config marker into the persisted index baseline", async () => {
+    const { plugin } = makeFakePlugin("https://sync.example.com", {
+      sessionToken: "token",
+      activeVaultId: "vault",
+    });
+    const localState = new LocalSyncState(`config-legacy:${freshGuid()}`);
+    await localState.whenSynced;
+    localState.mark(".obsidian/appearance.json", "config");
+    const indexDoc = new Y.Doc();
+    indexDoc
+      .getMap<ConfigMeta>("configFiles")
+      .set(".obsidian/appearance.json", { hash: "remote-hash", size: 1, mtime: 1 });
+    const sync = new ConfigSync(plugin as any, indexDoc, localState);
+    try {
+      sync.seedBaseline();
+      expect((sync as any).lastSyncedHash.get(".obsidian/appearance.json")).toBe(
+        "remote-hash",
+      );
     } finally {
       sync.destroy();
       indexDoc.destroy();

@@ -123,6 +123,7 @@ impl InstanceLock {
         }
         let mut file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&paths.lock)
@@ -254,7 +255,7 @@ async fn create_with_failure(
         copy_tree_or_empty(&paths.crdt, &data.join(CRDT_DIR))?;
         actions += 1;
         injected_backup_failure(fail_after, actions)?;
-        copy_tree_or_empty(&paths.blobs, &data.join(BLOBS_DIR))?;
+        copy_blob_tree_or_empty(&paths.blobs, &data.join(BLOBS_DIR))?;
         actions += 1;
         injected_backup_failure(fail_after, actions)?;
         copy_tree_or_empty(&paths.git, &data.join(GIT_DIR))?;
@@ -630,6 +631,54 @@ fn copy_tree_or_empty(source: &Path, destination: &Path) -> Result<()> {
         bail!("state path {} is not a real directory", source.display());
     }
     copy_directory_contents(source, destination)
+}
+
+fn copy_blob_tree_or_empty(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    set_private_directory(destination)?;
+    if !source.exists() {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(source)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!("state path {} is not a real directory", source.display());
+    }
+    copy_blob_directory_contents(source, destination)
+}
+
+fn copy_blob_directory_contents(source: &Path, destination: &Path) -> Result<()> {
+    let mut entries = fs::read_dir(source)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        if entry.file_name().to_string_lossy().starts_with(".tmp-") {
+            continue;
+        }
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path)?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "symbolic links are not allowed in backup state: {}",
+                source_path.display()
+            );
+        }
+        if metadata.is_dir() {
+            fs::create_dir(&destination_path)?;
+            fs::set_permissions(&destination_path, metadata.permissions())?;
+            copy_blob_directory_contents(&source_path, &destination_path)?;
+        } else if metadata.is_file() {
+            fs::copy(&source_path, &destination_path).with_context(|| {
+                format!(
+                    "copy {} -> {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+        } else {
+            bail!("unsupported state file type: {}", source_path.display());
+        }
+    }
+    Ok(())
 }
 
 fn copy_directory_contents(source: &Path, destination: &Path) -> Result<()> {

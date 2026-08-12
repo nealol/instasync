@@ -153,14 +153,20 @@ impl GitService {
         }
     }
 
-    pub(crate) async fn reconcile(&self, vault_id: &str, contributors: &[Principal]) -> Result<()> {
+    pub(crate) async fn reconcile(
+        &self,
+        vault_id: &str,
+        intent_key: &str,
+        revision: i64,
+    ) -> Result<()> {
         if !self.0.config.git_enabled {
             return Ok(());
         }
         let commit_lock = self.commit_lock(vault_id).await;
         let committed = {
             let _guard = commit_lock.lock().await;
-            self.commit_once(vault_id, contributors, None).await?
+            self.commit_once(vault_id, &[], None, Some((intent_key, revision)))
+                .await?
         };
         if committed {
             self.0.jobs.enqueue_backup(vault_id).await?;
@@ -185,7 +191,7 @@ impl GitService {
         let commit_lock = self.commit_lock(vault_id).await;
         let committed = {
             let _guard = commit_lock.lock().await;
-            self.commit_once(vault_id, std::slice::from_ref(who), Some(&ov))
+            self.commit_once(vault_id, std::slice::from_ref(who), Some(&ov), None)
                 .await?
         };
         if !committed {
@@ -234,6 +240,7 @@ impl GitService {
         vault_id: &str,
         contributors: &[Contributor],
         ov: Option<&CommitOverride>,
+        intent: Option<(&str, i64)>,
     ) -> Result<bool> {
         self.0.plugindb.reconcile_vault(vault_id).await?;
         let repo = self.ensure_repo(vault_id).await?;
@@ -338,8 +345,22 @@ impl GitService {
             .await
             .context("materialize task panicked")??;
 
-        // 4. Commit the diff, if any.
-        self.commit(&repo, vault_id, contributors, ov).await
+        // 4. Claim attribution after materialization, immediately before the
+        // commit boundary. Later writes remain queued for the next revision.
+        let claimed;
+        let (claim_revision, contributors) = if let Some((intent_key, revision)) = intent {
+            claimed = self.0.jobs.load_contributors(intent_key, revision).await?;
+            (Some(claimed.0), claimed.1.as_slice())
+        } else {
+            (None, contributors)
+        };
+        let committed = self
+            .commit(&repo, vault_id, contributors, ov)
+            .await?;
+        if let (Some((intent_key, _)), Some(revision)) = (intent, claim_revision) {
+            self.0.jobs.clear_contributors(intent_key, revision).await?;
+        }
+        Ok(committed)
     }
 
     /// Lazily create the vault's repo with a bot identity. Idempotent.
@@ -438,6 +459,7 @@ impl GitService {
                 "-c",
                 &committer_email,
                 "commit",
+                "--no-allow-empty",
                 "--author",
                 &author,
                 "-m",
@@ -809,6 +831,9 @@ const VERB_ORDER: [&str; 5] = ["rename", "move", "add", "update", "delete"];
 /// for folder-only changes). Otherwise each kind is listed under its own verb,
 /// or just counted when more than [`SUBJECT_MAX_FILES`] entries changed.
 fn commit_subject(changes: &[StagedChange], link_only: &HashSet<String>) -> String {
+    if changes.is_empty() {
+        return "Record contributors".to_string();
+    }
     let (renames, others): (Vec<&StagedChange>, Vec<&StagedChange>) =
         changes.iter().partition(|c| c.status == 'R');
     if !renames.is_empty() && others.iter().all(|c| link_only.contains(&c.path)) {
@@ -1433,6 +1458,7 @@ diff --git a/ref.md b/ref.md
 
     #[test]
     fn commit_subject_lists_few_files_with_matching_verb() {
+        assert_eq!(subject(&[]), "Record contributors");
         assert_eq!(subject(&changes(&[('A', "a.md")])), "Add a.md");
         assert_eq!(subject(&changes(&[('D', "a.md")])), "Delete a.md");
         assert_eq!(
@@ -1695,6 +1721,7 @@ diff --git a/ref.md b/ref.md
             crdt_epoch_max_updates: 100_000,
             crdt_epoch_max_state_bytes: 32 * 1024 * 1024,
             crdt_epoch_max_delete_set_bytes: 8 * 1024 * 1024,
+            crdt_max_documents_per_vault: 100_000,
             blob_dir: String::new(),
             oidc_mode: crate::config::OidcMode::Mock,
             oidc_issuer: None,

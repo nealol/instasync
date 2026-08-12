@@ -35,7 +35,7 @@ use crate::state::{AppState, Principal};
 pub const MAX_UPDATE_BYTES: usize = 64 * 1024 * 1024;
 const CONNECTION_CAPACITY: usize = 256;
 const BROADCAST_CAPACITY: usize = 512;
-const SYNC_STATUS_MESSAGE: u8 = 102;
+pub(crate) const SYNC_STATUS_MESSAGE: u8 = 102;
 const EPOCH_PROPOSAL_MESSAGE: u8 = 103;
 const EPOCH_ACK_MESSAGE: u8 = 104;
 const DOCUMENT_INVALIDATED_MESSAGE: u8 = 105;
@@ -204,7 +204,6 @@ impl DocumentStore {
             connection_pauses: Mutex::new(HashMap::new()),
         })))
     }
-
 
     pub fn directory(&self) -> &Path {
         &self.0.directory
@@ -376,6 +375,17 @@ impl DocumentStore {
             }
         }
         Ok(total)
+    }
+
+    pub async fn document_count_for_vault(&self, vault_id: &str) -> Result<u64, CrdtError> {
+        validate_document_id(vault_id)?;
+        let manifests = crdt_epoch::manifests_for_vault(&self.0.directory, vault_id)
+            .await
+            .map_err(epoch_error)?;
+        Ok(manifests
+            .iter()
+            .filter(|manifest| manifest.logical_document_id != vault_id)
+            .count() as u64)
     }
 
     pub(crate) async fn connect(
@@ -1357,6 +1367,7 @@ impl CrdtConnection {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_connection(
     store: DocumentStore,
     document_id: String,

@@ -999,7 +999,7 @@ impl PluginDbService {
             })
             .await
             .map_err(|e| AppError::Internal(format!("query task panicked: {e}")))?;
-        res.map_err(|e| AppError::BadRequest(e))
+        res.map_err(AppError::BadRequest)
     }
 
     /// Run write statements (INSERT/UPDATE/DELETE/REPLACE) in one transaction
@@ -2588,6 +2588,7 @@ pub mod routes {
         Ok(visible)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn query_inner(
         state: &AppState,
         principal: &ApiPrincipal,

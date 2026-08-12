@@ -28,6 +28,9 @@ pub struct Config {
     pub crdt_epoch_max_updates: u64,
     pub crdt_epoch_max_state_bytes: u64,
     pub crdt_epoch_max_delete_set_bytes: u64,
+    /// Maximum registered file documents in one vault. Index and plugin-db
+    /// documents are separate bounded surfaces.
+    pub crdt_max_documents_per_vault: u64,
     /// Filesystem directory for the content-addressed binary blob store.
     pub blob_dir: String,
     /// "oidc" for a real IdP, "mock" for the in-process test issuer.
@@ -133,6 +136,9 @@ impl Config {
             crdt_epoch_max_delete_set_bytes: opt("CRDT_EPOCH_MAX_DELETE_SET_BYTES")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(8 * 1024 * 1024),
+            crdt_max_documents_per_vault: opt("CRDT_MAX_DOCUMENTS_PER_VAULT")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100_000),
             blob_dir: opt("BLOB_DIR").unwrap_or_else(|| "./blobs".to_string()),
             oidc_mode,
             oidc_issuer: opt("OIDC_ISSUER"),
@@ -236,6 +242,7 @@ impl Config {
             crdt_epoch_max_updates: 100_000,
             crdt_epoch_max_state_bytes: 32 * 1024 * 1024,
             crdt_epoch_max_delete_set_bytes: 8 * 1024 * 1024,
+            crdt_max_documents_per_vault: 100_000,
             blob_dir: String::new(),
             oidc_mode: OidcMode::Mock,
             oidc_issuer: None,

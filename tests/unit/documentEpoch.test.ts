@@ -43,6 +43,10 @@ describe("document epochs", () => {
     expect(epochPersistenceName(first, "vault__note", "persisted")).toBe("persisted:epoch:4");
   });
 
+  it("keeps the released persistence namespace for epoch zero", () => {
+    expect(epochPersistenceName(plugin(), "vault__note", "persisted")).toBe("persisted");
+  });
+
   it("rejects invalid epoch values before they can be acknowledged", () => {
     const instance = plugin();
     expect(() => setDocumentEpoch(instance, "vault__note", -1)).toThrow("invalid document epoch");

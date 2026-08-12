@@ -637,7 +637,11 @@ export class BinarySync {
         this.activeUpload = true;
         this.refreshUploadStatus();
         try {
-          await this.doUpload(job);
+          const completed = await this.doUpload(job);
+          if (!completed) {
+            this.uploadQueue.unshift(job);
+            break;
+          }
         } catch (e) {
           job.attempts++;
           if (job.attempts < MAX_UPLOAD_ATTEMPTS) {
@@ -656,31 +660,35 @@ export class BinarySync {
     } finally {
       this.draining = false;
       this.refreshUploadStatus();
+      if (!this.paused && this.uploadQueue.length > 0) this.scheduleDrain();
     }
   }
 
-  private async doUpload(job: UploadJob): Promise<void> {
+  private async doUpload(job: UploadJob): Promise<boolean> {
     const exists = await this.plugin.auth.blobExists(this.vaultId, job.path, job.hash);
-    if (this.destroyed) return;
+    if (this.destroyed) return true;
+    if (this.paused) return false;
     if (!exists) {
       await this.plugin.auth.putBlob(this.vaultId, job.path, job.hash, job.bytes);
     }
-    if (this.destroyed) return;
+    if (this.destroyed) return true;
+    if (this.paused) return false;
     if ((this.diskVersions.get(job.path) ?? 0) !== job.diskVersion) {
       void this.reconcile(job.path);
-      return;
+      return true;
     }
     if (
       job.expectedRemoteHash !== undefined &&
       (this.binaries.get(job.path)?.hash ?? null) !== job.expectedRemoteHash
     ) {
       void this.reconcile(job.path);
-      return;
+      return true;
     }
     // Publish only now that the bytes are on the server.
     this.publishMeta(job.path, { hash: job.hash, size: job.size });
     this.urgentPaths.delete(job.path);
     dbg("binary uploaded+published", job.path, job.hash, job.size);
+    return true;
   }
 
   private bumpDiskVersion(path: string): void {

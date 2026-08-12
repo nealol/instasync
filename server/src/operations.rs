@@ -218,13 +218,24 @@ pub struct RuntimeHealth(Arc<RuntimeHealthInner>);
 struct RuntimeHealthInner {
     draining: AtomicBool,
     started: Instant,
+    writable_probe: tokio::sync::Mutex<Option<(Instant, WritableStores)>>,
 }
+
+#[derive(Clone, Copy)]
+struct WritableStores {
+    crdt: bool,
+    blob: bool,
+    git: bool,
+}
+
+const WRITABLE_PROBE_TTL: Duration = Duration::from_secs(5);
 
 impl Default for RuntimeHealth {
     fn default() -> Self {
         Self(Arc::new(RuntimeHealthInner {
             draining: AtomicBool::new(false),
             started: Instant::now(),
+            writable_probe: tokio::sync::Mutex::new(None),
         }))
     }
 }
@@ -240,6 +251,29 @@ impl RuntimeHealth {
 
     pub fn uptime_seconds(&self) -> u64 {
         self.0.started.elapsed().as_secs()
+    }
+
+    async fn writable_stores(&self, state: &AppState) -> WritableStores {
+        let mut cached = self.0.writable_probe.lock().await;
+        if let Some((checked_at, result)) = *cached {
+            if checked_at.elapsed() < WRITABLE_PROBE_TTL {
+                return result;
+            }
+        }
+        let (crdt, blob, git) = tokio::join!(
+            writable_directory(Path::new(&state.config.crdt_store_dir)),
+            writable_directory(Path::new(&state.config.blob_dir)),
+            async {
+                if state.config.git_enabled {
+                    writable_directory(Path::new(&state.config.git_data_dir)).await
+                } else {
+                    true
+                }
+            },
+        );
+        let result = WritableStores { crdt, blob, git };
+        *cached = Some((Instant::now(), result));
+        result
     }
 }
 
@@ -281,17 +315,7 @@ pub async fn ready(State(state): State<AppState>) -> Response {
     }
 
     let database = state.db.execute_unprepared("SELECT 1").await.is_ok();
-    let (crdt_store, blob_store, git_store) = tokio::join!(
-        writable_directory(Path::new(&state.config.crdt_store_dir)),
-        writable_directory(Path::new(&state.config.blob_dir)),
-        async {
-            if state.config.git_enabled {
-                writable_directory(Path::new(&state.config.git_data_dir)).await
-            } else {
-                true
-            }
-        },
-    );
+    let stores = state.runtime_health.writable_stores(&state).await;
     let restore_config = state.config.clone();
     let restore_complete = tokio::task::spawn_blocking(move || {
         crate::full_backup::ensure_restore_complete(&restore_config).is_ok()
@@ -301,12 +325,12 @@ pub async fn ready(State(state): State<AppState>) -> Response {
     let checks = HealthChecks {
         draining: false,
         database,
-        crdt_store,
-        blob_store,
-        git_store,
+        crdt_store: stores.crdt,
+        blob_store: stores.blob,
+        git_store: stores.git,
         restore_complete,
     };
-    let ready = database && crdt_store && blob_store && git_store && restore_complete;
+    let ready = database && stores.crdt && stores.blob && stores.git && restore_complete;
     health_response(
         if ready {
             StatusCode::OK

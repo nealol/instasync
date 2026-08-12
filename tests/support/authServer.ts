@@ -3,6 +3,7 @@
 
 import { spawn, execFileSync, type ChildProcess } from "child_process";
 import * as http from "http";
+import { rm } from "fs/promises";
 import * as net from "net";
 import * as os from "os";
 import * as path from "path";
@@ -140,6 +141,7 @@ export async function startAuthServer(opts: {
   const dbPath =
     opts.databasePath ?? path.join(os.tmpdir(), `realtime-test-${Date.now()}-${port}.db`);
   const blobDir = path.join(os.tmpdir(), `realtime-blobs-${Date.now()}-${port}`);
+  const ownsCrdtStore = opts.crdtStoreDir === undefined;
   const crdtStoreDir =
     opts.crdtStoreDir ?? path.join(os.tmpdir(), `realtime-crdt-${Date.now()}-${port}`);
 
@@ -221,10 +223,15 @@ export async function startAuthServer(opts: {
       }, timeoutMs);
     });
 
+  const terminateAndClean = async (signal: NodeJS.Signals, timeoutMs: number): Promise<void> => {
+    await terminate(signal, timeoutMs);
+    if (ownsCrdtStore) await rm(crdtStoreDir, { recursive: true, force: true });
+  };
+
   return {
     url,
-    stop: () => terminate("SIGTERM", 3000),
-    kill: () => terminate("SIGKILL", 1000),
+    stop: () => terminateAndClean("SIGTERM", 3000),
+    kill: () => terminateAndClean("SIGKILL", 1000),
   };
 }
 

@@ -76,6 +76,12 @@ impl MigrationTrait for Migration {
                             .text()
                             .not_null(),
                     )
+                    .col(
+                        ColumnDef::new(Alias::new("revision"))
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
                     .primary_key(
                         Index::create()
                             .name("pk_background_job_contributors")
@@ -95,6 +101,7 @@ impl MigrationTrait for Migration {
             .await?;
 
         add_text_column(manager, "remote_cursors", "plugin_id").await?;
+        add_big_integer_column(manager, JOB_CONTRIBUTORS, "revision", true, Some(0)).await?;
         add_text_column(manager, "users", "git_email").await?;
         add_text_column(manager, "users", "picture_url").await?;
         add_text_column(manager, "users", "avatar_url_override").await?;

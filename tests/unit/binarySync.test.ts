@@ -200,6 +200,43 @@ describe("BinarySync", () => {
     }
   });
 
+  it("requeues an upload paused during the blob existence check", async () => {
+    const A = makeDevice("pause-during-upload");
+    let release!: (exists: boolean) => void;
+    let checks = 0;
+    let checkedResolve!: () => void;
+    const checked = new Promise<void>((resolve) => {
+      checkedResolve = resolve;
+    });
+    A.plugin.auth.blobExists = vi.fn(async () => {
+      checks += 1;
+      checkedResolve();
+      if (checks > 1) return true;
+      return new Promise<boolean>((resolve) => {
+        release = resolve;
+      });
+    });
+    try {
+      await synced(A.provider);
+      A.vault.binaries.set("paused-flight.bin", bytes([9, 8, 7]));
+      A.bs.onLocalChanged("paused-flight.bin");
+      await checked;
+      A.bs.setPaused(true);
+      release(true);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(A.binaries.has("paused-flight.bin")).toBe(false);
+
+      A.bs.setPaused(false);
+      await waitFor(() => A.binaries.has("paused-flight.bin"), {
+        label: "in-flight paused upload resumed",
+      });
+    } finally {
+      A.bs.destroy();
+      A.provider.destroy();
+      A.indexDoc.destroy();
+    }
+  });
+
   it("preserves startup pull semantics across a mobile pause", async () => {
     const A = makeDevice("pause-source");
     const B = makeDevice("pause-target");

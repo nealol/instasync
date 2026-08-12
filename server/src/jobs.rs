@@ -455,7 +455,7 @@ impl JobQueue {
                      ELSE background_job_intents.active_generation END, \
                  run_after_ms=excluded.run_after_ms, \
                  updated_at=excluded.updated_at, last_error=NULL \
-             RETURNING active_generation,run_after_ms",
+             RETURNING active_generation,run_after_ms,revision",
         )
         .bind(&intent_key)
         .bind(payload_json)
@@ -465,16 +465,19 @@ impl JobQueue {
         .await?;
         let generation: i64 = row.try_get("active_generation")?;
         let effective_run_after: i64 = row.try_get("run_after_ms")?;
+        let revision: i64 = row.try_get("revision")?;
 
         if let Some(principal) = contributor {
             sqlx::query(
-                "INSERT INTO background_job_contributors(intent_key,actor_key,principal_json) \
-                 VALUES(?,?,?) ON CONFLICT(intent_key,actor_key) DO UPDATE SET \
-                 principal_json=excluded.principal_json",
+                "INSERT INTO background_job_contributors(\
+                     intent_key,actor_key,principal_json,revision\
+                 ) VALUES(?,?,?,?) ON CONFLICT(intent_key,actor_key) DO UPDATE SET \
+                 principal_json=excluded.principal_json,revision=excluded.revision",
             )
             .bind(&intent_key)
             .bind(principal.actor_key())
             .bind(serde_json::to_string(principal)?)
+            .bind(revision)
             .execute(&mut *transaction)
             .await?;
         }
@@ -608,7 +611,7 @@ impl JobQueue {
 
             let revision = intent.revision;
             let result = self
-                .execute_payload(state, &task.intent_key, &intent.payload)
+                .execute_payload(state, &task.intent_key, revision, &intent.payload)
                 .await;
             match result {
                 Ok(()) => {
@@ -639,6 +642,7 @@ impl JobQueue {
         &self,
         state: &AppState,
         intent_key: &str,
+        _revision: i64,
         payload: &JobPayload,
     ) -> Result<()> {
         match payload {
@@ -649,8 +653,7 @@ impl JobQueue {
                 state.search.reconcile_note(state, vault_id, guid).await?;
             }
             JobPayload::GitReconcile { vault_id } => {
-                let contributors = self.load_contributors(intent_key).await?;
-                state.git.reconcile(vault_id, &contributors).await?;
+                state.git.reconcile(vault_id, intent_key, _revision).await?;
             }
             JobPayload::PluginDbReconcile {
                 vault_id,
@@ -689,17 +692,26 @@ impl JobQueue {
         .transpose()
     }
 
-    async fn load_contributors(&self, intent_key: &str) -> Result<Vec<Principal>> {
+    pub(crate) async fn load_contributors(
+        &self,
+        intent_key: &str,
+        revision: i64,
+    ) -> Result<(i64, Vec<Principal>)> {
+        let mut transaction = self.0.pool.begin().await?;
         let rows = sqlx::query(
             "SELECT principal_json FROM background_job_contributors \
-             WHERE intent_key=? ORDER BY actor_key",
+             WHERE intent_key=? AND revision<=? ORDER BY actor_key",
         )
         .bind(intent_key)
-        .fetch_all(&self.0.pool)
+        .bind(revision)
+        .fetch_all(&mut *transaction)
         .await?;
-        rows.into_iter()
+        let contributors = rows
+            .into_iter()
             .map(|row| Ok(serde_json::from_str(row.try_get("principal_json")?)?))
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        transaction.commit().await?;
+        Ok((revision, contributors))
     }
 
     async fn complete_intent(
@@ -721,14 +733,17 @@ impl JobQueue {
         .bind(revision)
         .execute(&mut *transaction)
         .await?;
-        if result.rows_affected() == 1 {
-            sqlx::query("DELETE FROM background_job_contributors WHERE intent_key=?")
-                .bind(intent_key)
-                .execute(&mut *transaction)
-                .await?;
-        }
         transaction.commit().await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn clear_contributors(&self, intent_key: &str, revision: i64) -> Result<()> {
+        sqlx::query("DELETE FROM background_job_contributors WHERE intent_key=? AND revision<=?")
+            .bind(intent_key)
+            .bind(revision)
+            .execute(&self.0.pool)
+            .await?;
+        Ok(())
     }
 
     async fn record_error(
@@ -900,9 +915,49 @@ mod tests {
         }
         .intent_key();
         assert_eq!(
-            queue.load_contributors(&key).await.unwrap(),
+            queue.load_contributors(&key, 2).await.unwrap().1,
             vec![principal]
         );
+    }
+
+    #[tokio::test]
+    async fn failed_completion_preserves_contributors_for_the_next_reconcile() {
+        let queue = queue().await;
+        let first = Principal {
+            user_id: "first".into(),
+            display_name: "First".into(),
+            email: "first@example.com".into(),
+            git_email: None,
+            actor: crate::state::PrincipalActor::User,
+            expires_at_ms: i64::MAX,
+        };
+        let second = Principal {
+            user_id: "second".into(),
+            display_name: "Second".into(),
+            email: "second@example.com".into(),
+            git_email: None,
+            actor: crate::state::PrincipalActor::User,
+            expires_at_ms: i64::MAX,
+        };
+        queue
+            .enqueue_git("vault", &first, Duration::ZERO)
+            .await
+            .unwrap();
+        let key = JobPayload::GitReconcile {
+            vault_id: "vault".into(),
+        }
+        .intent_key();
+        queue
+            .enqueue_git("vault", &second, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            queue.load_contributors(&key, 2).await.unwrap().1,
+            vec![first, second]
+        );
+        assert!(!queue.complete_intent(&key, 1, 1).await.unwrap());
+        assert_eq!(queue.load_contributors(&key, 2).await.unwrap().1.len(), 2);
     }
 
     #[tokio::test]

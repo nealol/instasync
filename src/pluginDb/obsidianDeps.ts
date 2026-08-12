@@ -152,7 +152,10 @@ function makeDocHandle(plugin: RealtimePlugin, docId: string): PluginDbDocHandle
     // actually reaches the server instead of dying with the WebSocket.
     whenFlushed: () => {
       if (!provider.hasLocalChanges) return Promise.resolve();
-      const { promise, resolve } = Promise.withResolvers<void>();
+      let resolve!: () => void;
+      const promise = new Promise<void>((doneResolve) => {
+        resolve = doneResolve;
+      });
       let done = false;
       const finish = () => {
         if (done) return;
@@ -178,7 +181,10 @@ function makeDocHandle(plugin: RealtimePlugin, docId: string): PluginDbDocHandle
 
 /** Resolve on the provider's first server sync, or after `ms` to stay offline-tolerant. */
 function firstSyncedOrTimeout(provider: RealtimeProvider, ms: number): Promise<void> {
-  const { promise, resolve } = Promise.withResolvers<void>();
+  let resolve!: () => void;
+  const promise = new Promise<void>((doneResolve) => {
+    resolve = doneResolve;
+  });
   let done = false;
   const finish = () => {
     if (done) return;

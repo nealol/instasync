@@ -253,6 +253,27 @@ async fn run_session(
 
     // 6. Commit: flush the tail, drop the caret, attribute + audit the write.
     flush(&mut session, &document, &mut cl_tx).await.ok();
+    // `CrdtConnection::send` queues work into the document task. Before
+    // returning `done`, round-trip an opaque sync-status marker so REST reads
+    // are guaranteed to observe every queued stream update.
+    let flush_barrier = uuid::Uuid::new_v4().as_bytes().to_vec();
+    document
+        .send(
+            YMsg::Custom(crate::crdt::SYNC_STATUS_MESSAGE, flush_barrier.clone()).encode_v1(),
+        )
+        .await?;
+    loop {
+        let Some(message) = document.recv().await else {
+            anyhow::bail!("document connection closed before stream flush acknowledgement");
+        };
+        if matches!(
+            crate::safe_yrs::decode_v1::<YMsg>(&message),
+            Ok(YMsg::Custom(crate::crdt::SYNC_STATUS_MESSAGE, payload))
+                if payload == flush_barrier
+        ) {
+            break;
+        }
+    }
     if let Some(msg) = session.clear_awareness_message() {
         document.send(msg).await.ok();
     }
@@ -762,7 +783,7 @@ mod tests {
         assert_eq!(session.content(), "0123abcXY");
 
         // The stream keeps chaining after its own last character.
-        session.pending.push_str("Z");
+        session.pending.push('Z');
         apply_flush(&remote, &session.flush().unwrap());
         assert_eq!(remote_content(&remote), "0123abcXYZ");
     }

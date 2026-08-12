@@ -101,6 +101,7 @@ async fn git_state_ext_with_debounce(
         crdt_epoch_max_updates: 100_000,
         crdt_epoch_max_state_bytes: 32 * 1024 * 1024,
         crdt_epoch_max_delete_set_bytes: 8 * 1024 * 1024,
+        crdt_max_documents_per_vault: 100_000,
         blob_dir: std::env::temp_dir().display().to_string(),
         oidc_mode: OidcMode::Mock,
         oidc_issuer: None,
@@ -271,6 +272,7 @@ fn test_config(public_base_url: &str, attachment_max_bytes: u64) -> Config {
         crdt_epoch_max_updates: 100_000,
         crdt_epoch_max_state_bytes: 32 * 1024 * 1024,
         crdt_epoch_max_delete_set_bytes: 8 * 1024 * 1024,
+        crdt_max_documents_per_vault: 100_000,
         blob_dir: blob_dir.display().to_string(),
         oidc_mode: OidcMode::Mock,
         oidc_issuer: None,
@@ -3052,6 +3054,67 @@ async fn doc_token_scopes_and_mints() {
 }
 
 #[tokio::test]
+async fn doc_token_bounds_unregistered_document_reservations() {
+    let mut config = test_config(
+        "http://auth.test",
+        realtime_server::blobs::MAX_BLOB_BYTES,
+    );
+    config.crdt_max_documents_per_vault = 2;
+    let app = app_from_config(&config).await;
+    let alice = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&alice),
+        Some(json!({"name": "V"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap();
+
+    for index in 0..2 {
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/api/doc-token",
+            Some(&alice),
+            Some(json!({
+                "vaultId": vault_id,
+                "docId": format!("{vault_id}__pending-{index}"),
+                "path": format!("pending-{index}.md")
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = send(
+            &app,
+            "POST",
+            &format!("/api/vaults/{vault_id}/files"),
+            Some(&alice),
+            Some(json!({
+                "guid": format!("pending-{index}"),
+                "path": format!("pending-{index}.md")
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/doc-token",
+        Some(&alice),
+        Some(json!({
+            "vaultId": vault_id,
+            "docId": format!("{vault_id}__pending-overflow"),
+            "path": "overflow.md"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn search_tags_backlinks_reindex_and_rename_rewrite() {
     let app = test_app().await;
     let token = login(&app, "alice").await;
@@ -5334,6 +5397,7 @@ async fn history_test_app() -> (Router, std::path::PathBuf, std::path::PathBuf) 
         crdt_epoch_max_updates: 100_000,
         crdt_epoch_max_state_bytes: 32 * 1024 * 1024,
         crdt_epoch_max_delete_set_bytes: 8 * 1024 * 1024,
+        crdt_max_documents_per_vault: 100_000,
         blob_dir: blob_dir.display().to_string(),
         oidc_mode: OidcMode::Mock,
         oidc_issuer: None,
@@ -5396,6 +5460,7 @@ async fn git_ext_app(
         crdt_epoch_max_updates: 100_000,
         crdt_epoch_max_state_bytes: 32 * 1024 * 1024,
         crdt_epoch_max_delete_set_bytes: 8 * 1024 * 1024,
+        crdt_max_documents_per_vault: 100_000,
         blob_dir: std::env::temp_dir().display().to_string(),
         oidc_mode: OidcMode::Mock,
         oidc_issuer: None,
@@ -5503,7 +5568,7 @@ async fn history_endpoints_browse_commits_changes_trees_and_files() {
     assert_eq!(commits[1]["hash"], json!(c1));
     assert_eq!(commits[0]["parents"][0], json!(c1));
     assert_eq!(commits[0]["authorName"], "alice");
-    assert!(commits[0]["principalId"].as_str().unwrap().len() > 0);
+    assert!(!commits[0]["principalId"].as_str().unwrap().is_empty());
     assert_eq!(commits[0]["principalType"], "user");
 
     // Keyset paging: limit=1 has more; before=c2 yields only c1; before=c1 (root) is empty.
@@ -5577,7 +5642,7 @@ async fn history_endpoints_browse_commits_changes_trees_and_files() {
     assert_eq!(entries[0]["kind"], "markdown");
 
     // File content at both versions, and "absent" before it existed.
-    let file_q = format!("path=n%C3%B6tes%2Fhello%20one.md");
+    let file_q = "path=n%C3%B6tes%2Fhello%20one.md".to_string();
     let (_, f1) = send(
         &app,
         "GET",

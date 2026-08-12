@@ -315,7 +315,10 @@ export class RealtimeProvider {
     this.receivedServerSyncStep1 = false;
     this.receivedSyncStatus = false;
 
-    const { promise: result, resolve } = Promise.withResolvers<boolean>();
+    let resolve!: (connected: boolean) => void;
+    const result = new Promise<boolean>((done) => {
+      resolve = done;
+    });
     let settled = false;
     this.completeAttempt = (connected) => {
       if (settled) return;
@@ -586,7 +589,10 @@ export class RealtimeProvider {
 
   private sleep(ms: number, lifecycle: number): Promise<void> {
     if (!this.canContinue(lifecycle)) return Promise.resolve();
-    const { promise, resolve } = Promise.withResolvers<void>();
+    let resolve!: () => void;
+    const promise = new Promise<void>((done) => {
+      resolve = done;
+    });
     const finish = () => {
       window.clearTimeout(this.retryTimer ?? undefined);
       this.retryTimer = null;

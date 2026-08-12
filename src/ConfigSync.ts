@@ -110,6 +110,8 @@ export class ConfigSync {
   private writing = new Set<string>();
   private pollTimer: number | null = null;
   private started = false;
+  private paused = false;
+  private pauseGeneration = 0;
   private destroyed = false;
   /**
    * True while the reconcile pass triggered by start() runs. Baselines seeded
@@ -157,8 +159,7 @@ export class ConfigSync {
       if (
         state?.kind === "config" &&
         !state.candidate &&
-        state.identity === meta.hash &&
-        state.fingerprint === meta.hash
+        state.identity === meta.hash
       ) {
         this.lastSyncedHash.set(path, meta.hash);
       }
@@ -167,8 +168,7 @@ export class ConfigSync {
       if (
         state.kind === "config" &&
         !state.candidate &&
-        state.identity &&
-        state.fingerprint === state.identity
+        state.identity
       ) {
         this.lastSyncedHash.set(path, state.identity);
       }
@@ -209,6 +209,7 @@ export class ConfigSync {
   }
 
   private async runInitialPull(): Promise<void> {
+    if (this.paused) return;
     this.initialPull = true;
     try {
       await this.reconcileAll();
@@ -218,7 +219,7 @@ export class ConfigSync {
   }
 
   async reconcileAll(): Promise<void> {
-    if (this.destroyed || !this.started) return;
+    if (this.destroyed || !this.started || this.paused) return;
     const paths = new Set<string>();
     for (const path of this.configFiles.keys()) {
       if (!this.isHardExcluded(path)) paths.add(path);
@@ -231,7 +232,7 @@ export class ConfigSync {
   }
 
   private onConfigFilesChanged(event: Y.YMapEvent<ConfigMeta>): void {
-    if (this.destroyed || !this.started) return;
+    if (this.destroyed || !this.started || this.paused) return;
     event.changes.keys.forEach((_change, path) => {
       if (!this.isHardExcluded(path)) void this.reconcile(path);
     });
@@ -254,9 +255,13 @@ export class ConfigSync {
   }
 
   private async reconcileNow(path: string): Promise<void> {
-    if (this.destroyed) return;
+    if (this.destroyed || this.paused) return;
+    const generation = this.pauseGeneration;
     const local = await this.localInfo(path);
-    if (local === undefined || this.destroyed) return;
+    if (local === undefined || !this.canApply(generation)) {
+      if (!this.destroyed) void this.reconcile(path);
+      return;
+    }
     if (local && !this.localSyncState?.has(path)) {
       this.localSyncState?.beginCandidate(path, "config", local.hash, local.hash);
     }
@@ -272,6 +277,10 @@ export class ConfigSync {
       localState.candidate
     ) {
       const localBytes = await this.plugin.app.vault.adapter.readBinary(path);
+      if (!this.canApply(generation)) {
+        void this.reconcile(path);
+        return;
+      }
       const preservedPath = await preserveAdapterConflict(this.plugin, path, localBytes, "local");
       new Notice(
         `Realtime: kept the remote settings at "${path}" and preserved this device's unrelated file as "${preservedPath}".`,
@@ -280,11 +289,15 @@ export class ConfigSync {
         void this.reconcile(path);
         return;
       }
-      await this.download(path, remote, local.hash);
+      await this.download(path, remote, local.hash, generation);
       return;
     }
     if (local && !remote && base !== null && base !== local.hash) {
       const localBytes = await this.plugin.app.vault.adapter.readBinary(path);
+      if (!this.canApply(generation)) {
+        void this.reconcile(path);
+        return;
+      }
       const preservedPath = await preserveAdapterConflict(this.plugin, path, localBytes, "local");
       new Notice(
         `Realtime: "${path}" was deleted remotely; preserved this device's edited settings as "${preservedPath}".`,
@@ -293,7 +306,7 @@ export class ConfigSync {
         void this.reconcile(path);
         return;
       }
-      await this.deleteLocal(path);
+      await this.deleteLocal(path, generation);
       return;
     }
 
@@ -309,12 +322,13 @@ export class ConfigSync {
       return;
     }
     if (action === "upload" && local) {
-      await this.upload(path, local, remote?.hash ?? null);
+      await this.upload(path, local, remote?.hash ?? null, generation);
     } else if (action === "download" && remote) {
-      await this.download(path, remote, local?.hash ?? null);
-    } else if (action === "deleteLocal") await this.deleteLocal(path);
-    else if (action === "deleteRemote") this.publishDelete(path);
-    else if (action === "merge" && local && remote) await this.mergeConflict(path, local, remote);
+      await this.download(path, remote, local?.hash ?? null, generation);
+    } else if (action === "deleteLocal") await this.deleteLocal(path, generation);
+    else if (action === "deleteRemote") this.publishDelete(path, generation);
+    else if (action === "merge" && local && remote)
+      await this.mergeConflict(path, local, remote, generation);
   }
 
   private async localConfigPaths(): Promise<string[]> {
@@ -357,9 +371,14 @@ export class ConfigSync {
     path: string,
     meta: ConfigMeta,
     expectedRemoteHash: string | null,
+    generation = this.pauseGeneration,
   ): Promise<void> {
     const bytes = await this.plugin.app.vault.adapter.readBinary(path);
-    await this.uploadBytes(path, bytes, meta, expectedRemoteHash);
+    if (!this.canApply(generation)) {
+      if (!this.destroyed) void this.reconcile(path);
+      return;
+    }
+    await this.uploadBytes(path, bytes, meta, expectedRemoteHash, generation);
   }
 
   private async uploadBytes(
@@ -367,18 +386,29 @@ export class ConfigSync {
     bytes: ArrayBuffer,
     meta: ConfigMeta | null,
     expectedRemoteHash: string | null,
+    generation = this.pauseGeneration,
   ): Promise<void> {
     const hash = await sha256Hex(bytes);
-    if (this.destroyed) return;
+    if (!this.canApply(generation)) {
+      if (!this.destroyed) void this.reconcile(path);
+      return;
+    }
     const finalMeta =
       meta && hash === meta.hash ? meta : { hash, size: bytes.byteLength, mtime: Date.now() };
     if (!(await this.plugin.auth.blobExists(this.vaultId, path, finalMeta.hash))) {
+      if (!this.canApply(generation)) {
+        if (!this.destroyed) void this.reconcile(path);
+        return;
+      }
       await this.plugin.auth.putBlob(this.vaultId, path, finalMeta.hash, bytes);
     }
-    if (this.destroyed) return;
+    if (!this.canApply(generation)) {
+      if (!this.destroyed) void this.reconcile(path);
+      return;
+    }
     const currentLocal = await this.localInfo(path);
     if (
-      this.destroyed ||
+      !this.canApply(generation) ||
       !currentLocal ||
       currentLocal.hash !== finalMeta.hash ||
       (this.configFiles.get(path)?.hash ?? null) !== expectedRemoteHash
@@ -396,6 +426,7 @@ export class ConfigSync {
     path: string,
     meta: ConfigMeta,
     expectedLocalHash?: string | null,
+    generation = this.pauseGeneration,
   ): Promise<void> {
     let bytes: ArrayBuffer;
     try {
@@ -406,10 +437,13 @@ export class ConfigSync {
       window.setTimeout(() => void this.reconcile(path), RETRY_MS);
       return;
     }
-    if (this.destroyed) return;
+    if (!this.canApply(generation)) {
+      if (!this.destroyed) void this.reconcile(path);
+      return;
+    }
     const currentLocal = await this.localInfo(path);
     if (
-      this.destroyed ||
+      !this.canApply(generation) ||
       (this.configFiles.get(path)?.hash ?? null) !== meta.hash ||
       (expectedLocalHash !== undefined && (currentLocal?.hash ?? null) !== expectedLocalHash)
     ) {
@@ -419,6 +453,10 @@ export class ConfigSync {
     this.writing.add(path);
     try {
       await this.ensureParentFolders(path);
+      if (!this.canApply(generation)) {
+        void this.reconcile(path);
+        return;
+      }
       await this.plugin.app.vault.adapter.writeBinary(path, bytes);
       this.lastSyncedHash.set(path, meta.hash);
       this.localSyncState?.markSynced(path, "config", meta.hash, meta.hash, true);
@@ -435,7 +473,12 @@ export class ConfigSync {
    * keys, write the merged result locally, and publish it. Falls back to
    * newest-wins when either side isn't a plain JSON object.
    */
-  private async mergeConflict(path: string, local: ConfigMeta, remote: ConfigMeta): Promise<void> {
+  private async mergeConflict(
+    path: string,
+    local: ConfigMeta,
+    remote: ConfigMeta,
+    generation = this.pauseGeneration,
+  ): Promise<void> {
     let remoteBytes: ArrayBuffer;
     try {
       remoteBytes = await this.plugin.auth.getBlob(this.vaultId, path, remote.hash);
@@ -446,7 +489,10 @@ export class ConfigSync {
       return;
     }
     const localBytes = await this.plugin.app.vault.adapter.readBinary(path);
-    if (this.destroyed) return;
+    if (!this.canApply(generation)) {
+      if (!this.destroyed) void this.reconcile(path);
+      return;
+    }
     if (!(await this.configStateMatches(path, local.hash, remote.hash))) {
       void this.reconcile(path);
       return;
@@ -457,23 +503,26 @@ export class ConfigSync {
     if (merged === null) {
       // Not mergeable JSON → newest modified version wins.
       if (local.mtime >= remote.mtime) {
+        if (!this.canApply(generation)) return;
         await preserveAdapterConflict(this.plugin, path, remoteBytes, "remote");
         if (!(await this.configStateMatches(path, local.hash, remote.hash))) {
           void this.reconcile(path);
           return;
         }
-        await this.uploadBytes(path, localBytes, local, remote.hash);
+        await this.uploadBytes(path, localBytes, local, remote.hash, generation);
       } else {
+        if (!this.canApply(generation)) return;
         await preserveAdapterConflict(this.plugin, path, localBytes, "local");
         if (!(await this.configStateMatches(path, local.hash, remote.hash))) {
           void this.reconcile(path);
           return;
         }
-        await this.download(path, remote, local.hash);
+        await this.download(path, remote, local.hash, generation);
       }
       return;
     }
 
+    if (!this.canApply(generation)) return;
     const preservedPath = await preserveAdapterConflict(this.plugin, path, remoteBytes, "remote");
     new Notice(
       `Realtime: merged settings at "${path}" and preserved the conflicting remote version as "${preservedPath}".`,
@@ -490,12 +539,16 @@ export class ConfigSync {
     ) as ArrayBuffer;
     this.writing.add(path);
     try {
+      if (!this.canApply(generation)) {
+        void this.reconcile(path);
+        return;
+      }
       await this.plugin.app.vault.adapter.writeBinary(path, buffer);
     } finally {
       window.setTimeout(() => this.writing.delete(path), 0);
     }
-    if (this.destroyed) return;
-    await this.uploadBytes(path, buffer, null, remote.hash);
+    if (!this.canApply(generation)) return;
+    await this.uploadBytes(path, buffer, null, remote.hash, generation);
     dbg("config merged", path);
   }
 
@@ -512,10 +565,15 @@ export class ConfigSync {
     );
   }
 
-  private async deleteLocal(path: string): Promise<void> {
+  private async deleteLocal(path: string, generation = this.pauseGeneration): Promise<void> {
+    if (!this.canApply(generation)) return;
     this.writing.add(path);
     try {
       if (await this.plugin.app.vault.adapter.exists(path)) {
+        if (!this.canApply(generation)) {
+          void this.reconcile(path);
+          return;
+        }
         await this.plugin.app.vault.adapter.remove(path);
       }
       this.lastSyncedHash.delete(path);
@@ -526,7 +584,11 @@ export class ConfigSync {
     }
   }
 
-  private publishDelete(path: string): void {
+  private publishDelete(path: string, generation = this.pauseGeneration): void {
+    if (!this.canApply(generation)) {
+      if (!this.destroyed) void this.reconcile(path);
+      return;
+    }
     this.indexDoc.transact(() => this.configFiles.delete(path));
     this.lastSyncedHash.delete(path);
     this.localSyncState?.remove(path);
@@ -567,11 +629,28 @@ export class ConfigSync {
   }
 
   private schedulePoll(): void {
-    if (this.destroyed || this.pollTimer !== null) return;
+    if (this.destroyed || this.paused || this.pollTimer !== null) return;
     this.pollTimer = window.setTimeout(() => {
       this.pollTimer = null;
       void this.reconcileAll().finally(() => this.schedulePoll());
     }, POLL_MS);
+  }
+
+  setPaused(paused: boolean): void {
+    if (this.destroyed || this.paused === paused) return;
+    this.paused = paused;
+    this.pauseGeneration += 1;
+    if (paused && this.pollTimer !== null) {
+      window.clearTimeout(this.pollTimer);
+      this.pollTimer = null;
+    } else if (!paused && this.started) {
+      void this.reconcileAll();
+      this.schedulePoll();
+    }
+  }
+
+  private canApply(generation: number): boolean {
+    return !this.destroyed && !this.paused && this.pauseGeneration === generation;
   }
 
   /**

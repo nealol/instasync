@@ -26,6 +26,7 @@ import { LocalSyncState, shouldFoldOfflineDeletion, type MaterializedKind } from
 import { isConflictCopy, preserveTextConflict } from "./conflictRecovery";
 export { isConflictCopy } from "./conflictRecovery";
 import { sha256Text } from "./hash";
+import { CompatibilityError } from "./caps";
 
 type FileKind = "text" | "structured" | "binary" | "ignore";
 type StructuredKind = "canvas" | "base";
@@ -139,6 +140,7 @@ export class VaultSync {
   private filesObserver: (event: Y.YMapEvent<string>) => void;
   private structuredObserver: (event: Y.YMapEvent<StructuredMeta>) => void;
   private statusListener: (status: SyncStatus) => void;
+  private serverInfoRefreshPending = true;
   private vaultEvents: EventRef[] = [];
   private docQueue = new Map<string, QueueItem>();
   private activeDocConnections = 0;
@@ -176,6 +178,7 @@ export class VaultSync {
     this.binarySync = new BinarySync(plugin, this, this.indexDoc, this.localSyncState);
     if (this.mobileSuspended) this.binarySync.setPaused(true);
     this.configSync = new ConfigSync(plugin, this.indexDoc, this.localSyncState);
+    if (this.mobileSuspended) this.configSync.setPaused(true);
 
     // Connect only after the persisted index has loaded (see init()), so local
     // offline map changes merge with the server instead of racing it. The index
@@ -205,6 +208,20 @@ export class VaultSync {
         return;
       }
       if (status === SYNC_STATUS_CONNECTED) {
+        if (this.serverInfoRefreshPending) {
+          this.serverInfoRefreshPending = false;
+          void this.plugin.auth
+            .serverInfoChecked(this.plugin.settings.authServerUrl)
+            .then(() => this.scheduleMobileWorkingSetTrim())
+            .catch((error) => {
+              if (error instanceof CompatibilityError) {
+                this.indexProvider.disconnect();
+                this.plugin.setStatus("offline");
+                return;
+              }
+              this.serverInfoRefreshPending = true;
+            });
+        }
         this.wasConnected = true;
         this.plugin.setStatus("connected");
         void this.runInitialSync();
@@ -216,10 +233,12 @@ export class VaultSync {
         this.notifyDisconnected();
         this.plugin.setStatus("connecting");
       } else if (status === "error") {
+        this.serverInfoRefreshPending = true;
         if (Platform?.isMobile && this.initialSynced) this.mobileCatchUpPending = true;
         this.notifyDisconnected();
         this.plugin.setStatus("error");
       } else {
+        this.serverInfoRefreshPending = true;
         if (Platform?.isMobile && this.initialSynced) this.mobileCatchUpPending = true;
         this.notifyDisconnected();
       }
@@ -356,6 +375,7 @@ export class VaultSync {
     this.docConnectionGeneration++;
     this.activeDocConnections = 0;
     this.binarySync.setPaused(true);
+    this.configSync.setPaused(true);
     for (const doc of this.documents.values()) doc.disconnect();
     for (const doc of this.structuredDocuments.values()) doc.disconnect();
     this.indexProvider.disconnect();
@@ -389,6 +409,7 @@ export class VaultSync {
       return;
     }
     this.binarySync.setPaused(false);
+    this.configSync.setPaused(false);
     this.mobileCatchUpPending = false;
     this.queueMobileReconnects();
   }
@@ -553,6 +574,7 @@ export class VaultSync {
     try {
       await this.runInitialSyncPass();
       if (!this.destroyed) {
+        await this.runInitialSyncPass();
         this.initialSynced = true;
         this.startBackgroundSyncAfterPriorityDrain();
       }
@@ -1314,6 +1336,7 @@ export class VaultSync {
   }
 
   private onLocalCreate(file: TAbstractFile): void {
+    if (!this.initialSynced) return;
     void this.handleLocalCreate(file);
   }
 

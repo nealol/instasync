@@ -161,7 +161,10 @@ export abstract class SyncedDoc {
   /** Resolve after the next successful server handshake. */
   whenNextServerSync(): Promise<void> {
     if (this.destroyed) return Promise.resolve();
-    const { promise, resolve } = Promise.withResolvers<void>();
+    let resolve!: () => void;
+    const promise = new Promise<void>((done) => {
+      resolve = done;
+    });
     this.nextServerSyncWaiters.add(resolve);
     return promise;
   }

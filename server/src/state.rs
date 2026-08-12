@@ -56,6 +56,13 @@ pub struct SyncGrant {
     pub principal: Principal,
 }
 
+#[derive(Clone, Debug)]
+pub struct PendingDocumentCreation {
+    pub user_id: String,
+    pub path: String,
+    pub expires_at_ms: i64,
+}
+
 /// A synthetic identity used by the mock OIDC issuer (test mode).
 #[derive(Clone)]
 pub struct MockIdentity {
@@ -120,6 +127,11 @@ pub struct AppState {
     pub search: SearchService,
     /// Opaque, document-scoped sync tokens cached by this process.
     pub sync_grants: Arc<Mutex<HashMap<String, SyncGrant>>>,
+    /// Short-lived creation reservations for client-created file documents.
+    /// A reservation is keyed by document id and bound to its creator/path.
+    pub pending_document_creations: Arc<Mutex<HashMap<String, PendingDocumentCreation>>>,
+    /// Serializes document-count quota admission and first persistent creation.
+    pub document_creation_lock: Arc<Mutex<()>>,
     /// Process-local sync counters exported through `/metrics`.
     pub sync_metrics: SyncMetrics,
     /// Readiness state; set to draining before graceful HTTP shutdown.
@@ -161,4 +173,47 @@ impl AppState {
             .cloned()
     }
 
+    pub async fn reserve_document_creation(
+        &self,
+        document_id: String,
+        user_id: String,
+        path: String,
+    ) -> bool {
+        const MAX_PENDING_PER_USER: usize = 4_096;
+        const CREATION_TTL_MS: i64 = 5 * 60 * 1_000;
+
+        let now = now_millis();
+        let mut reservations = self.pending_document_creations.lock().await;
+        reservations.retain(|_, reservation| reservation.expires_at_ms > now);
+        if let Some(existing) = reservations.get_mut(&document_id) {
+            // Reconnects often omit the optional creation path after the first
+            // token request. Keep the original binding; reject only an attempt
+            // to rebind the same document id to a different non-empty path.
+            if existing.user_id != user_id {
+                return false;
+            }
+            if existing.path.is_empty() && !path.is_empty() {
+                existing.path = path;
+                return true;
+            }
+            return path.is_empty() || existing.path == path;
+        }
+        if reservations
+            .values()
+            .filter(|reservation| reservation.user_id == user_id)
+            .count()
+            >= MAX_PENDING_PER_USER
+        {
+            return false;
+        }
+        reservations.insert(
+            document_id,
+            PendingDocumentCreation {
+                user_id,
+                path,
+                expires_at_ms: now + CREATION_TTL_MS,
+            },
+        );
+        true
+    }
 }

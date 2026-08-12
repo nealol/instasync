@@ -11,7 +11,6 @@ use realtime_server::{
     SERVER_NAME,
 };
 
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -164,25 +163,27 @@ async fn run_crdt_command(args: Vec<String>) -> anyhow::Result<()> {
                 anyhow::bail!("{} document(s) could not be imported", report.errors.len());
             }
         }
-        [command, source, destination, pid]
-            if command == "migrate-ysweet-cutover" =>
-        {
+        [command, source, destination, pid] if command == "migrate-ysweet-cutover" => {
             let pid: i32 = pid.parse()?;
             #[cfg(unix)]
             {
-                let status = std::process::Command::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .status()?;
-                if !status.success() {
-                    anyhow::bail!("failed to signal y-sweet process {pid}");
-                }
-                loop {
-                    let status = std::process::Command::new("kill")
-                        .args(["-0", &pid.to_string()])
-                        .status()?;
-                    if !status.success() {
-                        break;
+                use nix::errno::Errno;
+                use nix::sys::signal::{kill, Signal};
+                use nix::unistd::Pid;
+
+                let pid = Pid::from_raw(pid);
+                kill(pid, Signal::SIGTERM).map_err(|error| {
+                    anyhow::anyhow!("failed to signal y-sweet process {pid}: {error}")
+                })?;
+                while match kill(pid, None) {
+                    Ok(()) | Err(Errno::EPERM) => true,
+                    Err(Errno::ESRCH) => false,
+                    Err(error) => {
+                        return Err(anyhow::anyhow!(
+                            "failed to check y-sweet process {pid}: {error}"
+                        ));
                     }
+                } {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
