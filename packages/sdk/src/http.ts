@@ -23,6 +23,8 @@ export interface HttpOptions {
   auth: TokenProvider;
   /** Override for tests; defaults to `globalThis.fetch`. */
   fetch?: typeof fetch;
+  /** Abort in-flight requests after this many milliseconds. Default 60_000. */
+  timeoutMs?: number;
 }
 
 export type Query = Record<string, string | number | boolean | undefined>;
@@ -56,12 +58,14 @@ export class Http {
   readonly baseUrl: string;
   private auth: TokenProvider;
   private fetchImpl: typeof fetch;
+  private timeoutMs: number;
 
   constructor(opts: HttpOptions) {
     this.baseUrl = normalizeBaseUrl(opts.baseUrl);
     this.auth = opts.auth;
     // Bind to globalThis: an unbound fetch reference throws "Illegal invocation".
     this.fetchImpl = opts.fetch ?? ((...args) => globalThis.fetch(...args));
+    this.timeoutMs = opts.timeoutMs ?? 60_000;
   }
 
   url(path: string, query?: Query): string {
@@ -98,11 +102,19 @@ export class Http {
     retried = false,
   ): Promise<Response> {
     const token = await this.auth.getToken();
-    const res = await this.fetchImpl(this.url(path, opts.query), {
-      method,
-      headers: { Authorization: `Bearer ${token}`, ...opts.headers },
-      body: opts.body,
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    let res: Response;
+    try {
+      res = await this.fetchImpl(this.url(path, opts.query), {
+        method,
+        headers: { Authorization: `Bearer ${token}`, ...opts.headers },
+        body: opts.body,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
     if (res.ok) return res;
     if (res.status === 401 && !retried && this.auth.onUnauthorized) {
       const fresh = await this.auth.onUnauthorized();

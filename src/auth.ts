@@ -658,7 +658,7 @@ export class AuthClient {
           tokenKey: session.tokenKey,
         };
         valid.push(updated);
-        this.rememberSession(updated, session.tokenKey);
+        this.rememberSession(updated, session.tokenKey, normalized, serverId);
       } catch (e) {
         if (e instanceof AuthError) this.forgetSession(session.tokenKey);
       }
@@ -776,12 +776,17 @@ export class AuthClient {
     }
   }
 
-  private rememberSession(me: MeResponse, tokenKey: string): void {
+  private rememberSession(
+    me: MeResponse,
+    tokenKey: string,
+    serverUrl = this.baseUrl,
+    serverId = this.plugin.settings.authServerId,
+  ): void {
     const session = this.knownSession(
       me,
       tokenKey,
-      this.baseUrl,
-      this.plugin.settings.authServerId,
+      serverUrl,
+      serverId,
     );
     this.saveKnownSessions([
       session,

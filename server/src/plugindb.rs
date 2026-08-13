@@ -175,6 +175,7 @@ struct PendingPublish {
     batch_id: String,
     rows: Vec<ChangeRow>,
     site_hex: String,
+    #[allow(dead_code)]
     site_b64: String,
     post: i64,
 }
@@ -818,7 +819,7 @@ impl PluginDbService {
             - 1;
         let batch = serde_json::json!({
             "id": publish.batch_id,
-            "siteId": publish.site_b64,
+            "siteId": publish.site_hex,
             "fromDbVersion": from,
             "toDbVersion": publish.post,
             "schemaVersion": schema_version,
@@ -2405,6 +2406,11 @@ fn lint_sql(sql: &str) -> std::result::Result<(), String> {
                 "SQL references SQLite internals ({ident}); those are not accessible from here"
             ));
         }
+        if lower == "realtime_server" || lower == "publish_outbox" {
+            return Err(format!(
+                "SQL references the server publish outbox ({ident}); those are not accessible from here"
+            ));
+        }
     }
     Ok(())
 }
@@ -3710,6 +3716,8 @@ mod tests {
         assert!(lint_sql("SELECT * FROM `crsql_changes`").is_err());
         assert!(lint_sql("SELECT * FROM realtime_internal_publish_outbox").is_ok());
         assert!(lint_sql("SELECT * FROM [sqlite_master]").is_err());
+        assert!(lint_sql("DELETE FROM realtime_server.publish_outbox").is_err());
+        assert!(lint_sql("INSERT INTO publish_outbox VALUES (1)").is_err());
         // Only identifiers *starting with* the reserved prefixes match.
         assert!(lint_sql("SELECT my_sqlite_col FROM tasks").is_ok());
         assert!(lint_sql("SELECT not_crsql_thing FROM tasks").is_ok());

@@ -59,7 +59,13 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
   sqlApi!: RealtimeSqlAPI;
   /** Public handle: `app.plugins.plugins["realtime"].sql` — typed by @realtime-md/plugin-api-types. */
   get sql(): RealtimeSql {
-    return this.sqlApi;
+    return {
+      whenAvailable: (opts) => this.sqlApi.whenAvailable(opts),
+      open: (opts) => this.sqlApi.open(opts),
+      delete: (opts) => this.sqlApi.delete(opts),
+      restore: (opts) => this.sqlApi.restore(opts),
+      isLive: (opts) => this.sqlApi.isLive(opts),
+    };
   }
   /** Plugin-managed remote cursor API for third-party plugins (see src/cursors/api.ts). */
   cursorsApi!: RealtimeCursorsAPI;

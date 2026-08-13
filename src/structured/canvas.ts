@@ -112,6 +112,11 @@ function reconcileCanvasItems(
 ): void {
   for (const id of Array.from(itemsMap.keys())) {
     if (!(id in incoming)) {
+      const originClient = (itemsMap as { _map?: Map<string, { id?: { client?: number } }> })._map?.get(id)?.id
+        ?.client;
+      // A stale snapshot must not tombstone items created by another client —
+      // those concurrent remote nodes would be permanently un-resurrectable.
+      if (originClient !== undefined && originClient !== clientID) continue;
       // Stamp the tombstone with this device's clientID so a later same-device
       // re-add (undo) can clear it, while a cross-device stale snapshot cannot.
       tombstones.set(id, clientID);

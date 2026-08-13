@@ -202,7 +202,7 @@ pub(crate) fn decode_message(bytes: &[u8]) -> Result<yrs::sync::Message, Error> 
                     let sv_buf = cursor.read_buf()?;
                     let mut sv_inner = SafeCursor::new(sv_buf);
                     let sv_count = sv_inner.read_var::<usize>()?;
-                    if sv_count > sv_buf.len() {
+                    if sv_count.saturating_mul(2) > sv_buf.len() {
                         return Err(Error::Custom(
                             "state-vector length exceeds encoded input".to_string(),
                         ));
@@ -220,7 +220,7 @@ pub(crate) fn decode_message(bytes: &[u8]) -> Result<yrs::sync::Message, Error> 
             let data = cursor.read_buf()?;
             let mut inner = SafeCursor::new(data);
             let count = inner.read_var::<usize>()?;
-            if count > data.len() {
+            if count.saturating_mul(3) > data.len() {
                 return Err(Error::Custom(
                     "awareness client count exceeds payload".to_string(),
                 ));

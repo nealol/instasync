@@ -117,6 +117,20 @@ describe("NoteStream", () => {
     await expect(stream.write("y")).rejects.toThrow(StreamError);
   });
 
+  it("returns the committed result when done arrives after an error frame", async () => {
+    server.onFrame = (frame, ws) => {
+      if (frame.type === "start") {
+        ws.send(JSON.stringify({ type: "started", guid: "g", position: 0 }));
+      } else if (frame.type === "end") {
+        ws.send(JSON.stringify({ type: "error", code: "busy", message: "retry" }));
+        ws.send(JSON.stringify({ type: "done", auditId: "audit-committed", inserted: 3 }));
+      }
+    };
+    const stream = await NoteStream.open({ url: server.url, token: "t", path: "a.md" });
+    await stream.write("abc");
+    await expect(stream.end()).resolves.toEqual({ auditId: "audit-committed", inserted: 3 });
+  });
+
   it("enforces the 2MB session budget client-side", async () => {
     const stream = await NoteStream.open({ url: server.url, token: "t", path: "a.md" });
     const big = "x".repeat(MAX_STREAM_BYTES + 1);

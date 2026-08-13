@@ -28,6 +28,7 @@ use crate::error::{AppError, AppResult};
 use crate::routes::require_member;
 use crate::session::{now_millis, ApiPrincipal};
 use crate::state::AppState;
+use crate::ydoc;
 
 /// How often an SSE connection polls the document store for changes.
 const POLL_INTERVAL: Duration = Duration::from_millis(1500);
@@ -543,7 +544,14 @@ pub async fn view_attachment(
     State(state): State<AppState>,
     Path((share_id, path)): Path<(String, String)>,
 ) -> AppResult<Response> {
-    let (share, _) = resolve_share(&state, &share_id).await?;
+    let (share, file) = resolve_share(&state, &share_id).await?;
+    let note_doc_id = format!("{}__{}", share.vault_id, share.guid);
+    let update = ydoc::read_update(&state, &note_doc_id).await?;
+    let content = ydoc::decode_text(&update, "contents")
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    if !note_references_attachment(&content, &file.path, &path) {
+        return Err(AppError::NotFound);
+    }
     attachments::read_attachment_public(&state, &share.vault_id, &path).await
 }
 
@@ -690,4 +698,96 @@ mod tests {
         assert_eq!(resolve_wikilink_target(&files, "other").unwrap().guid, "g2");
         assert!(resolve_wikilink_target(&files, "Missing").is_none());
     }
+
+    #[test]
+    fn share_attachment_must_be_referenced_by_note() {
+        let note = "See ![[HR/offer-letters.pdf]] and ![chart](images/chart.png)";
+        assert!(note_references_attachment(
+            note,
+            "Notes/hiring.md",
+            "HR/offer-letters.pdf"
+        ));
+        assert!(note_references_attachment(
+            note,
+            "Notes/hiring.md",
+            "images/chart.png"
+        ));
+        assert!(!note_references_attachment(
+            note,
+            "Notes/hiring.md",
+            "HR/salary.pdf"
+        ));
+        assert!(note_references_attachment(
+            "![[chart.png]]",
+            "Notes/hiring.md",
+            "Notes/chart.png"
+        ));
+    }
+}
+
+/// True when `requested` is an embed/image target of `note_content`.
+fn note_references_attachment(note_content: &str, note_path: &str, requested: &str) -> bool {
+    let requested = requested.trim().trim_matches('/');
+    if requested.is_empty() {
+        return false;
+    }
+    let note_dir = note_path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    for target in extract_attachment_targets(note_content) {
+        if attachment_target_matches(&target, requested, note_dir) {
+            return true;
+        }
+    }
+    false
+}
+
+fn extract_attachment_targets(content: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'!' && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            if i + 2 < bytes.len() && bytes[i + 2] == b'[' {
+                if let Some(end) = content[i + 3..].find("]]") {
+                    let inner = content[i + 3..i + 3 + end].trim();
+                    let target = inner.split('|').next().unwrap_or(inner).trim();
+                    if !target.is_empty() {
+                        targets.push(target.to_string());
+                    }
+                    i += 3 + end + 2;
+                    continue;
+                }
+            } else if let Some(close) = content[i + 2..].find("](") {
+                let after = i + 2 + close + 2;
+                if let Some(end) = content[after..].find(')') {
+                    let target = content[after..after + end].trim();
+                    if !target.is_empty() {
+                        targets.push(target.to_string());
+                    }
+                    i = after + end + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    targets
+}
+
+fn attachment_target_matches(target: &str, requested: &str, note_dir: &str) -> bool {
+    let target = target.trim().trim_matches('/');
+    if target.eq_ignore_ascii_case(requested) {
+        return true;
+    }
+    let target_base = target.rsplit('/').next().unwrap_or(target);
+    let requested_base = requested.rsplit('/').next().unwrap_or(requested);
+    if target_base.eq_ignore_ascii_case(requested_base) && !target.contains('/') {
+        return true;
+    }
+    if !note_dir.is_empty() {
+        let relative = format!("{note_dir}/{target}");
+        if relative.eq_ignore_ascii_case(requested) {
+            return true;
+        }
+    }
+    false
 }

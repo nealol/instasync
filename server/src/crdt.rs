@@ -42,6 +42,7 @@ const EPOCH_PROPOSAL_MESSAGE: u8 = 103;
 const EPOCH_ACK_MESSAGE: u8 = 104;
 const DOCUMENT_INVALIDATED_MESSAGE: u8 = 105;
 const RETIRED_EPOCH_RETRY_MS: u64 = 60_000;
+const EPOCH_ACK_TIMEOUT_MS: u64 = 30_000;
 
 /// Access level encoded in client tokens and enforced on every content update.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -938,13 +939,21 @@ impl DocumentStore {
                 return Ok(());
             };
             let current_epoch = runtime.manifest.current.epoch;
-            if runtime.activating
-                || runtime
-                    .connections
-                    .values()
-                    .any(|connection| connection.epoch == current_epoch && !connection.acknowledged)
-            {
+            let waiting = runtime
+                .connections
+                .values()
+                .any(|connection| connection.epoch == current_epoch && !connection.acknowledged);
+            let timed_out = crdt_epoch::now_millis().saturating_sub(pending.proposed_at_ms)
+                >= EPOCH_ACK_TIMEOUT_MS;
+            if runtime.activating || (waiting && !timed_out) {
                 return Ok(());
+            }
+            if waiting {
+                tracing::warn!(
+                    document_id,
+                    pending_epoch = pending.epoch,
+                    "activating document epoch after ack timeout"
+                );
             }
             runtime.activating = true;
             (current_epoch, pending.epoch, pending.physical_document_id)
@@ -1227,13 +1236,18 @@ impl PersistentDocument {
 
     async fn epoch_measurements(&self) -> Result<(u64, u64, u64), CrdtError> {
         let _mutation = self.mutation.lock().await;
-        let (encoded_state_bytes, delete_set_bytes) = {
+        let doc = {
             let awareness = self
                 .awareness
                 .read()
                 .map_err(|_| CrdtError::Protocol("document lock poisoned".into()))?;
-            crdt_epoch::document_measurements(awareness.doc())
+            awareness.doc().clone()
         };
+        let (encoded_state_bytes, delete_set_bytes) = tokio::task::spawn_blocking(move || {
+            crdt_epoch::document_measurements(&doc)
+        })
+        .await
+        .map_err(|error| CrdtError::Protocol(format!("epoch measurements join: {error}")))?;
         let update_count = self.persistence.lock().await.total_records();
         Ok((encoded_state_bytes, delete_set_bytes, update_count))
     }

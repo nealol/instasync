@@ -164,6 +164,7 @@ export class NoteStream {
         this.ackedBytes += frame.applied ?? 0;
       } else if (frame.type === "done") {
         this.result = { auditId: frame.auditId ?? null, inserted: frame.inserted ?? 0 };
+        this.fatal = null;
       } else if (frame.type === "error") {
         this.fatal = new StreamError(frame.code ?? "error", frame.message ?? "stream error");
       }
@@ -223,15 +224,16 @@ export class NoteStream {
   async end(): Promise<StreamResult> {
     if (this.ended) throw new Error("stream already ended");
     this.ended = true;
-    if (this.fatal) throw this.fatal;
-    this.ws.send(JSON.stringify({ type: "end" }));
-    while (this.result === null) {
-      if (this.fatal) throw this.fatal;
-      if (this.closed) throw new Error("WebSocket closed before done frame");
+    if (this.result === null && !this.closed) {
+      this.ws.send(JSON.stringify({ type: "end" }));
+    }
+    while (this.result === null && !this.closed) {
       await this.waitForWake();
     }
     this.ws.close();
-    return this.result;
+    if (this.result) return this.result;
+    if (this.fatal) throw this.fatal;
+    throw new Error("WebSocket closed before done frame");
   }
 
   /** Abort without committing the remainder (the server still audits applied text). */

@@ -319,6 +319,34 @@ describe("canvas concurrent merge", () => {
     const nodes = canvasNodes(doc.getMap("root"));
     expect(nodes.map((n) => n.id)).toEqual(["n2"]);
   });
+
+  it("does not tombstone concurrent remote nodes missing from a stale snapshot", () => {
+    const doc1 = new Y.Doc();
+    const doc2 = new Y.Doc();
+    apply(doc1, {
+      nodes: [{ id: "n1", type: "text", text: "first", x: 0, y: 0 }],
+      edges: [],
+    });
+    Y.applyUpdate(doc2, Y.encodeStateAsUpdate(doc1));
+
+    apply(doc1, {
+      nodes: [
+        { id: "n1", type: "text", text: "first", x: 0, y: 0 },
+        { id: "n3", type: "text", text: "remote", x: 10, y: 10 },
+      ],
+      edges: [],
+    });
+    Y.applyUpdate(doc2, Y.encodeStateAsUpdate(doc1));
+
+    apply(doc2, {
+      nodes: [{ id: "n1", type: "text", text: "moved", x: 5, y: 5 }],
+      edges: [],
+    });
+
+    expect(canvasNodes(doc2.getMap("root")).map((n) => n.id).sort()).toEqual(["n1", "n3"]);
+    Y.applyUpdate(doc1, Y.encodeStateAsUpdate(doc2));
+    expect(canvasNodes(doc1.getMap("root")).map((n) => n.id).sort()).toEqual(["n1", "n3"]);
+  });
 });
 
 describe("base serializer", () => {

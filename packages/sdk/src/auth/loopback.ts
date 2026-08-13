@@ -34,6 +34,15 @@ export async function startLoopback(
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    const host = req.headers.host ?? "";
+    if (host !== "127.0.0.1" && !host.startsWith("127.0.0.1:")) {
+      res.writeHead(403).end();
+      return;
+    }
+    if (req.method !== "GET") {
+      res.writeHead(405).end();
+      return;
+    }
     if (url.pathname !== path) {
       res.writeHead(404).end();
       return;

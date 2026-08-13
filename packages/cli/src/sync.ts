@@ -244,6 +244,7 @@ export async function pull(
   const report: SyncReport = { applied: [], conflicts: [] };
 
   for (const [relPath, r] of remote) {
+    if (isExcluded(relPath)) continue;
     const snap = snapshot[relPath];
     const l = local.get(relPath);
     // Attachment fast path: unchanged on the server, nothing to fetch.
@@ -265,6 +266,17 @@ export async function pull(
       continue;
     }
     const abs = path.join(ws.dir, relPath);
+    try {
+      if (fs.lstatSync(abs).isSymbolicLink()) {
+        report.conflicts.push({
+          path: relPath,
+          reason: "local path is a symlink; refusing to overwrite",
+        });
+        continue;
+      }
+    } catch {
+      // Path does not exist yet.
+    }
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, content.bytes);
     recordLocal(ws.dir, relPath, r.kind, content.hash, snapshot, content.guid);

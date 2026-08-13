@@ -27,6 +27,8 @@ export abstract class StructuredDocument extends SyncedDoc {
   private baselineTextAtStartup = "";
   private diskAtStartup: JsonValue | null = null;
   private localChangedAtStartup = false;
+  /** True when the on-disk file exists but could not be parsed. */
+  private diskParseFailed = false;
 
   protected constructor(
     plugin: RealtimePlugin,
@@ -128,7 +130,9 @@ export abstract class StructuredDocument extends SyncedDoc {
         this.path.endsWith(".canvas") ? "canvas" : "base",
         this.guid,
       );
-      if (!this.suppressedWhileOpen()) await this.writeToDisk(this.serialize(this.value));
+      if (!this.suppressedWhileOpen() && !this.diskParseFailed) {
+        await this.writeToDisk(this.serialize(this.value));
+      }
       if (!this.provider.hasLocalChanges) await this.recordAcknowledgedContent(true);
       completed = true;
     } catch (e) {
@@ -214,12 +218,18 @@ export abstract class StructuredDocument extends SyncedDoc {
 
   private async readParsedFromDisk(): Promise<JsonValue | null> {
     const file = this.getFile();
-    if (!file) return null;
+    if (!file) {
+      this.diskParseFailed = false;
+      return null;
+    }
     try {
-      return this.parse(await this.plugin.app.vault.read(file));
+      const parsed = this.parse(await this.plugin.app.vault.read(file));
+      this.diskParseFailed = false;
+      return parsed;
     } catch (e) {
       console.error(`[Realtime] failed to parse ${this.path}`, e);
       new Notice(`Realtime: could not parse ${this.path}; keeping the last synced version.`);
+      this.diskParseFailed = true;
       return null;
     }
   }
@@ -263,7 +273,7 @@ export abstract class StructuredDocument extends SyncedDoc {
     } finally {
       window.setTimeout(() => {
         this.writingTextToDisk = null;
-      }, 0);
+      }, 250);
     }
   }
 

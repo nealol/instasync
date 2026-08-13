@@ -140,6 +140,10 @@ export class LiveEditPluginValue implements PluginValue {
   /** Apply a remote Yjs change to the editor. */
   private onYTextChanged(): void {
     if (!this.ytext || this.destroyed) return;
+    // Initial sync still streams into Y.Text before isReady(); applying it
+    // would clobber text typed during that window. reconcileOnAttach runs
+    // after ready and preserves those local edits.
+    if (this.doc && !this.doc.isReady()) return;
     // Re-derive the editor content from the shared text using a minimal diff.
     // (Using delta would be more precise, but observe() here is invoked without
     // the event; we recompute against the current editor text instead.)

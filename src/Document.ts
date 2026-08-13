@@ -453,7 +453,7 @@ export class Document extends SyncedDoc {
       window.setTimeout(() => {
         this.writingToDisk = false;
         this.writingTextToDisk = null;
-      }, 0);
+      }, 250);
     }
   }
 

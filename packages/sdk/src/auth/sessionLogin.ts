@@ -29,7 +29,11 @@ export interface BrowserLoginOptions {
  */
 export async function loginViaBrowser(opts: BrowserLoginOptions): Promise<string> {
   const baseUrl = normalizeBaseUrl(opts.baseUrl);
-  const loopback = await startLoopback({ port: opts.port, path: "/login-callback" });
+  const state = crypto.randomUUID();
+  const loopback = await startLoopback({
+    port: opts.port,
+    path: `/login-callback/${state}`,
+  });
   try {
     const loginUrl = `${baseUrl}/auth/login?redirect=${encodeURIComponent(loopback.url)}`;
     await (opts.openBrowser ?? openInBrowser)(loginUrl);

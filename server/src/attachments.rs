@@ -18,10 +18,11 @@ use url::Url;
 use yrs::Any;
 
 use crate::audit::{self, AuditEntry};
+use crate::crdt::Level;
 use crate::config::OidcMode;
 use crate::entities::upload_jtis;
 use crate::error::{AppError, AppResult};
-use crate::routes::require_member;
+use crate::routes::{authorize_path, require_member};
 use crate::session::{now_millis, ApiPrincipal};
 use crate::state::{AppState, Principal, PrincipalActor};
 use crate::ydoc;
@@ -167,11 +168,7 @@ pub async fn read_attachment(
         .await
         .map_err(|_| AppError::NotFound)?;
     let body = Body::from_stream(ReaderStream::new(file));
-    Ok(Response::builder()
-        .header(header::CONTENT_TYPE, content_type_for_path(&path))
-        .header(header::CONTENT_LENGTH, meta.size.to_string())
-        .body(body)
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
+    Ok(attachment_file_response(&path, meta.size, body))
 }
 
 /// Read an attachment without an authenticated principal. Used by the public
@@ -194,11 +191,7 @@ pub(crate) async fn read_attachment_public(
         .await
         .map_err(|_| AppError::NotFound)?;
     let body = Body::from_stream(ReaderStream::new(file));
-    Ok(Response::builder()
-        .header(header::CONTENT_TYPE, content_type_for_path(path))
-        .header(header::CONTENT_LENGTH, size.to_string())
-        .body(body)
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
+    Ok(attachment_file_response(path, size, body))
 }
 
 /// Read a public attachment only while the live vault index still maps the
@@ -221,13 +214,7 @@ pub(crate) async fn read_attachment_public_exact(
         .await
         .map_err(|_| AppError::NotFound)?;
     let body = Body::from_stream(ReaderStream::new(file));
-    Ok(Response::builder()
-        .header(header::CONTENT_TYPE, content_type_for_path(path))
-        .header(header::CONTENT_LENGTH, size.to_string())
-        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-        .header(header::CONTENT_SECURITY_POLICY, "sandbox")
-        .body(body)
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
+    Ok(attachment_file_response(path, size, body))
 }
 
 pub(crate) async fn read_attachment_inner(
@@ -272,6 +259,9 @@ pub(crate) async fn upload_attachment_bytes_inner(
     if bytes.len() as u64 > state.config.attachment_max_bytes {
         return Err(AppError::PayloadTooLarge);
     }
+    require_attachment_write(state, principal, vault_id, path).await?;
+    reject_html_upload(None, bytes)?;
+    validate_magic_for_path(path, bytes)?;
     let (hash, size) = store_bytes(state, vault_id, bytes).await?;
     ydoc::index_set_binary(state, vault_id, path, &hash, size).await?;
     state
@@ -411,6 +401,7 @@ pub(crate) async fn upload_attachment_url_inner(
     principal.require_vault(vault_id)?;
     require_member(state, &principal.user.id, vault_id).await?;
     validate_external_upload_path(state, &body.path)?;
+    require_attachment_write(state, principal, vault_id, &body.path).await?;
     let url = validate_source_url(state, &body.source_url)?;
     let res = state
         .http
@@ -439,6 +430,11 @@ pub(crate) async fn upload_attachment_url_inner(
     if bytes.len() as u64 > state.config.attachment_max_bytes {
         return Err(AppError::PayloadTooLarge);
     }
+    reject_html_upload(
+        None,
+        &bytes,
+    )?;
+    validate_magic_for_path(&body.path, &bytes)?;
     let (hash, size) = store_bytes(state, vault_id, &bytes).await?;
     ydoc::index_set_binary(state, vault_id, &body.path, &hash, size).await?;
     state
@@ -529,6 +525,7 @@ async fn public_upload_inner(
     if payload.expires_at < now_millis() {
         return Err(AppError::Unauthorized);
     }
+    require_member(state, &payload.principal.user_id, &payload.vault_id).await?;
     if upload_jtis::Entity::find_by_id(payload.jti.clone())
         .one(&state.db)
         .await?
@@ -897,9 +894,7 @@ fn validate_magic_for_path(path: &str, bytes: &[u8]) -> AppResult<()> {
         "gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
         "webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP",
         "pdf" => bytes.starts_with(b"%PDF-"),
-        "svg" => std::str::from_utf8(&bytes[..bytes.len().min(512)])
-            .ok()
-            .is_some_and(|text| text.to_ascii_lowercase().contains("<svg")),
+        "svg" => svg_upload_allowed(bytes),
         _ => true,
     };
     if ok {
@@ -909,6 +904,37 @@ fn validate_magic_for_path(path: &str, bytes: &[u8]) -> AppResult<()> {
             "file content does not match extension".into(),
         ))
     }
+}
+
+fn svg_upload_allowed(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let lower = text.to_ascii_lowercase();
+    lower.contains("<svg") && !lower.contains("<script") && !lower.contains("javascript:")
+}
+
+fn attachment_file_response(path: &str, size: i64, body: Body) -> Response {
+    Response::builder()
+        .header(header::CONTENT_TYPE, content_type_for_path(path))
+        .header(header::CONTENT_LENGTH, size.to_string())
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CONTENT_SECURITY_POLICY, "sandbox")
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn require_attachment_write(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+    path: &str,
+) -> AppResult<()> {
+    let level = authorize_path(state, &principal.user, vault_id, path).await?;
+    if level == Level::ReadOnly {
+        return Err(AppError::Forbidden);
+    }
+    Ok(())
 }
 
 impl UploadPrincipal {

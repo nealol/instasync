@@ -985,21 +985,7 @@ async fn update_canvas_doc<F>(
 where
     F: FnOnce(&mut JsonMap<String, JsonValue>) -> AppResult<()>,
 {
-    let mut response = read_structured_json(state, principal, vault_id, path, "canvas").await?;
-    let root = response
-        .value
-        .as_object_mut()
-        .ok_or_else(|| AppError::Internal("structured root is not object".into()))?;
-    edit(root)?;
-    response = write_structured_json(
-        state,
-        principal,
-        vault_id,
-        path,
-        "canvas",
-        JsonValue::Object(root.clone()),
-    )
-    .await?;
+    let mut response = mutate_structured_doc(state, principal, vault_id, path, "canvas", edit).await?;
     response.value = canvas_to_file_json(response.value);
     Ok(response)
 }
@@ -1014,21 +1000,56 @@ async fn update_base_doc<F>(
 where
     F: FnOnce(&mut JsonMap<String, JsonValue>) -> AppResult<()>,
 {
-    let mut response = read_structured_json(state, principal, vault_id, path, "base").await?;
-    let root = response
-        .value
+    mutate_structured_doc(state, principal, vault_id, path, "base", edit).await
+}
+
+async fn mutate_structured_doc<F>(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+    path: &str,
+    kind: &str,
+    edit: F,
+) -> AppResult<StructuredResponse>
+where
+    F: FnOnce(&mut JsonMap<String, JsonValue>) -> AppResult<()>,
+{
+    let entry = require_structured_access(state, principal, vault_id, path, kind, true).await?;
+    let document_id = doc_id(vault_id, &entry.guid);
+    let mutation_lock = canvas_mutation_lock(&document_id).await;
+    let _mutation_guard = mutation_lock.lock().await;
+    let (epoch, current) = ydoc::read_update_for_write(state, &document_id).await?;
+    let mut value =
+        ydoc::decode_structured(&current).map_err(|error| AppError::Internal(error.to_string()))?;
+    let before = value.clone();
+    let root = value
         .as_object_mut()
         .ok_or_else(|| AppError::Internal("structured root is not object".into()))?;
     edit(root)?;
-    write_structured_json(
-        state,
-        principal,
-        vault_id,
-        path,
-        "base",
-        JsonValue::Object(root.clone()),
-    )
-    .await
+    let update = ydoc::build_structured_update(&current, &value)?;
+    if !update.is_empty() {
+        ydoc::write_update_at_epoch(state, &document_id, epoch, update).await?;
+        mark_structured_write(state, vault_id, principal).await;
+        if audit::is_cursor(principal) {
+            audit::record(
+                state,
+                principal,
+                vault_id,
+                AuditEntry::new("structured_set", path)
+                    .before(pretty_json(&before))
+                    .after(pretty_json(&value))
+                    .details(json!({ "kind": kind })),
+            )
+            .await;
+        }
+    }
+    Ok(StructuredResponse {
+        permalink: permalink_for_guid(state, &entry.guid),
+        path: entry.path,
+        guid: entry.guid,
+        kind: entry.kind,
+        value,
+    })
 }
 
 pub(crate) async fn read_structured_json(

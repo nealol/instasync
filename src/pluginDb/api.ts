@@ -11,7 +11,6 @@ import type {
   DatabaseHandle,
   DeleteOrRestoreOptions,
   OpenOptions,
-  RealtimeSql,
 } from "@realtime-md/plugin-api-types";
 import type RealtimePlugin from "../main";
 import {
@@ -35,7 +34,7 @@ export interface DebugDatabase {
   state: SyncedPluginDatabase["state"];
 }
 
-export class RealtimeSqlAPI implements RealtimeSql {
+export class RealtimeSqlAPI {
   private plugin: RealtimePlugin;
   private engines = new Map<string, SyncedPluginDatabase>();
   private activeScope: string | null = null;

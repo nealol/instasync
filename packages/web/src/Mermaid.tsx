@@ -10,10 +10,13 @@ export function Mermaid({ source }: { source: string }) {
 
   useEffect(() => {
     let cancelled = false;
+    setFailed(false);
+    setSvg(null);
     (async () => {
       const mermaid = (await import("mermaid")).default;
       mermaid.initialize({ startOnLoad: false, theme: "neutral" });
-      const { svg } = await mermaid.render(idRef, source);
+      const renderId = `${idRef}-${Date.now()}`;
+      const { svg } = await mermaid.render(renderId, source);
       if (!cancelled) setSvg(sanitizeSvg(svg));
     })().catch(() => {
       if (!cancelled) setFailed(true);

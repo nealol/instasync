@@ -1625,7 +1625,10 @@ export class VaultSync {
       );
       if (!wasStructuredTracked) {
         if (wasTracked) {
-          this.indexDoc.transact(() => this.files.delete(oldPath));
+          this.indexDoc.transact(() => {
+            if (guid) this.recordTrashIn({ path: oldPath, kind: "text", guid });
+            this.files.delete(oldPath);
+          });
         }
         await doc.whenReady();
         if (this.destroyed) return;

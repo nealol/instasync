@@ -108,7 +108,6 @@ export class RealtimeProvider {
   private localVersion = 0;
   private acknowledgedVersion = -1;
   private receivedServerSyncStep1 = false;
-  private receivedSyncStatus = false;
   private heartbeatTimer: number | null = null;
   private responseTimer: number | null = null;
   private handshakeTimer: number | null = null;
@@ -320,7 +319,6 @@ export class RealtimeProvider {
     this.socket = socket;
     socket.binaryType = "arraybuffer";
     this.receivedServerSyncStep1 = false;
-    this.receivedSyncStatus = false;
 
     let resolve!: (connected: boolean) => void;
     const result = new Promise<boolean>((done) => {
@@ -471,7 +469,6 @@ export class RealtimeProvider {
       case MESSAGE_SYNC_STATUS: {
         const versionDecoder = decoding.createDecoder(decoding.readVarUint8Array(decoder));
         this.acknowledgeVersion(decoding.readVarUint(versionDecoder));
-        this.receivedSyncStatus = true;
         break;
       }
       case MESSAGE_EPOCH_PROPOSAL:
@@ -543,7 +540,7 @@ export class RealtimeProvider {
     encoding.writeVarUint8Array(encoder, encoding.toUint8Array(versionEncoder));
     if (!this.send(encoding.toUint8Array(encoder))) return;
 
-    if (this.receivedSyncStatus && !this.responseTimer) {
+    if (!this.responseTimer) {
       this.responseTimer = window.setTimeout(() => {
         const socket = this.socket;
         if (socket) {

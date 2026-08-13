@@ -62,6 +62,4 @@ export interface RealtimeSql {
   restore(opts: DeleteOrRestoreOptions): Promise<void>;
   /** True when a non-tombstoned database with this id currently exists. */
   isLive(opts: DeleteOrRestoreOptions): Promise<boolean>;
-  /** Escape hatch: rebuild every currently-open database from the server replica. */
-  rebaseAll(): Promise<number>;
 }

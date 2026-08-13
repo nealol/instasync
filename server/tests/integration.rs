@@ -48,7 +48,7 @@ async fn fake_attachment_source() -> String {
     use axum::routing::get;
 
     async fn image() -> ([(&'static str, &'static str); 1], Vec<u8>) {
-        ([("content-type", "image/png")], b"remote image".to_vec())
+        ([("content-type", "image/png")], b"\x89PNG\r\n\x1a\nremote image".to_vec())
     }
 
     let router = Router::new().route("/image.png", get(image));
@@ -1769,7 +1769,7 @@ async fn attachment_upload_list_read_delete_roundtrip() {
     let vault_id = vault["id"].as_str().unwrap();
     let url = format!("/api/vaults/{vault_id}/attachments/images/pic.png");
 
-    let payload = b"image bytes".to_vec();
+    let payload = b"\x89PNG\r\n\x1a\nimage bytes".to_vec();
     let (status, uploaded_bytes) = send_raw(&app, "PUT", &url, Some(&token), payload.clone()).await;
     assert_eq!(status, StatusCode::OK);
     let uploaded: Value = serde_json::from_slice(&uploaded_bytes).unwrap();
@@ -2006,7 +2006,7 @@ async fn attachment_upload_from_url_roundtrip() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(uploaded["path"], "web/image.png");
-    assert_eq!(uploaded["size"], "remote image".len() as i64);
+    assert_eq!(uploaded["size"], b"\x89PNG\r\n\x1a\nremote image".len() as i64);
 
     let url = format!("/api/vaults/{vault_id}/attachments/web/image.png");
     let res = app
@@ -2023,7 +2023,7 @@ async fn attachment_upload_from_url_roundtrip() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(bytes.as_ref(), b"remote image");
+    assert_eq!(bytes.as_ref(), b"\x89PNG\r\n\x1a\nremote image");
 }
 
 #[tokio::test]
@@ -3854,7 +3854,7 @@ async fn attachment_move_update_embeds_rewrites_opt_in_only() {
         "PUT",
         &format!("/api/vaults/{vault_id}/attachments/old/img.png"),
         Some(&token),
-        b"image bytes".to_vec(),
+        b"\x89PNG\r\n\x1a\nimage bytes".to_vec(),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -3892,7 +3892,7 @@ async fn attachment_move_update_embeds_rewrites_opt_in_only() {
         "PUT",
         &format!("/api/vaults/{vault_id}/attachments/old2/pic.png"),
         Some(&token),
-        b"image bytes".to_vec(),
+        b"\x89PNG\r\n\x1a\nimage bytes".to_vec(),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -6273,7 +6273,7 @@ async fn rollback_restores_attachment_blob_from_git_after_gc() {
     let base = format!("/api/vaults/{vault_id}/history/commits");
 
     // Commit 1: a small attachment (inlined verbatim into git).
-    let payload = b"\x89PNG fake image bytes".to_vec();
+    let payload = b"\x89PNG\r\n\x1a\nfake image bytes".to_vec();
     let att_url = format!("/api/vaults/{vault_id}/attachments/img/pic.png");
     let (status, up) = send_raw(&app, "PUT", &att_url, Some(&alice), payload.clone()).await;
     assert_eq!(status, StatusCode::OK);
@@ -7063,7 +7063,7 @@ async fn public_attachment_share_is_scoped_to_the_shared_version_and_revocable()
     let vault_id = vault["id"].as_str().unwrap();
     let attachment_path = "images/public.png";
     let attachment_url = format!("/api/vaults/{vault_id}/attachments/{attachment_path}");
-    let first_bytes = b"first image".to_vec();
+    let first_bytes = b"\x89PNG\r\n\x1a\nfirst image".to_vec();
     let (status, _) = send_raw(
         &app,
         "PUT",
@@ -7136,7 +7136,7 @@ async fn public_attachment_share_is_scoped_to_the_shared_version_and_revocable()
         "PUT",
         &attachment_url,
         Some(&alice),
-        b"second image".to_vec(),
+        b"\x89PNG\r\n\x1a\nsecond image".to_vec(),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -7165,7 +7165,7 @@ async fn public_attachment_share_is_scoped_to_the_shared_version_and_revocable()
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(body.as_ref(), b"second image");
+    assert_eq!(body.as_ref(), b"\x89PNG\r\n\x1a\nsecond image");
 
     let race_path = "images/race.png";
     let (status, _) = send_raw(
@@ -7173,7 +7173,7 @@ async fn public_attachment_share_is_scoped_to_the_shared_version_and_revocable()
         "PUT",
         &format!("/api/vaults/{vault_id}/attachments/{race_path}"),
         Some(&alice),
-        b"race image".to_vec(),
+        b"\x89PNG\r\n\x1a\nrace image".to_vec(),
     )
     .await;
     assert_eq!(status, StatusCode::OK);

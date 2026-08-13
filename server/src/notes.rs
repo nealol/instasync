@@ -9,7 +9,7 @@ use crate::audit::{self, AuditEntry};
 use crate::crdt::Level;
 use crate::entities::vault_files;
 use crate::error::{AppError, AppResult};
-use crate::routes::{authorize_doc, require_member};
+use crate::routes::{authorize_doc, authorize_path, require_member};
 use crate::session::{now_millis, ApiPrincipal};
 use crate::state::AppState;
 use crate::ydoc;
@@ -222,6 +222,7 @@ pub(crate) async fn create_note_inner(
     principal.require_vault(vault_id)?;
     require_member(state, &principal.user.id, vault_id).await?;
     validate_note_path(&body.path)?;
+    require_path_write(state, principal, vault_id, &body.path).await?;
 
     // The `vault_files` table is a mirror of the authoritative Yjs index
     // doc and drifts when clients delete files through the index CRDT without
@@ -440,6 +441,7 @@ pub(crate) async fn move_note_inner(
         return Err(AppError::Conflict("same_path".into()));
     }
     let file = require_note_access(state, principal, vault_id, path, true).await?;
+    require_path_write(state, principal, vault_id, &body.to_path).await?;
     if file_by_path(state, vault_id, &body.to_path)
         .await?
         .is_some()
@@ -823,6 +825,7 @@ pub(crate) async fn periodic_note_get_or_create_inner(
     }
 
     validate_note_path(&note_path)?;
+    require_path_write(state, principal, vault_id, &note_path).await?;
     let guid = uuid::Uuid::new_v4().to_string();
     let doc_id = doc_id(vault_id, &guid);
     state.ensure_vault_document(vault_id, &doc_id).await?;
@@ -947,6 +950,19 @@ pub(crate) async fn require_note_access(
         return Err(AppError::Forbidden);
     }
     Ok(file)
+}
+
+async fn require_path_write(
+    state: &AppState,
+    principal: &ApiPrincipal,
+    vault_id: &str,
+    path: &str,
+) -> AppResult<()> {
+    let level = authorize_path(state, &principal.user, vault_id, path).await?;
+    if level == Level::ReadOnly {
+        return Err(AppError::Forbidden);
+    }
+    Ok(())
 }
 
 async fn require_file_access(

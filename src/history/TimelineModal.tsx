@@ -88,6 +88,7 @@ function TimelineView({ plugin, initialHash }: { plugin: RealtimePlugin; initial
   const [hasMore, setHasMore] = useState(false);
   const [selected, setSelected] = useState<string | null>(initialHash ?? null);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [selectedCommitPath, setSelectedCommitPath] = useState<string | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const loadingRef = useRef(false);
@@ -137,7 +138,13 @@ function TimelineView({ plugin, initialHash }: { plugin: RealtimePlugin; initial
   // fresh detail fetch lands (with a stale-fetch guard).
   useEffect(() => {
     setSelectedPath(null);
+    setSelectedCommitPath(null);
   }, [selected]);
+
+  const onSelectedPathChange = useCallback((current: string | null, commitEra?: string | null) => {
+    setSelectedPath(current);
+    setSelectedCommitPath(commitEra ?? current);
+  }, []);
 
   if (!vaultId) {
     return <p className="setting-item-description">Connect to a vault to view its history.</p>;
@@ -165,7 +172,7 @@ function TimelineView({ plugin, initialHash }: { plugin: RealtimePlugin; initial
             hash={selected}
             narrow={narrow}
             selectedPath={selectedPath}
-            onSelectedPathChange={setSelectedPath}
+            onSelectedPathChange={onSelectedPathChange}
           />
         ) : (
           <p className="setting-item-description">Select a commit.</p>
@@ -177,6 +184,7 @@ function TimelineView({ plugin, initialHash }: { plugin: RealtimePlugin; initial
           vaultId={vaultId}
           hash={selected}
           filePath={selectedPath}
+          commitPath={selectedCommitPath}
           onDone={() => void loadPage()}
         />
       )}
@@ -315,7 +323,7 @@ function CommitDetailPane({
   hash: string;
   narrow: boolean;
   selectedPath: string | null;
-  onSelectedPathChange: (path: string | null) => void;
+  onSelectedPathChange: (path: string | null, commitPath?: string | null) => void;
 }) {
   const [detail, setDetail] = useState<CommitDetail | null>(null);
   const [allFiles, setAllFiles] = useState<string[] | null>(null);
@@ -336,7 +344,11 @@ function CommitDetailPane({
         setDetail(d);
         // Stale-fetch guard: only propagate the initial path if this fetch
         // is still the current one for `hash`.
-        onSelectedPathChange(d.changes[0]?.renamedTo ?? d.changes[0]?.path ?? null);
+        const first = d.changes[0];
+        onSelectedPathChange(
+          first?.renamedTo ?? first?.path ?? null,
+          first?.path ?? null,
+        );
       } catch (e) {
         if (cancelled) return;
         setError(e instanceof Error ? e.message : String(e));
@@ -406,7 +418,8 @@ function CommitDetailPane({
   if (!detail) return <p className="setting-item-description">Loading…</p>;
 
   const handleFileSelect = (p: string) => {
-    onSelectedPathChange(p);
+    const change = changes.find((c) => (c.renamedTo ?? c.path) === p);
+    onSelectedPathChange(p, change?.path ?? p);
     if (narrow) setFilesOpen(false);
   };
 
@@ -569,6 +582,7 @@ function RollbackBar({
   vaultId,
   hash,
   filePath,
+  commitPath,
   onDone,
 }: {
   plugin: RealtimePlugin;
@@ -576,6 +590,8 @@ function RollbackBar({
   hash: string;
   /** Currently selected path in the commit detail pane (null while loading). */
   filePath: string | null;
+  /** Path at the selected commit, if the file was later renamed. */
+  commitPath: string | null;
   onDone: () => void;
 }) {
   const [vaultBusy, setVaultBusy] = useState(false);
@@ -611,19 +627,20 @@ function RollbackBar({
     if (!filePath) return;
     setFileBusy(true);
     try {
+      const targetPath = commitPath ?? filePath;
       const plan = await plugin.auth.rollbackPreview(vaultId, hash, {
         path: filePath,
-        targetPath: filePath,
+        targetPath,
       });
       const confirmed = await openRollbackConfirm(plugin.app, plan, {
         kind: "file",
         path: filePath,
-        targetPath: filePath,
+        targetPath,
       });
       if (!confirmed) return;
       const result = await plugin.auth.rollbackVault(vaultId, hash, {
         path: filePath,
-        targetPath: filePath,
+        targetPath,
       });
       new Notice(
         `${PLUGIN_NAME}: rolled back ${filePath} — ${result.applied} updated, ${result.deleted} deleted.`,

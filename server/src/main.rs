@@ -48,10 +48,10 @@ async fn main() -> anyhow::Result<()> {
     let server_shutdown_timeout_ms = config.server_shutdown_timeout_ms;
     let server_shutdown_timeout = Duration::from_millis(server_shutdown_timeout_ms);
 
-    if config.upload_token == "dev-upload-token-change-me" {
+    if config.upload_token == "dev-upload-token-change-me" || config.upload_token.len() < 32 {
         tracing::warn!(
-            "UPLOAD_TOKEN is using the insecure default. \
-             Set UPLOAD_TOKEN to a strong secret in production."
+            "UPLOAD_TOKEN is weak or using the documented default. \
+             Set UPLOAD_TOKEN to a high-entropy secret in production."
         );
     }
 

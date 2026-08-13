@@ -129,7 +129,7 @@ in the Obsidian plugin's **Auth server URL**.
 | `ATTACHMENT_MAX_BYTES` | raw blob max | Per-attachment upload/fetch size cap |
 | `ATTACHMENTS_PATH_MODE` | `relative` | `relative` or `subfolder`; `subfolder` requires attachment paths under `ATTACHMENTS_SUBFOLDER` |
 | `ATTACHMENTS_SUBFOLDER` | — | Required for subfolder path mode and used as the default signed-upload landing directory |
-| `UPLOAD_TOKEN` | `dev-upload-token-change-me` | HMAC key for signed single-use browser upload links; set a long random secret in production |
+| `UPLOAD_TOKEN` | generated persistent secret under `GIT_DATA_DIR/.upload-token` | HMAC key for signed single-use browser upload links. When unset, the server generates a 256-bit secret and reuses it across restarts. Production (`OIDC_MODE=oidc`) refuses to start if the value is the old documented default or shorter than 32 characters. |
 | `WEB_DIST_PATH` | `/usr/local/share/realtime-web` in Docker, else `../packages/web/dist` | Vite build output of the read-only web viewer (`packages/web`), served at `/view/{share_id}` for public note shares |
 | `CRSQLITE_EXT_PATH` | `/usr/local/lib/crsqlite/crsqlite.so` in Docker, else unset | Path to the cr-sqlite loadable extension that backs synced **plugin databases** (server-side replica + git dumps under `.sql/`). When unset/missing, plugin-database replication degrades gracefully: client-to-client sync over the Y log is unaffected, but the server keeps no replica and git skips the per-DB SQL dumps. Its major version must match the client WASM's sync-format major. |
 

@@ -1,6 +1,13 @@
 use std::env;
+use std::path::{Path, PathBuf};
+
+use rand::RngCore;
 
 use crate::{SERVER_BOT_EMAIL, SERVER_NAME};
+
+/// Reject the documented default and other low-entropy HMAC keys in production.
+const INSECURE_UPLOAD_TOKEN: &str = "dev-upload-token-change-me";
+const MIN_PRODUCTION_UPLOAD_TOKEN_LEN: usize = 32;
 
 /// Runtime configuration, read from the environment. See README for the full list.
 #[derive(Clone, Debug)]
@@ -95,6 +102,8 @@ impl Config {
         if oidc_mode == OidcMode::Mock && opt("ALLOW_MOCK_OIDC").as_deref() != Some("1") {
             panic!("OIDC_MODE=mock requires ALLOW_MOCK_OIDC=1 and must not be used in production");
         }
+        let git_data_dir = opt("GIT_DATA_DIR").unwrap_or_else(|| "./git".to_string());
+        let upload_token_path = PathBuf::from(&git_data_dir).join(".upload-token");
         Config {
             database_url: opt("DATABASE_URL")
                 .unwrap_or_else(|| "sqlite://realtime.db?mode=rwc".to_string()),
@@ -147,7 +156,7 @@ impl Config {
             oidc_redirect_url: opt("OIDC_REDIRECT_URL"),
             allowed_login_redirects: list("ALLOWED_LOGIN_REDIRECTS"),
             cors_allowed_origins: list("CORS_ALLOWED_ORIGINS"),
-            git_data_dir: opt("GIT_DATA_DIR").unwrap_or_else(|| "./git".to_string()),
+            git_data_dir,
             git_enabled: opt("GIT_AUDIT_ENABLED").as_deref() != Some("0"),
             git_debounce_ms: opt("GIT_DEBOUNCE_MS")
                 .and_then(|s| s.parse().ok())
@@ -199,8 +208,7 @@ impl Config {
             attachments_path_mode: opt("ATTACHMENTS_PATH_MODE")
                 .unwrap_or_else(|| "relative".to_string()),
             attachments_subfolder: opt("ATTACHMENTS_SUBFOLDER"),
-            upload_token: opt("UPLOAD_TOKEN")
-                .unwrap_or_else(|| "dev-upload-token-change-me".to_string()),
+            upload_token: resolve_upload_token(opt("UPLOAD_TOKEN"), oidc_mode, &upload_token_path),
             crsqlite_ext_path: opt("CRSQLITE_EXT_PATH"),
             web_dist_path: opt("WEB_DIST_PATH")
                 .unwrap_or_else(|| "../packages/web/dist".to_string()),
@@ -285,4 +293,84 @@ fn list(name: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn resolve_upload_token(configured: Option<String>, oidc_mode: OidcMode, persist_path: &Path) -> String {
+    if let Some(token) = configured {
+        enforce_upload_token_entropy(&token, oidc_mode);
+        return token;
+    }
+    if let Ok(existing) = std::fs::read_to_string(persist_path) {
+        let existing = existing.trim().to_string();
+        if !existing.is_empty() && existing != INSECURE_UPLOAD_TOKEN {
+            enforce_upload_token_entropy(&existing, oidc_mode);
+            return existing;
+        }
+    }
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let generated: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    if let Some(parent) = persist_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(error) = std::fs::write(persist_path, &generated) {
+        if oidc_mode == OidcMode::Oidc {
+            panic!(
+                "failed to persist generated UPLOAD_TOKEN to {}: {error}",
+                persist_path.display()
+            );
+        }
+    }
+    generated
+}
+
+fn enforce_upload_token_entropy(token: &str, oidc_mode: OidcMode) {
+    if oidc_mode != OidcMode::Oidc {
+        return;
+    }
+    if token == INSECURE_UPLOAD_TOKEN || token.len() < MIN_PRODUCTION_UPLOAD_TOKEN_LEN {
+        panic!(
+            "UPLOAD_TOKEN must be at least {MIN_PRODUCTION_UPLOAD_TOKEN_LEN} characters \
+             and must not use the documented default in production"
+        );
+    }
+}
+
+#[cfg(test)]
+mod upload_token_tests {
+    use super::*;
+
+    #[test]
+    fn production_rejects_insecure_default() {
+        let err = std::panic::catch_unwind(|| {
+            enforce_upload_token_entropy(INSECURE_UPLOAD_TOKEN, OidcMode::Oidc);
+        });
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn production_rejects_short_secret() {
+        let err = std::panic::catch_unwind(|| {
+            enforce_upload_token_entropy("short-secret", OidcMode::Oidc);
+        });
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn mock_mode_allows_short_secret() {
+        enforce_upload_token_entropy("test-upload-token", OidcMode::Mock);
+    }
+
+    #[test]
+    fn generates_and_reuses_persistent_secret() {
+        let dir = std::env::temp_dir().join(format!("realtime-upload-token-{}", nanoid::nanoid!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".upload-token");
+        let first = resolve_upload_token(None, OidcMode::Mock, &path);
+        let second = resolve_upload_token(None, OidcMode::Mock, &path);
+        assert_eq!(first, second);
+        assert!(first.len() >= MIN_PRODUCTION_UPLOAD_TOKEN_LEN);
+        assert_ne!(first, INSECURE_UPLOAD_TOKEN);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

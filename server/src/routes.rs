@@ -867,6 +867,14 @@ fn clean_cursor_name(name: String) -> AppResult<String> {
     if name.is_empty() {
         return Err(AppError::BadRequest("cursor name is required".into()));
     }
+    if name.len() > 128 {
+        return Err(AppError::BadRequest("cursor name is too long".into()));
+    }
+    if name.chars().any(|c| c.is_control() || c == '<' || c == '>') {
+        return Err(AppError::BadRequest(
+            "cursor name contains invalid characters".into(),
+        ));
+    }
     Ok(name)
 }
 
