@@ -32,7 +32,7 @@ function SharedNote({ shareId }: { shareId: string }) {
     <div className="page">
       <article className="note">
         <h1 className="note-title">{note.title}</h1>
-        <Markdown shareId={shareId} content={note.content} />
+        <Markdown shareId={shareId} notePath={note.path} content={note.content} />
       </article>
       <footer className="footer">
         Shared with <a href="https://github.com/nealol/realtime">Realtime.md</a> · live updating

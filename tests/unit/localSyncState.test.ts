@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { LocalSyncState, shouldFoldOfflineDeletion } from "../../src/localSyncState";
+import { LocalSyncState } from "../../src/localSyncState";
 import { freshGuid } from "../support/util";
 
 async function state() {
@@ -9,22 +9,6 @@ async function state() {
 }
 
 describe("LocalSyncState", () => {
-  it("folds only an offline delete of the exact acknowledged identity", () => {
-    const acknowledged = {
-      kind: "text" as const,
-      identity: "old-guid",
-      fingerprint: "hash",
-      candidate: false,
-    };
-    expect(shouldFoldOfflineDeletion(acknowledged, "old-guid", false)).toBe(true);
-    expect(shouldFoldOfflineDeletion(acknowledged, "replacement-guid", false)).toBe(false);
-    expect(shouldFoldOfflineDeletion(acknowledged, "old-guid", true)).toBe(false);
-    expect(shouldFoldOfflineDeletion({ ...acknowledged, candidate: true }, "old-guid", false)).toBe(
-      false,
-    );
-    expect(shouldFoldOfflineDeletion(null, "old-guid", false)).toBe(false);
-  });
-
   it("keeps a candidate unresolved until identity and content are acknowledged", async () => {
     const local = await state();
     try {

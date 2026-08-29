@@ -8,7 +8,7 @@ import {
   type ConfigCategoryId,
 } from "./configCategories";
 import { dbg } from "./debug";
-import { shouldFoldOfflineDeletion, type LocalSyncState } from "./localSyncState";
+import type { LocalSyncState } from "./localSyncState";
 import { isConflictCopy, preserveAdapterConflict } from "./conflictRecovery";
 
 export interface ConfigMeta {
@@ -167,25 +167,6 @@ export class ConfigSync {
       }
     }
     dbg("ConfigSync seedBaseline", this.lastSyncedHash.size, "entries");
-  }
-
-  async foldOfflineDeletions(categories: Set<ConfigCategoryId>): Promise<void> {
-    this.enabledCategories = new Set(categories);
-    for (const [path, meta] of this.configFiles.entries()) {
-      const state = this.localSyncState?.get(path);
-      if (
-        this.syncableCategory(path) === null ||
-        !shouldFoldOfflineDeletion(
-          state,
-          meta.hash,
-          await this.plugin.app.vault.adapter.exists(path),
-        )
-      ) {
-        continue;
-      }
-      this.configFiles.delete(path);
-      this.localSyncState?.remove(path);
-    }
   }
 
   start(categories: Set<ConfigCategoryId>): void {

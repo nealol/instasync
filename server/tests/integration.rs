@@ -48,7 +48,10 @@ async fn fake_attachment_source() -> String {
     use axum::routing::get;
 
     async fn image() -> ([(&'static str, &'static str); 1], Vec<u8>) {
-        ([("content-type", "image/png")], b"\x89PNG\r\n\x1a\nremote image".to_vec())
+        (
+            [("content-type", "image/png")],
+            b"\x89PNG\r\n\x1a\nremote image".to_vec(),
+        )
     }
 
     let router = Router::new().route("/image.png", get(image));
@@ -922,6 +925,48 @@ async fn logout_revokes_session() {
     let (status, _) = send(&app, "POST", "/api/logout", Some(&token), Some(json!({}))).await;
     assert_eq!(status, StatusCode::OK);
 
+    let (status, _) = send(&app, "GET", "/api/me", Some(&token), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn active_sessions_renew_without_an_absolute_lifetime() {
+    use realtime_server::entities::sessions;
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+    let (app, state) = test_app_with_state().await;
+    let token = login(&app, "alice").await;
+    let token_hash = Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let session = sessions::Entity::find_by_id(&token_hash)
+        .one(&state.db)
+        .await
+        .unwrap()
+        .unwrap();
+    let near_expiry = realtime_server::session::now_millis() + 60_000;
+    let mut active: sessions::ActiveModel = session.into();
+    // An old creation date must not impose an absolute session lifetime.
+    active.created_at = Set(0);
+    active.expires_at = Set(near_expiry);
+    active.update(&state.db).await.unwrap();
+
+    let (status, _) = send(&app, "GET", "/api/me", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let renewed = sessions::Entity::find_by_id(&token_hash)
+        .one(&state.db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        renewed.expires_at > near_expiry + 29 * 24 * 60 * 60 * 1000,
+        "active session should receive a fresh 30-day inactivity deadline"
+    );
+
+    let mut expired: sessions::ActiveModel = renewed.into();
+    expired.expires_at = Set(realtime_server::session::now_millis() - 1);
+    expired.update(&state.db).await.unwrap();
     let (status, _) = send(&app, "GET", "/api/me", Some(&token), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
@@ -2006,7 +2051,10 @@ async fn attachment_upload_from_url_roundtrip() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(uploaded["path"], "web/image.png");
-    assert_eq!(uploaded["size"], b"\x89PNG\r\n\x1a\nremote image".len() as i64);
+    assert_eq!(
+        uploaded["size"],
+        b"\x89PNG\r\n\x1a\nremote image".len() as i64
+    );
 
     let url = format!("/api/vaults/{vault_id}/attachments/web/image.png");
     let res = app

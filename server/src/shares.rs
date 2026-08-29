@@ -547,8 +547,8 @@ pub async fn view_attachment(
     let (share, file) = resolve_share(&state, &share_id).await?;
     let note_doc_id = format!("{}__{}", share.vault_id, share.guid);
     let update = ydoc::read_update(&state, &note_doc_id).await?;
-    let content = ydoc::decode_text(&update, "contents")
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let content =
+        ydoc::decode_text(&update, "contents").map_err(|e| AppError::Internal(e.to_string()))?;
     if !note_references_attachment(&content, &file.path, &path) {
         return Err(AppError::NotFound);
     }
@@ -722,6 +722,11 @@ mod tests {
             "Notes/hiring.md",
             "Notes/chart.png"
         ));
+        assert!(note_references_attachment(
+            "![chart](../images/chart%20one.png)",
+            "Notes/Published/hiring.md",
+            "Notes/images/chart one.png"
+        ));
     }
 }
 
@@ -774,20 +779,49 @@ fn extract_attachment_targets(content: &str) -> Vec<String> {
 }
 
 fn attachment_target_matches(target: &str, requested: &str, note_dir: &str) -> bool {
-    let target = target.trim().trim_matches('/');
-    if target.eq_ignore_ascii_case(requested) {
+    let Some(requested) = normalize_attachment_path("", requested) else {
+        return false;
+    };
+    let Some(vault_target) = normalize_attachment_path("", target) else {
+        return false;
+    };
+    if vault_target.eq_ignore_ascii_case(&requested) {
         return true;
     }
-    let target_base = target.rsplit('/').next().unwrap_or(target);
-    let requested_base = requested.rsplit('/').next().unwrap_or(requested);
-    if target_base.eq_ignore_ascii_case(requested_base) && !target.contains('/') {
+    let target_base = vault_target.rsplit('/').next().unwrap_or(&vault_target);
+    let requested_base = requested.rsplit('/').next().unwrap_or(&requested);
+    if target_base.eq_ignore_ascii_case(requested_base) && !vault_target.contains('/') {
         return true;
     }
-    if !note_dir.is_empty() {
-        let relative = format!("{note_dir}/{target}");
-        if relative.eq_ignore_ascii_case(requested) {
+    if let Some(relative) = normalize_attachment_path(note_dir, target) {
+        if relative.eq_ignore_ascii_case(&requested) {
             return true;
         }
     }
     false
+}
+
+fn normalize_attachment_path(base_dir: &str, path: &str) -> Option<String> {
+    let path = path.trim().split(['?', '#']).next().unwrap_or("");
+    let decoded = percent_encoding::percent_decode_str(path)
+        .decode_utf8()
+        .ok()?;
+    let mut segments: Vec<&str> = if decoded.starts_with('/') {
+        Vec::new()
+    } else {
+        base_dir
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect()
+    };
+    for segment in decoded.split(['/', '\\']) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            segment => segments.push(segment),
+        }
+    }
+    (!segments.is_empty()).then(|| segments.join("/"))
 }

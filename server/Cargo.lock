@@ -2277,7 +2277,7 @@ dependencies = [
 
 [[package]]
 name = "realtime-server"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "apalis",
@@ -2294,6 +2294,7 @@ dependencies = [
  "nanoid",
  "nix",
  "openidconnect",
+ "percent-encoding",
  "proptest",
  "rand 0.8.6",
  "regex",

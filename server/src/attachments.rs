@@ -18,8 +18,8 @@ use url::Url;
 use yrs::Any;
 
 use crate::audit::{self, AuditEntry};
-use crate::crdt::Level;
 use crate::config::OidcMode;
+use crate::crdt::Level;
 use crate::entities::upload_jtis;
 use crate::error::{AppError, AppResult};
 use crate::routes::{authorize_path, require_member};
@@ -430,10 +430,7 @@ pub(crate) async fn upload_attachment_url_inner(
     if bytes.len() as u64 > state.config.attachment_max_bytes {
         return Err(AppError::PayloadTooLarge);
     }
-    reject_html_upload(
-        None,
-        &bytes,
-    )?;
+    reject_html_upload(None, &bytes)?;
     validate_magic_for_path(&body.path, &bytes)?;
     let (hash, size) = store_bytes(state, vault_id, &bytes).await?;
     ydoc::index_set_binary(state, vault_id, &body.path, &hash, size).await?;

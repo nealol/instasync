@@ -1243,11 +1243,12 @@ impl PersistentDocument {
                 .map_err(|_| CrdtError::Protocol("document lock poisoned".into()))?;
             awareness.doc().clone()
         };
-        let (encoded_state_bytes, delete_set_bytes) = tokio::task::spawn_blocking(move || {
-            crdt_epoch::document_measurements(&doc)
-        })
-        .await
-        .map_err(|error| CrdtError::Protocol(format!("epoch measurements join: {error}")))?;
+        let (encoded_state_bytes, delete_set_bytes) =
+            tokio::task::spawn_blocking(move || crdt_epoch::document_measurements(&doc))
+                .await
+                .map_err(|error| {
+                    CrdtError::Protocol(format!("epoch measurements join: {error}"))
+                })?;
         let update_count = self.persistence.lock().await.total_records();
         Ok((encoded_state_bytes, delete_set_bytes, update_count))
     }

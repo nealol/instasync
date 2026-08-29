@@ -154,6 +154,53 @@ describe("BinarySync", () => {
     }
   });
 
+  it("leaves device-excluded binaries in the shared index without transferring bytes", async () => {
+    const A = makeDevice("filter-source");
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+      clientName: "filter-target",
+    });
+    const indexDoc = new Y.Doc();
+    const provider = new RealtimeProvider(vaultId, indexDoc, () =>
+      getClientToken(plugin as any, vaultId),
+    );
+    const bs = new BinarySync(
+      plugin as any,
+      {
+        isTextSyncBusy: () => false,
+        recordTrash: () => {},
+      } as any,
+      indexDoc,
+      undefined,
+      () => false,
+    );
+    const binaries = indexDoc.getMap<BinaryMeta>("binaries");
+    try {
+      await synced(A.provider);
+      await synced(provider);
+      await bs.reconcileAll([]);
+
+      A.vault.binaries.set("excluded.png", bytes([1, 2, 3]));
+      A.bs.seedBaseline();
+      await A.bs.reconcileAll(["excluded.png"]);
+      await waitFor(() => binaries.has("excluded.png"), {
+        label: "excluded binary metadata received",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(vault.binaries.has("excluded.png")).toBe(false);
+      expect(binaries.has("excluded.png")).toBe(true);
+    } finally {
+      A.bs.destroy();
+      A.provider.destroy();
+      A.indexDoc.destroy();
+      bs.destroy();
+      provider.destroy();
+      indexDoc.destroy();
+    }
+  });
+
   it("signals uploading then idle around an upload", async () => {
     const A = makeDevice("A");
     try {

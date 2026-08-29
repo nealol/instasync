@@ -2,8 +2,10 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { Markdown } from "../../src/Markdown";
 
-function render(content: string): string {
-  return renderToStaticMarkup(<Markdown shareId="share123" content={content} />);
+function render(content: string, notePath = "Notes/Shared.md"): string {
+  return renderToStaticMarkup(
+    <Markdown shareId="share123" notePath={notePath} content={content} />,
+  );
 }
 
 describe("Markdown component", () => {
@@ -23,6 +25,23 @@ describe("Markdown component", () => {
   it("renders image embeds against the share-scoped attachment route", () => {
     const html = render("![[pics/cat.png]]");
     expect(html).toContain('src="/api/view/share123/attachments/pics/cat.png"');
+  });
+
+  it("renders Markdown images relative to the shared note", () => {
+    const html = render("![cat](../pics/cat%20photo.png)", "Notes/Published/Shared.md");
+    expect(html).toContain(
+      'src="/api/view/share123/attachments/Notes/pics/cat%20photo.png"',
+    );
+  });
+
+  it("renders vault-root Markdown images against the share route", () => {
+    const html = render("![cat](/pics/cat.png)");
+    expect(html).toContain('src="/api/view/share123/attachments/pics/cat.png"');
+  });
+
+  it("leaves remote Markdown images unchanged", () => {
+    const html = render("![cat](https://cdn.example.com/cat.png)");
+    expect(html).toContain('src="https://cdn.example.com/cat.png"');
   });
 
   it("renders callouts with type, title and body", () => {

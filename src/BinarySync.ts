@@ -6,7 +6,7 @@ import { sha256Hex } from "./hash";
 import { dbg } from "./debug";
 import { ensureParentFolder, getFileByPath, isOpenInWorkspace } from "./vaultHelpers";
 import { openBinaryConflictModal, type ConflictChoice } from "./BinaryConflictModal";
-import { shouldFoldOfflineDeletion, type LocalSyncState } from "./localSyncState";
+import type { LocalSyncState } from "./localSyncState";
 import { preserveBinaryConflict } from "./conflictRecovery";
 
 /**
@@ -65,6 +65,8 @@ export class BinarySync {
   private binaries: Y.Map<BinaryMeta>;
   private indexDoc: Y.Doc;
   private localSyncState?: LocalSyncState;
+  /** Device-local filter; excluded paths stay in the shared index for peers. */
+  private shouldTrack: (path: string) => boolean;
 
   /** Per-path hash this device has reconciled with disk (the merge baseline). */
   private lastSyncedHash = new Map<string, string>();
@@ -107,11 +109,13 @@ export class BinarySync {
     vaultSync: VaultSync,
     indexDoc: Y.Doc,
     localSyncState?: LocalSyncState,
+    shouldTrack: (path: string) => boolean = () => true,
   ) {
     this.plugin = plugin;
     this.vaultSync = vaultSync;
     this.indexDoc = indexDoc;
     this.localSyncState = localSyncState;
+    this.shouldTrack = shouldTrack;
     this.binaries = indexDoc.getMap<BinaryMeta>("binaries");
     this.observer = this.onBinariesChanged.bind(this);
     this.binaries.observe(this.observer);
@@ -154,28 +158,6 @@ export class BinarySync {
     dbg("BinarySync seedBaseline", this.lastSyncedHash.size, "entries");
   }
 
-  foldOfflineDeletions(shouldTrack: (path: string) => boolean): void {
-    for (const [path, meta] of this.binaries.entries()) {
-      const state = this.localSyncState?.get(path);
-      if (
-        !shouldTrack(path) ||
-        !shouldFoldOfflineDeletion(state, meta.hash, getFileByPath(this.plugin.app, path) !== null)
-      ) {
-        continue;
-      }
-      if (meta?.hash) {
-        this.vaultSync.recordTrash({
-          path,
-          kind: "binary",
-          hash: meta.hash,
-          size: meta.size,
-        });
-      }
-      this.binaries.delete(path);
-      this.localSyncState?.remove(path);
-    }
-  }
-
   /**
    * One-shot reconcile after the first server sync: walk every path known to the
    * remote map or present locally, then enable the live observer.
@@ -211,6 +193,7 @@ export class BinarySync {
     if (this.destroyed) return;
     const added: string[] = [];
     for (const path of paths) {
+      if (!this.shouldTrack(path)) continue;
       if (!this.urgentPaths.has(path)) added.push(path);
       this.urgentPaths.add(path);
     }
@@ -242,6 +225,7 @@ export class BinarySync {
 
   /** A local binary file was created or modified. */
   onLocalChanged(path: string): void {
+    if (!this.shouldTrack(path)) return;
     if (this.ignoredPaths.has(path)) return;
     if (this.writing.has(path)) return;
     this.bumpDiskVersion(path);
@@ -250,6 +234,7 @@ export class BinarySync {
 
   /** A local binary file was deleted. */
   onLocalDeleted(path: string): void {
+    if (!this.shouldTrack(path)) return;
     if (this.ignoredPaths.has(path)) return;
     if (this.writing.has(path)) return;
     this.bumpDiskVersion(path);
@@ -258,6 +243,7 @@ export class BinarySync {
 
   /** A local binary file was renamed: treat as a delete of old + change of new. */
   onLocalRenamed(file: TFile, oldPath: string): void {
+    if (!this.shouldTrack(oldPath) && !this.shouldTrack(file.path)) return;
     if (this.ignoredPaths.has(oldPath) || this.ignoredPaths.has(file.path)) return;
     this.bumpDiskVersion(oldPath);
     this.bumpDiskVersion(file.path);
@@ -268,6 +254,7 @@ export class BinarySync {
   private onBinariesChanged(event: Y.YMapEvent<BinaryMeta>): void {
     if (this.destroyed || !this.started) return;
     event.changes.keys.forEach((_change, path) => {
+      if (!this.shouldTrack(path)) return;
       if (this.ignoredPaths.has(path)) return;
       void this.reconcile(path);
     });
@@ -301,6 +288,7 @@ export class BinarySync {
 
   private async reconcileNow(path: string): Promise<void> {
     if (this.destroyed) return;
+    if (!this.shouldTrack(path)) return;
     if (this.ignoredPaths.has(path)) return;
     const initialPull = this.pullingMissingRemote || this.deferredInitialPulls.delete(path);
     if (this.paused) {

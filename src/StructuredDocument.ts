@@ -21,6 +21,8 @@ export abstract class StructuredDocument extends SyncedDoc {
   private writingTextToDisk: string | null = null;
   private writeTimer: number | null = null;
   private startupReconciled = false;
+  /** True only after startup content is durably present on this device. */
+  private startupReady = false;
   private startupReconciling = false;
   private readonly forceBootstrapConflict: boolean;
   private baselineAtStartup: JsonValue = {};
@@ -85,54 +87,62 @@ export abstract class StructuredDocument extends SyncedDoc {
   }
 
   protected async finishStartupReconcile(): Promise<void> {
-    if (this.startupReconciled || this.startupReconciling || this.destroyed) return;
+    if (this.startupReady || this.startupReconciling || this.destroyed) return;
     this.startupReconciling = true;
     let completed = false;
     try {
-      const remote = this.value;
-      if (
-        this.diskAtStartup !== null &&
-        (this.localChangedAtStartup || this.forceBootstrapConflict)
-      ) {
-        const merge = this.forceBootstrapConflict
-          ? {
-              value: this.diskAtStartup,
-              conflicted: this.serialize(this.diskAtStartup) !== this.serialize(remote),
+      if (!this.startupReconciled) {
+        const remote = this.value;
+        if (
+          this.diskAtStartup !== null &&
+          (this.localChangedAtStartup || this.forceBootstrapConflict)
+        ) {
+          const merge = this.forceBootstrapConflict
+            ? {
+                value: this.diskAtStartup,
+                conflicted: this.serialize(this.diskAtStartup) !== this.serialize(remote),
+              }
+            : mergeStructuredStartupResult(this.baselineAtStartup, this.diskAtStartup, remote);
+          if (merge.conflicted) {
+            const preservedPath = await preserveTextConflict(
+              this.plugin,
+              this.path,
+              this.serialize(remote),
+              "remote",
+            );
+            new Notice(
+              `Realtime: merged "${this.path}" and preserved the conflicting remote version as "${preservedPath}".`,
+            );
+            const latestDisk = await this.readParsedFromDisk();
+            if (this.destroyed) return;
+            if (
+              latestDisk === null ||
+              this.serialize(latestDisk) !== this.serialize(this.diskAtStartup) ||
+              this.serialize(this.value) !== this.serialize(remote)
+            ) {
+              this.diskAtStartup = latestDisk;
+              return;
             }
-          : mergeStructuredStartupResult(this.baselineAtStartup, this.diskAtStartup, remote);
-        if (merge.conflicted) {
-          const preservedPath = await preserveTextConflict(
-            this.plugin,
-            this.path,
-            this.serialize(remote),
-            "remote",
-          );
-          new Notice(
-            `Realtime: merged "${this.path}" and preserved the conflicting remote version as "${preservedPath}".`,
-          );
-          const latestDisk = await this.readParsedFromDisk();
-          if (this.destroyed) return;
-          if (
-            latestDisk === null ||
-            this.serialize(latestDisk) !== this.serialize(this.diskAtStartup) ||
-            this.serialize(this.value) !== this.serialize(remote)
-          ) {
-            this.diskAtStartup = latestDisk;
-            return;
           }
+          if (this.destroyed) return;
+          this.applyValue(merge.value, DISK_ORIGIN);
         }
-        if (this.destroyed) return;
-        this.applyValue(merge.value, DISK_ORIGIN);
+        this.startupReconciled = true;
       }
-      this.startupReconciled = true;
-      this.plugin.vaultSync?.noteMaterialized(
-        this.path,
-        this.path.endsWith(".canvas") ? "canvas" : "base",
-        this.guid,
-      );
+
+      let materialized = this.getFile() !== null;
       if (!this.suppressedWhileOpen() && !this.diskParseFailed) {
-        await this.writeToDisk(this.serialize(this.value));
+        materialized = await this.writeToDisk(this.serialize(this.value));
+      } else if (materialized) {
+        this.plugin.vaultSync?.noteMaterialized(
+          this.path,
+          this.path.endsWith(".canvas") ? "canvas" : "base",
+          this.guid,
+        );
       }
+      if (!materialized || this.destroyed) return;
+
+      this.startupReady = true;
       if (!this.provider.hasLocalChanges) await this.recordAcknowledgedContent(true);
       completed = true;
     } catch (e) {
@@ -148,7 +158,7 @@ export abstract class StructuredDocument extends SyncedDoc {
   }
 
   protected async afterChangesSynced(): Promise<void> {
-    if (!this.startupReconciled || this.destroyed) return;
+    if (!this.startupReady || this.destroyed) return;
     await this.recordAcknowledgedContent(true);
   }
 
@@ -159,7 +169,7 @@ export abstract class StructuredDocument extends SyncedDoc {
       this.destroyed ||
       this.provider.hasLocalChanges ||
       this.serialize(this.value) !== content ||
-      !this.startupReconciled
+      !this.startupReady
     ) {
       return;
     }
@@ -189,7 +199,7 @@ export abstract class StructuredDocument extends SyncedDoc {
   }
 
   protected onRootChanged(_origin?: unknown): void {
-    if (this.destroyed || !this.startupReconciled) return;
+    if (this.destroyed || !this.startupReady) return;
     this.plugin.vaultSync?.noteTextActivity();
     if (this.suppressedWhileOpen()) return;
     this.scheduleWriteToDisk();
@@ -199,7 +209,7 @@ export abstract class StructuredDocument extends SyncedDoc {
     if (this.writeTimer !== null) window.clearTimeout(this.writeTimer);
     this.writeTimer = window.setTimeout(() => {
       this.writeTimer = null;
-      if (this.destroyed || !this.startupReconciled || this.suppressedWhileOpen()) return;
+      if (this.destroyed || !this.startupReady || this.suppressedWhileOpen()) return;
       void this.writeToDisk(this.serialize(this.value));
     }, 100);
   }
@@ -234,32 +244,49 @@ export abstract class StructuredDocument extends SyncedDoc {
     }
   }
 
-  protected async writeToDisk(text: string): Promise<void> {
-    if (this.destroyed) return;
+  protected async writeToDisk(text: string): Promise<boolean> {
+    if (this.destroyed) return false;
     this.writingTextToDisk = text;
     try {
       const file = this.getFile();
       if (file) {
-        if (this.suppressedWhileOpen()) return;
+        if (this.suppressedWhileOpen()) {
+          this.plugin.vaultSync?.noteMaterialized(
+            this.path,
+            this.path.endsWith(".canvas") ? "canvas" : "base",
+            this.guid,
+          );
+          return true;
+        }
         if ((await this.plugin.app.vault.read(file)) === text) {
           this.plugin.vaultSync?.noteMaterialized(
             this.path,
             this.path.endsWith(".canvas") ? "canvas" : "base",
             this.guid,
           );
-          if (!this.provider.hasLocalChanges) await this.recordAcknowledgedContent(true);
-          return;
+          if (this.startupReady && !this.provider.hasLocalChanges) {
+            await this.recordAcknowledgedContent(true);
+          }
+          return true;
         }
         // Re-check destroyed after the await: a doc replaced mid-write (rename,
         // guid change) must not clobber the file its successor now owns.
-        if (this.destroyed || this.suppressedWhileOpen()) return;
-        if (this.serialize(this.value) !== text) return;
+        if (this.destroyed) return false;
+        if (this.suppressedWhileOpen()) {
+          this.plugin.vaultSync?.noteMaterialized(
+            this.path,
+            this.path.endsWith(".canvas") ? "canvas" : "base",
+            this.guid,
+          );
+          return true;
+        }
+        if (this.serialize(this.value) !== text) return false;
         await this.plugin.app.vault.modify(file, text);
       } else {
         const path = normalizePath(this.path);
         await ensureParentFolder(this.plugin.app, path);
-        if (this.destroyed) return;
-        if (this.serialize(this.value) !== text) return;
+        if (this.destroyed) return false;
+        if (this.serialize(this.value) !== text) return false;
         await this.plugin.app.vault.create(path, text);
       }
       this.plugin.vaultSync?.noteMaterialized(
@@ -267,9 +294,13 @@ export abstract class StructuredDocument extends SyncedDoc {
         this.path.endsWith(".canvas") ? "canvas" : "base",
         this.guid,
       );
-      if (!this.provider.hasLocalChanges) await this.recordAcknowledgedContent(true);
+      if (this.startupReady && !this.provider.hasLocalChanges) {
+        await this.recordAcknowledgedContent(true);
+      }
+      return true;
     } catch (e) {
       console.error(`[Realtime] structured writeToDisk failed for ${this.path}`, e);
+      return false;
     } finally {
       window.setTimeout(() => {
         this.writingTextToDisk = null;

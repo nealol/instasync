@@ -18,11 +18,11 @@ import { Document } from "./Document";
 import { CanvasDocument } from "./CanvasDocument";
 import { BaseDocument } from "./BaseDocument";
 import type { StructuredDocument } from "./StructuredDocument";
-import { BinarySync } from "./BinarySync";
-import { ConfigSync } from "./ConfigSync";
+import { BinarySync, type BinaryMeta } from "./BinarySync";
+import { ConfigSync, type ConfigMeta } from "./ConfigSync";
 import { categoryForConfigPath, enabledConfigCategories } from "./configCategories";
 import { matchesAnyGlob, parseGlobs } from "./glob";
-import { LocalSyncState, shouldFoldOfflineDeletion, type MaterializedKind } from "./localSyncState";
+import { LocalSyncState, type MaterializedKind } from "./localSyncState";
 import { isConflictCopy, preserveTextConflict } from "./conflictRecovery";
 export { isConflictCopy } from "./conflictRecovery";
 import { sha256Text } from "./hash";
@@ -188,7 +188,19 @@ export class VaultSync {
     const serverScope = plugin.settings.authServerId || plugin.settings.authServerUrl;
     const localScope = `${serverScope}:${vaultId}`;
     this.localSyncState = new LocalSyncState(localScope);
-    this.binarySync = new BinarySync(plugin, this, this.indexDoc, this.localSyncState);
+    this.binarySync = new BinarySync(
+      plugin,
+      this,
+      this.indexDoc,
+      this.localSyncState,
+      (path) =>
+        this.structuredKindForPath(path) !== null ||
+        shouldSyncCanvasBinaryPath(
+          path,
+          this.plugin.settings.syncBinaries,
+          this.plugin.settings.binaryExcludeGlobs,
+        ),
+    );
     if (this.mobileSuspended) this.binarySync.setPaused(true);
     this.configSync = new ConfigSync(plugin, this.indexDoc, this.localSyncState);
     if (this.mobileSuspended) this.configSync.setPaused(true);
@@ -261,8 +273,6 @@ export class VaultSync {
     }
     if (this.destroyed) return;
     this.migrateLegacyLocalState();
-    await this.foldOfflineDeletions();
-    if (this.destroyed) return;
     this.startupFiles = new Map(this.files.entries());
     this.startupStructured = new Map(
       [...this.structured.entries()].filter((entry): entry is [string, StructuredMeta] =>
@@ -315,49 +325,6 @@ export class VaultSync {
           this.localSyncState.migrateLegacyIdentity(path, "config", meta.hash);
         }
       }
-    }
-  }
-
-  /**
-   * Fold deletions made while Obsidian was stopped into the persisted index
-   * before connecting. Missing paths on a fresh device are still pulled.
-   */
-  private async foldOfflineDeletions(): Promise<void> {
-    this.indexDoc.transact(() => {
-      for (const [path, guid] of this.files.entries()) {
-        const state = this.localSyncState.get(path);
-        if (!shouldFoldOfflineDeletion(state, guid, this.localFileExists(path))) {
-          continue;
-        }
-        this.recordTrashIn({ path, kind: "text", guid });
-        this.files.delete(path);
-        this.localSyncState.remove(path);
-      }
-      for (const [path, meta] of this.structured.entries()) {
-        const state = this.localSyncState.get(path);
-        if (
-          !isStructuredMeta(meta) ||
-          !shouldFoldOfflineDeletion(state, meta.guid, this.localFileExists(path))
-        ) {
-          continue;
-        }
-        this.recordTrashIn({ path, kind: meta.kind, guid: meta.guid });
-        this.structured.delete(path);
-        this.localSyncState.remove(path);
-      }
-    });
-
-    this.binarySync.foldOfflineDeletions((path) =>
-      shouldSyncCanvasBinaryPath(
-        path,
-        this.plugin.settings.syncBinaries,
-        this.plugin.settings.binaryExcludeGlobs,
-      ),
-    );
-    if (this.plugin.settings.syncConfigEnabled) {
-      await this.configSync.foldOfflineDeletions(
-        enabledConfigCategories(this.plugin.settings.configSyncCategories),
-      );
     }
   }
 
@@ -483,6 +450,7 @@ export class VaultSync {
     const binaryPaths: string[] = [];
     for (const path of paths) {
       if (
+        this.isConfigPath(path) ||
         !shouldSyncCanvasBinaryPath(
           path,
           this.plugin.settings.syncBinaries,
@@ -1007,6 +975,39 @@ export class VaultSync {
   }
 
   private async reconcileBinariesAndMigrateStructured(): Promise<void> {
+    // Config files used to be routed through BinarySync. They are invisible to
+    // Obsidian's indexed Vault API, so BinarySync would repeatedly call
+    // createBinary for an adapter file that already exists. ConfigSync owns the
+    // whole config directory now; remove legacy binary entries before any blob
+    // reconciliation can try to materialize them.
+    const legacyBinaries = this.indexDoc.getMap<BinaryMeta>("binaries");
+    const configFiles = this.indexDoc.getMap<ConfigMeta>("configFiles");
+    const configPrefix = `${this.plugin.app.vault.configDir.replace(/\/+$/, "")}/`;
+    for (const path of this.binarySync.remotePaths()) {
+      if (!this.isConfigPath(path)) continue;
+      const legacy = legacyBinaries.get(path);
+      const relativePath = path.slice(configPrefix.length);
+      const isRealtimePluginFile =
+        relativePath === "plugins/realtime" || relativePath.startsWith("plugins/realtime/");
+      if (
+        legacy?.hash &&
+        !isRealtimePluginFile &&
+        categoryForConfigPath(relativePath) !== null &&
+        !configFiles.has(path)
+      ) {
+        // Keep the existing blob reachable during the ownership cutover.
+        // Legacy binary metadata had no mtime; zero makes any later local
+        // conflict newer without changing fresh-device remote-first behavior.
+        configFiles.set(path, {
+          hash: legacy.hash,
+          size: legacy.size,
+          mtime: 0,
+        });
+      }
+      this.binarySync.stopTrackingPath(path);
+      this.localSyncState.remove(path);
+    }
+
     await this.binarySync.reconcileAll(this.localBinaryPaths());
     if (this.destroyed) return;
 
@@ -1389,6 +1390,7 @@ export class VaultSync {
   private classify(file: TAbstractFile): FileKind {
     if (!(file instanceof TFile)) return "ignore";
     if (isConflictCopy(file.path)) return "ignore";
+    if (this.isConfigPath(file.path)) return "ignore";
     if (file.extension === "md") return "text";
     if (file.extension === "canvas" && this.plugin.settings.syncCanvases) return "structured";
     if (file.extension === "base" && this.plugin.settings.syncBases) return "structured";
@@ -1397,6 +1399,11 @@ export class VaultSync {
       return "ignore";
     }
     return "binary";
+  }
+
+  private isConfigPath(path: string): boolean {
+    const configDir = this.plugin.app.vault.configDir.replace(/\/+$/, "");
+    return configDir.length > 0 && path.startsWith(`${configDir}/`);
   }
 
   private structuredKindForExtension(extension: string): StructuredKind | null {

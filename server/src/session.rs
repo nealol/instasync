@@ -1,6 +1,8 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{
+    sea_query::Expr, ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set,
+};
 use sha2::{Digest, Sha256};
 
 use crate::entities::{oauth_tokens, remote_cursor_tokens, remote_cursors, sessions, users};
@@ -17,6 +19,7 @@ pub fn now_millis() -> i64 {
 }
 
 const SESSION_TTL_MS: i64 = 1000 * 60 * 60 * 24 * 30; // 30 days
+const SESSION_RENEWAL_WINDOW_MS: i64 = 1000 * 60 * 60 * 24 * 7; // final 7 days
 
 fn random_token() -> String {
     use rand::Rng;
@@ -96,6 +99,42 @@ pub fn bearer_token(header: &str) -> Option<&str> {
         .or_else(|| header.strip_prefix("bearer "))
 }
 
+/// Resolve a user session and slide its inactivity deadline when it enters the
+/// renewal window. There is intentionally no absolute lifetime: a session can
+/// remain valid indefinitely while it is used, but still expires after 30 days
+/// without an authenticated request.
+async fn session_user(
+    db: &impl ConnectionTrait,
+    token_hash: &str,
+) -> Result<Option<users::Model>, AppError> {
+    let Some(session) = sessions::Entity::find_by_id(token_hash).one(db).await? else {
+        return Ok(None);
+    };
+    let now = now_millis();
+    if session.expires_at < now {
+        return Err(AppError::Unauthorized);
+    }
+
+    let user = users::Entity::find_by_id(&session.user_id)
+        .one(db)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+
+    if session.expires_at <= now + SESSION_RENEWAL_WINDOW_MS {
+        sessions::Entity::update_many()
+            .col_expr(
+                sessions::Column::ExpiresAt,
+                Expr::value(now + SESSION_TTL_MS),
+            )
+            .filter(sessions::Column::Token.eq(&session.token))
+            .filter(sessions::Column::ExpiresAt.eq(session.expires_at))
+            .exec(db)
+            .await?;
+    }
+
+    Ok(Some(user))
+}
+
 /// Authenticated user, extracted from the `Authorization: Bearer <token>` header.
 pub struct AuthUser(pub users::Model);
 
@@ -113,17 +152,7 @@ impl FromRequestParts<AppState> for AuthUser {
             .ok_or(AppError::Unauthorized)?;
         let token = bearer_token(header).ok_or(AppError::Unauthorized)?;
 
-        let session = sessions::Entity::find_by_id(hash_token(token))
-            .one(&state.db)
-            .await?
-            .ok_or(AppError::Unauthorized)?;
-
-        if session.expires_at < now_millis() {
-            return Err(AppError::Unauthorized);
-        }
-
-        let user = users::Entity::find_by_id(session.user_id)
-            .one(&state.db)
+        let user = session_user(&state.db, &hash_token(token))
             .await?
             .ok_or(AppError::Unauthorized)?;
 
@@ -246,17 +275,7 @@ impl FromRequestParts<AppState> for ApiPrincipal {
         let token = bearer_token(header).ok_or(AppError::Unauthorized)?;
         let token_hash = hash_token(token);
 
-        if let Some(session) = sessions::Entity::find_by_id(token_hash.clone())
-            .one(&state.db)
-            .await?
-        {
-            if session.expires_at < now_millis() {
-                return Err(AppError::Unauthorized);
-            }
-            let user = users::Entity::find_by_id(session.user_id)
-                .one(&state.db)
-                .await?
-                .ok_or(AppError::Unauthorized)?;
+        if let Some(user) = session_user(&state.db, &token_hash).await? {
             return Ok(ApiPrincipal {
                 user,
                 actor: ApiActor::User,

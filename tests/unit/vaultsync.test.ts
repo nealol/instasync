@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import * as Y from "yjs";
-import { Platform } from "obsidian";
+import { Platform, TFile } from "obsidian";
 import { RealtimeProvider } from "../../src/sync/RealtimeProvider";
 import { VaultSync, shouldSyncCanvasBinaryPath } from "../../src/VaultSync";
 import { getClientToken } from "../../src/sync/clientToken";
@@ -415,7 +415,52 @@ describe("VaultSync index", () => {
     }
   });
 
-  it("reproduces acknowledged-note loss after an offline local deletion", async () => {
+  it("does not publish a deletion when restart interrupts remote note materialization", async () => {
+    const vault = await harness.createVault(aliceToken, "remote-create-interrupted");
+    const created = await createNote(vault.id, "Servant42/interrupted.md", "remote content");
+    const local = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    const originalCreate = local.vault.create.bind(local.vault);
+    let createStarted = false;
+    let releaseCreate!: () => void;
+    const createBlocked = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    local.vault.create = vi.fn(async () => {
+      createStarted = true;
+      await createBlocked;
+      throw new Error("simulated shutdown during create");
+    });
+
+    const first = new VaultSync(local.plugin as any);
+    (local.plugin as any).vaultSync = first;
+    await waitFor(() => createStarted, {
+      timeout: 20_000,
+      label: "remote note disk create started",
+    });
+    expect((first as any).localSyncState.has(created.path)).toBe(false);
+    first.destroy();
+    releaseCreate();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    local.vault.create = originalCreate;
+
+    const restarted = new VaultSync(local.plugin as any);
+    (local.plugin as any).vaultSync = restarted;
+    try {
+      await waitFor(() => local.vault.files.get(created.path) === created.content, {
+        timeout: 20_000,
+        label: "interrupted remote note materialized after restart",
+      });
+      expect((await listNotes(vault.id)).map((note) => note.guid)).toContain(created.guid);
+      expect(await readNoteStatus(vault.id, created.path)).toBe(200);
+    } finally {
+      restarted.destroy();
+    }
+  });
+
+  it("restores an acknowledged note missing when the client starts", async () => {
     const vault = await harness.createVault(aliceToken, "offline-delete");
     const local = makeFakePlugin(harness.authUrl, {
       sessionToken: aliceToken,
@@ -431,17 +476,19 @@ describe("VaultSync index", () => {
     });
     sync.destroy();
 
-    // The file disappears while the plugin is stopped, so no live delete event
-    // publishes a tombstone. Startup folds the absence into the persisted index.
+    // The file disappears while the plugin is stopped. Absence alone is not
+    // proof of an intentional delete: cloud storage may be unavailable or
+    // evicted, so startup must restore the authoritative remote note.
     local.vault.files.delete(created.path);
     const restarted = new VaultSync(local.plugin as any);
     (local.plugin as any).vaultSync = restarted;
     try {
-      await waitFor(
-        async () => !(await listNotes(vault.id)).some((note) => note.guid === created.guid),
-        { timeout: 20_000, label: "registry row pruned after offline delete" },
-      );
-      expect(await readNoteStatus(vault.id, created.path)).toBe(404);
+      await waitFor(() => local.vault.files.get(created.path) === created.content, {
+        timeout: 20_000,
+        label: "missing startup note restored",
+      });
+      expect((await listNotes(vault.id)).map((note) => note.guid)).toContain(created.guid);
+      expect(await readNoteStatus(vault.id, created.path)).toBe(200);
     } finally {
       restarted.destroy();
     }
@@ -525,7 +572,54 @@ describe("VaultSync index", () => {
     expect(shouldSyncCanvasBinaryPath("image.png", true, "")).toBe(true);
   });
 
-  it("resumes a binary rename after stopping before its async reconcile runs", async () => {
+  it("keeps config files out of binary sync and removes legacy binary entries", async () => {
+    const vault = await harness.createVault(aliceToken, "config-binary-cutover");
+    const local = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    const sync = new VaultSync(local.plugin as any);
+    try {
+      const state = sync as any;
+      const configPath = ".obsidian/workspace.json";
+      const existingConfigPath = ".obsidian/app.json";
+      expect(state.classify(new TFile(configPath))).toBe("ignore");
+      expect(state.classify(new TFile("attachment.bin"))).toBe("binary");
+
+      state.indexDoc.getMap("binaries").set(configPath, {
+        hash: "a".repeat(64),
+        size: 2,
+      });
+      state.indexDoc.getMap("binaries").set(existingConfigPath, {
+        hash: "b".repeat(64),
+        size: 3,
+      });
+      state.indexDoc.getMap("configFiles").set(existingConfigPath, {
+        hash: "c".repeat(64),
+        size: 4,
+        mtime: 42,
+      });
+      await state.reconcileBinariesAndMigrateStructured();
+
+      expect(state.indexDoc.getMap("binaries").has(configPath)).toBe(false);
+      expect(state.indexDoc.getMap("binaries").has(existingConfigPath)).toBe(false);
+      expect(state.indexDoc.getMap("configFiles").get(configPath)).toEqual({
+        hash: "a".repeat(64),
+        size: 2,
+        mtime: 0,
+      });
+      expect(state.indexDoc.getMap("configFiles").get(existingConfigPath)).toEqual({
+        hash: "c".repeat(64),
+        size: 4,
+        mtime: 42,
+      });
+      expect(local.vault.binaries.has(configPath)).toBe(false);
+    } finally {
+      sync.destroy();
+    }
+  });
+
+  it("preserves both binary paths when shutdown interrupts rename publication", async () => {
     const vault = await harness.createVault(aliceToken, "binary-rename-restart");
     const local = makeFakePlugin(harness.authUrl, {
       sessionToken: aliceToken,
@@ -556,11 +650,14 @@ describe("VaultSync index", () => {
       await waitFor(
         () => {
           const binarySync = (sync as any).binarySync;
-          return binarySync.hasPath("new.bin") && !binarySync.hasPath("old.bin");
+          return binarySync.hasPath("new.bin") && binarySync.hasPath("old.bin");
         },
-        { timeout: 20_000, label: "binary rename resumed after restart" },
+        { timeout: 20_000, label: "interrupted binary rename recovered safely" },
       );
       expect([...new Uint8Array(local.vault.binaries.get("new.bin")!)]).toEqual([
+        4, 8, 15, 16, 23, 42,
+      ]);
+      expect([...new Uint8Array(local.vault.binaries.get("old.bin")!)]).toEqual([
         4, 8, 15, 16, 23, 42,
       ]);
     } finally {
@@ -670,7 +767,7 @@ describe("VaultSync index", () => {
     }
   });
 
-  it("propagates deletes and renames made while sync is stopped", async () => {
+  it("restores missing paths and preserves offline rename targets", async () => {
     const vault = await harness.createVault(aliceToken, "offline-path-changes");
     const vaultId = vault.id;
     const { plugin, vault: localVault } = makeFakePlugin(harness.authUrl, {
@@ -712,10 +809,12 @@ describe("VaultSync index", () => {
       (plugin as any).vaultSync = sync;
       await waitFor(
         () =>
-          !peer.files.has("delete.md") &&
-          !peer.files.has("rename.md") &&
-          peer.files.has("renamed.md"),
-        { timeout: 20_000, label: "offline path changes propagated" },
+          peer.files.has("delete.md") &&
+          peer.files.has("rename.md") &&
+          peer.files.has("renamed.md") &&
+          localVault.files.get("delete.md") === "delete me" &&
+          localVault.files.get("rename.md") === "rename me",
+        { timeout: 20_000, label: "offline path changes recovered safely" },
       );
     } finally {
       sync?.destroy();

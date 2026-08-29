@@ -9,6 +9,7 @@ import { AuthClient } from "../../src/auth";
 type Handler = (...args: any[]) => void;
 
 export class FakeVault {
+  configDir = ".obsidian";
   files = new Map<string, string>();
   /** Binary file contents, keyed by path (parallel to `files`). */
   binaries = new Map<string, ArrayBuffer>();

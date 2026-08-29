@@ -151,6 +151,56 @@ describe("Document sync", () => {
     }
   });
 
+  it("does not acknowledge a remote note before its disk create completes", async () => {
+    const guid = freshGuid();
+    const peer = new Peer(memberPlugin, docId(guid));
+    await peer.whenSynced();
+    peer.setText("authored elsewhere");
+    await peer.whenChangesSynced();
+
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const noteMaterialized = vi.fn();
+    (plugin as any).vaultSync = {
+      noteMaterialized,
+      noteContentAcknowledged: vi.fn(),
+      noteTextActivity: vi.fn(),
+    };
+    const originalCreate = vault.create.bind(vault);
+    let releaseCreate!: () => void;
+    const createBlocked = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    vault.create = vi.fn(async (path, content) => {
+      await createBlocked;
+      return originalCreate(path, content);
+    });
+
+    const doc = new Document(plugin as any, "remote.md", guid, docId(guid), false);
+    let ready = false;
+    void doc.whenReady().then(() => {
+      ready = true;
+    });
+    try {
+      await waitFor(() => vi.mocked(vault.create).mock.calls.length > 0, {
+        label: "remote disk create started",
+      });
+      expect(noteMaterialized).not.toHaveBeenCalled();
+      expect(ready).toBe(false);
+
+      releaseCreate();
+      await doc.whenReady();
+      expect(vault.files.get("remote.md")).toBe("authored elsewhere");
+      expect(noteMaterialized).toHaveBeenCalledWith("remote.md", "text", guid);
+    } finally {
+      releaseCreate();
+      doc.destroy();
+      peer.destroy();
+    }
+  });
+
   it("does not write remote updates to disk while the note is open", async () => {
     const guid = freshGuid();
     const { plugin, vault } = makeFakePlugin(harness.authUrl, {

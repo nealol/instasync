@@ -47,6 +47,8 @@ export class Document extends SyncedDoc {
   private localChangedAtStartup = false;
   /** Guards the one-time startup merge so reconnects don't re-run it. */
   private startupReconciled = false;
+  /** True only after startup content is durably present on this device. */
+  private startupReady = false;
   private startupReconciling = false;
   private readonly forceBootstrapConflict: boolean;
   /** Suppress write-through while IndexedDB is replaying the startup baseline. */
@@ -137,65 +139,71 @@ export class Document extends SyncedDoc {
    *                                     the chosen text as canonical.
    */
   protected async finishStartupReconcile(): Promise<void> {
-    if (this.startupReconciled || this.startupReconciling || this.destroyed) return;
+    if (this.startupReady || this.startupReconciling || this.destroyed) return;
     this.startupReconciling = true;
     let completed = false;
 
     try {
-      const remote = this.content;
-      const baseline = this.baselineAtStartup;
-      const localDisk = this.diskAtStartup;
-      const remoteChanged = remote !== baseline;
-      const creatorHasLocalAgainstEmptyRemote =
-        this.isCreator && localDisk !== null && localDisk.length > 0 && remote.length === 0;
+      if (!this.startupReconciled) {
+        const remote = this.content;
+        const baseline = this.baselineAtStartup;
+        const localDisk = this.diskAtStartup;
+        const remoteChanged = remote !== baseline;
+        const creatorHasLocalAgainstEmptyRemote =
+          this.isCreator && localDisk !== null && localDisk.length > 0 && remote.length === 0;
 
-      // Creator docs are the only side allowed to seed a brand-new server doc.
-      // If their first remote is empty, treat it as unseeded instead of asking
-      // the user to resolve a blank-vs-local conflict.
-      const isConflict =
-        localDisk !== null &&
-        (this.localChangedAtStartup || this.forceBootstrapConflict) &&
-        remote !== localDisk &&
-        (remoteChanged || this.forceBootstrapConflict) &&
-        !creatorHasLocalAgainstEmptyRemote;
+        // Creator docs are the only side allowed to seed a brand-new server doc.
+        // If their first remote is empty, treat it as unseeded instead of asking
+        // the user to resolve a blank-vs-local conflict.
+        const isConflict =
+          localDisk !== null &&
+          (this.localChangedAtStartup || this.forceBootstrapConflict) &&
+          remote !== localDisk &&
+          (remoteChanged || this.forceBootstrapConflict) &&
+          !creatorHasLocalAgainstEmptyRemote;
 
-      const sameDevicePrefixFastForward =
-        isConflict &&
-        !this.forceBootstrapConflict &&
-        getDocumentEpoch(this.plugin, this.serverDocId) === 0 &&
-        baseline.length === 0 &&
-        localDisk !== null &&
-        localDisk.length > remote.length &&
-        localDisk.startsWith(remote);
+        const sameDevicePrefixFastForward =
+          isConflict &&
+          !this.forceBootstrapConflict &&
+          getDocumentEpoch(this.plugin, this.serverDocId) === 0 &&
+          baseline.length === 0 &&
+          localDisk !== null &&
+          localDisk.length > remote.length &&
+          localDisk.startsWith(remote);
 
-      if (sameDevicePrefixFastForward) {
-        this.applyText(localDisk);
-      } else if (isConflict) {
-        const merge = this.forceBootstrapConflict
-          ? ({ kind: "conflict" } as const)
-          : mergeText(baseline, localDisk, remote);
-        if (merge.kind === "merged") {
-          this.applyText(merge.content);
-        } else {
-          await this.resolveStartupConflict(localDisk, remote);
-          if (this.destroyed) return;
+        if (sameDevicePrefixFastForward) {
+          this.applyText(localDisk);
+        } else if (isConflict) {
+          const merge = this.forceBootstrapConflict
+            ? ({ kind: "conflict" } as const)
+            : mergeText(baseline, localDisk, remote);
+          if (merge.kind === "merged") {
+            this.applyText(merge.content);
+          } else {
+            await this.resolveStartupConflict(localDisk, remote);
+            if (this.destroyed) return;
+          }
+        } else if (
+          this.localChangedAtStartup &&
+          localDisk !== null &&
+          (!remoteChanged || creatorHasLocalAgainstEmptyRemote)
+        ) {
+          this.applyText(localDisk);
         }
-      } else if (
-        this.localChangedAtStartup &&
-        localDisk !== null &&
-        (!remoteChanged || creatorHasLocalAgainstEmptyRemote)
-      ) {
-        this.applyText(localDisk);
+        this.startupReconciled = true;
       }
-
-      this.startupReconciled = true;
-      this.plugin.vaultSync?.noteMaterialized(this.path, "text", this.guid);
 
       // The editor (if open) receives the merged text via the ytext observer;
       // writing through vault.modify would make Obsidian merge an external change.
+      let materialized = this.getFile() !== null;
       if (!this.hasBoundEditor && !this.isOpenInEditableMarkdown()) {
-        await this.writeToDisk(this.content);
+        materialized = await this.writeToDisk(this.content);
+      } else if (materialized) {
+        this.plugin.vaultSync?.noteMaterialized(this.path, "text", this.guid);
       }
+      if (!materialized || this.destroyed) return;
+
+      this.startupReady = true;
       if (!this.provider.hasLocalChanges) await this.recordAcknowledgedContent(true);
       completed = true;
     } catch (e) {
@@ -211,7 +219,7 @@ export class Document extends SyncedDoc {
   }
 
   protected async afterChangesSynced(): Promise<void> {
-    if (!this.startupReconciled || this.destroyed) return;
+    if (!this.startupReady || this.destroyed) return;
     await this.recordAcknowledgedContent(true);
   }
 
@@ -222,7 +230,7 @@ export class Document extends SyncedDoc {
       this.destroyed ||
       this.provider.hasLocalChanges ||
       this.content !== content ||
-      !this.startupReconciled
+      !this.startupReady
     ) {
       return;
     }
@@ -291,7 +299,7 @@ export class Document extends SyncedDoc {
 
   private onYTextChanged(): void {
     if (this.destroyed) return;
-    if (!this.startupBaselineCaptured || !this.startupReconciled) return;
+    if (!this.startupBaselineCaptured || !this.startupReady) return;
     // Note text-sync activity so the binary upload queue can defer large
     // transfers while notes are actively syncing.
     this.plugin.vaultSync?.noteTextActivity();
@@ -314,7 +322,7 @@ export class Document extends SyncedDoc {
       if (
         this.destroyed ||
         !this.startupBaselineCaptured ||
-        !this.startupReconciled ||
+        !this.startupReady ||
         this.hasBoundEditor ||
         this.isOpenInEditableMarkdown()
       )
@@ -381,8 +389,8 @@ export class Document extends SyncedDoc {
     return await this.plugin.app.vault.read(file);
   }
 
-  private async writeToDisk(text: string): Promise<void> {
-    if (this.destroyed) return;
+  private async writeToDisk(text: string): Promise<boolean> {
+    if (this.destroyed) return false;
     this.writingToDisk = true;
     this.writingTextToDisk = text;
     try {
@@ -402,16 +410,19 @@ export class Document extends SyncedDoc {
             "open",
             this.isOpenInEditableMarkdown(),
           );
-          return;
+          this.plugin.vaultSync?.noteMaterialized(this.path, "text", this.guid);
+          return true;
         }
         if ((await this.plugin.app.vault.read(file)) === text) {
           this.plugin.vaultSync?.noteMaterialized(this.path, "text", this.guid);
-          if (!this.provider.hasLocalChanges) await this.recordAcknowledgedContent(true);
-          return;
+          if (this.startupReady && !this.provider.hasLocalChanges) {
+            await this.recordAcknowledgedContent(true);
+          }
+          return true;
         }
         // Re-check destroyed after the await: a doc replaced mid-write (rename,
         // guid change) must not clobber the file its successor now owns.
-        if (this.destroyed) return;
+        if (this.destroyed) return false;
         if (this.hasBoundEditor || this.isOpenInEditableMarkdown()) {
           dbg(
             "writeToDisk SKIP after read (open/bound)",
@@ -421,9 +432,10 @@ export class Document extends SyncedDoc {
             "open",
             this.isOpenInEditableMarkdown(),
           );
-          return;
+          this.plugin.vaultSync?.noteMaterialized(this.path, "text", this.guid);
+          return true;
         }
-        if (this.content !== text) return;
+        if (this.content !== text) return false;
         dbg(
           "%cwriteToDisk MODIFY",
           "color:orange",
@@ -439,14 +451,18 @@ export class Document extends SyncedDoc {
         // Remote-created file that does not exist locally yet.
         const path = normalizePath(this.path);
         await ensureParentFolder(this.plugin.app, path);
-        if (this.destroyed || this.content !== text) return;
+        if (this.destroyed || this.content !== text) return false;
         await this.plugin.app.vault.create(path, text);
       }
       this.plugin.vaultSync?.noteMaterialized(this.path, "text", this.guid);
-      if (!this.provider.hasLocalChanges) await this.recordAcknowledgedContent(true);
+      if (this.startupReady && !this.provider.hasLocalChanges) {
+        await this.recordAcknowledgedContent(true);
+      }
+      return true;
     } catch (e) {
       console.error(`[Realtime] writeToDisk failed for ${this.path}`, e);
       if (!this.destroyed) this.scheduleWriteToDisk(DISK_WRITE_RETRY_MS);
+      return false;
     } finally {
       // Release on the next tick so the resulting vault 'modify' event,
       // which is dispatched asynchronously, is still treated as our own.

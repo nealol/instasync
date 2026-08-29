@@ -985,7 +985,8 @@ async fn update_canvas_doc<F>(
 where
     F: FnOnce(&mut JsonMap<String, JsonValue>) -> AppResult<()>,
 {
-    let mut response = mutate_structured_doc(state, principal, vault_id, path, "canvas", edit).await?;
+    let mut response =
+        mutate_structured_doc(state, principal, vault_id, path, "canvas", edit).await?;
     response.value = canvas_to_file_json(response.value);
     Ok(response)
 }

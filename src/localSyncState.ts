@@ -19,21 +19,14 @@ export interface LocalPathState {
   candidateFingerprint?: string;
 }
 
-export function shouldFoldOfflineDeletion(
-  state: LocalPathState | null | undefined,
-  currentIdentity: string,
-  localExists: boolean,
-): boolean {
-  return !localExists && !!state && !state.candidate && state.identity === currentIdentity;
-}
-
 /**
- * Device-local record of paths that were successfully present on disk.
+ * Device-local record of paths and content identities successfully reconciled
+ * on disk.
  *
- * The shared index cannot distinguish a fresh device (missing means pull) from
- * a device that deleted a file while Obsidian was stopped (missing means
- * delete). This small IndexedDB-backed map provides that distinction without
- * publishing device-local filesystem state to collaborators.
+ * Identities provide three-way merge baselines and protect local candidates.
+ * A missing path at startup is deliberately not treated as a deletion: the
+ * file may be temporarily unavailable or evicted by an external storage
+ * provider. Only live vault delete events publish shared deletions.
  */
 export class LocalSyncState {
   private readonly doc = new Y.Doc();

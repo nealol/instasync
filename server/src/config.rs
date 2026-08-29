@@ -295,7 +295,11 @@ fn list(name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn resolve_upload_token(configured: Option<String>, oidc_mode: OidcMode, persist_path: &Path) -> String {
+fn resolve_upload_token(
+    configured: Option<String>,
+    oidc_mode: OidcMode,
+    persist_path: &Path,
+) -> String {
     if let Some(token) = configured {
         enforce_upload_token_entropy(&token, oidc_mode);
         return token;
